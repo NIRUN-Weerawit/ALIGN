@@ -20,6 +20,23 @@ A 3-way contrastive pretraining step aligns vision embeddings (from egocentric c
 - **Text-conditioned corrections** — same visual scene + same motion but different task description → different Δpose. The assistant is task-aware.
 - **Graceful degradation** — any alignment score drops on OOD inputs → min drops → α drops → human stays in control.
 
+### Text Specificity Spectrum
+
+The system does NOT require strict directions. It works across the full spectrum:
+- **Specific** ("pick up the red mug") → highest α, object disambiguation via CLIP
+- **Descriptive** ("pick up the mug") → high α if only one mug is visible
+- **Neutral** ("pick and place") → moderate α, general smoothing, no disambiguation
+- **None** → vision-only fallback, cos_sim_vt still gates
+
+Training uses multiple text variants per episode so the model learns to calibrate confidence to specificity. Neutral text helps less because it *should* — the system is appropriately uncertain.
+
+### Future Work
+
+- **Enriched trajectory encoder input** — expand from (K,6) EEF pose to (K,13) by adding
+  EEF velocity, angular velocity, and gripper state. Already recorded, trivially computed.
+  Gives the Transformer explicit motion dynamics without the joint-level noise and 60% zero-padding
+  of RDT-1B's full 128-dim unified action space.
+
 ### Development Plan
 
 | Phase | Platform | Scope |
