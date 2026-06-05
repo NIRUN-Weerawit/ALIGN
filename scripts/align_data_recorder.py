@@ -27,8 +27,10 @@ Usage:
 import json
 import os
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image
@@ -51,10 +53,10 @@ class DataRecorder:
     def __init__(
         self,
         output_dir: str = "./align_data",
-        episode_name: str | None = None,
+        episode_name: Optional[str] = None,
         max_frames: int = 10000,
         jpeg_quality: int = 85,
-        camera_label: str = "wrist",
+        camera_label: Sequence[str] = ["wrist", "mid"],
     ):
         self.output_dir = Path(output_dir)
         if episode_name is None:
@@ -66,12 +68,12 @@ class DataRecorder:
         self.camera_label = camera_label
 
         # Data buffers
-        self.frames: list[np.ndarray] = []       # stored as compressed JPEG
-        self.noisy_poses: list[np.ndarray] = []  # (6,) each
-        self.gripper_states: list[float] = []
-        self.timestamps: list[float] = []
-        self.smooth_poses: list[np.ndarray] = []  # filled later by GT generation
-        self.absolute_poses: list[np.ndarray] = []  # world-frame EEF pose for reference
+        self.frames: Dict[str, List[np.ndarray]] = {label: [] for label in camera_label}  # stored as compressed JPEG
+        self.noisy_poses: List[np.ndarray] = []  # (6,) each
+        self.gripper_states: List[float] = []
+        self.timestamps: List[float] = []
+        self.smooth_poses: List[np.ndarray] = []  # filled later by GT generation
+        self.absolute_poses: List[np.ndarray] = []  # world-frame EEF pose for reference
 
         # Metadata
         self.task_description: str = ""
@@ -79,7 +81,7 @@ class DataRecorder:
         self.target_object: str = ""
         self.operator_id: str = ""
         self.notes: str = ""
-        self._start_time: float | None = None
+        self._start_time: Optional[float] = None
         self._finalized: bool = False
 
         # Create directories
@@ -91,7 +93,7 @@ class DataRecorder:
     def set_task_description(self, text: str):
         self.task_description = text
 
-    def set_object_poses(self, objects: dict[str, list[float]]):
+    def set_object_poses(self, objects: Dict[str, List[float]]):
         """Set object poses in world frame. {name: [x, y, z]}"""
         self.objects_on_table = objects
 
@@ -108,15 +110,15 @@ class DataRecorder:
 
     def step(
         self,
-        frame: np.ndarray,
+        frame: Mapping[str, np.ndarray],
         noisy_pose: np.ndarray,
         gripper_state: float = 0.0,
-        absolute_pose: np.ndarray | None = None,
+        absolute_pose: Optional[np.ndarray] = None,
     ):
         """Record one timestep.
 
         Args:
-            frame: (H, W, 3) uint8 RGB camera image.
+            frame: Mapping from camera label to (H, W, 3) uint8 RGB image.
             noisy_pose: (6,) or (7,) EEF pose. 6D = [x, y, z, rx, ry, rz]
                         (axis-angle) or 7D = [x, y, z, qx, qy, qz, qw].
             gripper_state: 0.0 = open, 1.0 = closed.
@@ -128,12 +130,29 @@ class DataRecorder:
         if self._start_time is None:
             self._start_time = time.time()
 
-        if len(self.frames) >= self.max_frames:
+        if self.num_frames >= self.max_frames:
             print(f"[Recorder] Max frames ({self.max_frames}) reached. Call finalize().")
             return
 
+        if not isinstance(frame, Mapping):
+            raise TypeError("frame must be a mapping from camera label to image array")
+
+        frame_labels = set(frame.keys())
+        expected_labels = set(self.camera_label)
+        missing = expected_labels - frame_labels
+        extra = frame_labels - expected_labels
+        if missing or extra:
+            raise ValueError(
+                f"frame keys must match camera_label {self.camera_label}. "
+                f"Missing: {sorted(missing)}; Extra: {sorted(extra)}"
+            )
+
         # Store raw frame (will compress on save)
-        self.frames.append(frame)
+        for label in self.camera_label:
+            img = np.asarray(frame[label], dtype=np.uint8)
+            if img.ndim != 3 or img.shape[2] != 3:
+                raise ValueError(f"frame['{label}'] must be an HxWx3 RGB image")
+            self.frames[label].append(img)
 
         # Normalize pose to 6D if it's 7D quaternion
         pose = np.asarray(noisy_pose, dtype=np.float64).flatten()
@@ -150,7 +169,7 @@ class DataRecorder:
         if absolute_pose is not None:
             self.absolute_poses.append(np.asarray(absolute_pose, dtype=np.float64).flatten())
 
-    def set_smooth_poses(self, smooth_poses: list[np.ndarray] | np.ndarray):
+    def set_smooth_poses(self, smooth_poses: Union[List[np.ndarray], np.ndarray]):
         """Set ground-truth smooth poses (computed offline by GT pipeline)."""
         self.smooth_poses = [np.asarray(p, dtype=np.float64).flatten() for p in smooth_poses]
         assert len(self.smooth_poses) == len(self.noisy_poses), (
@@ -159,7 +178,10 @@ class DataRecorder:
 
     @property
     def num_frames(self) -> int:
-        return len(self.frames)
+        if not self.frames:
+            return 0
+        first_label = next(iter(self.frames))
+        return len(self.frames[first_label])
 
     # ── Finalize & Save ───────────────────────────────────────────────
 
@@ -168,14 +190,14 @@ class DataRecorder:
         self._finalized = True
         elapsed = self.timestamps[-1] if self.timestamps else 0.0
         print(f"[Recorder] Episode '{self.episode_name}' finalized: "
-              f"{len(self.frames)} frames, {elapsed:.1f}s")
+              f"{self.num_frames} frames, {elapsed:.1f}s")
 
     def save(self):
         """Save all data to disk. Call after finalize()."""
         if not self._finalized:
             print("[Recorder] WARNING: Saving without finalize(). Consider calling finalize() first.")
 
-        n = len(self.frames)
+        n = self.num_frames
         if n == 0:
             print("[Recorder] WARNING: No frames recorded. Nothing saved.")
             return
@@ -186,9 +208,12 @@ class DataRecorder:
         # ── 1. Save frames as JPEG ──
         frames_dir = episode_dir / "frames"
         frames_dir.mkdir(exist_ok=True)
-        for i, frame in enumerate(self.frames):
-            img = Image.fromarray(frame.astype(np.uint8))
-            img.save(frames_dir / f"{i:05d}.jpg", quality=self.jpeg_quality)
+        for label in self.camera_label:
+            label_dir = frames_dir / label
+            label_dir.mkdir(exist_ok=True)
+            for i, frame in enumerate(self.frames[label]):
+                img = Image.fromarray(frame.astype(np.uint8))
+                img.save(label_dir / f"{i:05d}.jpg", quality=self.jpeg_quality)
 
         # ── 2. Save numpy arrays ──
         npz_dict = {
@@ -222,9 +247,11 @@ class DataRecorder:
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
-        # Size estimate
+        # Size estimate (use first camera view)
+        first_label = self.camera_label[0]
+        label_dir = frames_dir / first_label
         total_bytes = sum(
-            os.path.getsize(frames_dir / f"{i:05d}.jpg") for i in range(min(n, 10))
+            os.path.getsize(label_dir / f"{i:05d}.jpg") for i in range(min(n, 10))
         )
         avg_bytes = total_bytes / min(n, 10)
         estimated_mb = (avg_bytes * n) / (1024 * 1024)
@@ -246,7 +273,7 @@ def load_episode(episode_dir: str) -> tuple[np.ndarray, dict, dict]:
 
     Returns:
         (frames, data, meta)
-            frames: (N, H, W, 3) uint8 RGB array
+            frames: dict[label, (N, H, W, 3) uint8 RGB] for each camera view
             data: dict with keys from data.npz (noisy_poses, gripper_states, etc.)
             meta: dict from meta.json
     """
@@ -254,14 +281,20 @@ def load_episode(episode_dir: str) -> tuple[np.ndarray, dict, dict]:
     if not episode_path.exists():
         raise FileNotFoundError(f"Episode directory not found: {episode_dir}")
 
-    # Load frames
+    # Load frames from multi-camera directory structure.
     frames_dir = episode_path / "frames"
-    frame_files = sorted(frames_dir.glob("*.jpg"), key=lambda p: int(p.stem))
-    frames = []
-    for f in frame_files:
-        img = Image.open(f)
-        frames.append(np.array(img))
-    frames_arr = np.stack(frames, axis=0) if frames else np.array([])
+    frames = {}
+    camera_dirs = sorted([p for p in frames_dir.iterdir() if p.is_dir()])
+    if camera_dirs:
+        for label_dir in camera_dirs:
+            label = label_dir.name
+            frame_files = sorted(label_dir.glob("*.jpg"), key=lambda p: int(p.stem))
+            frames[label] = np.stack([np.array(Image.open(f)) for f in frame_files], axis=0) if frame_files else np.array([])
+    else:
+        frame_files = sorted(frames_dir.glob("*.jpg"), key=lambda p: int(p.stem))
+        frames["default"] = np.stack([np.array(Image.open(f)) for f in frame_files], axis=0) if frame_files else np.array([])
+
+    frames_arr = frames
 
     # Load numpy arrays
     data = {}

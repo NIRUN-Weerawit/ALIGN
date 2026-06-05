@@ -36,6 +36,10 @@ Training uses multiple text variants per episode so the model learns to calibrat
   EEF velocity, angular velocity, and gripper state. Already recorded, trivially computed.
   Gives the Transformer explicit motion dynamics without the joint-level noise and 60% zero-padding
   of RDT-1B's full 128-dim unified action space.
+- **DMP-based approach phase** — replace quintic interpolation with Dynamic Movement Primitives.
+  One expert demo per object type → learned forcing term encodes approach style (arc, wrist rotation).
+  DMP adapts to arbitrary start/goal poses via attractor scaling. Human-like paths by construction,
+  deterministic, instant in deployment. Bi-RRT + smoothing as collision-fallback only.
 
 ### Development Plan
 

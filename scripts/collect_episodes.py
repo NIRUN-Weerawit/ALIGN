@@ -207,11 +207,15 @@ def setup_mqtt():
 # ============================================================
 # Pre-defined object templates (name, prim_path_suffix)
 OBJECT_TEMPLATES = [
-    {"name": "cube_1",      "prim": "/World/Xform_dex_cube"},
-    {"name": "cube_2",    "prim": "/World/Xform_dex_cube_01"},
-    {"name": "rubik_1",     "prim": "/World/Xform_rubik"},
-    {"name": "rubik_2",    "prim": "/World/Xform_rubik_01"},
-    {"name": "nvidia_cube", "prim": "/World/Xform_nvidia_cube"},
+    {"name": "letter_cube",     "prim": "/World/Xform_dex_cube_01"},
+    {"name": "rubik",           "prim": "/World/Xform_rubik"},
+    {"name": "tall_rubik",      "prim": "/World/Xform_rubik_01"},
+    {"name": "mug",             "prim": "/World/Xform_mug"},
+    {"name": "bottle",          "prim": "/World/Xform_cleaner"},
+    {"name": "tomato soup can", "prim": "/World/Xform_soup_can"},
+    {"name": "potted meat can", "prim": "/World/Xform_spam_can"},
+    {"name": "can",             "prim": "/World/Xform_chef_can"},
+    {"name": "bowl",            "prim": "/World/Xform_bowl"},
 ]
 
 def random_pose(is_tray=False):
@@ -220,8 +224,8 @@ def random_pose(is_tray=False):
         regions = [((0.1, 0.5), (-0.6, -0.3)), ((0.1, 0.5), (0.3, 0.6)),
                    ((0.5, 0.6), (-0.6, 0.6))]
     else:
-        regions = [((0.0, 0.5), (-1.0, -0.3)), ((0.0, 0.5), (0.3, 1.0)),
-                   ((0.5, 1.15), (-1.0, 1.0))]
+        regions = [((0.0, 0.5), (-0.8, -0.3)), ((0.0, 0.5), (0.3, 0.8)),
+                   ((0.5, 1.1), (-0.8, 0.8))]
     areas = [(x1 - x0) * (y1 - y0) for (x0, x1), (y0, y1) in regions]
     p = np.array(areas) / sum(areas)
     region = regions[np.random.choice(len(regions), p=p)]
@@ -235,7 +239,7 @@ def spawn_objects(object_names: list[str] | None = None):
     from isaacsim.core.utils.prims import get_prim_at_path
 
     if object_names is None:
-        object_names = [t["name"] for t in OBJECT_TEMPLATES[:5]]
+        object_names = [t["name"] for t in OBJECT_TEMPLATES]
 
     objects = {}
     for t in OBJECT_TEMPLATES:
@@ -277,9 +281,12 @@ def get_episode_config(
 
     # Generate text variants based on episode number
     variants = [
-        f"pick up the {target}",
-        f"grasp the {target}",
-        f"reach for the {target}",
+        f"pick up the {target} and put it in the box",
+        f"pick up the {target} and place it in the box",
+        f"grasp the {target} and place it in the box",
+        f"grasp the {target} and leave it in the purple box",
+        f"reach for the {target} and put it in the box",
+        f"reach for the {target} and place it in the box",
     ]
     task_desc = variants[episode_num % len(variants)]
     
@@ -295,7 +302,7 @@ def main():
     )
     parser.add_argument("--num-episodes", type=int, default=10,
                         help="Number of episodes to collect (default: 10)")
-    parser.add_argument("--output-dir", type=str, default="/home/ucluser/VRWIT/ALIGN/align_data",
+    parser.add_argument("--output-dir", type=str, default="/home/ucluser/ALIGN/align_data",
                         help="Output directory (default: ./align_data)")
     parser.add_argument("--noise", type=str, default="none",
                         choices=["none", "mild", "moderate", "heavy"],
@@ -304,7 +311,7 @@ def main():
                         help="Record clean expert demos")
     parser.add_argument("--operator", type=str, default="anonymous",
                         help="Operator ID for metadata")
-    parser.add_argument("--episode-timeout", type=float, default=60.0,
+    parser.add_argument("--episode-timeout", type=float, default=30.0,
                         help="Max seconds per episode before auto-finalize")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for object placement")
@@ -322,7 +329,7 @@ def main():
     print("\n=== Isaac Sim Setup ===")
     open_stage(
         "/home/ucluser/isaacgym/assets/urdf/piper_description/urdf/"
-        "piper_description/franka_simple_1.usd"
+        "piper_description/ALIGN_franka_1.usd"
     )
     sim = SimulationContext()
     dt = sim.get_physics_dt()
@@ -412,7 +419,15 @@ def main():
     # ── Output dir ──
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
+    
+    if output_dir.exists() and any(output_dir.iterdir()):
+        print(f"\n[Warning] Output directory '{output_dir}' is not empty. New episodes will be added to existing contents.\n")
+        initial_count = len(list(output_dir.glob("ep_*")))
+        print(f"  Existing episodes found: {initial_count}")
+        episode_num = initial_count
+    else: 
+        episode_num = 0
+        initial_count = 0
     # ── Set initial pose ──
     robot.set_joint_positions(FRANKA_HOME)
 
@@ -429,14 +444,14 @@ def main():
     print(f"{'='*60}\n")
 
     t = 0
-    episode_num = 0
+    
     recorder = None
     episode_start_time = 0.0
     episode_recording = False  # True while trigger is held during recording
     waiting_for_trigger = True
     elapsed = 0.0
 
-    while simulation_app.is_running() and episode_num < args.num_episodes:
+    while simulation_app.is_running() and episode_num < (args.num_episodes + initial_count):
         sim.step(render=True)
 
         # ── 1. Read VR state ──
@@ -451,9 +466,9 @@ def main():
         # ── 2. Gripper ──
         joint_efforts = robot.get_measured_joint_efforts()
         if grip:
-            joint_efforts[7] = -500.0
+            joint_efforts[7] = -100.0
         else:
-            joint_efforts[7] = 1000.0
+            joint_efforts[7] = 500.0
         robot.apply_action(ArticulationAction(joint_efforts=joint_efforts))
 
         # ── 3. VR teleoperation ──
@@ -504,13 +519,46 @@ def main():
         target_rot_IK = target_rot_VR.copy()
 
         # ── 4. Camera capture ──
-        wrist_rgba = wrist_cam.get_rgba()
+        wrist_rgba  = wrist_cam.get_rgba()
+        mid_rgba    = mid_cam.get_rgba()
         wrist_rgb = (
             wrist_rgba.copy().reshape((HEIGHT, WIDTH, 4))[:, :, :3].astype(np.uint8)
             if len(wrist_rgba) > 0
             else np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
         )
+        mid_rgb = (
+            mid_rgba.copy().reshape((HEIGHT, WIDTH, 4))[:, :, :3].astype(np.uint8)
+            if len(mid_rgba) > 0
+            else np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+        )
 
+        # ── 6. Episode start logic ──
+        if waiting_for_trigger and buttonB and not prev_buttonB:
+            # Start a new episode on first trigger press
+            task_desc, target_name, active_objects = get_episode_config(
+                objects, episode_num, args.num_episodes
+            )
+            episode_name = f"ep_{episode_num:04d}_{target_name}"
+
+            recorder = DataRecorder(
+                output_dir=str(output_dir),
+                episode_name=episode_name,
+                camera_label=["wrist", "mid"],
+            )
+            recorder.set_task_description(task_desc)
+            recorder.set_target_object(target_name)
+            recorder.set_object_poses(obj_positions)
+            recorder.set_operator(args.operator)
+
+            print(f"\n{'─'*50}")
+            print(f"[Episode {episode_num + 1}/{args.num_episodes + initial_count}] {episode_name}")
+            print(f"  Task: {task_desc}")
+            print(f"  Target: {target_name}")
+            print(f"{'─'*50}")
+
+            episode_recording = True
+            waiting_for_trigger = False
+            
         # ── 5. Data recording ──
         if recorder is not None and episode_recording:
             
@@ -524,16 +572,25 @@ def main():
                 recorder = None
                 episode_recording = False
                 waiting_for_trigger = True
+                episode_num += 1
+                print(f"\nReady for episode {episode_num + 1}/{args.num_episodes + initial_count}")
+                print("  Press B to start...\n")
+                elapsed = 0.0
 
             # Button B: force-finalize current episode
-            if buttonB and not prev_buttonB and episode_recording:
+            if buttonB and not prev_buttonB and recorder is not None and recorder.num_frames > 10:
                 print("\n[Force finalize] Button B pressed")
+                print(f"\n[Complete] Episode {episode_num + 1} finished — "
+                  f"{recorder.num_frames} frames recorded")
                 recorder.set_notes("force-finalized (button B)")
                 recorder.finalize()
                 recorder.save()
                 recorder = None
                 episode_recording = False
                 waiting_for_trigger = True
+                episode_num += 1
+                print(f"\nReady for episode {episode_num + 1}/{args.num_episodes + initial_count}")
+                print("  Press B to start...\n")
 
             # Keep recording
             if episode_recording:
@@ -545,7 +602,7 @@ def main():
                 gripper_state = 1.0 if grip else 0.0
 
                 recorder.step(
-                    frame=wrist_rgb,
+                    frame={"wrist": wrist_rgb, "mid": mid_rgb},
                     noisy_pose=noisy_pose,
                     gripper_state=gripper_state,
                     absolute_pose=None,  # same as noisy — real teleop is what we train on
@@ -553,35 +610,9 @@ def main():
                 elapsed = time.time() - recorder._start_time
             
 
-        # ── 6. Episode start / end logic ──
-        if waiting_for_trigger and buttonB and not prev_buttonB:
-            # Start a new episode on first trigger press
-            task_desc, target_name, active_objects = get_episode_config(
-                objects, episode_num, args.num_episodes
-            )
-            episode_name = f"ep_{episode_num:04d}_{target_name}"
-
-            recorder = DataRecorder(
-                output_dir=str(output_dir),
-                episode_name=episode_name,
-                camera_label="wrist",
-            )
-            recorder.set_task_description(task_desc)
-            recorder.set_target_object(target_name)
-            recorder.set_object_poses(obj_positions)
-            recorder.set_operator(args.operator)
-
-            print(f"\n{'─'*50}")
-            print(f"[Episode {episode_num + 1}/{args.num_episodes}] {episode_name}")
-            print(f"  Task: {task_desc}")
-            print(f"  Target: {target_name}")
-            print(f"{'─'*50}")
-
-            episode_recording = True
-            waiting_for_trigger = False
             
         prev_buttonB = buttonB
-        prev_buttonA = buttonA
+        
         # Button A: reset (cancel current episode)
         if buttonA and not prev_buttonA:
             if recorder is not None and episode_recording:
@@ -613,7 +644,7 @@ def main():
             _, reset_ee_rot = franka_hand.get_world_pose()
             quat_save = reset_ee_rot
             prev_trigger = False
-            prev_buttonA = False
+            # prev_buttonA = False
             prev_buttonB = False
             sim.play()
             sim.step(render=True)
@@ -624,7 +655,8 @@ def main():
 
             t = 0
             continue
-
+        
+        prev_buttonA = buttonA
         # ── 7. IK solve and apply ──
         # No noise injection needed — real human teleop is already noisy enough
         action_target, success = kin_solver.compute_inverse_kinematics(
@@ -643,7 +675,7 @@ def main():
 
         # ── 8. Episode completion ──
         # Episode ends when: trigger is released after having been held
-        if episode_recording and recorder is not None and buttonB and not prev_buttonB and recorder.num_frames > 10:
+        '''if episode_recording and recorder is not None and buttonB and not prev_buttonB and recorder.num_frames > 10:
             print(f"\n[Complete] Episode {episode_num + 1} finished — "
                   f"{recorder.num_frames} frames recorded")
             recorder.finalize()
@@ -658,7 +690,7 @@ def main():
             quat_save = target_rot_VR.copy()
 
             print(f"\nReady for episode {episode_num + 1}/{args.num_episodes}")
-            print("  Hold trigger to start...\n")
+            print("  Hold trigger to start...\n")'''
 
         t += 1
 

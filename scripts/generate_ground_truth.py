@@ -41,6 +41,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from PIL import Image
@@ -81,7 +82,12 @@ def load_episode(episode_dir: str) -> tuple:
 
     # Frames
     frames_dir = ep_path / "frames"
-    frame_files = sorted(frames_dir.glob("*.jpg"), key=lambda p: int(p.stem))
+    camera_dirs = sorted([p for p in frames_dir.iterdir() if p.is_dir()])
+    if camera_dirs:
+        label_dir = camera_dirs[0]
+        frame_files = sorted(label_dir.glob("*.jpg"), key=lambda p: int(p.stem))
+    else:
+        frame_files = sorted(frames_dir.glob("*.jpg"), key=lambda p: int(p.stem))
     frames = []
     for f in frame_files:
         frames.append(np.array(Image.open(f)))
@@ -455,7 +461,7 @@ def compute_chunk_targets(
 
 def process_episode(
     episode_dir: str,
-    output_dir: str | None = None,
+    output_dir: Optional[str] = None,
     visualize: bool = False,
 ) -> dict:
     """Run full ground truth pipeline on one episode.
@@ -592,7 +598,7 @@ def process_episode(
 # Batch processing
 # ================================================================
 
-def process_all(input_dir: str, output_dir: str | None = None):
+def process_all(input_dir: str, output_dir: Optional[str] = None):
     """Process all episodes in a directory."""
     in_path = Path(input_dir)
     out_path = Path(output_dir) if output_dir else in_path
