@@ -48,6 +48,16 @@ from PIL import Image
 from scipy.signal import savgol_filter
 from scipy.spatial.transform import Rotation as R, Slerp
 
+# Optional approach planners (installed alongside this module)
+try:
+    from align_dmp import dmp_approach_plan as _dmp_plan
+except ImportError:
+    _dmp_plan = None
+try:
+    from align_chomp import chomp_approach_plan as _chomp_plan
+except ImportError:
+    _chomp_plan = None
+
 
 # ================================================================
 # Constants
@@ -118,27 +128,83 @@ def load_episode(episode_dir: str) -> tuple:
 # Smoothing — Position
 # ================================================================
 
+def _plan_approach_quintic(
+    noisy_approach_pos: np.ndarray,
+    start_idx: int,
+    grasp_goal: np.ndarray,
+    n_approach: int,
+) -> np.ndarray:
+    """Quintic polynomial interpolation (default)."""
+    start_pos = noisy_approach_pos[0].copy()
+    t_vals = np.linspace(0, 1, n_approach)
+    smooth_step = lambda t: 10*t**3 - 15*t**4 + 6*t**5
+    weights = smooth_step(t_vals)
+    return start_pos + np.outer(weights, grasp_goal - start_pos)
+
+
+def _plan_approach_dmp(
+    noisy_approach_pos: np.ndarray,
+    start_idx: int,
+    grasp_goal: np.ndarray,
+    n_approach: int,
+) -> np.ndarray:
+    """DMP-based approach — encodes human approach style from demo."""
+    if _dmp_plan is None:
+        raise ImportError("align_dmp module not found")
+    return _dmp_plan(noisy_approach_pos, grasp_goal, n_steps=n_approach)
+
+
+def _plan_approach_chomp(
+    noisy_approach_pos: np.ndarray,
+    start_idx: int,
+    grasp_goal: np.ndarray,
+    n_approach: int,
+) -> np.ndarray:
+    """CHOMP-based approach — optimizes for smoothness from straight-line init."""
+    if _chomp_plan is None:
+        raise ImportError("align_chomp module not found")
+    # CHOMP uses the noisy demo only to size the output — it optimizes from
+    # a straight-line initialization, using the demo as a rough prior.
+    return _chomp_plan(noisy_approach_pos, grasp_goal, n_steps=n_approach)
+
+
+# Registry of available planners
+APPROACH_PLANNERS = {
+    "quintic": _plan_approach_quintic,
+    "dmp": _plan_approach_dmp,
+    "chomp": _plan_approach_chomp,
+}
+
+
 def smooth_position(
     noisy_pos: np.ndarray,
     grasp_goal: np.ndarray,
     is_approach: np.ndarray,
+    approach_planner: str = "quintic",
 ) -> np.ndarray:
     """Generate smooth position trajectory.
 
     Transit phase: SavGol filter (preserves human path shape, removes noise).
-    Approach phase: quintic polynomial interpolation to grasp goal.
+    Approach phase: configurable planner (quintic / dmp / chomp).
     Blend: smooth step transition between the two.
 
     Args:
         noisy_pos: (N, 3) noisy EEF positions.
         grasp_goal: (3,) target grasp position (last stable pose).
         is_approach: (N,) bool mask — True for approach phase frames.
+        approach_planner: One of 'quintic', 'dmp', 'chomp'.
 
     Returns:
         (N, 3) smooth positions.
     """
     N = len(noisy_pos)
     smooth_pos = np.zeros_like(noisy_pos)
+
+    planner_fn = APPROACH_PLANNERS.get(approach_planner)
+    if planner_fn is None:
+        print(f"  [GT] WARNING: Unknown approach planner '{approach_planner}', falling back to quintic")
+        planner_fn = _plan_approach_quintic
+        approach_planner = "quintic"
 
     # ── Step 1: SavGol on full trajectory ──
     if N >= SAVGOL_WINDOW:
@@ -158,19 +224,14 @@ def smooth_position(
         end_idx = approach_idx[-1]
         n_approach = end_idx - start_idx + 1
 
-        # Quintic polynomial interpolation from start to grasp goal
-        # (produces smooth, C2 continuous motion)
-        start_pos = noisy_pos[start_idx].copy()
-        t_vals = np.linspace(0, 1, n_approach)
-
-        # Quintic polynomial: p(t) = a0 + a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5
-        # With zero velocity and acceleration at both ends
-        # Coefficients for smooth step (0→1 with zero first and second derivatives at ends):
-        # p(t) = 10*t^3 - 15*t^4 + 6*t^5   (standard smoothstep, C2 continuous)
-        smooth_step = lambda t: 10*t**3 - 15*t**4 + 6*t**5
-        weights = smooth_step(t_vals)
-
-        approach_traj = start_pos + np.outer(weights, grasp_goal - start_pos)
+        # Extract approach segment positions and plan
+        noisy_approach_pos = noisy_pos[start_idx:end_idx + 1]
+        try:
+            approach_traj = planner_fn(noisy_approach_pos, start_idx, grasp_goal, n_approach)
+        except (ImportError, ValueError) as e:
+            print(f"  [GT] WARNING: {approach_planner} planner failed ({e}), falling back to quintic")
+            approach_traj = _plan_approach_quintic(noisy_approach_pos, start_idx, grasp_goal, n_approach)
+            approach_planner = "quintic"
 
         # Fill ALL frames in three regions: pre-approach, approach blend, post-approach
         approach_start = max(0, start_idx - 10)   # blend zone begins a bit early
@@ -463,6 +524,7 @@ def process_episode(
     episode_dir: str,
     output_dir: Optional[str] = None,
     visualize: bool = False,
+    approach_planner: str = "quintic",
 ) -> dict:
     """Run full ground truth pipeline on one episode.
 
@@ -470,6 +532,7 @@ def process_episode(
         episode_dir: Path to episode directory.
         output_dir: Output path (default: same as episode_dir).
         visualize: If True, print summary statistics.
+        approach_planner: 'quintic', 'dmp', or 'chomp'.
 
     Returns:
         dict with keys: smooth_poses, alpha_target, chunk_targets
@@ -489,7 +552,7 @@ def process_episode(
     is_approach = detect_approach_phase(noisy_poses, goal)
 
     # ── 4. Smooth position ──
-    smooth_pos = smooth_position(noisy_poses[:, :3], goal[:3], is_approach)
+    smooth_pos = smooth_position(noisy_poses[:, :3], goal[:3], is_approach, approach_planner=approach_planner)
 
     # ── 5. Smooth orientation ──
     # Ensure quaternion format for orientation smoothing
@@ -598,7 +661,7 @@ def process_episode(
 # Batch processing
 # ================================================================
 
-def process_all(input_dir: str, output_dir: Optional[str] = None):
+def process_all(input_dir: str, output_dir: Optional[str] = None, approach_planner: str = "quintic"):
     """Process all episodes in a directory."""
     in_path = Path(input_dir)
     out_path = Path(output_dir) if output_dir else in_path
@@ -613,12 +676,13 @@ def process_all(input_dir: str, output_dir: Optional[str] = None):
         return
 
     print("Processing " + str(len(episode_dirs)) + " episodes...")
+    print("Approach planner: " + approach_planner)
     print("-" * 50)
 
     all_stats = []
     for ep in episode_dirs:
         ep_out = out_path / ep.name
-        result = process_episode(str(ep), str(ep_out), visualize=True)
+        result = process_episode(str(ep), str(ep_out), visualize=True, approach_planner=approach_planner)
         if result:
             stats = {
                 "episode": ep.name,
@@ -655,18 +719,22 @@ if __name__ == "__main__":
     parser.add_argument("--visualize", action="store_true", help="Print per-episode statistics")
     parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE,
                         help="Chunk size K for Assistant head (default: 5)")
+    parser.add_argument("--approach-planner", type=str, default="quintic",
+                        choices=["quintic", "dmp", "chomp"],
+                        help="Approach phase trajectory planner (default: quintic)")
     args = parser.parse_args()
 
     CHUNK_SIZE = args.chunk_size
 
     if args.episode:
-        result = process_episode(args.episode, args.output_dir, visualize=True)
+        result = process_episode(args.episode, args.output_dir, visualize=True,
+                                 approach_planner=args.approach_planner)
         if not result:
             print("No data generated")
         sys.exit(0)
 
     if args.input_dir:
-        process_all(args.input_dir, args.output_dir)
+        process_all(args.input_dir, args.output_dir, approach_planner=args.approach_planner)
         sys.exit(0)
 
     # ── No args: run a synthetic test ──
