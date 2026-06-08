@@ -1,0 +1,36 @@
+# ALIGN — Conda environment
+# Create:  conda env create -f environment.yml
+# Update:  conda env update -f environment.yml
+# Activate: conda activate align
+name: align
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  # Python
+  - python=3.10
+  # Core ML / data (conda-preferred for CUDA + HDF5 libs)
+  - pytorch=2.4.0
+  - torchvision=0.19.0
+  - numpy
+  - scipy
+  - h5py
+  - pillow
+  # Monitoring / utils
+  - wandb
+  - tqdm
+  - requests
+  # Pip-only packages (not available on all conda channels)
+  - pip
+  - pip:
+    # CLIP-based vision-language backbone
+    - open-clip-torch
+    # LeRobot v3 streaming adapter
+    - lerobot>=1.0
+    # xFormers — memory-efficient attention for DINOv2 (matches torch 2.4.0)
+    - xformers==0.0.28
+    # Optional: Isaac Sim data collection and VR teleop
+    # - isaacsim  # Follow NVIDIA's install guide
+    # - paho-mqtt
+    # - tensorflow-datasets

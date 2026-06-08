@@ -1,0 +1,35 @@
+# ALIGN — pip requirements
+# Install: pip install -r requirements.txt
+#
+# For GPU support, install PyTorch and xFormers separately:
+#   pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
+#   pip install xformers==0.0.28 --index-url https://download.pytorch.org/whl/cu121 --no-deps
+# or for CPU-only:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# ── Core ML & data ──────────────────────────────────────────────
+numpy
+scipy>=1.10
+h5py
+Pillow
+open-clip-torch>=2.24
+lerobot>=1.0
+
+# ── xFormers (optional but recommended for DINOv2 speed) ────────
+# Must match your torch version. Pin both together:
+#   torch==2.4.0+cu121  +  xformers==0.0.28   (CUDA 12.1)
+#   torch==2.3.1+cu121  +  xformers==0.0.27   (CUDA 12.1, fallback)
+# Install with --no-deps to avoid pip downgrading torch:
+#   pip install xformers==0.0.28 --index-url https://download.pytorch.org/whl/cu121 --no-deps
+
+# ── Monitoring ──────────────────────────────────────────────────
+wandb
+tqdm
+
+# ── Utilities ───────────────────────────────────────────────────
+requests
+
+# ── Optional: Isaac Sim data collection ─────────────────────────
+# Install Isaac Sim separately (pip install isaacsim or NVIDIA's installer)
+# paho-mqtt        # MQTT for VR controller
+# tensorflow-datasets  # BridgeData v2 adapter

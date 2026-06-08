@@ -2,6 +2,10 @@
 align_data/
 h5_data/
 
+# Training artifacts
+checkpoints/
+wandb/
+
 # Python
 __pycache__/
 *.pyc

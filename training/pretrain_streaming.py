@@ -669,7 +669,7 @@ def run_streaming_pipeline(
 
         pretrained_path = pretrain_from_stream(
             repo_ids=repo_ids,
-            output_dir=str(output_dir / "checkpoints" / "pretrain"),
+            output_dir=str(output_dir / "pretrain"),
             epochs=epochs_pretrain,
             batch_size=batch_size,
             lr=lr,
@@ -680,7 +680,7 @@ def run_streaming_pipeline(
         )
     else:
         if pretrained_path is None:
-            pretrained_path = str(output_dir / "checkpoints" / "pretrain" / "best.pt")
+            pretrained_path = str(output_dir / "pretrain" / "best.pt")
         if not Path(pretrained_path).exists():
             print(f"[pipeline] ERROR: No pretrained checkpoint at {pretrained_path}")
             sys.exit(1)
@@ -695,7 +695,7 @@ def run_streaming_pipeline(
         head_path = train_heads_from_stream(
             repo_ids=repo_ids,
             pretrained_checkpoint=pretrained_path,
-            output_dir=str(output_dir / "checkpoints" / "heads"),
+            output_dir=str(output_dir / "heads"),
             epochs_decision=epochs_heads // 3,
             epochs_assistant=2 * epochs_heads // 3,
             epochs_joint=epochs_heads // 3,
@@ -707,7 +707,7 @@ def run_streaming_pipeline(
             enable_wandb=enable_wandb,
         )
     else:
-        head_path = str(output_dir / "checkpoints" / "heads" / "joint_best.pt")
+        head_path = str(output_dir / "heads" / "joint_best.pt")
 
     # -- Summary ──
     print(f"\n{'='*60}")

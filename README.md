@@ -2,6 +2,32 @@
 
 **Assistive Latent Intention-Guided Network (ALIGN)** is a shared autonomy framework for assistive teleoperation of robotic manipulators. It learns *when* to assist (decision) and *what* to do (assistant) from a single shared **3-modal** visual-motion-language representation — using contrastive vision-trajectory-language alignment as a natural gating signal.
 
+## Getting Started
+
+```bash
+# 1. Clone and install dependencies
+git clone <repo-url> && cd ALIGN
+
+# Option A — Conda (recommended for GPU training)
+conda env create -f environment.yml
+conda activate align
+
+# Option B — pip / venv
+python3 -m venv align-env
+source align-env/bin/activate
+pip install -r requirements.txt
+pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
+pip install xformers==0.0.28 --index-url https://download.pytorch.org/whl/cu121 --no-deps
+
+# Option C — auto-setup script (detects conda/pip)
+./setup.sh
+
+# 2. Run streaming pretraining (zero disk — pulls data from Hugging Face Hub)
+python training/pretrain_streaming.py --epochs-pretrain 10
+```
+
+See [`environment.yml`](environment.yml) for the full conda env, [`requirements.txt`](requirements.txt) for pip, or [`setup.sh`](setup.sh) for the auto-installer.
+
 ### Core Idea
 
 A 3-way contrastive pretraining step aligns vision embeddings (from egocentric camera frames), trajectory embeddings (from noisy teleoperation poses), and language embeddings (from task descriptions) into a shared space. The pairwise cosine similarities between these embeddings serve as a confidence score that:

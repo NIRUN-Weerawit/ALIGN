@@ -131,17 +131,31 @@ class TrajectoryEncoder(nn.Module):
 # ================================================================
 
 class TextEncoder(nn.Module):
-    """Frozen CLIP ViT-B/32 text tower + trainable projection head."""
+    """Frozen CLIP ViT-B/32 text tower + trainable projection head.
+
+    Uses open_clip (LAION) which is actively maintained and installable via pip.
+    Fallback to OpenAI's clip package if open_clip is unavailable.
+    """
 
     def __init__(self, embed_dim: int = 256):
         super().__init__()
+        self._use_open_clip = False
         try:
-            import clip
-        except ImportError:
-            raise ImportError(
-                "CLIP not installed. Run: pip install git+https://github.com/openai/CLIP.git"
+            import open_clip
+            self.model, _, _ = open_clip.create_model_and_transforms(
+                "ViT-B-32", pretrained="laion2b_s34b_b79k"
             )
-        self.model, _ = clip.load("ViT-B/32", device="cpu")
+            self._tokenizer = open_clip.get_tokenizer("ViT-B-32")
+            self._use_open_clip = True
+        except ImportError:
+            try:
+                import clip
+            except ImportError:
+                raise ImportError(
+                    "Neither open_clip nor clip installed. "
+                    "Run: pip install open-clip-torch"
+                )
+            self.model, _ = clip.load("ViT-B/32", device="cpu")
         for param in self.model.parameters():
             param.requires_grad = False
         self.projection = nn.Sequential(
@@ -158,11 +172,12 @@ class TextEncoder(nn.Module):
         Returns:
             (B, embed_dim) text embeddings.
         """
-        try:
+        if self._use_open_clip:
+            import open_clip
+            tokens = self._tokenizer(texts).to(next(self.projection.parameters()).device)
+        else:
             import clip
-        except ImportError:
-            raise ImportError("CLIP not installed")
-        tokens = clip.tokenize(texts, truncate=True).to(next(self.projection.parameters()).device)
+            tokens = clip.tokenize(texts, truncate=True).to(next(self.projection.parameters()).device)
         with torch.no_grad():
             features = self.model.encode_text(tokens).float()  # (B, 512)
         return self.projection(features)  # (B, 256)
