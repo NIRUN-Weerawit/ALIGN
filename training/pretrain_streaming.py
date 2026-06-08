@@ -28,7 +28,7 @@ import math
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Any, Optional
 
 import numpy as np
 import torch
@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.align_model import ALIGNModel
 from training.contrastive_loss import ContrastiveLoss3Way
+from training.wandb_utils import init_wandb
 from data.open_dataset import LeRobotAdapter
 
 
@@ -165,6 +166,9 @@ def pretrain_from_stream(
     device: Optional[str] = None,
     max_steps_per_epoch: int = 2000,
     checkpoint_every: int = 10,
+    wandb_project: str = "align-streaming",
+    wandb_run: Optional[str] = None,
+    enable_wandb: bool = True,
 ):
     """Contrastive pretraining directly from LeRobot v3 streaming datasets.
 
@@ -181,6 +185,9 @@ def pretrain_from_stream(
         device: Compute device.
         max_steps_per_epoch: Steps per epoch (streaming is infinite).
         checkpoint_every: Save checkpoints every N epochs.
+        wandb_project: W&B project name.
+        wandb_run: W&B run name.
+        enable_wandb: Enable W&B logging.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     output_dir = Path(output_dir)
@@ -194,7 +201,27 @@ def pretrain_from_stream(
     print(f"  LR:       {lr}")
     print(f"  Output:   {output_dir}")
 
-    # ── Streaming dataset ──
+    # -- W&B ──
+    wandb_trainer = init_wandb(
+        project=wandb_project,
+        name=wandb_run,
+        config={
+            "model": "align-streaming-pretrain",
+            "datasets": repo_ids,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "embed_dim": embed_dim,
+            "temperature": temperature,
+            "max_grad_norm": max_grad_norm,
+            "max_steps_per_epoch": max_steps_per_epoch,
+            "device": str(device),
+        },
+    ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
+    print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
+
+    # -- Streaming dataset ──
     stream_ds = MultiDatasetStream(repo_ids)
     loader = DataLoader(
         stream_ds,
@@ -204,7 +231,7 @@ def pretrain_from_stream(
         pin_memory=True,
     )
 
-    # ── Model ──
+    # -- Model ──
     model = ALIGNModel(
         embed_dim=embed_dim,
         use_text=True,
@@ -225,7 +252,7 @@ def pretrain_from_stream(
     criterion = ContrastiveLoss3Way(temperature=temperature)
     optimizer = optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
 
-    # ── Training ──
+    # -- Training ──
     log_path = output_dir / "streaming_training_log.jsonl"
     log_fp = open(log_path, "a")
     best_loss = float("inf")
@@ -278,6 +305,15 @@ def pretrain_from_stream(
         print(f"  Epoch {epoch + 1:3d}  loss: {avg_loss:.4f}  "
               f"cos_vt: {avg_vt:.3f}  cos_vl: {avg_vl:.3f}  cos_tl: {avg_tl:.3f}")
 
+        # W&B epoch logging
+        wandb_trainer.log({
+            "epoch": epoch + 1,
+            "loss": avg_loss,
+            "cos_vt": avg_vt,
+            "cos_vl": avg_vl,
+            "cos_tl": avg_tl,
+        }, step=epoch + 1)
+
         # Log
         log_fp.write(json.dumps({
             "epoch": epoch + 1,
@@ -299,6 +335,7 @@ def pretrain_from_stream(
                 "loss": avg_loss,
             }, output_dir / "best.pt")
             print(f"  -> best checkpoint (loss: {avg_loss:.4f})")
+            wandb_trainer.log({"best_loss": best_loss}, step=epoch + 1)
 
         if (epoch + 1) % checkpoint_every == 0:
             torch.save({
@@ -310,6 +347,7 @@ def pretrain_from_stream(
     log_fp.close()
     print(f"\n  Pretraining complete. Best loss: {best_loss:.4f}")
     print(f"  Logs: {log_path}")
+    wandb_trainer.finish()
     return str(output_dir / "best.pt")
 
 
@@ -331,6 +369,9 @@ def train_heads_from_stream(
     max_steps_per_epoch: int = 2000,
     device: Optional[str] = None,
     noise_configs: Optional[list[dict]] = None,
+    wandb_project: str = "align-streaming",
+    wandb_run: Optional[str] = None,
+    enable_wandb: bool = True,
 ):
     """Train Decision + Assistant heads from streamed data with on-the-fly noise.
 
@@ -364,7 +405,29 @@ def train_heads_from_stream(
     print(f"  Pretrained:  {pretrained_checkpoint}")
     print(f"  Device:      {device}")
 
-    # ── Streaming dataset ──
+    # -- W&B ──
+    wandb_trainer = init_wandb(
+        project=wandb_project,
+        name=wandb_run,
+        config={
+            "model": "align-streaming-heads",
+            "datasets": repo_ids,
+            "pretrained_checkpoint": pretrained_checkpoint,
+            "epochs_decision": epochs_decision,
+            "epochs_assistant": epochs_assistant,
+            "epochs_joint": epochs_joint,
+            "batch_size": batch_size,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "chunk_size": chunk_size,
+            "max_steps_per_epoch": max_steps_per_epoch,
+            "device": str(device),
+            "noise_configs": noise_configs,
+        },
+    ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
+    print(f"  W&B:         {'enabled' if wandb_trainer.enabled else 'disabled'}")
+
+    # -- Streaming dataset ──
     stream_ds = MultiDatasetStream(repo_ids)
     loader = DataLoader(
         stream_ds,
@@ -374,7 +437,7 @@ def train_heads_from_stream(
         pin_memory=True,
     )
 
-    # ── Model ──
+    # -- Model ──
     model = ALIGNModel(
         embed_dim=256,
         chunk_size=chunk_size,
@@ -387,7 +450,7 @@ def train_heads_from_stream(
     model.freeze_backbone()
     print(f"  Loaded backbone from {pretrained_checkpoint}")
 
-    # ── Noise injectors (one per config) ──
+    # -- Noise injectors (one per config) ──
     injectors = [
         SyntheticNoiseInjector(
             pos_noise_std=cfg["pos_noise_std"],
@@ -486,23 +549,33 @@ def train_heads_from_stream(
             print(f"  Epoch {epoch + 1:3d} [{stage}] loss: {avg:.4f}  "
                   f"α: {entry['alpha_mean']:.3f}  Δ: {entry['delta_mean']:.4f}")
 
+            # W&B logging
+            wandb_trainer.log({
+                f"{stage}/loss": avg,
+                f"{stage}/alpha_mean": entry["alpha_mean"],
+                f"{stage}/delta_mean": entry["delta_mean"],
+                f"{stage}/epoch": epoch + 1,
+            }, step=epoch + 1)
+
             if avg < best:
                 best = avg
                 torch.save(model.state_dict(), output_dir / f"{stage}_best.pt")
+                # Upload checkpoint to W&B
+                wandb_trainer.save(str(output_dir / f"{stage}_best.pt"))
         torch.save(model.state_dict(), output_dir / f"{stage}_last.pt")
         print(f"  [{stage}] best loss: {best:.4f}")
 
-    # ── Stage 1: Decision ──
+    # -- Stage 1: Decision ──
     print(f"\n  --- Decision Head ({epochs_decision} epochs) ---")
     opt_d = optim.AdamW(model.decision_head.parameters(), lr=lr, weight_decay=weight_decay)
     _run_stage("decision", opt_d, epochs_decision)
 
-    # ── Stage 2: Assistant ──
+    # -- Stage 2: Assistant ──
     print(f"\n  --- Assistant Head ({epochs_assistant} epochs) ---")
     opt_a = optim.AdamW(model.assistant_head.parameters(), lr=lr, weight_decay=weight_decay)
     _run_stage("assistant", opt_a, epochs_assistant)
 
-    # ── Stage 3: Joint ──
+    # -- Stage 3: Joint ──
     print(f"\n  --- Joint Fine-Tuning ({epochs_joint} epochs) ---")
     opt_j = optim.AdamW(
         [p for p in model.decision_head.parameters()] + [p for p in model.assistant_head.parameters()],
@@ -513,6 +586,7 @@ def train_heads_from_stream(
     log_fp.close()
     print(f"\n  Head training complete.")
     print(f"  Logs: {log_path}")
+    wandb_trainer.finish()
     return str(output_dir / "joint_best.pt")
 
 
@@ -560,6 +634,9 @@ def run_streaming_pipeline(
     device: Optional[str] = None,
     stages: str = "all",
     pretrained_checkpoint: Optional[str] = None,
+    wandb_project: str = "align-streaming",
+    wandb_run: Optional[str] = None,
+    enable_wandb: bool = True,
 ):
     """Full ALIGN training pipeline using ONLY streaming data.
 
@@ -575,13 +652,16 @@ def run_streaming_pipeline(
         device: Compute device.
         stages: 'all', 'pretrain', or 'heads'.
         pretrained_checkpoint: Skip pretraining, use existing backbone.
+        wandb_project: W&B project name.
+        wandb_run: W&B run name.
+        enable_wandb: Enable W&B logging.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pretrained_path = pretrained_checkpoint
 
-    # ── Stage 1: Contrastive Pretraining ──
+    # -- Stage 1: Contrastive Pretraining ──
     if stages in ("all", "pretrain"):
         print(f"\n{'='*60}")
         print(f"[pipeline] Stage 1: Streaming Contrastive Pretraining ({epochs_pretrain} epochs)")
@@ -594,6 +674,9 @@ def run_streaming_pipeline(
             batch_size=batch_size,
             lr=lr,
             device=device,
+            wandb_project=wandb_project,
+            wandb_run=(wandb_run or "streaming") + "-pretrain",
+            enable_wandb=enable_wandb,
         )
     else:
         if pretrained_path is None:
@@ -603,7 +686,7 @@ def run_streaming_pipeline(
             sys.exit(1)
         print(f"[pipeline] Using existing pretrained checkpoint: {pretrained_path}")
 
-    # ── Stage 2: Head Training ──
+    # -- Stage 2: Head Training ──
     if stages in ("all", "heads"):
         print(f"\n{'='*60}")
         print(f"[pipeline] Stage 2: Streaming Head Training ({epochs_heads} epochs)")
@@ -619,11 +702,14 @@ def run_streaming_pipeline(
             batch_size=batch_size,
             lr=lr,
             device=device,
+            wandb_project=wandb_project,
+            wandb_run=(wandb_run or "streaming") + "-heads",
+            enable_wandb=enable_wandb,
         )
     else:
         head_path = str(output_dir / "checkpoints" / "heads" / "joint_best.pt")
 
-    # ── Summary ──
+    # -- Summary ──
     print(f"\n{'='*60}")
     print("[pipeline] Streaming Training Complete! (zero disk used for data)")
     print(f"[pipeline]")
@@ -657,6 +743,9 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--stages", default="all", choices=["all", "pretrain", "heads"])
     parser.add_argument("--pretrained", help="Resume from existing pretrained backbone")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", default="align-streaming", help="W&B project name")
+    parser.add_argument("--wandb-run", default=None, help="W&B run name")
 
     args = parser.parse_args()
 
@@ -670,6 +759,9 @@ def main():
         device=args.device,
         stages=args.stages,
         pretrained_checkpoint=args.pretrained,
+        wandb_project=args.wandb_project,
+        wandb_run=args.wandb_run,
+        enable_wandb=args.wandb,
     )
 
 

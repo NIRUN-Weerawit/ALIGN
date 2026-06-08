@@ -46,6 +46,7 @@ import argparse
 import json
 import os
 import sys
+import torch
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple

@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.align_model import ALIGNModel
 from training.contrastive_loss import ContrastiveLoss3Way
+from training.wandb_utils import init_wandb, log_metrics
 from data.align_dataset import ALIGNDataset, pretrain_collate
 
 
@@ -60,6 +61,9 @@ def main():
     parser.add_argument("--val-every", type=int, default=5, help="Validate every N epochs")
     parser.add_argument("--no-text", action="store_true", help="Disable text modality")
     parser.add_argument("--resume", help="Resume from checkpoint")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", default="align-pretrain", help="W&B project name")
+    parser.add_argument("--wandb-run", default=None, help="W&B run name")
 
     args = parser.parse_args()
 
@@ -67,12 +71,35 @@ def main():
     print(f"=== ALIGN Contrastive Pretraining ===")
     print(f"  Dataset:  {args.data}")
     print(f"  Output:   {args.output_dir}")
+
+    # W&B
+    wandb_trainer = init_wandb(
+        project=args.wandb_project,
+        name=args.wandb_run,
+        config={
+            "model": "align-pretrain",
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "embed_dim": args.embed_dim,
+            "temperature": args.temperature,
+            "text_enabled": not args.no_text,
+            "traj_window": args.traj_window,
+            "frames_per_ep": args.frames_per_ep,
+            "val_split": args.val_split,
+            "max_grad_norm": args.max_grad_norm,
+            "dataset": str(args.data),
+            "device": str(device),
+        },
+    ) if args.wandb else init_wandb(project=args.wandb_project, name=args.wandb_run, config={})
+    print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
     print(f"  Device:   {device}")
     print(f"  Epochs:   {args.epochs}")
     print(f"  LR:       {args.lr}")
     print(f"  Text:     {'disabled' if args.no_text else 'enabled'}")
 
-    # ── Dataset ──
+    # -- Dataset ──
     full_ds = ALIGNDataset(
         args.data,
         mode="pretrain",
@@ -103,7 +130,7 @@ def main():
         num_workers=2,
     )
 
-    # ── Model ──
+    # -- Model ──
     model = ALIGNModel(
         embed_dim=args.embed_dim,
         use_text=not args.no_text,
@@ -121,13 +148,13 @@ def main():
     n_params = sum(p.numel() for p in trainable)
     print(f"  Trainable: {n_params:,}")
 
-    # ── Loss ──
+    # -- Loss ──
     criterion = ContrastiveLoss3Way(temperature=args.temperature)
 
-    # ── Optimizer ──
+    # -- Optimizer ──
     optimizer = optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
 
-    # ── Resume ──
+    # -- Resume ──
     start_epoch = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
@@ -139,13 +166,13 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Training loop ──
+    # -- Training loop ──
     best_val_loss = float("inf")
     log_path = output_dir / "training_log.jsonl"
     log_fp = open(log_path, "a")
 
     for epoch in range(start_epoch, args.epochs):
-        # ── Train ──
+        # -- Train ──
         model.train()
         train_losses = []
         train_vt = []
@@ -174,13 +201,31 @@ def main():
             train_vl.append(stats["avg_cos_vl"].item())
             train_tl.append(stats["avg_cos_tl"].item())
 
+            # W&B step-level logging
+            wandb_trainer.log({
+                "train_loss": loss.item(),
+                "cos_vt": stats["avg_cos_vt"].item(),
+                "cos_vl": stats["avg_cos_vl"].item(),
+                "cos_tl": stats["avg_cos_tl"].item(),
+                "lr": optimizer.param_groups[0]["lr"],
+            }, step=(epoch * len(train_loader)) + i)
+
         avg_train_loss = float(np.mean(train_losses))
         print(f"  Epoch {epoch + 1:3d}  train loss: {avg_train_loss:.4f}  "
               f"cos_vt: {float(np.mean(train_vt)):.3f}  "
               f"cos_vl: {float(np.mean(train_vl)):.3f}  "
               f"cos_tl: {float(np.mean(train_tl)):.3f}")
 
-        # ── Val ──
+        # W&B epoch-level logging
+        wandb_trainer.log({
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "train_cos_vt": float(np.mean(train_vt)),
+            "train_cos_vl": float(np.mean(train_vl)),
+            "train_cos_tl": float(np.mean(train_tl)),
+        }, step=epoch + 1)
+
+        # -- Val ──
         if (epoch + 1) % args.val_every == 0:
             model.eval()
             val_losses = []
@@ -206,6 +251,15 @@ def main():
                   f"cos_vt: {float(np.mean(val_vt)):.3f}  "
                   f"cos_vl: {float(np.mean(val_vl)):.3f}  "
                   f"cos_tl: {float(np.mean(val_tl)):.3f}")
+
+            # W&B validation logging
+            wandb_trainer.log({
+                "val_loss": avg_val_loss,
+                "val_cos_vt": float(np.mean(val_vt)),
+                "val_cos_vl": float(np.mean(val_vl)),
+                "val_cos_tl": float(np.mean(val_tl)),
+                "best_val_loss": best_val_loss,
+            }, step=epoch + 1)
 
             # Log
             log_fp.write(json.dumps({
@@ -233,7 +287,7 @@ def main():
                 }, output_dir / "best.pt")
                 print(f"  -> best checkpoint saved (val_loss: {avg_val_loss:.4f})")
 
-        # ── Periodic checkpoint ──
+        # -- Periodic checkpoint ──
         if (epoch + 1) % args.checkpoint_every == 0:
             torch.save({
                 "epoch": epoch,
@@ -244,6 +298,7 @@ def main():
     log_fp.close()
     print(f"\n  Training complete. Best val loss: {best_val_loss:.4f}")
     print(f"  Logs saved to {log_path}")
+    wandb_trainer.finish()
 
 
 if __name__ == "__main__":

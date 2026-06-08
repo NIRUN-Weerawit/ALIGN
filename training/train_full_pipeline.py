@@ -274,7 +274,7 @@ def run_full_pipeline(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Stage 0: Convert open datasets ──
+    # -- Stage 0: Convert open datasets ──
     clean_h5 = output_dir / "align_clean.h5"
     noisy_h5 = output_dir / "align_noisy.h5"
 
@@ -332,11 +332,11 @@ def run_full_pipeline(
             create_noisy_hdf5(str(clean_h5), str(noisy_h5))
             return
 
-        # ── Stage 0c: Generate noisy variants for head training ──
+        # -- Stage 0c: Generate noisy variants for head training ──
         print("\n[pipeline] Stage 0c: Generating synthetic noise variants")
         create_noisy_hdf5(str(clean_h5), str(noisy_h5))
 
-    # ── Stage 1: Contrastive Pretraining ──
+    # -- Stage 1: Contrastive Pretraining ──
     if stages in ("all", "pretrain"):
         print(f"\n{'='*60}")
         print(f"[pipeline] Stage 1: 3-Way Contrastive Pretraining ({epochs_pretrain} epochs)")
@@ -350,6 +350,8 @@ def run_full_pipeline(
             "--batch-size", str(batch_size),
             "--epochs", str(epochs_pretrain),
             "--lr", str(lr),
+            "--wandb",
+            "--wandb-project", "align-pretrain",
         ]
         import subprocess
         result = subprocess.run(train_cmd)
@@ -367,7 +369,7 @@ def run_full_pipeline(
             sys.exit(1)
         print(f"[pipeline] Using existing pretrained checkpoint: {pretrained_path}")
 
-    # ── Stage 2: Head Training ──
+    # -- Stage 2: Head Training ──
     if stages in ("all", "heads"):
         print(f"\n{'='*60}")
         print(f"[pipeline] Stage 2: Head Training ({epochs_heads} epochs)")
@@ -384,6 +386,8 @@ def run_full_pipeline(
             "--epochs-assistant", str(2 * epochs_heads // 3),
             "--epochs-joint", str(epochs_heads // 3),
             "--lr", str(lr),
+            "--wandb",
+            "--wandb-project", "align-heads",
         ]
         import subprocess
         result = subprocess.run(train_cmd)
@@ -391,7 +395,7 @@ def run_full_pipeline(
             print("[pipeline] ERROR: Head training failed")
             sys.exit(1)
 
-    # ── Summary ──
+    # -- Summary ──
     print(f"\n{'='*60}")
     print("[pipeline] Training Complete!")
     print(f"[pipeline]")

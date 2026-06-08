@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.align_model import ALIGNModel
+from training.wandb_utils import init_wandb, WandBTrainer
 from data.align_dataset import ALIGNDataset, head_collate
 
 
@@ -158,6 +159,9 @@ def main():
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", default="align-heads", help="W&B project name")
+    parser.add_argument("--wandb-run", default=None, help="W&B run name")
 
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -167,7 +171,28 @@ def main():
     print(f"  Pretrained: {args.pretrained}")
     print(f"  Output:     {args.output_dir}")
 
-    # ── Dataset ──
+    # -- W&B ──
+    wandb_trainer = init_wandb(
+        project=args.wandb_project,
+        name=args.wandb_run,
+        config={
+            "model": "align-heads",
+            "data": str(args.data),
+            "pretrained": str(args.pretrained),
+            "epochs_decision": args.epochs_decision,
+            "epochs_assistant": args.epochs_assistant,
+            "epochs_joint": args.epochs_joint,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "chunk_size": args.chunk_size,
+            "val_split": args.val_split,
+            "device": str(device),
+        },
+    ) if args.wandb else init_wandb(project=args.wandb_project, name=args.wandb_run, config={})
+    print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
+
+    # -- Dataset ──
     full_ds = ALIGNDataset(args.data, mode="head", traj_window=10)
     n_total = len(full_ds)
     n_val = max(1, int(n_total * args.val_split))
@@ -192,7 +217,7 @@ def main():
         num_workers=2,
     )
 
-    # ── Model ──
+    # -- Model ──
     model = ALIGNModel(
         embed_dim=256,
         chunk_size=args.chunk_size,
@@ -225,7 +250,7 @@ def main():
         log_fp.write(json.dumps(entry) + "\n")
         log_fp.flush()
 
-    # ── Stage 1: Decision Head ──
+    # -- Stage 1: Decision Head ──
     print(f"\n  --- Stage 1: Decision Head ({args.epochs_decision} epochs) ---")
     opt_decision = optim.AdamW(
         model.decision_head.parameters(),
@@ -241,13 +266,24 @@ def main():
               f"α: {val_stats['alpha_mean']:.3f}")
         log_entry("decision", epoch + 1, train_stats, val_stats)
 
+        # W&B logging
+        wandb_trainer.log({
+            "decision/train_loss": train_stats["loss"],
+            "decision/val_loss": val_stats["loss"],
+            "decision/train_alpha_mean": train_stats["alpha_mean"],
+            "decision/val_alpha_mean": val_stats["alpha_mean"],
+            "decision/epoch": epoch + 1,
+            "best_val_loss": best_val_loss,
+        }, step=epoch + 1)
+
         if val_stats["loss"] < best_val_loss:
             best_val_loss = val_stats["loss"]
             torch.save(model.state_dict(), output_dir / "decision_best.pt")
+            wandb_trainer.save(str(output_dir / "decision_best.pt"))
     torch.save(model.state_dict(), output_dir / "decision_last.pt")
     print(f"  Best val loss: {best_val_loss:.4f}")
 
-    # ── Stage 2: Assistant Head ──
+    # -- Stage 2: Assistant Head ──
     print(f"\n  --- Stage 2: Assistant Head ({args.epochs_assistant} epochs) ---")
     opt_assistant = optim.AdamW(
         model.assistant_head.parameters(),
@@ -263,13 +299,24 @@ def main():
               f"Δ: {val_stats['delta_mean']:.4f}")
         log_entry("assistant", epoch + 1, train_stats, val_stats)
 
+        # W&B logging
+        wandb_trainer.log({
+            "assistant/train_loss": train_stats["loss"],
+            "assistant/val_loss": val_stats["loss"],
+            "assistant/train_delta_mean": train_stats["delta_mean"],
+            "assistant/val_delta_mean": val_stats["delta_mean"],
+            "assistant/epoch": epoch + 1,
+            "best_val_loss": best_val_loss,
+        }, step=epoch + 1)
+
         if val_stats["loss"] < best_val_loss:
             best_val_loss = val_stats["loss"]
             torch.save(model.state_dict(), output_dir / "assistant_best.pt")
+            wandb_trainer.save(str(output_dir / "assistant_best.pt"))
     torch.save(model.state_dict(), output_dir / "assistant_last.pt")
     print(f"  Best val loss: {best_val_loss:.4f}")
 
-    # ── Stage 3: Joint Fine-tuning ──
+    # -- Stage 3: Joint Fine-tuning ──
     print(f"\n  --- Stage 3: Joint Fine-Tuning ({args.epochs_joint} epochs) ---")
     opt_joint = optim.AdamW(
         [p for p in model.decision_head.parameters()] + [p for p in model.assistant_head.parameters()],
@@ -285,9 +332,22 @@ def main():
               f"α: {val_stats['alpha_mean']:.3f}  Δ: {val_stats['delta_mean']:.4f}")
         log_entry("joint", epoch + 1, train_stats, val_stats)
 
+        # W&B logging
+        wandb_trainer.log({
+            "joint/train_loss": train_stats["loss"],
+            "joint/val_loss": val_stats["loss"],
+            "joint/train_alpha_mean": train_stats["alpha_mean"],
+            "joint/val_alpha_mean": val_stats["alpha_mean"],
+            "joint/train_delta_mean": train_stats["delta_mean"],
+            "joint/val_delta_mean": val_stats["delta_mean"],
+            "joint/epoch": epoch + 1,
+            "best_val_loss": best_val_loss,
+        }, step=epoch + 1)
+
         if val_stats["loss"] < best_val_loss:
             best_val_loss = val_stats["loss"]
             torch.save(model.state_dict(), output_dir / "joint_best.pt")
+            wandb_trainer.save(str(output_dir / "joint_best.pt"))
     torch.save(model.state_dict(), output_dir / "joint_last.pt")
     print(f"  Best val loss: {best_val_loss:.4f}")
 
@@ -295,6 +355,7 @@ def main():
     print(f"\n  Training complete.")
     print(f"  Logs: {log_path}")
     print(f"  Best checkpoint: {output_dir}/joint_best.pt")
+    wandb_trainer.finish()
 
 
 if __name__ == "__main__":
