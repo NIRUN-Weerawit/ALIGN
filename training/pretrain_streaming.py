@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.align_model import ALIGNModel
 from training.contrastive_loss import ContrastiveLoss3Way
 from training.wandb_utils import init_wandb
-from data.open_dataset import LeRobotAdapter
+from data.open_dataset import LeRobotAdapter, _lerobot_align_collate
 
 
 # ================================================================
@@ -95,7 +95,7 @@ class MultiDatasetStream(IterableDataset):
             )
             ds = adapter.get_streaming_dataset()
             adapters.append(adapter)
-            loaders.append(iter(DataLoader(ds, batch_size=1, shuffle=False)))
+            loaders.append(iter(DataLoader(ds, batch_size=1, shuffle=False, collate_fn=_lerobot_align_collate)))
 
         # Track which loaders have been exhausted (replace them on exhaustion)
         exhausted: list[bool] = [False] * len(loaders)
@@ -117,7 +117,7 @@ class MultiDatasetStream(IterableDataset):
             for i, is_exhausted in enumerate(exhausted):
                 if is_exhausted:
                     ds = adapters[i].get_streaming_dataset()
-                    loaders[i] = iter(DataLoader(ds, batch_size=1, shuffle=False))
+                    loaders[i] = iter(DataLoader(ds, batch_size=1, shuffle=False, collate_fn=_lerobot_align_collate))
                     exhausted[i] = False
 
 

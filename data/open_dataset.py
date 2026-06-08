@@ -907,63 +907,67 @@ class LeRobotAdapter:
             yield batch
 
 
-def _lerobot_align_collate(batch: list[dict]) -> dict:
-    """Collate function converting LeRobot v3 samples to ALIGN format.
+def convert_lerobot_sample(sample: dict) -> dict:
+    """Convert a single raw LeRobot v3 sample to ALIGN-compatible dict.
 
-    LeRobot v3 schema:
-        sample["observation.state"]    — (T, D) or (D,)
-        sample["action"]               — (T, A) or (A,)
-        sample["observation.images.X"] — (T, C, H, W)
-        sample["task"]                 — str
+    Input (raw LeRobot v3):
+        observation.state    — (T, D) or (D,) tensor
+        observation.images.X — (T, C, H, W) or (C, H, W) tensor
+        task                 — str
 
-    ALIGN expects:
-        frames: (B, H, W, 3) uint8
-        poses: (B, K, 6) float32
-        texts: list[str]
+    Output:
+        frames — (H, W, C) torch.uint8
+        poses  — (D,) or (6,) torch.float32 (EEF pose)
+        text   — str
     """
-    import torch
+    # Extract camera frame (take first timestep if temporal, last frame)
+    img = None
+    for key, val in sample.items():
+        if "images" in key:
+            img = val
+            if img.dim() == 4:  # (T, C, H, W)
+                img = img[-1]  # take most recent frame
+            elif img.dim() == 3:  # (C, H, W)
+                pass
+            else:
+                continue
+            img = img.permute(1, 2, 0)  # (H, W, C)
+            break
 
+    # Extract state (EEF pose)
+    state = sample.get("observation.state", sample.get("state", None))
+    if state is not None:
+        if state.dim() == 2:  # (T, D)
+            state = state[-1]  # take most recent
+        state = state.to(torch.float32)
+    else:
+        state = torch.zeros(6, dtype=torch.float32)
+
+    # Text
+    task = sample.get("task", sample.get("language_instruction", "pick and place"))
+    if isinstance(task, torch.Tensor):
+        task = str(task.item())
+
+    return {
+        "frames": img if img is not None else torch.zeros(1, 1, 3, dtype=torch.uint8),
+        "poses": state,
+        "text": str(task),
+    }
+
+
+def _lerobot_align_collate(batch: list[dict]) -> dict:
+    """Collate function converting LeRobot v3 samples to ALIGN format."""
     all_frames = []
     all_poses = []
     all_texts = []
 
     for sample in batch:
-        # Extract camera frame (take first timestep if temporal, last frame)
-        img = None
-        for key in sample:
-            if "images" in key:
-                img = sample[key]
-                # Handle temporal dimension
-                if img.dim() == 4:  # (T, C, H, W)
-                    img = img[-1]  # take most recent frame
-                elif img.dim() == 3:  # (C, H, W)
-                    pass
-                else:
-                    continue
-                # Convert C,H,W → H,W,C for ALIGN's DINOv2 encoder
-                img = img.permute(1, 2, 0)  # (H, W, C)
-                all_frames.append(img)
-                break
+        converted = convert_lerobot_sample(sample)
+        all_frames.append(converted["frames"])
+        all_poses.append(converted["poses"])
+        all_texts.append(converted["text"])
 
-        # Extract state (EEF pose)
-        state = sample.get("observation.state", sample.get("state", None))
-        if state is not None:
-            if state.dim() == 2:  # (T, D)
-                state = state[-1]  # take most recent
-            # Convert to numpy for compatibility
-            all_poses.append(state.to(torch.float32))
-        else:
-            # Dummy pose
-            all_poses.append(torch.zeros(6, dtype=torch.float32))
-
-        # Text
-        task = sample.get("task", sample.get("language_instruction", "pick and place"))
-        if isinstance(task, torch.Tensor):
-            task = str(task.item())
-        all_texts.append(str(task))
-
-    # Stack
-    frames = torch.stack(all_frames, dim=0)  # (B, H, W, C)
+    frames = torch.stack(all_frames, dim=0)
     poses = torch.stack(all_poses, dim=0) if len(all_poses[0].shape) == 1 else all_poses
 
     return {
