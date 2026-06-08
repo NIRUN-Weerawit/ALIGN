@@ -711,6 +711,17 @@ class LeRobotAdapter:
         self._meta = None
         self._dataset = None
 
+        # Patch lerobot's get_safe_version in the module that holds the local
+        # reference (lerobot_dataset.py does `from .utils import get_safe_version`).
+        # This prevents the crash on datasets without a _version_ tag.
+        # Applied once at init so both _load_meta and get_streaming_dataset are covered.
+        import lerobot.datasets.lerobot_dataset as _ld
+        if not hasattr(_ld, '_get_safe_version_patched'):
+            _ld._get_safe_version_orig = getattr(_ld, 'get_safe_version', None)
+            if _ld._get_safe_version_orig is not None:
+                _ld.get_safe_version = lambda repo_id, revision: revision or "main"
+            _ld._get_safe_version_patched = True
+
     def _load_meta(self):
         """Load dataset metadata (features, stats, tasks) for schema detection."""
         if self._meta is not None:
@@ -837,35 +848,6 @@ class LeRobotAdapter:
             kwargs["image_transforms"] = transforms
 
         print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
-        # Datasets like LIBERO lack the _version_ tag. lerobot's get_safe_version
-        # crashes. Fix: pre-seed the cache with meta files so load_metadata
-        # succeeds and never reaches get_safe_version.
-        import os
-        cache_root = Path(os.environ.get("LEROBOT_CACHE_DIR",
-                                          os.path.join(Path.home(), ".cache", "huggingface", "lerobot")))
-        cache_meta = cache_root / "nvidia" / "LIBERO_LeRobot_v3" / "meta"
-        if not (cache_meta / "info.json").exists():
-            print(f"  Pre-seeding metadata cache from first sub-task directory: {cache_meta}")
-            local_dir = snapshot_download(
-                self.repo_id, repo_type="dataset", revision="main",
-                allow_patterns="*/meta/*",
-            )
-            # snapshot_download puts files under libero_10/meta/, libero_90/meta/, etc.
-            # Use only the FIRST sub-task directory, not all of them, to avoid
-            # schema mismatches between different sub-task sets.
-            for item in sorted(Path(local_dir).iterdir()):
-                if item.is_dir():
-                    meta_src = item / "meta"
-                    if meta_src.exists() and (meta_src / "info.json").exists():
-                        for f in meta_src.rglob("*"):
-                            if f.is_file():
-                                rel = f.relative_to(meta_src)
-                                dest = cache_meta / rel
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                import shutil
-                                shutil.copy2(f, dest)
-                        break  # only use ONE sub-task set
-            print(f"    Cached {len(list(cache_meta.rglob('*')))} files")
         dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
         print(f"  Streaming ready (no downloads, no disk space used)")
 
