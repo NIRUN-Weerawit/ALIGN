@@ -164,11 +164,12 @@ def pretrain_from_stream(
     temperature: float = 0.07,
     max_grad_norm: float = 1.0,
     device: Optional[str] = None,
-    max_steps_per_epoch: int = 5,
+    max_steps_per_epoch: int = 2000,
     checkpoint_every: int = 10,
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
+    num_workers: int = 4,
 ):
     """Contrastive pretraining directly from LeRobot v3 streaming datasets.
 
@@ -188,6 +189,7 @@ def pretrain_from_stream(
         wandb_project: W&B project name.
         wandb_run: W&B run name.
         enable_wandb: Enable W&B logging.
+        num_workers: DataLoader workers. Set to 0 if HF Hub download is slow.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     output_dir = Path(output_dir)
@@ -226,7 +228,7 @@ def pretrain_from_stream(
     loader = DataLoader(
         stream_ds,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=num_workers,
         collate_fn=streaming_pretrain_collate,
         pin_memory=True,
     )
@@ -379,6 +381,7 @@ def train_heads_from_stream(
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
+    num_workers: int = 4,
 ):
     """Train Decision + Assistant heads from streamed data with on-the-fly noise.
 
@@ -439,7 +442,7 @@ def train_heads_from_stream(
     loader = DataLoader(
         stream_ds,
         batch_size=batch_size,
-        num_workers=4,
+        num_workers=num_workers,
         collate_fn=streaming_head_collate,
         pin_memory=True,
     )
@@ -649,6 +652,7 @@ def run_streaming_pipeline(
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
+    num_workers: int = 4,
 ):
     """Full ALIGN training pipeline using ONLY streaming data.
 
@@ -689,6 +693,7 @@ def run_streaming_pipeline(
             wandb_project=wandb_project,
             wandb_run=(wandb_run or "streaming") + "-pretrain",
             enable_wandb=enable_wandb,
+            num_workers=num_workers,
         )
     else:
         if pretrained_path is None:
@@ -717,6 +722,7 @@ def run_streaming_pipeline(
             wandb_project=wandb_project,
             wandb_run=(wandb_run or "streaming") + "-heads",
             enable_wandb=enable_wandb,
+            num_workers=num_workers,
         )
     else:
         head_path = str(output_dir / "heads" / "joint_best.pt")
@@ -758,6 +764,8 @@ def main():
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", default="align-streaming", help="W&B project name")
     parser.add_argument("--wandb-run", default=None, help="W&B run name")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader workers (default 4, set 0 if HF Hub is slow)")
 
     args = parser.parse_args()
 
@@ -774,6 +782,7 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run=args.wandb_run,
         enable_wandb=args.wandb,
+        num_workers=args.num_workers,
     )
 
 
