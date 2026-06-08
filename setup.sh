@@ -39,7 +39,6 @@ case "$METHOD" in
     *) err "Unknown method: $METHOD. Use 'conda', 'pip', or 'auto'."; exit 1 ;;
 esac
 
-# Shift consumed args
 if [ "$METHOD" = "auto" ] && [ "${1:-}" = "--minimal" ]; then MINIMAL=true; fi
 if [ "$METHOD" = "auto" ] && ([ "${1:-}" = "-y" ] || [ "${1:-}" = "--yes" ]); then AUTO_CONFIRM=true; fi
 
@@ -58,18 +57,12 @@ if [ "$METHOD" = "auto" ]; then
 fi
 
 # ── Confirm ──
-FULL_NOTE=""
-MINIMAL_NOTE=""
-if $MINIMAL; then
-    MINIMAL_NOTE=" (training/inference only, no data collection tools)"
-fi
-
 echo ""
 echo -e "${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║            ALIGN — Dependency Installation             ║${NC}"
 echo -e "${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
-info "Method:   ${METHOD}${FULL_NOTE}${MINIMAL_NOTE}"
+info "Method:   ${METHOD}"
 info "Minimal:  ${MINIMAL} (excludes Isaac Sim and data collection deps)"
 echo ""
 
@@ -84,12 +77,11 @@ if ! $AUTO_CONFIRM; then
 fi
 
 # =============================================================================
-# Core training/inference dependencies (always installed)
+# Dependencies — latest compatible versions (no dead pins)
 # =============================================================================
+# Conda core (installed first via conda, then pip for what conda can't provide)
 CORE_CONDA=(
     "python=3.10"
-    "pytorch=2.4.0"
-    "torchvision=0.19.0"
     "numpy"
     "scipy"
     "h5py"
@@ -99,25 +91,30 @@ CORE_CONDA=(
     "requests"
 )
 
-# pip-equivalent of core deps (used in conda for packages not on conda-forge)
+# Pip core — install these via pip even in conda, because conda-forge
+# versions lag behind or are missing
 CORE_PIP=(
     "open-clip-torch"
     "lerobot"
-    "xformers==0.0.28"
+    "torchcodec"
+    "xformers"
 )
 
-# =============================================================================
-# Optional: data collection / Isaac Sim / VR deps
-# =============================================================================
-OPTIONAL_CONDA=(
-    "paho-mqtt"
+# PyTorch is special — install via pip with CUDA index, not conda
+# This avoids channel conflicts and version lag
+TORCH_PIP=(
+    "torch"
+    "torchvision"
 )
+
+# Optional: data collection / Isaac Sim / VR deps
 OPTIONAL_PIP=(
+    "paho-mqtt"
     "tensorflow-datasets"
 )
 
 # =============================================================================
-# Install
+# Install functions
 # =============================================================================
 
 install_conda() {
@@ -125,83 +122,81 @@ install_conda() {
 
     info "Creating conda environment '${env_name}'..."
     conda create -y -n "$env_name" python=3.10 -c conda-forge
-    eval "$(conda shell.bash hook)"
-    conda activate "$env_name"
 
-    info "Installing core deps via conda..."
-    conda install -y -n "$env_name" "${CORE_CONDA[@]}" -c pytorch -c conda-forge || {
-        warn "conda install had issues; trying pip fallback..."
-    }
+    info "Installing system deps via conda..."
+    conda install -y -n "$env_name" "${CORE_CONDA[@]}" -c conda-forge
 
-    info "Installing core deps via pip..."
-    pip install "${CORE_PIP[@]}"
+    info "Installing PyTorch + CUDA (latest, via pip)..."
+    conda run -n "$env_name" pip install "${TORCH_PIP[@]}" \
+        --index-url https://download.pytorch.org/whl/cu124
+
+    info "Installing core ML deps via pip..."
+    conda run -n "$env_name" pip install "${CORE_PIP[@]}"
 
     if ! $MINIMAL; then
         info "Installing optional deps..."
-        if [ ${#OPTIONAL_CONDA[@]} -gt 0 ]; then
-            conda install -y -n "$env_name" "${OPTIONAL_CONDA[@]}" -c conda-forge 2>/dev/null || true
-        fi
-        pip install "${OPTIONAL_PIP[@]}"
+        conda run -n "$env_name" pip install "${OPTIONAL_PIP[@]}"
     fi
 
-    # Optional: install this package in dev mode
-    pip install -e "$SCRIPT_DIR"
+    # Install ALIGN as dev package
+    conda run -n "$env_name" pip install -e "$SCRIPT_DIR"
 
     ok "Conda environment '${env_name}' ready!"
     echo ""
     echo "  Activate:  conda activate ${env_name}"
-    echo "  Deactivate later: conda deactivate"
+    echo "  Verify:    conda run -n ${env_name} python -c \"import open_clip; import xformers; import lerobot; import torchcodec; print('All deps OK')\""
     echo ""
-    echo "  For Isaac Sim data collection (separate install required):"
-    echo "    pip install isaacsim   # follow NVIDIA's install instructions"
+    echo "  Training:  conda run -n ${env_name} python training/pretrain_streaming.py --epochs 10"
+    echo ""
+
+    # Verify
+    conda run -n "$env_name" python -c "
+import open_clip; print(f'  open_clip:   {open_clip.__version__}')
+import xformers; print(f'  xformers:    {xformers.__version__}')
+import lerobot; print(f'  lerobot:     {lerobot.__version__}')
+import torchcodec; print(f'  torchcodec:  OK')
+import torch; print(f'  torch:       {torch.__version__}  CUDA:{torch.cuda.is_available()}')
+"
 }
 
 install_pip() {
-    info "Installing core deps via pip..."
-    pip install --upgrade pip
+    info "Installing PyTorch + CUDA (latest)..."
+    pip install "${TORCH_PIP[@]}" \
+        --index-url https://download.pytorch.org/whl/cu124
 
-    info "Installing PyTorch 2.4.0 + CUDA 12.1..."
-    pip install torch==2.4.0 torchvision==0.19.0 \
-        --index-url https://download.pytorch.org/whl/cu121
-    pip install xformers==0.0.28 \
-        --index-url https://download.pytorch.org/whl/cu121 --no-deps
+    info "Installing core deps..."
     pip install numpy scipy h5py Pillow wandb tqdm requests
-    pip install open-clip-torch lerobot
+    pip install "${CORE_PIP[@]}"
 
     if ! $MINIMAL; then
         info "Installing optional deps..."
-        pip install paho-mqtt tensorflow-datasets
+        pip install "${OPTIONAL_PIP[@]}"
     fi
 
     pip install -e "$SCRIPT_DIR"
 
     ok "Dependencies installed in current Python environment!"
     echo ""
-    echo "  For Isaac Sim data collection (separate install required):"
-    echo "    pip install isaacsim   # follow NVIDIA's install instructions"
+    echo "  To verify:"
+    echo "    python -c \"import open_clip; import xformers; import lerobot; import torchcodec; print('All deps OK')\""
     echo ""
-    echo "  If you want an isolated venv:"
-    echo "    python3 -m venv align-env"
-    echo "    source align-env/bin/activate"
-    echo "    ./setup.sh pip"
+    echo "  For an isolated venv:"
+    echo "    python3 -m venv align-env && source align-env/bin/activate && ./setup.sh pip"
+    echo ""
 }
 
 # ── Execute ──
 case "$METHOD" in
-    conda)
-        install_conda "align"
-        ;;
-    pip)
-        install_pip
-        ;;
+    conda) install_conda "align" ;;
+    pip) install_pip ;;
 esac
 
-ok "Done! Run your first training with:"
+ok "Done!"
 echo ""
-echo "    conda activate align  (or: source align-env/bin/activate)"
-echo "    python training/pretrain_streaming.py --epochs 10"
+echo "  Activate:  conda activate align  (or: source align-env/bin/activate)"
+echo "  Run:       python training/pretrain_streaming.py --epochs 10"
 echo ""
 if $MINIMAL; then
-    echo "NOTE: Ran with --minimal. Isaac Sim + data collection deps are not installed."
-    echo "      If you need them later, re-run without --minimal."
+    echo "NOTE: Ran with --minimal. Isaac Sim + data collection deps not installed."
+    echo "      If needed later, re-run without --minimal."
 fi

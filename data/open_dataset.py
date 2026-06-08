@@ -838,27 +838,45 @@ class LeRobotAdapter:
 
         print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
         # Datasets like LIBERO lack the _version_ tag. lerobot's get_safe_version
-        # crashes. We can't monkey-patch because lerobot uses local imports.
-        # Fix: pre-seed the cache with info.json so load_metadata finds it
-        # and never reaches get_safe_version.
-        import json, os
+        # crashes. Fix: pre-seed the cache with meta files so load_metadata
+        # succeeds and never reaches get_safe_version.
+        import json, os, shutil
         cache_root = Path(os.environ.get("LEROBOT_CACHE_DIR",
                                           os.path.join(Path.home(), ".cache", "huggingface", "lerobot")))
-        meta_dest = cache_root / "nvidia" / "LIBERO_LeRobot_v3" / "meta" / "info.json"
-        if not meta_dest.exists():
+        cache_meta = cache_root / "nvidia" / "LIBERO_LeRobot_v3" / "meta"
+        missing = [
+            "info.json", "stats.json", "tasks.parquet",
+            "episodes/chunk-000/file-000.parquet", "episodes/chunk-000/file-001.parquet",
+        ]
+        needed = [f for f in missing if not (cache_meta / f).exists()]
+        if needed:
             import requests
-            print(f"  Pre-seeding cache: {meta_dest}")
+            print(f"  Pre-seeding {len(needed)} meta file(s) to: {cache_meta}")
             api_url = f"https://huggingface.co/api/datasets/{self.repo_id}"
             siblings = requests.get(api_url, timeout=30).json().get("siblings", [])
-            info_paths = [s["rfilename"] for s in siblings
-                         if s["rfilename"].endswith("/meta/info.json")]
-            if info_paths:
-                raw_url = f"https://huggingface.co/datasets/{self.repo_id}/raw/main/{info_paths[0]}"
-                info = requests.get(raw_url, timeout=30).json()
-                meta_dest.parent.mkdir(parents=True, exist_ok=True)
-                with open(meta_dest, 'w') as f:
-                    json.dump(info, f)
-                print(f"  Cached info.json ({info.get('total_episodes', '?')} episodes)")
+            # find any path under libero_*/meta that matches our needed files
+            file_map = {}
+            for s in siblings:
+                path = s["rfilename"]
+                for fname in needed:
+                    if path.endswith("/meta/" + fname):
+                        file_map[fname] = path
+                        break
+            for fname in needed:
+                if fname in file_map:
+                    raw_url = f"https://huggingface.co/datasets/{self.repo_id}/raw/main/{file_map[fname]}"
+                    dest = cache_meta / fname
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with requests.get(raw_url, stream=True, timeout=120) as r:
+                        r.raise_for_status()
+                        with open(dest, 'wb') as f:
+                            shutil.copyfileobj(r.raw, f)
+                    print(f"    Cached: {fname}")
+                else:
+                    print(f"    WARNING: {fname} not found in repo, creating empty placeholder")
+                    dest = cache_meta / fname
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.touch()
         dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
         print(f"  Streaming ready (no downloads, no disk space used)")
 

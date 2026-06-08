@@ -4,15 +4,12 @@
 # Activate: conda activate align
 name: align
 channels:
-  - pytorch
   - conda-forge
   - defaults
 dependencies:
   # Python
   - python=3.10
-  # Core ML / data (conda-preferred for CUDA + HDF5 libs)
-  - pytorch=2.4.0
-  - torchvision=0.19.0
+  # System deps (conda handles the native libs like HDF5 + BLAS)
   - numpy
   - scipy
   - h5py
@@ -21,16 +18,17 @@ dependencies:
   - wandb
   - tqdm
   - requests
-  # Pip-only packages (not available on all conda channels)
+  # Pip-only packages (PyTorch via pip avoids channel conflicts)
   - pip
   - pip:
-    # CLIP-based vision-language backbone
+    # PyTorch + CUDA (latest, via pip for version parity)
+    - torch
+    - torchvision
+    # Core ML
     - open-clip-torch
-    # LeRobot v3 streaming adapter
-    # lerobot>=1.0  # requires version tags on HF Hub datasets
-    # Pin lerobot<1.0 if your dataset (like nvidia/LIBERO_LeRobot_v3) lacks version tags
-    # xFormers — memory-efficient attention for DINOv2 (matches torch 2.4.0)
-    - xformers==0.0.28
+    - lerobot
+    - torchcodec
+    - xformers
     # Optional: Isaac Sim data collection and VR teleop
     # - isaacsim  # Follow NVIDIA's install guide
     # - paho-mqtt
