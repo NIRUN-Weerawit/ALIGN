@@ -862,12 +862,11 @@ class LeRobotAdapter:
             kwargs["image_transforms"] = transforms
 
         if local_dir:
-            # Load from local directory — no Hub access needed
-            # Keep streaming=True because StreamingLeRobotDataset crashes
-            # with streaming=False (missing num_shards on regular Dataset)
-            kwargs["root"] = local_dir
+            # Load from local directory using LeRobotDataset (map-style, no Hub)
+            # StreamingLeRobotDataset crashes with local data (num_shards attr error)
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
             print(f"[lerobot] Loading local dataset for {self.repo_id} from {local_dir}...")
-            dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
+            dataset = LeRobotDataset(self.repo_id, root=local_dir, **kwargs)
             print(f"  Local dataset ready (no Hub access)")
         else:
             print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
