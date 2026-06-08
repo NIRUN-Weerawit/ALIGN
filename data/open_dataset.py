@@ -683,6 +683,7 @@ class LeRobotAdapter:
     def __init__(
         self,
         repo_id: str,
+        data_dir: Optional[str] = None,  # ignored — kept for factory compat
         camera: Optional[str] = None,
         batch_size: int = 64,
         num_workers: int = 2,
@@ -691,6 +692,7 @@ class LeRobotAdapter:
         max_episodes: Optional[int] = None,
     ):
         self.repo_id = repo_id
+        # data_dir is ignored for LeRobot v3 — data streams from Hub
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.max_episodes = max_episodes

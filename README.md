@@ -11,6 +11,52 @@ A 3-way contrastive pretraining step aligns vision embeddings (from egocentric c
 3. **Detects out-of-distribution inputs** — low alignment across any pair → safe fallback to pure teleoperation.
 4. **Filters tremor** — the trajectory encoder learns to suppress noise that doesn't correlate with visual features or task semantics.
 
+### Implementation Status
+
+| Component | Status |
+|-----------|--------|
+| Phase 0: Data Collection | ✅ Complete — `scripts/align_data_recorder.py`, `collect_episodes.py`, `align_noise.py` |
+| Phase 0: Ground Truth | ✅ Complete — `scripts/generate_ground_truth.py` (SavGol + Quintic/DMP/CHOMP) |
+| Model Architecture | ✅ Complete — `models/align_model.py` (DINOv2 + CLIP + Transformer + dual heads) |
+| Contrastive Loss | ✅ Complete — `training/contrastive_loss.py` (3-way InfoNCE) |
+| Training Pipeline (local) | ✅ Complete — `training/pretrain.py`, `training/train_heads.py` |
+| Training Pipeline (streaming) | ✅ Complete — `training/pretrain_streaming.py` |
+| Training Pipeline (full) | ✅ Complete — `training/train_full_pipeline.py` |
+| Inference Runtime | ✅ Complete — `inference/align_inference.py` (30Hz loop) |
+| Open Dataset Adapters | ✅ Complete — `data/open_dataset.py` (Robomimic, DROID, Bridge, LeRobot v3) |
+| DMP/CHOMP Planners | ✅ Complete — `scripts/align_dmp.py`, `scripts/align_chomp.py` |
+| Phase 1: Data Collection | ⬜ Next |
+| Phase 2: Contrastive Pretraining | ⬜ Needs data or `pip install lerobot` |
+| Phase 3: Head Training | ⬜ Depends on Phase 2 |
+
+### Verified Open Datasets
+
+| Dataset | Robot | Frames | EEF Pose | Text | Wrist Camera | Match |
+|---------|-------|--------|----------|------|-------------|-------|
+| **nvidia/LIBERO_LeRobot_v3** | Franka Panda (sim) | 130K eps | ✅ 8D [x,y,z,ax3,grip2] | ✅ Multi-step tasks | ✅ `observation.images.wrist_image` (256×256) | **Perfect** |
+| nvidia/BridgeData2_LeRobot_v3 | WidowX 250 (real) | 50K+ traj | ✅ EEF | ✅ Language | ⚠️ Front view | Good |
+
+LIBERO is the ideal match: same Franka Panda robot, egocentric wrist camera, rich language tasks ("put the white mug on the left plate and put the yellow and white mug on the right plate"), 20fps video in AV1 codec. Requires `lerobot` + `torchcodec` for streaming decode.
+
+### Three Training Pathways
+
+```bash
+# 1. STREAMING (zero disk, recommended for pretraining)
+# Requires: pip install lerobot torchcodec
+python training/pretrain_streaming.py --epochs-pretrain 50
+
+# 2. LOCAL DATA (own Phase 1 collection + converted open datasets)
+python -m data.open_dataset --dataset robomimic --data-dir ./robomimic_data --task lift
+python training/pretrain.py --data align.h5 --epochs 50
+python training/train_heads.py --data align.h5 --pretrained checkpoints/pretrain/best.pt
+
+# 3. FULL PIPELINE (open datasets → synthetic noise → heads)
+python training/train_full_pipeline.py --robomimic-dir ./robomimic_data
+
+# Inference
+python inference/align_inference.py --checkpoint checkpoints/heads/joint_best.pt --task "pick up the red mug"
+```
+
 ### Key Design Decisions
 
 - **Hybrid shared encoder** — single vision + trajectory + text encoder with two lightweight heads (Decision, Assistant). Text is computed once per task (~5ms) and cached. Runs at 25Hz on G1's Jetson Orin.
@@ -43,12 +89,12 @@ Training uses multiple text variants per episode so the model learns to calibrat
 
 ### Development Plan
 
-| Phase | Platform | Scope |
-|-------|----------|-------|
-| 0 | Isaac Sim + Franka Panda | Simulated pick-and-place, data collection, offline training |
-| 1 | Franka Panda (real) | Real hardware validation, user studies |
-| 2 | Unitree G1 arm-only | Full humanoid, fixed-base pick-and-place |
-| 3 | Unitree G1 full-body | Add locomotion coordination |
+| Phase | Platform | Scope | Status |
+|-------|----------|-------|--------|
+| 0 | Isaac Sim + Franka Panda | Simulated pick-and-place, data collection, offline training | ✅ Complete |
+| 1 | Franka Panda (real) | Real hardware validation, user studies | ⬜ |
+| 2 | Unitree G1 arm-only | Full humanoid, fixed-base pick-and-place | ⬜ |
+| 3 | Unitree G1 full-body | Add locomotion coordination | ⬜ |
 
 ### Venue Target
 
@@ -58,18 +104,25 @@ ICRA 2026 / RA-L. Core contribution: using contrastive vision-trajectory alignme
 
 ```
 ALIGN/
-├── README.md              ← This file
-├── INITIAL_PLAN.md        ← Problem statement, motivation, overview
-├── ARCHITECTURE.md        ← System architecture, components, data flow
-├── TRAINING_PIPELINE.md   ← Data collection, ground truth, training stages
-├── LITERATURE_REVIEW.md   ← Related works, baselines, gaps, position
-├── CONTRIBUTION.md        ← Novelty, paper framing, ablation design, venues
-├── DESIGN_DECISIONS.md    ← Trade-offs, alternatives considered, rationale
-├── TASK_PLAN.md           ← Detailed phased checklists, timeline, risks
-├── PRESENTATION.md        ← Professor presentation deck (15 slides)
-├── CONVERSATION_LOG.md    ← Discussion history and decision log
-└── scripts/
-    ├── align_data_recorder.py
-    ├── align_noise.py
-    └── collect_episodes.py
+├── README.md                  ← This file
+├── models/
+│   └── align_model.py         ← DINOv2 + CLIP + Transformer + Decision + Assistant heads
+├── training/
+│   ├── contrastive_loss.py    ← 3-way InfoNCE loss
+│   ├── pretrain.py            ← Contrastive pretraining (HDF5 data)
+│   ├── train_heads.py         ← Staged head training (Decision → Assistant → Joint)
+│   ├── pretrain_streaming.py  ← Zero-disk streaming pretraining from LeRobot v3 Hub
+│   └── train_full_pipeline.py ← Full pipeline: convert → noise → pretrain → heads
+├── inference/
+│   └── align_inference.py     ← 30Hz runtime: vision+traj+text → α + Δpose
+├── data/
+│   ├── align_dataset.py       ← HDF5 converter + PyTorch Dataset + collate
+│   └── open_dataset.py        ← Adapters for Robomimic, DROID, Bridge, LeRobot v3
+├── scripts/
+│   ├── align_data_recorder.py ← Episode recording (frames + poses + text + metadata)
+│   ├── align_noise.py         ← Noise injection: Gaussian, tremor, fatigue ramp
+│   ├── collect_episodes.py    ← Isaac Sim Franka + VR teleop + data collection
+│   ├── generate_ground_truth.py ← SavGol + Quintic/DMP/CHOMP + α/Δpose targets
+│   ├── align_dmp.py           ← DMP approach planner (Ijspeert 2013)
+│   └── align_chomp.py         ← CHOMP trajectory optimizer (Ratliff 2009)
 ```

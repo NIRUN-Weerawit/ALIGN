@@ -52,6 +52,7 @@ class MultiDatasetStream(IterableDataset):
     """IterableDataset that round-robins between multiple LeRobot v3 streams.
 
     Each worker gets a different offset so different GPUs see different data.
+    Exhausted loaders are recreated for infinite streaming.
     """
 
     def __init__(self, repo_ids: list[str], frames_per_item: int = 8):
@@ -62,35 +63,42 @@ class MultiDatasetStream(IterableDataset):
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
 
+        # Create loaders for each dataset
         adapters: list[LeRobotAdapter] = []
         loaders: list = []
         for i, repo_id in enumerate(self.repo_ids):
-            # Offset so each worker and each dataset starts at a different position
-            seed_offset = worker_id * 1000 + i * 100
             adapter = LeRobotAdapter(
                 repo_id,
-                batch_size=1,  # we want per-item streaming, batching happens in DataLoader
-                num_workers=0,  # single process for streaming source
+                batch_size=1,
+                num_workers=0,
             )
             ds = adapter.get_streaming_dataset()
             adapters.append(adapter)
             loaders.append(iter(DataLoader(ds, batch_size=1, shuffle=False)))
 
+        # Track which loaders have been exhausted (replace them on exhaustion)
+        exhausted: list[bool] = [False] * len(loaders)
+
         while True:
-            for loader in loaders:
+            for i, loader in enumerate(loaders):
                 try:
                     batch = next(loader)
-                    # Unpack single-item batch from collate
                     yield {
-                        "frames": batch["frames"][0],      # (H, W, 3)
-                        "poses": batch["poses"][0],        # (D,) EEF state
-                        "text": batch["texts"][0],         # str
+                        "frames": batch["frames"][0],
+                        "poses": batch["poses"][0],
+                        "text": batch["texts"][0],
                     }
                 except StopIteration:
-                    # Recreate iterator for infinite streaming
-                    pass
+                    # Recreate this loader (streaming datasets are finite;
+                    # we restart from scratch to simulate infinite epochs)
+                    exhausted[i] = True
+            # Recreate all exhausted loaders
+            for i, is_exhausted in enumerate(exhausted):
+                if is_exhausted:
+                    ds = adapters[i].get_streaming_dataset()
+                    loaders[i] = iter(DataLoader(ds, batch_size=1, shuffle=False))
+                    exhausted[i] = False
 
 
 def streaming_pretrain_collate(batch: list[dict], traj_window: int = 10) -> dict:
@@ -116,21 +124,19 @@ def streaming_pretrain_collate(batch: list[dict], traj_window: int = 10) -> dict
         pose = item["poses"]
         text = item.get("text", "pick and place")
 
-        # Ensure HWC format for DINOv2
-        if frame.dim() == 3 and frame.shape[0] == 3:  # (C, H, W)
-            frame = frame.permute(1, 2, 0)  # → (H, W, C)
-        # Ensure uint8
+        # LeRobot v3 images are always (C, H, W) — permute to (H, W, C) for DINOv2
+        if frame.dim() == 3 and frame.shape[0] in (1, 3):
+            frame = frame.permute(1, 2, 0)  # (C, H, W) → (H, W, C)
+        # Ensure uint8 format
         if frame.dtype != torch.uint8:
             frame = frame.to(torch.uint8)
 
         all_frames.append(frame)
 
-        # Build trajectory window from pose
-        pose_dim = pose.shape[-1] if pose.dim() > 0 else 6
-        if pose.dim() == 0:
-            pose = pose.unsqueeze(0)
-        # Repeat pose K times for trajectory window (clean data — no variance)
-        traj = pose.unsqueeze(0).repeat(traj_window, 1)  # (K, D)
+        # Build trajectory window from pose (use first 6 dims for EEF)
+        # LIBERO state is 8D [x,y,z,ax,ay,az,grip,grip], ALIGN expects 6D
+        pose_eef = pose[..., :6] if pose.shape[-1] > 6 else pose
+        traj = pose_eef.unsqueeze(0).repeat(traj_window, 1)  # (K, 6)
         all_trajs.append(traj)
 
         all_texts.append(text)
@@ -436,10 +442,13 @@ def train_heads_from_stream(
 
                 B, D = clean_poses.shape
                 delta_target = torch.zeros(B, chunk_size, 6, device=device)
-                # Use first pose repeated as synthetic future (no real future from stream)
+                # Ensure 6D for orientation: take first 6 dims (pos) or use identity
+                clean_6d = clean_poses[:, :6] if D >= 6 else torch.cat([
+                    clean_poses, torch.zeros(B, 6 - D, device=device)
+                ], dim=-1)
+                # Delta = clean − noisy (both already 6D from injector output)
                 for i in range(1, chunk_size + 1):
-                    delta_target[:, i - 1, :3] = clean_poses[:, :3] - noisy_poses[:, :3]
-                    delta_target[:, i - 1, 3:6] = clean_poses[:, min(D - 3, 3):min(D, 6)] - noisy_poses[:, min(D - 3, 3):min(D, 6)]
+                    delta_target[:, i - 1, :] = clean_6d - noisy_poses[:, :6]
 
                 # Encode
                 with torch.no_grad():
@@ -521,7 +530,7 @@ def streaming_head_collate(batch: list[dict]) -> dict:
         pose = item["poses"]
         text = item.get("text", "pick and place")
 
-        if frame.dim() == 3 and frame.shape[0] == 3:
+        if frame.dim() == 3 and frame.shape[0] in (1, 3):  # (C, H, W)
             frame = frame.permute(1, 2, 0)
         if frame.dtype != torch.uint8:
             frame = frame.to(torch.uint8)
