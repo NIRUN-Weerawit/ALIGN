@@ -53,6 +53,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image
+from huggingface_hub import HfApi, snapshot_download
 
 # Lazy imports — only import when needed
 try:
@@ -723,7 +724,45 @@ class LeRobotAdapter:
             )
 
         print(f"[lerobot] Loading metadata for {self.repo_id}...")
-        self._meta = LeRobotDatasetMetadata(self.repo_id)
+        try:
+            self._meta = LeRobotDatasetMetadata(self.repo_id)
+        except Exception as e:
+            err_msg = str(e)
+            if any(marker in err_msg for marker in [
+                "tagged with a codebase version",
+                "RevisionNotFoundError",
+                "missing 1 required keyword-only argument: 'response'",
+            ]):
+                # Newer lerobot versions (>=1.0) require a version tag that
+                # nvidia/LIBERO_LeRobot_v3 doesn't have. Fallback: download
+                # and cache the dataset snapshot without the version check.
+                print(f"  Version check failed (lerobot >= 1.0 bug). Downloading dataset metadata...")
+                local_dir = snapshot_download(
+                    self.repo_id, repo_type="dataset", revision="main",
+                    allow_patterns="meta/*",
+                )
+                import json
+                meta_dir = Path(local_dir) / "meta"
+                info_path = meta_dir / "info.json"
+                if info_path.exists():
+                    with open(info_path) as f:
+                        info = json.load(f)
+                    total_episodes = info.get("total_episodes", 0)
+                    features = info.get("features", {})
+                    # Build a minimal metadata-like object
+                    class _MinimalMeta:
+                        def __init__(self, features, total_episodes, repo_id):
+                            self.features = features
+                            self.total_episodes = total_episodes
+                            self.repo_id = repo_id
+                    self._meta = _MinimalMeta(features, total_episodes, self.repo_id)
+                else:
+                    raise RuntimeError(
+                        f"Cannot load metadata for {self.repo_id}. "
+                        "Try: pip install 'lerobot<1.0'"
+                    )
+            else:
+                raise
 
         # Print available features
         features = self._meta.features
@@ -784,7 +823,31 @@ class LeRobotAdapter:
             kwargs["image_transforms"] = transforms
 
         print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
-        dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
+        try:
+            dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
+        except (RevisionNotFoundError, Exception) as e:
+            err_msg = str(e)
+            if any(marker in err_msg for marker in [
+                "tagged with a codebase version",
+                "RevisionNotFoundError",
+                "missing 1 required keyword-only argument: 'response'",
+            ]):
+                # Newer lerobot versions require a version tag that most datasets lack.
+                # Fix: pip install "lerobot<1.0" which doesn't enforce this check.
+                print(f"  [WARN] Streaming failed: lerobot version check ({type(e).__name__})")
+                print(f"  Fix: pip install 'lerobot<1.0'  (older lerobot doesn't require version tags)")
+                print(f"  Falling back to local download + LeRobotDataset...")
+                local_dir = snapshot_download(
+                    self.repo_id, repo_type="dataset", revision="main",
+                )
+                root_dir = str(Path(local_dir).parent)
+                from lerobot.datasets.lerobot_dataset import LeRobotDataset
+                dataset = LeRobotDataset(
+                    self.repo_id, root=root_dir,
+                    delta_timestamps=dt, image_transforms=transforms,
+                )
+            else:
+                raise
         print(f"  Streaming ready (no downloads, no disk space used)")
 
         self._dataset = dataset

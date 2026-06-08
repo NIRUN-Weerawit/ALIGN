@@ -13,7 +13,9 @@ scipy>=1.10
 h5py
 Pillow
 open-clip-torch>=2.24
-lerobot>=1.0
+# lerobot>=1.0  # requires version tags on HF Hub datasets
+# Use lerobot<1.0 if your dataset (like nvidia/LIBERO_LeRobot_v3) lacks version tags:
+#   pip install 'lerobot<1.0'
 
 # ── xFormers (optional but recommended for DINOv2 speed) ────────
 # Must match your torch version. Pin both together:

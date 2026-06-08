@@ -27,7 +27,8 @@ dependencies:
     # CLIP-based vision-language backbone
     - open-clip-torch
     # LeRobot v3 streaming adapter
-    - lerobot>=1.0
+    # lerobot>=1.0  # requires version tags on HF Hub datasets
+    # Pin lerobot<1.0 if your dataset (like nvidia/LIBERO_LeRobot_v3) lacks version tags
     # xFormers — memory-efficient attention for DINOv2 (matches torch 2.4.0)
     - xformers==0.0.28
     # Optional: Isaac Sim data collection and VR teleop
