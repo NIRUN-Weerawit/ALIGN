@@ -840,43 +840,30 @@ class LeRobotAdapter:
         # Datasets like LIBERO lack the _version_ tag. lerobot's get_safe_version
         # crashes. Fix: pre-seed the cache with meta files so load_metadata
         # succeeds and never reaches get_safe_version.
-        import json, os, shutil
+        import os
         cache_root = Path(os.environ.get("LEROBOT_CACHE_DIR",
                                           os.path.join(Path.home(), ".cache", "huggingface", "lerobot")))
         cache_meta = cache_root / "nvidia" / "LIBERO_LeRobot_v3" / "meta"
-        missing = [
-            "info.json", "stats.json", "tasks.parquet",
-            "episodes/chunk-000/file-000.parquet", "episodes/chunk-000/file-001.parquet",
-        ]
-        needed = [f for f in missing if not (cache_meta / f).exists()]
-        if needed:
-            import requests
-            print(f"  Pre-seeding {len(needed)} meta file(s) to: {cache_meta}")
-            api_url = f"https://huggingface.co/api/datasets/{self.repo_id}"
-            siblings = requests.get(api_url, timeout=30).json().get("siblings", [])
-            # find any path under libero_*/meta that matches our needed files
-            file_map = {}
-            for s in siblings:
-                path = s["rfilename"]
-                for fname in needed:
-                    if path.endswith("/meta/" + fname):
-                        file_map[fname] = path
-                        break
-            for fname in needed:
-                if fname in file_map:
-                    raw_url = f"https://huggingface.co/datasets/{self.repo_id}/raw/main/{file_map[fname]}"
-                    dest = cache_meta / fname
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    with requests.get(raw_url, stream=True, timeout=120) as r:
-                        r.raise_for_status()
-                        with open(dest, 'wb') as f:
-                            shutil.copyfileobj(r.raw, f)
-                    print(f"    Cached: {fname}")
-                else:
-                    print(f"    WARNING: {fname} not found in repo, creating empty placeholder")
-                    dest = cache_meta / fname
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.touch()
+        if not (cache_meta / "info.json").exists():
+            print(f"  Pre-seeding metadata cache: {cache_meta}")
+            local_dir = snapshot_download(
+                self.repo_id, repo_type="dataset", revision="main",
+                allow_patterns="*/meta/*",
+            )
+            # snapshot_download puts files under libero_10/meta/, libero_90/meta/, etc.
+            # Copy everything under libero_*/meta to a flat cache_meta dir
+            for item in Path(local_dir).iterdir():
+                if item.is_dir():
+                    meta_src = item / "meta"
+                    if meta_src.exists():
+                        for f in meta_src.rglob("*"):
+                            if f.is_file():
+                                rel = f.relative_to(meta_src)
+                                dest = cache_meta / rel
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                import shutil
+                                shutil.copy2(f, dest)
+            print(f"    Cached {len(list(cache_meta.rglob('*')))} files")
         dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
         print(f"  Streaming ready (no downloads, no disk space used)")
 
