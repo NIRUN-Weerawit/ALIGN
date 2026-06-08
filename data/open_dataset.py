@@ -736,20 +736,34 @@ class LeRobotAdapter:
                 # Newer lerobot versions (>=1.0) require a version tag that
                 # nvidia/LIBERO_LeRobot_v3 doesn't have. Fallback: download
                 # and cache the dataset snapshot without the version check.
-                print(f"  Version check failed (lerobot >= 1.0 bug). Downloading dataset metadata...")
-                local_dir = snapshot_download(
-                    self.repo_id, repo_type="dataset", revision="main",
-                    allow_patterns="meta/*",
-                )
-                import json
-                meta_dir = Path(local_dir) / "meta"
-                info_path = meta_dir / "info.json"
-                if info_path.exists():
-                    with open(info_path) as f:
-                        info = json.load(f)
+                print(f"  Version check failed (lerobot >= 1.0 bug). Loading metadata directly via HF Hub...")
+                # LIBERO stores info.json under sub-task dirs like libero_10/meta/info.json
+                # Fetch the repo file list and find all info.jsons
+                import json, requests
+                api_url = f"https://huggingface.co/api/datasets/{self.repo_id}"
+                resp = requests.get(api_url, timeout=30)
+                siblings = resp.json().get("siblings", [])
+                info_files = [s["rfilename"] for s in siblings if s["rfilename"].endswith("/meta/info.json")]
+                if not info_files:
+                    # Fallback: download the whole meta tree
+                    local_dir = snapshot_download(
+                        self.repo_id, repo_type="dataset", revision="main",
+                        allow_patterns="*/meta/*",
+                    )
+                    info_files = list(Path(local_dir).rglob("meta/info.json"))
+                else:
+                    info_files = [f"https://huggingface.co/datasets/{self.repo_id}/raw/main/{f}"
+                                  for f in info_files]
+                print(f"  Found {len(info_files)} info.json(s): {info_files}")
+                # Build merged metadata from first info.json
+                if info_files:
+                    if isinstance(info_files[0], Path):
+                        with open(info_files[0]) as f:
+                            info = json.load(f)
+                    else:
+                        info = requests.get(info_files[0], timeout=30).json()
                     total_episodes = info.get("total_episodes", 0)
                     features = info.get("features", {})
-                    # Build a minimal metadata-like object
                     class _MinimalMeta:
                         def __init__(self, features, total_episodes, repo_id):
                             self.features = features
