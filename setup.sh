@@ -102,7 +102,7 @@ CORE_CONDA=(
 # pip-equivalent of core deps (used in conda for packages not on conda-forge)
 CORE_PIP=(
     "open-clip-torch"
-    "lerobot>=1.0"
+    "lerobot"
     "xformers==0.0.28"
 )
 

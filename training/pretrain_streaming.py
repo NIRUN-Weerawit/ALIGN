@@ -164,7 +164,7 @@ def pretrain_from_stream(
     temperature: float = 0.07,
     max_grad_norm: float = 1.0,
     device: Optional[str] = None,
-    max_steps_per_epoch: int = 2000,
+    max_steps_per_epoch: int = 5,
     checkpoint_every: int = 10,
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
@@ -296,6 +296,13 @@ def pretrain_from_stream(
             epoch_cos_vt.append(stats["avg_cos_vt"].item())
             epoch_cos_vl.append(stats["avg_cos_vl"].item())
             epoch_cos_tl.append(stats["avg_cos_tl"].item())
+
+            # Progress every 100 steps
+            if (step + 1) % 100 == 0:
+                print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
+                      f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
+                      f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
+                      flush=True)
 
         avg_loss = float(np.mean(epoch_losses))
         avg_vt = float(np.mean(epoch_cos_vt))
@@ -543,6 +550,11 @@ def train_heads_from_stream(
                     alphas.append(alpha_pred.detach().mean().item())
                 if stage in ("assistant", "joint"):
                     deltas.append(delta_pred.detach().abs().mean().item())
+
+                # Progress every 100 steps
+                if (step + 1) % 100 == 0:
+                    print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch} "
+                          f"[{stage}] loss: {loss.item():.4f}", flush=True)
 
             entry = _head_collate_stats(stage, epoch + 1, losses, alphas, deltas)
             avg = entry["loss"]

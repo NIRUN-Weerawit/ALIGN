@@ -201,6 +201,13 @@ def main():
             train_vl.append(stats["avg_cos_vl"].item())
             train_tl.append(stats["avg_cos_tl"].item())
 
+            # Progress every 50 batches
+            if (i + 1) % 50 == 0:
+                print(f"  Epoch {epoch + 1}, batch {i + 1}/{len(train_loader)}  "
+                      f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
+                      f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
+                      flush=True)
+
             # W&B step-level logging
             wandb_trainer.log({
                 "train_loss": loss.item(),

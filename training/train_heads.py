@@ -93,6 +93,11 @@ def train_epoch(
         if stage in ("assistant", "joint"):
             deltas.append(delta_pred.detach().abs().mean().item())
 
+        # Progress every 50 batches during training
+        if (len(losses)) % 50 == 0:
+            print(f"  [{stage}] batch {len(losses)}/{len(loader) if hasattr(loader, '__len__') else '?'}  "
+                  f"loss: {loss.item():.4f}", flush=True)
+
     return {
         "loss": float(np.mean(losses)),
         "alpha_mean": float(np.mean(alphas)) if alphas else 0.0,
