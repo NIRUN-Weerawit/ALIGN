@@ -845,17 +845,18 @@ class LeRobotAdapter:
                                           os.path.join(Path.home(), ".cache", "huggingface", "lerobot")))
         cache_meta = cache_root / "nvidia" / "LIBERO_LeRobot_v3" / "meta"
         if not (cache_meta / "info.json").exists():
-            print(f"  Pre-seeding metadata cache: {cache_meta}")
+            print(f"  Pre-seeding metadata cache from first sub-task directory: {cache_meta}")
             local_dir = snapshot_download(
                 self.repo_id, repo_type="dataset", revision="main",
                 allow_patterns="*/meta/*",
             )
             # snapshot_download puts files under libero_10/meta/, libero_90/meta/, etc.
-            # Copy everything under libero_*/meta to a flat cache_meta dir
-            for item in Path(local_dir).iterdir():
+            # Use only the FIRST sub-task directory, not all of them, to avoid
+            # schema mismatches between different sub-task sets.
+            for item in sorted(Path(local_dir).iterdir()):
                 if item.is_dir():
                     meta_src = item / "meta"
-                    if meta_src.exists():
+                    if meta_src.exists() and (meta_src / "info.json").exists():
                         for f in meta_src.rglob("*"):
                             if f.is_file():
                                 rel = f.relative_to(meta_src)
@@ -863,6 +864,7 @@ class LeRobotAdapter:
                                 dest.parent.mkdir(parents=True, exist_ok=True)
                                 import shutil
                                 shutil.copy2(f, dest)
+                        break  # only use ONE sub-task set
             print(f"    Cached {len(list(cache_meta.rglob('*')))} files")
         dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
         print(f"  Streaming ready (no downloads, no disk space used)")

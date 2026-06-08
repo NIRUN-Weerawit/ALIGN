@@ -766,6 +766,8 @@ def main():
     parser.add_argument("--wandb-run", default=None, help="W&B run name")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader workers (default 4, set 0 if HF Hub is slow)")
+    parser.add_argument("--max-steps-per-epoch", type=int, default=2000,
+                        help="Max steps per epoch (default 2000, set low for testing)")
 
     args = parser.parse_args()
 
@@ -783,6 +785,7 @@ def main():
         wandb_run=args.wandb_run,
         enable_wandb=args.wandb,
         num_workers=args.num_workers,
+        max_steps_per_epoch=args.max_steps_per_epoch,
     )
 
 
