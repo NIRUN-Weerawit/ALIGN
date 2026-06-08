@@ -837,15 +837,29 @@ class LeRobotAdapter:
             kwargs["image_transforms"] = transforms
 
         print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
-        # Monkey-patch lerobot's get_safe_version to skip the version tag check.
-        # Datasets like nvidia/LIBERO_LeRobot_v3 lack the _version_ tag.
-        from lerobot.datasets import utils as lerobot_utils
-        orig = lerobot_utils.get_safe_version
-        lerobot_utils.get_safe_version = lambda repo_id, revision: revision or "main"
-        try:
-            dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
-        finally:
-            lerobot_utils.get_safe_version = orig
+        # Datasets like LIBERO lack the _version_ tag. lerobot's get_safe_version
+        # crashes. We can't monkey-patch because lerobot uses local imports.
+        # Fix: pre-seed the cache with info.json so load_metadata finds it
+        # and never reaches get_safe_version.
+        import json, os
+        cache_root = Path(os.environ.get("LEROBOT_CACHE_DIR",
+                                          os.path.join(Path.home(), ".cache", "huggingface", "lerobot")))
+        meta_dest = cache_root / "nvidia" / "LIBERO_LeRobot_v3" / "meta" / "info.json"
+        if not meta_dest.exists():
+            import requests
+            print(f"  Pre-seeding cache: {meta_dest}")
+            api_url = f"https://huggingface.co/api/datasets/{self.repo_id}"
+            siblings = requests.get(api_url, timeout=30).json().get("siblings", [])
+            info_paths = [s["rfilename"] for s in siblings
+                         if s["rfilename"].endswith("/meta/info.json")]
+            if info_paths:
+                raw_url = f"https://huggingface.co/datasets/{self.repo_id}/raw/main/{info_paths[0]}"
+                info = requests.get(raw_url, timeout=30).json()
+                meta_dest.parent.mkdir(parents=True, exist_ok=True)
+                with open(meta_dest, 'w') as f:
+                    json.dump(info, f)
+                print(f"  Cached info.json ({info.get('total_episodes', '?')} episodes)")
+        dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
         print(f"  Streaming ready (no downloads, no disk space used)")
 
         self._dataset = dataset
