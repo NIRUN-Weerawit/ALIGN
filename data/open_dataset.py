@@ -685,7 +685,7 @@ class LeRobotAdapter:
     def __init__(
         self,
         repo_id: str,
-        data_dir: Optional[str] = None,  # ignored — kept for factory compat
+        data_dir: Optional[str] = None,  # None = stream from Hub; path = use local data
         camera: Optional[str] = None,
         batch_size: int = 64,
         num_workers: int = 2,
@@ -694,7 +694,7 @@ class LeRobotAdapter:
         max_episodes: Optional[int] = None,
     ):
         self.repo_id = repo_id
-        # data_dir is ignored for LeRobot v3 — data streams from Hub
+        self.data_dir = data_dir
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.max_episodes = max_episodes
@@ -722,8 +722,12 @@ class LeRobotAdapter:
                 _ld.get_safe_version = lambda repo_id, revision: revision or "main"
             _ld._align_patched = True
 
-    def _load_meta(self):
-        """Load dataset metadata (features, stats, tasks) for schema detection."""
+    def _load_meta(self, local_dir: Optional[str] = None):
+        """Load dataset metadata (features, stats, tasks) for schema detection.
+
+        Args:
+            local_dir: If set, load metadata from this local directory instead of the Hub.
+        """
         if self._meta is not None:
             return
 
@@ -736,7 +740,10 @@ class LeRobotAdapter:
 
         print(f"[lerobot] Loading metadata for {self.repo_id}...")
         try:
-            self._meta = LeRobotDatasetMetadata(self.repo_id)
+            meta_kwargs: dict = {}
+            if local_dir is not None:
+                meta_kwargs["root"] = local_dir
+            self._meta = LeRobotDatasetMetadata(self.repo_id, **meta_kwargs)
         except Exception as e:
             err_msg = str(e)
             if any(marker in err_msg for marker in [
@@ -805,11 +812,15 @@ class LeRobotAdapter:
                 self.camera = available[0]
                 print(f"  WARNING: Camera '{self.camera}' not found. Using '{self.camera}' instead.")
 
-    def get_streaming_dataset(self):
-        """Create streaming dataset that pulls data from Hub on-the-fly.
+    def get_streaming_dataset(self, data_dir: Optional[str] = None):
+        """Create streaming dataset — pulls from Hub or reads local data.
+
+        Args:
+            data_dir: If set, load from this local directory instead of the Hub.
+                      Falls back to self.data_dir if not provided.
 
         Returns:
-            StreamingLeRobotDataset — iterable, no local downloads.
+            StreamingLeRobotDataset — iterable.
         """
         try:
             from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
@@ -818,7 +829,10 @@ class LeRobotAdapter:
                 "StreamingLeRobotDataset requires lerobot>=0.4.0. Install: pip install lerobot[streaming]"
             )
 
-        self._load_meta()
+        # Resolve data directory: explicit arg > instance default
+        local_dir = data_dir if data_dir is not None else self.data_dir
+
+        self._load_meta(local_dir)
 
         # Build delta_timestamps for trajectory windows
         dt = self.delta_timestamps
@@ -843,13 +857,21 @@ class LeRobotAdapter:
             except ImportError:
                 pass
 
-        kwargs = {"delta_timestamps": dt}
+        kwargs: dict = {"delta_timestamps": dt}
         if transforms is not None:
             kwargs["image_transforms"] = transforms
 
-        print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
-        dataset = StreamingLeRobotDataset(self.repo_id, revision="main", **kwargs)
-        print(f"  Streaming ready (no downloads, no disk space used)")
+        if local_dir:
+            # Load from local directory — no Hub access needed
+            kwargs["root"] = local_dir
+            kwargs["streaming"] = False
+            print(f"[lerobot] Loading local dataset for {self.repo_id} from {local_dir}...")
+            dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
+            print(f"  Local dataset ready (no Hub access)")
+        else:
+            print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
+            dataset = StreamingLeRobotDataset(self.repo_id, revision="main", **kwargs)
+            print(f"  Streaming ready (no downloads, no disk space used)")
 
         self._dataset = dataset
         return dataset

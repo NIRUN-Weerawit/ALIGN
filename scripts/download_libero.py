@@ -62,7 +62,18 @@ def main():
     total = sum(f.stat().st_size for f in Path(local_dir).rglob("*") if f.is_file())
     print(f"\nDownloaded to: {local_dir}")
     print(f"Total size: {total / 1e9:.1f} GB")
-    print(f"\nDone. Train with: python training/pretrain_streaming.py --local")
+
+    # Each subset lives at local_dir/<subset>/ with its own meta/info.json
+    # StreamingLeRobotDataset(root=dir) loads dir/meta/info.json directly
+    print(f"\nDone. Train with (point at subset dir):")
+    for subset in args.subsets:
+        subset_path = local_dir / subset
+        if subset_path.exists():
+            print(f"  python training/pretrain_streaming.py \\")
+            print(f"      --data-dir {subset_path}")
+            break  # show first as example
+    else:
+        print(f"  python training/pretrain_streaming.py --data-dir {local_dir}")
 
 
 if __name__ == "__main__":

@@ -56,14 +56,32 @@ class MultiDatasetStream(IterableDataset):
     Exhausted loaders are recreated for infinite streaming.
     """
 
-    def __init__(self, repo_ids: list[str], frames_per_item: int = 8):
+    def __init__(self, repo_ids: list[str], frames_per_item: int = 8, data_dir: Optional[str] = None):
         super().__init__()
         self.repo_ids = repo_ids
         self.frames_per_item = frames_per_item
+        self.data_dir = data_dir
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
+
+        # Compute local data path for each repo
+        repo_data_dirs = []
+        for repo_id in self.repo_ids:
+            if self.data_dir:
+                # If data_dir is a direct repo path, use it; otherwise look under data_dir/repo_id
+                candidate = Path(self.data_dir) / repo_id
+                if candidate.exists():
+                    repo_data_dirs.append(str(candidate))
+                else:
+                    # data_dir might be the repo dir itself (single dataset)
+                    if Path(self.data_dir).exists():
+                        repo_data_dirs.append(self.data_dir)
+                    else:
+                        repo_data_dirs.append(None)
+            else:
+                repo_data_dirs.append(None)
 
         # Create loaders for each dataset
         adapters: list[LeRobotAdapter] = []
@@ -71,6 +89,7 @@ class MultiDatasetStream(IterableDataset):
         for i, repo_id in enumerate(self.repo_ids):
             adapter = LeRobotAdapter(
                 repo_id,
+                data_dir=repo_data_dirs[i],
                 batch_size=1,
                 num_workers=0,
             )
@@ -166,6 +185,7 @@ def pretrain_from_stream(
     device: Optional[str] = None,
     max_steps_per_epoch: int = 2000,
     checkpoint_every: int = 10,
+    data_dir: Optional[str] = None,
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
@@ -186,17 +206,22 @@ def pretrain_from_stream(
         device: Compute device.
         max_steps_per_epoch: Steps per epoch (streaming is infinite).
         checkpoint_every: Save checkpoints every N epochs.
+        data_dir: Path to local data directory. If set, reads from disk
+                  instead of streaming from Hub. Compatible with pre-downloaded
+                  datasets from scripts/download_libero.py.
         wandb_project: W&B project name.
         wandb_run: W&B run name.
         enable_wandb: Enable W&B logging.
-        num_workers: DataLoader workers. Set to 0 if HF Hub download is slow.
+        num_workers: DataLoader workers.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== ALIGN Streaming Contrastive Pretraining ===")
+    print(f"=== ALIGN {'Local' if data_dir else 'Streaming'} Contrastive Pretraining ===")
     print(f"  Datasets: {repo_ids}")
+    if data_dir:
+        print(f"  Data dir: {data_dir}")
     print(f"  Device:   {device}")
     print(f"  Epochs:   {epochs}")
     print(f"  Steps/ep: {max_steps_per_epoch}")
@@ -210,6 +235,7 @@ def pretrain_from_stream(
         config={
             "model": "align-streaming-pretrain",
             "datasets": repo_ids,
+            "data_dir": data_dir,
             "epochs": epochs,
             "batch_size": batch_size,
             "lr": lr,
@@ -224,7 +250,7 @@ def pretrain_from_stream(
     print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Streaming dataset ──
-    stream_ds = MultiDatasetStream(repo_ids)
+    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir)
     loader = DataLoader(
         stream_ds,
         batch_size=batch_size,
@@ -378,6 +404,7 @@ def train_heads_from_stream(
     max_steps_per_epoch: int = 2000,
     device: Optional[str] = None,
     noise_configs: Optional[list[dict]] = None,
+    data_dir: Optional[str] = None,
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
@@ -438,7 +465,7 @@ def train_heads_from_stream(
     print(f"  W&B:         {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Streaming dataset ──
-    stream_ds = MultiDatasetStream(repo_ids)
+    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir)
     loader = DataLoader(
         stream_ds,
         batch_size=batch_size,
@@ -649,14 +676,13 @@ def run_streaming_pipeline(
     device: Optional[str] = None,
     stages: str = "all",
     pretrained_checkpoint: Optional[str] = None,
+    data_dir: Optional[str] = None,
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
     num_workers: int = 4,
 ):
-    """Full ALIGN training pipeline using ONLY streaming data.
-
-    Zero downloads. Zero disk space. Zero conversion.
+    """Full ALIGN training pipeline using streaming or local data.
 
     Args:
         repo_ids: LeRobot v3 dataset IDs.
@@ -668,6 +694,7 @@ def run_streaming_pipeline(
         device: Compute device.
         stages: 'all', 'pretrain', or 'heads'.
         pretrained_checkpoint: Skip pretraining, use existing backbone.
+        data_dir: Path to local data. Overrides Hub streaming if set.
         wandb_project: W&B project name.
         wandb_run: W&B run name.
         enable_wandb: Enable W&B logging.
@@ -690,6 +717,7 @@ def run_streaming_pipeline(
             batch_size=batch_size,
             lr=lr,
             device=device,
+            data_dir=data_dir,
             wandb_project=wandb_project,
             wandb_run=(wandb_run or "streaming") + "-pretrain",
             enable_wandb=enable_wandb,
@@ -719,6 +747,7 @@ def run_streaming_pipeline(
             batch_size=batch_size,
             lr=lr,
             device=device,
+            data_dir=data_dir,
             wandb_project=wandb_project,
             wandb_run=(wandb_run or "streaming") + "-heads",
             enable_wandb=enable_wandb,
@@ -768,6 +797,8 @@ def main():
                         help="DataLoader workers (default 4, set 0 if HF Hub is slow)")
     parser.add_argument("--max-steps-per-epoch", type=int, default=2000,
                         help="Max steps per epoch (default 2000, set low for testing)")
+    parser.add_argument("--data-dir", default=None,
+                        help="Path to local data directory (pre-downloaded). Overrides Hub streaming.")
 
     args = parser.parse_args()
 
@@ -781,6 +812,7 @@ def main():
         device=args.device,
         stages=args.stages,
         pretrained_checkpoint=args.pretrained,
+        data_dir=args.data_dir,
         wandb_project=args.wandb_project,
         wandb_run=args.wandb_run,
         enable_wandb=args.wandb,
