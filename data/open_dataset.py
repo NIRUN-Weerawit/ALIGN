@@ -837,26 +837,15 @@ class LeRobotAdapter:
             kwargs["image_transforms"] = transforms
 
         print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
+        # Monkey-patch lerobot's get_safe_version to skip the version tag check.
+        # Datasets like nvidia/LIBERO_LeRobot_v3 lack the _version_ tag.
+        from lerobot.datasets import utils as lerobot_utils
+        orig = lerobot_utils.get_safe_version
+        lerobot_utils.get_safe_version = lambda repo_id, revision: revision or "main"
         try:
             dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
-        except Exception as e:
-            err_msg = str(e)
-            if any(marker in err_msg for marker in [
-                "tagged with a codebase version",
-                "RevisionNotFoundError",
-                "missing 1 required keyword-only argument: 'response'",
-            ]):
-                # Newer lerobot versions require a version tag that most datasets lack.
-                # Monkey-patch get_safe_version to return "main" instead of crashing.
-                from lerobot.datasets import utils as lerobot_utils
-                orig = lerobot_utils.get_safe_version
-                lerobot_utils.get_safe_version = lambda repo_id, revision: revision or "main"
-                try:
-                    dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
-                finally:
-                    lerobot_utils.get_safe_version = orig
-            else:
-                raise
+        finally:
+            lerobot_utils.get_safe_version = orig
         print(f"  Streaming ready (no downloads, no disk space used)")
 
         self._dataset = dataset
