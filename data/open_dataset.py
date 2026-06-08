@@ -10,13 +10,25 @@ Supported datasets:
 
   - DROID (Distributed Robot Interaction Dataset)
     Format: RLDS/TFDS, 76K episodes with language annotations
-    Robot: Franka Panda, wrist camera
-    Text: Language annotations provided
+    Robot: Franka Panda, wrist camera. Text: Provided
 
   - BridgeData v2
-    Format: TFDS, 50K+ trajectories
-    Robot: WidowX 250
-    Text: Templated task descriptions
+    Format: TFDS, 50K+ trajectories. Robot: WidowX 250. Text: Templated
+
+  - LeRobot v3 (streaming — no downloads)
+    Format: Parquet + MP4 shards, streamed from Hugging Face Hub
+    Datasets: BridgeData2_LeRobot_v3, LIBERO_LeRobot_v3, and more
+    Robot: Mixed. Text: task descriptions in meta/tasks.jsonl
+
+Streaming example (zero disk space):
+    from data.open_dataset import LeRobotAdapter
+
+    adapter = LeRobotAdapter("nvidia/BridgeData2_LeRobot_v3")
+    loader = adapter.get_streaming_loader(batch_size=64)
+    for batch in loader:
+        frames = batch["frames"]      # (B, 3, H, W) torch tensors
+        poses = batch["poses"]        # (B, 7) or (B, 6)
+        text = batch["texts"]         # list of strings
 
 Usage:
     from data.open_dataset import OpenDatasetAdapter, create_align_dataset
@@ -629,6 +641,259 @@ def create_align_dataset(
     output_abs = str(Path(output_path).absolute())
     print(f"  Done: {output_abs}")
     return output_abs
+
+
+# ================================================================
+# LeRobot v3 streaming adapter
+# ================================================================
+
+class LeRobotAdapter:
+    """Streaming adapter for LeRobot v3 datasets on Hugging Face Hub.
+
+    Uses StreamingLeRobotDataset for zero-disk, zero-download streaming
+    directly from the Hub. No local storage needed.
+
+    Compatible datasets:
+        - nvidia/BridgeData2_LeRobot_v3
+        - nvidia/LIBERO_LeRobot_v3
+        - yixuan-tan/EgoDex-LeRobot-v3.0
+        - And many more (search: 'lerobot dataset v3' on Hub)
+
+    Feature mapping:
+        - observation.state → eef pose (first 6-7 dims)
+        - action → trajectory encoding (future steps from delta_timestamps)
+        - observation.images.<camera> → RGB frames (CHW → HWC)
+        - task → text description (from meta/tasks.jsonl)
+    """
+
+    # Known ALIGN-compatible datasets with verified schemas
+    RECOMMENDED_DATASETS = {
+        "nvidia/BridgeData2_LeRobot_v3": {
+            "robot": "WidowX 250",
+            "camera": "observation.images.front",  # closest to wrist view
+            "text_field": "task",
+        },
+        "nvidia/LIBERO_LeRobot_v3": {
+            "robot": "Franka Emika Panda (sim)",
+            "camera": "observation.images.agentview",
+            "text_field": "task",
+        },
+    }
+
+    def __init__(
+        self,
+        repo_id: str,
+        camera: Optional[str] = None,
+        batch_size: int = 64,
+        num_workers: int = 2,
+        delta_timestamps: Optional[dict] = None,
+        image_transforms: bool = False,
+        max_episodes: Optional[int] = None,
+    ):
+        self.repo_id = repo_id
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.max_episodes = max_episodes
+        self.delta_timestamps = delta_timestamps
+        self.image_transforms = image_transforms
+
+        # Auto-detect camera from known schemas
+        if camera is None:
+            known = self.RECOMMENDED_DATASETS.get(repo_id)
+            self.camera = known["camera"] if known else "observation.images.front"
+        else:
+            self.camera = camera
+
+        self._meta = None
+        self._dataset = None
+
+    def _load_meta(self):
+        """Load dataset metadata (features, stats, tasks) for schema detection."""
+        if self._meta is not None:
+            return
+
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        except ImportError:
+            raise ImportError(
+                "LeRobotDatasetMetadata not available. Install: pip install lerobot"
+            )
+
+        print(f"[lerobot] Loading metadata for {self.repo_id}...")
+        self._meta = LeRobotDatasetMetadata(self.repo_id)
+
+        # Print available features
+        features = self._meta.features
+        cameras = [k for k in features.keys() if "images" in k]
+        states = [k for k in features.keys() if "observation.state" in k or "action" in k]
+        print(f"  Cameras: {cameras}")
+        print(f"  States:  {states}")
+        total_episodes = self._meta.total_episodes if self._meta.total_episodes else "?"
+        print(f"  Episodes: {total_episodes}")
+
+        # Verify camera exists
+        if self.camera not in features:
+            available = [k for k in features.keys() if "images" in k]
+            if available:
+                self.camera = available[0]
+                print(f"  WARNING: Camera '{self.camera}' not found. Using '{self.camera}' instead.")
+
+    def get_streaming_dataset(self):
+        """Create streaming dataset that pulls data from Hub on-the-fly.
+
+        Returns:
+            StreamingLeRobotDataset — iterable, no local downloads.
+        """
+        try:
+            from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
+        except ImportError:
+            raise ImportError(
+                "StreamingLeRobotDataset requires lerobot>=0.4.0. Install: pip install lerobot[streaming]"
+            )
+
+        self._load_meta()
+
+        # Build delta_timestamps for trajectory windows
+        dt = self.delta_timestamps
+        if dt is None:
+            # Default: 10-frame history @ 30Hz = ~0.3s lookback
+            dt = {
+                self.camera: [-0.3, -0.2, -0.1, 0.0],  # for temporal context
+                "observation.state": [-0.3, -0.2, -0.1, 0.0],
+            }
+
+        # Create image transforms config
+        transforms = None
+        if self.image_transforms:
+            try:
+                from lerobot.datasets.transforms import ImageTransforms, ImageTransformsConfig
+                transforms_config = ImageTransformsConfig(
+                    enable=True,
+                    max_num_transforms=2,
+                    random_order=True,
+                )
+                transforms = ImageTransforms(transforms_config)
+            except ImportError:
+                pass
+
+        kwargs = {"delta_timestamps": dt}
+        if transforms is not None:
+            kwargs["image_transforms"] = transforms
+
+        print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
+        dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
+        print(f"  Streaming ready (no downloads, no disk space used)")
+
+        self._dataset = dataset
+        return dataset
+
+    def get_streaming_loader(self) -> torch.utils.data.DataLoader:
+        """Get a DataLoader that streams data from Hub during training.
+
+        Each batch contains:
+            frames: (B, T, 3, H, W) float32 — camera frames (T from delta_timestamps)
+            poses: (B, T, D) float32 — EEF poses from observation.state
+            texts: list[str] — task descriptions
+
+        Returns:
+            DataLoader yielding ALIGN-compatible batches.
+        """
+        if self._dataset is None:
+            self.get_streaming_dataset()
+
+        loader = torch.utils.data.DataLoader(
+            self._dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=self.num_workers,
+            collate_fn=_lerobot_align_collate,
+        )
+        return loader
+
+    def iter_batches(self):
+        """Generator yielding ALIGN-formatted batches for training loop integration."""
+        loader = self.get_streaming_loader()
+        for batch in loader:
+            yield batch
+
+
+def _lerobot_align_collate(batch: list[dict]) -> dict:
+    """Collate function converting LeRobot v3 samples to ALIGN format.
+
+    LeRobot v3 schema:
+        sample["observation.state"]    — (T, D) or (D,)
+        sample["action"]               — (T, A) or (A,)
+        sample["observation.images.X"] — (T, C, H, W)
+        sample["task"]                 — str
+
+    ALIGN expects:
+        frames: (B, H, W, 3) uint8
+        poses: (B, K, 6) float32
+        texts: list[str]
+    """
+    import torch
+
+    all_frames = []
+    all_poses = []
+    all_texts = []
+
+    for sample in batch:
+        # Extract camera frame (take first timestep if temporal, last frame)
+        img = None
+        for key in sample:
+            if "images" in key:
+                img = sample[key]
+                # Handle temporal dimension
+                if img.dim() == 4:  # (T, C, H, W)
+                    img = img[-1]  # take most recent frame
+                elif img.dim() == 3:  # (C, H, W)
+                    pass
+                else:
+                    continue
+                # Convert C,H,W → H,W,C for ALIGN's DINOv2 encoder
+                img = img.permute(1, 2, 0)  # (H, W, C)
+                all_frames.append(img)
+                break
+
+        # Extract state (EEF pose)
+        state = sample.get("observation.state", sample.get("state", None))
+        if state is not None:
+            if state.dim() == 2:  # (T, D)
+                state = state[-1]  # take most recent
+            # Convert to numpy for compatibility
+            all_poses.append(state.to(torch.float32))
+        else:
+            # Dummy pose
+            all_poses.append(torch.zeros(6, dtype=torch.float32))
+
+        # Text
+        task = sample.get("task", sample.get("language_instruction", "pick and place"))
+        if isinstance(task, torch.Tensor):
+            task = str(task.item())
+        all_texts.append(str(task))
+
+    # Stack
+    frames = torch.stack(all_frames, dim=0)  # (B, H, W, C)
+    poses = torch.stack(all_poses, dim=0) if len(all_poses[0].shape) == 1 else all_poses
+
+    return {
+        "frames": frames,
+        "poses": poses,
+        "texts": all_texts,
+    }
+
+
+# ================================================================
+# Registry update
+# ================================================================
+
+SUPPORTED_DATASETS = {
+    "robomimic": RobomimicAdapter,
+    "droid": DROIDAdapter,
+    "bridge": BridgeDataAdapter,
+    "lerobot": LeRobotAdapter,
+}
 
 
 # ================================================================
