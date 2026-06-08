@@ -839,7 +839,7 @@ class LeRobotAdapter:
         print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
         try:
             dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
-        except (RevisionNotFoundError, Exception) as e:
+        except Exception as e:
             err_msg = str(e)
             if any(marker in err_msg for marker in [
                 "tagged with a codebase version",
@@ -847,19 +847,14 @@ class LeRobotAdapter:
                 "missing 1 required keyword-only argument: 'response'",
             ]):
                 # Newer lerobot versions require a version tag that most datasets lack.
-                # Fix: pip install "lerobot<1.0" which doesn't enforce this check.
-                print(f"  [WARN] Streaming failed: lerobot version check ({type(e).__name__})")
-                print(f"  Fix: pip install 'lerobot<1.0'  (older lerobot doesn't require version tags)")
-                print(f"  Falling back to local download + LeRobotDataset...")
-                local_dir = snapshot_download(
-                    self.repo_id, repo_type="dataset", revision="main",
-                )
-                root_dir = str(Path(local_dir).parent)
-                from lerobot.datasets.lerobot_dataset import LeRobotDataset
-                dataset = LeRobotDataset(
-                    self.repo_id, root=root_dir,
-                    delta_timestamps=dt, image_transforms=transforms,
-                )
+                # Monkey-patch get_safe_version to return "main" instead of crashing.
+                from lerobot.datasets import utils as lerobot_utils
+                orig = lerobot_utils.get_safe_version
+                lerobot_utils.get_safe_version = lambda repo_id, revision: revision or "main"
+                try:
+                    dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
+                finally:
+                    lerobot_utils.get_safe_version = orig
             else:
                 raise
         print(f"  Streaming ready (no downloads, no disk space used)")
