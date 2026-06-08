@@ -49,14 +49,14 @@ def main():
             f"{subset}/videos/**/*.mp4",
         ])
 
-    local_dir = snapshot_download(
+    local_dir = Path(snapshot_download(
         REPO_ID,
         repo_type="dataset",
         revision="main",
         allow_patterns=patterns,
         local_dir=dest,
         local_dir_use_symlinks=False,
-    )
+    ))
 
     # Print sizes
     total = sum(f.stat().st_size for f in Path(local_dir).rglob("*") if f.is_file())
