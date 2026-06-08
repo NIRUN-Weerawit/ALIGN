@@ -863,8 +863,9 @@ class LeRobotAdapter:
 
         if local_dir:
             # Load from local directory — no Hub access needed
+            # Keep streaming=True because StreamingLeRobotDataset crashes
+            # with streaming=False (missing num_shards on regular Dataset)
             kwargs["root"] = local_dir
-            kwargs["streaming"] = False
             print(f"[lerobot] Loading local dataset for {self.repo_id} from {local_dir}...")
             dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
             print(f"  Local dataset ready (no Hub access)")
