@@ -716,11 +716,11 @@ class LeRobotAdapter:
         # This prevents the crash on datasets without a _version_ tag.
         # Applied once at init so both _load_meta and get_streaming_dataset are covered.
         import lerobot.datasets.lerobot_dataset as _ld
-        if not hasattr(_ld, '_get_safe_version_patched'):
+        if not hasattr(_ld, '_align_patched'):
             _ld._get_safe_version_orig = getattr(_ld, 'get_safe_version', None)
             if _ld._get_safe_version_orig is not None:
                 _ld.get_safe_version = lambda repo_id, revision: revision or "main"
-            _ld._get_safe_version_patched = True
+            _ld._align_patched = True
 
     def _load_meta(self):
         """Load dataset metadata (features, stats, tasks) for schema detection."""
@@ -848,7 +848,7 @@ class LeRobotAdapter:
             kwargs["image_transforms"] = transforms
 
         print(f"[lerobot] Creating streaming dataset for {self.repo_id}...")
-        dataset = StreamingLeRobotDataset(self.repo_id, **kwargs)
+        dataset = StreamingLeRobotDataset(self.repo_id, revision="main", **kwargs)
         print(f"  Streaming ready (no downloads, no disk space used)")
 
         self._dataset = dataset
