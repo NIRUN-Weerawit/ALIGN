@@ -806,11 +806,12 @@ class LeRobotAdapter:
         print(f"  Episodes: {total_episodes}")
 
         # Verify camera exists
-        if self.camera not in features:
-            available = [k for k in features.keys() if "images" in k]
-            if available:
-                self.camera = available[0]
-                print(f"  WARNING: Camera '{self.camera}' not found. Using '{self.camera}' instead.")
+        cam_keys = [k for k in features.keys() if "images" in k]
+        if self.camera not in cam_keys:
+            if cam_keys:
+                fallback = cam_keys[0]
+                print(f"  INFO: Camera '{self.camera}' not found. Using '{fallback}' instead.")
+                self.camera = fallback
 
     def get_streaming_dataset(self, data_dir: Optional[str] = None):
         """Create streaming dataset — pulls from Hub or reads local data.
