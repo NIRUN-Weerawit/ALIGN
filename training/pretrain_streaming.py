@@ -327,6 +327,15 @@ def pretrain_from_stream(
 
             # Progress every 100 steps
             if (step + 1) % 100 == 0:
+                # W&B step logging
+                wandb_trainer.log({
+                    "loss": loss.item(),
+                    "cos_vt": stats["avg_cos_vt"].item(),
+                    "cos_vl": stats["avg_cos_vl"].item(),
+                    "cos_tl": stats["avg_cos_tl"].item(),
+                    "lr": lr,
+                    "step": step + 1,
+                })
                 print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
                       f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
                       f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
@@ -681,6 +690,7 @@ def run_streaming_pipeline(
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
     num_workers: int = 4,
+    max_steps_per_epoch: int = 2000,
 ):
     """Full ALIGN training pipeline using streaming or local data.
 
@@ -722,6 +732,7 @@ def run_streaming_pipeline(
             wandb_run=(wandb_run or "streaming") + "-pretrain",
             enable_wandb=enable_wandb,
             num_workers=num_workers,
+            max_steps_per_epoch=max_steps_per_epoch,
         )
     else:
         if pretrained_path is None:
@@ -752,6 +763,7 @@ def run_streaming_pipeline(
             wandb_run=(wandb_run or "streaming") + "-heads",
             enable_wandb=enable_wandb,
             num_workers=num_workers,
+            max_steps_per_epoch=max_steps_per_epoch,
         )
     else:
         head_path = str(output_dir / "heads" / "joint_best.pt")
@@ -817,7 +829,7 @@ def main():
         wandb_run=args.wandb_run,
         enable_wandb=args.wandb,
         num_workers=args.num_workers,
-        # max_steps_per_epoch=args.max_steps_per_epoch,
+        max_steps_per_epoch=args.max_steps_per_epoch,
     )
 
 
