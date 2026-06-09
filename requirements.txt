@@ -1,10 +1,11 @@
 # ALIGN — pip requirements
 # Install: pip install -r requirements.txt
-# For GPU support, add: --index-url https://download.pytorch.org/whl/cu124
+# For GPU support, use: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 #
 # Recommended approach:
 #   pip install -r requirements.txt
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   python scripts/check_deps.py
 
 # ── Core ML & data ──────────────────────────────────────────────
 numpy
@@ -13,8 +14,9 @@ h5py
 Pillow
 open-clip-torch
 lerobot
-torchcodec
 xformers
+transformers
+PyAV
 
 # ── Monitoring ──────────────────────────────────────────────────
 wandb

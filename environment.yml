@@ -2,6 +2,8 @@
 # Create:  conda env create -f environment.yml
 # Update:  conda env update -f environment.yml
 # Activate: conda activate align
+# Verify:  PYTHONNOUSERSITE=1 which python  # should be miniconda3/envs/align/bin/python
+#          python scripts/check_deps.py
 name: align
 channels:
   - conda-forge
@@ -9,7 +11,7 @@ channels:
 dependencies:
   # Python
   - python=3.10
-  # System deps (conda handles the native libs like HDF5 + BLAS)
+  # System deps (conda handles native libs: HDF5, BLAS)
   - numpy
   - scipy
   - h5py
@@ -18,17 +20,20 @@ dependencies:
   - wandb
   - tqdm
   - requests
-  # Pip-only packages (PyTorch via pip avoids channel conflicts)
+  # Pip-only packages (PyTorch via pip avoids conda channel conflicts)
   - pip
   - pip:
-    # PyTorch + CUDA (latest, via pip for version parity)
+    # PyTorch + CUDA — install via pip with CUDA index:
+    #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
     - torch
     - torchvision
     # Core ML
     - open-clip-torch
     - lerobot
-    - torchcodec
     - xformers
+    - transformers
+    # Video decoding — lerobot falls back to pyav if torchcodec unavailable
+    - PyAV
     # Optional: Isaac Sim data collection and VR teleop
     # - isaacsim  # Follow NVIDIA's install guide
     # - paho-mqtt

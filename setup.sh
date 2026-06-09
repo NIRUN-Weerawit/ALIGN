@@ -98,6 +98,8 @@ CORE_PIP=(
     "lerobot"
     "torchcodec"
     "xformers"
+    "transformers"
+    "PyAV"
 )
 
 # PyTorch is special — install via pip with CUDA index, not conda
@@ -149,13 +151,16 @@ install_conda() {
     echo "  Training:  conda run -n ${env_name} python training/pretrain_streaming.py --epochs 10"
     echo ""
 
-    # Verify
+    # ── Verify ──
     conda run -n "$env_name" python -c "
 import open_clip; print(f'  open_clip:   {open_clip.__version__}')
 import xformers; print(f'  xformers:    {xformers.__version__}')
 import lerobot; print(f'  lerobot:     {lerobot.__version__}')
-import torchcodec; print(f'  torchcodec:  OK')
+import av; print(f'  pyav:        {av.__version__}')
 import torch; print(f'  torch:       {torch.__version__}  CUDA:{torch.cuda.is_available()}')
+import transformers; print(f'  transformers:{transformers.__version__}')
+import wandb; print(f'  wandb:       {wandb.__version__}')
+print('All deps OK')
 "
 }
 
