@@ -62,7 +62,6 @@ def train_epoch(
         traj = torch.from_numpy(batch["trajectory"]).float().to(device)
         noisy = torch.from_numpy(batch["noisy_pose"]).float().to(device)
         texts = batch["texts"]
-        dists = torch.from_numpy(batch["distances"]).float().to(device)
         alpha_t = torch.from_numpy(batch["alpha_target"]).float().to(device)
         delta_t = torch.from_numpy(batch["delta_target"]).float().to(device)
 
@@ -72,13 +71,13 @@ def train_epoch(
             z_text = model.encode_text(texts)
 
         if stage == "decision":
-            alpha_pred = model.decision_head(z_v, z_t, z_text, dists)
+            alpha_pred = model.decision_head(z_v, z_t, z_text)
             loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_t)
         elif stage == "assistant":
             delta_pred = model.assistant_head(z_v, z_t, z_text, noisy)
             loss = F.mse_loss(delta_pred, delta_t)
         elif stage == "joint":
-            alpha_pred = model.decision_head(z_v, z_t, z_text, dists)
+            alpha_pred = model.decision_head(z_v, z_t, z_text)
             delta_pred = model.assistant_head(z_v, z_t, z_text, noisy)
             loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_t) + 0.5 * F.mse_loss(delta_pred, delta_t)
 
@@ -118,7 +117,6 @@ def validate(model: ALIGNModel, loader: DataLoader, stage: str, device: torch.de
         traj = torch.from_numpy(batch["trajectory"]).float().to(device)
         noisy = torch.from_numpy(batch["noisy_pose"]).float().to(device)
         texts = batch["texts"]
-        dists = torch.from_numpy(batch["distances"]).float().to(device)
         alpha_t = torch.from_numpy(batch["alpha_target"]).float().to(device)
         delta_t = torch.from_numpy(batch["delta_target"]).float().to(device)
 
@@ -127,13 +125,13 @@ def validate(model: ALIGNModel, loader: DataLoader, stage: str, device: torch.de
         z_text = model.encode_text(texts)
 
         if stage == "decision":
-            alpha_pred = model.decision_head(z_v, z_t, z_text, dists)
+            alpha_pred = model.decision_head(z_v, z_t, z_text)
             loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_t)
         elif stage == "assistant":
             delta_pred = model.assistant_head(z_v, z_t, z_text, noisy)
             loss = F.mse_loss(delta_pred, delta_t)
         elif stage == "joint":
-            alpha_pred = model.decision_head(z_v, z_t, z_text, dists)
+            alpha_pred = model.decision_head(z_v, z_t, z_text)
             delta_pred = model.assistant_head(z_v, z_t, z_text, noisy)
             loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_t) + 0.5 * F.mse_loss(delta_pred, delta_t)
 

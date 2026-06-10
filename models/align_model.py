@@ -19,7 +19,11 @@ Usage:
     vision = model.encode_vision(frames)        # (B, 256)
     traj = model.encode_trajectory(poses)       # (B, K, 6) → (B, 256)
     text = model.encode_text(descriptions)      # (B, 256)
-    alpha = model.decision_head(vision, traj, text, cos_sims, distances)
+    alpha = model.decision_head(vision, traj, text, cos_sims)
+    # NOTE: decision head now takes ONLY z_v, z_t, z_text — no distances
+    # Distance is learned implicitly from visual features (DINOv2 captures
+    # object scale/depth cues). This is required for real deployment where
+    # per-object distance sensors are unreliable or absent.
     delta = model.assistant_head(vision, traj, text, noisy_pose)
 """
 
@@ -188,12 +192,19 @@ class TextEncoder(nn.Module):
 # ================================================================
 
 class DecisionHead(nn.Module):
-    """MLP predicting α ∈ [0, 1] from shared embeddings + alignment scores."""
+    """MLP predicting α ∈ [0, 1] from shared embeddings + alignment scores.
+
+    Input is everything computable from the encoders at inference time:
+        z_v, z_t, z_text (256d each) + cos_vt, cos_vl, cos_tl (1d each).
+    No external inputs (e.g. object distance) — the model must learn
+    "near vs. far" from the visual features themselves. This is critical
+    for real deployment where per-object distance is rarely available.
+    """
 
     def __init__(self, latent_dim: int = 256):
         super().__init__()
-        # Input: z_v (256) + z_t (256) + z_text (256) + cos_vt(1) + cos_vl(1) + cos_tl(1) + dist(3)
-        input_dim = latent_dim * 3 + 3 + 3
+        # Input: z_v (256) + z_t (256) + z_text (256) + cos_vt(1) + cos_vl(1) + cos_tl(1)
+        input_dim = latent_dim * 3 + 3
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, 256),
             nn.ReLU(),
@@ -208,7 +219,6 @@ class DecisionHead(nn.Module):
         z_v: torch.Tensor,
         z_t: torch.Tensor,
         z_text: torch.Tensor,
-        distances: torch.Tensor,
     ) -> torch.Tensor:
         """Predict assist confidence α.
 
@@ -216,7 +226,6 @@ class DecisionHead(nn.Module):
             z_v: (B, D) vision embeddings.
             z_t: (B, D) trajectory embeddings.
             z_text: (B, D) text embeddings.
-            distances: (B, 3) distance features.
 
         Returns:
             (B, 1) α ∈ [0, 1].
@@ -228,7 +237,7 @@ class DecisionHead(nn.Module):
         cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)  # (B, 1)
         cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)  # (B, 1)
         cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)  # (B, 1)
-        x = torch.cat([z_v, z_t, z_text, cos_vt, cos_vl, cos_tl, distances], dim=-1)
+        x = torch.cat([z_v, z_t, z_text, cos_vt, cos_vl, cos_tl], dim=-1)
         return self.mlp(x)
 
 
@@ -333,7 +342,6 @@ class ALIGNModel(nn.Module):
         frames: torch.Tensor,
         traj: torch.Tensor,
         texts: Optional[list[str]] = None,
-        distances: Optional[torch.Tensor] = None,
         compute_decision: bool = True,
         compute_assistant: bool = True,
     ) -> Dict[str, torch.Tensor]:
@@ -343,7 +351,6 @@ class ALIGNModel(nn.Module):
             frames: (B, H, W, 3) RGB images.
             traj: (B, K, 6) trajectory window.
             texts: Optional list of task descriptions.
-            distances: (B, 3) distance features. Required for Decision head.
             compute_decision: Whether to compute α.
             compute_assistant: Whether to compute Δposes.
 
@@ -359,9 +366,7 @@ class ALIGNModel(nn.Module):
 
         result: Dict[str, torch.Tensor] = {}
         if compute_decision:
-            if distances is None:
-                distances = torch.zeros(z_v.shape[0], 3, device=z_v.device)
-            result["alpha"] = self.decision_head(z_v, z_t, z_text, distances)
+            result["alpha"] = self.decision_head(z_v, z_t, z_text)
         if compute_assistant:
             result["delta"] = self.assistant_head(z_v, z_t, z_text, traj[:, -1])
         return result

@@ -914,12 +914,15 @@ def convert_lerobot_sample(sample: dict) -> dict:
     Input (raw LeRobot v3):
         observation.state    — (T, D) or (D,) tensor
         observation.images.X — (T, C, H, W) or (C, H, W) tensor
+        action               — (T, A) or (A,) tensor — target actions
+                              (for head training: future K steps become chunk targets)
         task                 — str
 
     Output:
         frames — (H, W, C) torch.uint8
-        poses  — (D,) or (6,) torch.float32 (EEF pose)
+        poses  — (D,) or (6,) torch.float32 (EEF pose), or (K, D) trajectory window
         text   — str
+        action — (A,) or (K_chunk, A) — action targets (None if absent)
     """
     # Extract camera frame (take first timestep if temporal, last frame)
     img = None
@@ -938,11 +941,18 @@ def convert_lerobot_sample(sample: dict) -> dict:
     # Extract state (EEF pose)
     state = sample.get("observation.state", sample.get("state", None))
     if state is not None:
-        if state.dim() == 2:  # (T, D)
-            state = state[-1]  # take most recent
-        state = state.to(torch.float32)
+        if state.dim() == 2:  # (T, D) — trajectory window
+            # KEEP as (K, D) — downstream can use the window
+            state = state.to(torch.float32)
+        else:
+            state = state.to(torch.float32)
     else:
         state = torch.zeros(6, dtype=torch.float32)
+
+    # Extract action (may be 1D or K-chunk window)
+    action = sample.get("action", None)
+    if action is not None:
+        action = action.to(torch.float32)
 
     # Text
     task = sample.get("task", sample.get("language_instruction", "pick and place"))
@@ -953,28 +963,50 @@ def convert_lerobot_sample(sample: dict) -> dict:
         "frames": img if img is not None else torch.zeros(1, 1, 3, dtype=torch.uint8),
         "poses": state,
         "text": str(task),
+        "action": action,
     }
 
 
 def _lerobot_align_collate(batch: list[dict]) -> dict:
-    """Collate function converting LeRobot v3 samples to ALIGN format."""
+    """Collate function converting LeRobot v3 samples to ALIGN format.
+
+    Returns dict with:
+        frames: (B, H, W, 3) uint8
+        poses:  (B, D) or (B, K, D) — EEF state or trajectory window
+        texts:  list[str]
+        actions: (B, A) or (B, K_chunk, A) — action targets (may be None)
+    """
     all_frames = []
     all_poses = []
     all_texts = []
+    all_actions = []
 
     for sample in batch:
         converted = convert_lerobot_sample(sample)
         all_frames.append(converted["frames"])
         all_poses.append(converted["poses"])
         all_texts.append(converted["text"])
+        all_actions.append(converted.get("action"))
 
     frames = torch.stack(all_frames, dim=0)
-    poses = torch.stack(all_poses, dim=0) if len(all_poses[0].shape) == 1 else all_poses
+    # Poses may be (D,) or (K, D) — handle both
+    if all_poses[0].dim() == 1:
+        poses = torch.stack(all_poses, dim=0)
+    else:
+        # Variable window lengths: pad to max K, or just return as list
+        poses = torch.stack(all_poses, dim=0)
+
+    # Actions: only stack if all present and same shape
+    if all(a is not None and a.shape == all_actions[0].shape for a in all_actions):
+        actions = torch.stack(all_actions, dim=0)
+    else:
+        actions = all_actions  # keep as list (variable shape)
 
     return {
         "frames": frames,
         "poses": poses,
         "texts": all_texts,
+        "actions": actions,
     }
 
 

@@ -22,8 +22,12 @@ PRESENTATION.md
 PROFESSOR_QA.md
 TASK_PLAN.md
 TRAINING_PIPELINE.md
+CONTRASTIVE_TRAINING_AUDIT.MD
 
 # Admin scripts (Notion debug, etc.)
 scripts/check_notion_*.py
 scripts/check_projects_db.py
 scripts/create_notion_project.py
+
+# Graphify output (regeneratable)
+graphify-out/

@@ -63,6 +63,7 @@ class MultiDatasetStream(IterableDataset):
         data_dir: Optional[str] = None,
         traj_window: int = 20,
         fps: int = 20,
+        chunk_size: int = 5,
     ):
         super().__init__()
         self.repo_ids = repo_ids
@@ -70,6 +71,7 @@ class MultiDatasetStream(IterableDataset):
         self.data_dir = data_dir
         self.traj_window = traj_window
         self.fps = fps
+        self.chunk_size = chunk_size
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -99,9 +101,14 @@ class MultiDatasetStream(IterableDataset):
         # K frames of history = (K-1) / fps seconds.
         fps = self.fps
         dt_seconds = [(i - (self.traj_window - 1)) / fps for i in range(self.traj_window)]
+        # Also request future actions for the chunk head target.
+        # chunk_size is set on the head — use 5 future steps by default.
+        chunk_size = self.chunk_size
+        dt_future = [i / fps for i in range(1, chunk_size + 1)]
         delta_timestamps = {
             "observation.state": dt_seconds,
             "observation.images.wrist_image": dt_seconds,
+            "action": dt_future,   # K=chunk_size future actions for Δpose target
         }
         for i, repo_id in enumerate(self.repo_ids):
             adapter = LeRobotAdapter(
@@ -122,10 +129,14 @@ class MultiDatasetStream(IterableDataset):
             for i, loader in enumerate(loaders):
                 try:
                     batch = next(loader)
+                    actions = batch.get("actions", None)
+                    if isinstance(actions, list):
+                        actions = actions[0] if actions else None
                     yield {
                         "frames": batch["frames"][0],
                         "poses": batch["poses"][0],
                         "text": batch["texts"][0],
+                        "actions": actions,
                     }
                 except StopIteration:
                     # Recreate this loader (streaming datasets are finite;
@@ -165,8 +176,14 @@ def streaming_pretrain_collate(batch: list[dict], traj_window: int = 10) -> dict
         # LeRobot v3 images are always (C, H, W) — permute to (H, W, C) for DINOv2
         if frame.dim() == 3 and frame.shape[0] in (1, 3):
             frame = frame.permute(1, 2, 0)  # (C, H, W) → (H, W, C)
-        # Ensure uint8 format
-        if frame.dtype != torch.uint8:
+        # Convert to uint8 [0, 255]. LeRobot returns float32 [0, 1] — .to(uint8)
+        # would TRUNCATE to 0 or 1 (all-black). Multiply first when float.
+        if frame.dtype == torch.float32:
+            if frame.max() <= 1.0:
+                frame = (frame * 255.0).clamp(0, 255).to(torch.uint8)
+            else:
+                frame = frame.clamp(0, 255).to(torch.uint8)
+        elif frame.dtype != torch.uint8:
             frame = frame.to(torch.uint8)
 
         all_frames.append(frame)
@@ -221,6 +238,7 @@ def pretrain_from_stream(
     num_workers: int = 4,
     traj_window: int = 20,
     fps: int = 20,
+    chunk_size: int = 5,
 ):
     """Contrastive pretraining directly from LeRobot v3 streaming datasets.
 
@@ -289,7 +307,7 @@ def pretrain_from_stream(
     print(f"  K_traj:   {traj_window}  (trajectory encoder window size)")
 
     # -- Streaming dataset ──
-    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir, traj_window=traj_window, fps=fps)
+    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir, traj_window=traj_window, fps=fps, chunk_size=chunk_size)
     loader = DataLoader(
         stream_ds,
         batch_size=batch_size,
@@ -457,6 +475,8 @@ def train_heads_from_stream(
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
     num_workers: int = 4,
+    traj_window: int = 20,
+    fps: int = 20,
 ):
     """Train Decision + Assistant heads from streamed data with on-the-fly noise.
 
@@ -513,7 +533,7 @@ def train_heads_from_stream(
     print(f"  W&B:         {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Streaming dataset ──
-    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir)
+    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir, traj_window=traj_window, fps=fps, chunk_size=chunk_size)
     loader = DataLoader(
         stream_ds,
         batch_size=batch_size,
@@ -577,6 +597,7 @@ def train_heads_from_stream(
                 frames = batch["frames"].to(device)
                 clean_poses = batch["poses"].float().to(device)
                 texts = batch["texts"]
+                actions_window = batch.get("actions", None)  # (B, chunk_size, 7) or None
 
                 # Rotate noise injectors
                 injector = injectors[step % len(injectors)]
@@ -584,19 +605,30 @@ def train_heads_from_stream(
                 noisy_poses = torch.from_numpy(noisy_poses_np).float().to(device)
 
                 # Compute targets on-the-fly
-                d_max = 0.10
+                # Combine position AND orientation error (orientation matters too)
+                d_max_pos = 0.10
+                d_max_orn = 0.52  # ~30° axis-angle
                 pos_error = torch.norm(noisy_poses[:, :3] - clean_poses[:, :3], dim=1)
-                alpha_target = torch.clamp(pos_error / d_max, 0.0, 1.0)
+                orn_error = torch.norm(noisy_poses[:, 3:6] - clean_poses[:, 3:6], dim=1)
+                alpha_target = torch.clamp(
+                    torch.maximum(pos_error / d_max_pos, orn_error / d_max_orn),
+                    0.0, 1.0,
+                )
 
                 B, D = clean_poses.shape
-                delta_target = torch.zeros(B, chunk_size, 6, device=device)
-                # Ensure 6D for orientation: take first 6 dims (pos) or use identity
-                clean_6d = clean_poses[:, :6] if D >= 6 else torch.cat([
-                    clean_poses, torch.zeros(B, 6 - D, device=device)
-                ], dim=-1)
-                # Delta = clean − noisy (both already 6D from injector output)
-                for i in range(1, chunk_size + 1):
-                    delta_target[:, i - 1, :] = clean_6d - noisy_poses[:, :6]
+                # Build delta_target from the future action window (real K-step targets).
+                # Action is (B, chunk_size, 7) in LeRobot LIBERO: [x,y,z,ax,ay,az,grip].
+                # Δpose = action[t+i] - noisy_pose[t] for i=0..chunk_size-1.
+                if actions_window is not None and isinstance(actions_window, torch.Tensor) and actions_window.dim() == 3:
+                    # Take first 6 dims (EEF pos + axis-angle)
+                    delta_target = actions_window[:, :chunk_size, :6].to(device).float()
+                else:
+                    # Fallback: single-step delta (no future info)
+                    delta_target = torch.zeros(B, chunk_size, 6, device=device)
+                    clean_6d = clean_poses[:, :6] if D >= 6 else torch.cat([
+                        clean_poses, torch.zeros(B, 6 - D, device=device)
+                    ], dim=-1)
+                    delta_target[:, 0, :] = clean_6d - noisy_poses[:, :6]
 
                 # Encode
                 with torch.no_grad():
@@ -604,16 +636,16 @@ def train_heads_from_stream(
                     z_t = model.encode_trajectory(noisy_poses.unsqueeze(1).repeat(1, 10, 1))
                     z_text = model.encode_text(texts)
 
-                dists = torch.zeros(B, 3, device=device)
-
+                # No external distances — decision head learns from
+                # visual features + cosines (DINOv2 captures scale/depth).
                 if stage == "decision":
-                    alpha_pred = model.decision_head(z_v, z_t, z_text, dists)
+                    alpha_pred = model.decision_head(z_v, z_t, z_text)
                     loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target)
                 elif stage == "assistant":
                     delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_poses[:, :6])
                     loss = F.mse_loss(delta_pred, delta_target)
                 elif stage == "joint":
-                    alpha_pred = model.decision_head(z_v, z_t, z_text, dists)
+                    alpha_pred = model.decision_head(z_v, z_t, z_text)
                     delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_poses[:, :6])
                     loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target) +
                             0.5 * F.mse_loss(delta_pred, delta_target))
@@ -696,7 +728,13 @@ def streaming_head_collate(batch: list[dict]) -> dict:
 
         if frame.dim() == 3 and frame.shape[0] in (1, 3):  # (C, H, W)
             frame = frame.permute(1, 2, 0)
-        if frame.dtype != torch.uint8:
+        # Convert to uint8 [0, 255] without truncating float [0,1] to 0/1
+        if frame.dtype == torch.float32:
+            if frame.max() <= 1.0:
+                frame = (frame * 255.0).clamp(0, 255).to(torch.uint8)
+            else:
+                frame = frame.clamp(0, 255).to(torch.uint8)
+        elif frame.dtype != torch.uint8:
             frame = frame.to(torch.uint8)
 
         all_frames.append(frame)
@@ -732,6 +770,7 @@ def run_streaming_pipeline(
     max_steps_per_epoch: int = 2000,
     traj_window: int = 20,
     fps: int = 20,
+    chunk_size: int = 5,
 ):
     """Full ALIGN training pipeline using streaming or local data.
 
@@ -776,6 +815,7 @@ def run_streaming_pipeline(
             max_steps_per_epoch=max_steps_per_epoch,
             traj_window=traj_window,
             fps=fps,
+            chunk_size=chunk_size,
         )
     else:
         if pretrained_path is None:
@@ -807,6 +847,9 @@ def run_streaming_pipeline(
             enable_wandb=enable_wandb,
             num_workers=num_workers,
             max_steps_per_epoch=max_steps_per_epoch,
+            traj_window=traj_window,
+            fps=fps,
+            chunk_size=chunk_size,
         )
     else:
         head_path = str(output_dir / "heads" / "joint_best.pt")

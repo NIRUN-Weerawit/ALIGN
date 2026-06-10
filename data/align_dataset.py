@@ -4,8 +4,9 @@
 
 Converts recorded episodes (frames/ + data.npz + meta.json) into HDF5 format
 for efficient training. Handles multi-camera, text variants, and produces
-(batch frame, trajectory, text, distances) chunks for contrastive pretraining
-and head training.
+(batch frame, trajectory, text) chunks for contrastive pretraining
+and head training. (Distances were removed from the Decision head
+to make ALIGN fully self-contained for real deployment.)
 
 Usage:
     # Convert raw recordings to HDF5
@@ -132,6 +133,27 @@ class ALIGNDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
+    def close(self):
+        """Close the HDF5 file handle. Call when done to release the FD."""
+        if hasattr(self, "_h5") and self._h5 is not None:
+            self._h5.close()
+            self._h5 = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def __del__(self):
+        # Best-effort cleanup; in multi-worker DataLoaders, each worker
+        # has its own serialized copy of the dataset, so the file handle
+        # is per-worker. Always close() explicitly when possible.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def __getitem__(self, idx: int) -> dict:
         ep_idx, start, count = self._index[idx]
         frames = self._read_frames(ep_idx, start, count + self.traj_window)
@@ -175,11 +197,15 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
         ep_idx = item["ep_idx"]
 
         N = len(frames)
-        # Sample a random positive pair within this episode
+        # Sample a random anchor timestep within this episode
+        # The vision frame and trajectory window are both anchored at the
+        # same time t — vision and trajectory are temporally aligned for
+        # the positive pair. (Previously t1 and t2 were independent
+        # randoms — that breaks the contrastive signal.)
         max_offset = N - traj_window
         if max_offset > 0:
-            t1 = np.random.randint(0, max_offset)
-            t2 = np.random.randint(0, max_offset)
+            t1 = np.random.randint(0, max_offset)  # vision anchor
+            t2 = t1                                # trajectory anchor — SAME time
         else:
             t1 = 0
             t2 = 0
@@ -205,6 +231,10 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
 
     Returns sequential chunks for Decision + Assistant supervision.
 
+    Note: distances were removed from the Decision head — DINOv2
+    visual features implicitly encode scale/depth, so explicit
+    distance features are not needed (and hard to obtain at deploy).
+
     Returns:
         {
             "frames": (B, H, W, 3) uint8,
@@ -213,7 +243,6 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
             "alpha_target": (B,) float32,
             "delta_target": (B, chunk_size, 6) float32,
             "texts": list of strings,
-            "distances": (B, 3) float32,
         }
     """
     all_frames = []
@@ -222,7 +251,6 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
     all_alphas = []
     all_deltas = []
     all_texts = []
-    all_dists = []
 
     for item in batch:
         frames = item["frames"]
@@ -253,9 +281,6 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         # α_target placeholder — to be overwritten after GT generation
         alpha_target = 0.5  # placeholder
 
-        # Distance placeholder
-        dist = np.zeros(3, dtype=np.float32)
-
         # Text variant
         if isinstance(texts, list):
             text = texts[np.random.randint(len(texts))]
@@ -268,7 +293,6 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         all_alphas.append(alpha_target)
         all_deltas.append(delta)
         all_texts.append(text)
-        all_dists.append(dist)
 
     return {
         "frames": np.stack(all_frames, axis=0),
@@ -277,7 +301,6 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         "alpha_target": np.array(all_alphas, dtype=np.float32),
         "delta_target": np.stack(all_deltas, axis=0).astype(np.float32),
         "texts": all_texts,
-        "distances": np.stack(all_dists, axis=0).astype(np.float32),
     }
 
 

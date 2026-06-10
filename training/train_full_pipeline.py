@@ -181,10 +181,20 @@ def create_noisy_hdf5(
                     noisy_poses = injector.inject(clean_poses)
                     N = len(noisy_poses)
 
-                    # Compute α_target = need × capability (capability=1.0 for open data)
-                    d_max = 0.10
+                    # Compute α_target combining position AND orientation error.
+                    # Previous version only used position — a 30° rotation
+                    # error with good position was being ignored.
+                    d_max_pos = 0.10      # 10cm position error
+                    d_max_orn = 0.52      # 30° (≈ 0.52 rad) orientation error
                     pos_error = np.linalg.norm(noisy_poses[:, :3] - clean_poses[:, :3], axis=1)
-                    alpha_target = np.clip(pos_error / d_max, 0.0, 1.0)
+                    # Axis-angle difference (assume state[3:6] is axis-angle)
+                    orn_diff = noisy_poses[:, 3:6] - clean_poses[:, 3:6]
+                    orn_error = np.linalg.norm(orn_diff, axis=1)
+                    # Combine: max of the two normalized errors (more conservative)
+                    alpha_target = np.clip(
+                        np.maximum(pos_error / d_max_pos, orn_error / d_max_orn),
+                        0.0, 1.0,
+                    )
 
                     # Compute chunk targets
                     chunk_targets = _compute_chunk_targets(noisy_poses, clean_poses, chunk_size=5)

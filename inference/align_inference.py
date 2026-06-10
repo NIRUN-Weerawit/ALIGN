@@ -103,15 +103,14 @@ class ALIGNInference:
         # Prepare tensors
         frame_t = torch.from_numpy(frame).unsqueeze(0).to(self.device, non_blocking=True)  # (1, H, W, 3)
         traj_t = torch.from_numpy(np.stack(self.pose_buffer, axis=0)).unsqueeze(0).float().to(self.device)  # (1, K, 6)
-        dist_t = torch.zeros(1, 3, device=self.device)  # placeholder
 
         # Encode
         z_v = self.model.encode_vision(frame_t)
         z_t = self.model.encode_trajectory(traj_t)
         z_text = self.z_text
 
-        # Decision head
-        alpha = self.model.decision_head(z_v, z_t, z_text, dist_t)  # (1, 1)
+        # Decision head (no external distances — learned from visual features)
+        alpha = self.model.decision_head(z_v, z_t, z_text)  # (1, 1)
         alpha_val = float(alpha.squeeze().cpu())
 
         # Assistant head
