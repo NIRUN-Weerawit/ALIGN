@@ -56,11 +56,20 @@ class MultiDatasetStream(IterableDataset):
     Exhausted loaders are recreated for infinite streaming.
     """
 
-    def __init__(self, repo_ids: list[str], frames_per_item: int = 8, data_dir: Optional[str] = None):
+    def __init__(
+        self,
+        repo_ids: list[str],
+        frames_per_item: int = 8,
+        data_dir: Optional[str] = None,
+        traj_window: int = 20,
+        fps: int = 20,
+    ):
         super().__init__()
         self.repo_ids = repo_ids
         self.frames_per_item = frames_per_item
         self.data_dir = data_dir
+        self.traj_window = traj_window
+        self.fps = fps
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -86,12 +95,21 @@ class MultiDatasetStream(IterableDataset):
         # Create loaders for each dataset
         adapters: list[LeRobotAdapter] = []
         loaders: list = []
+        # Build delta_timestamps matching the requested trajectory window.
+        # K frames of history = (K-1) / fps seconds.
+        fps = self.fps
+        dt_seconds = [(i - (self.traj_window - 1)) / fps for i in range(self.traj_window)]
+        delta_timestamps = {
+            "observation.state": dt_seconds,
+            "observation.images.wrist_image": dt_seconds,
+        }
         for i, repo_id in enumerate(self.repo_ids):
             adapter = LeRobotAdapter(
                 repo_id,
                 data_dir=repo_data_dirs[i],
                 batch_size=1,
                 num_workers=0,
+                delta_timestamps=delta_timestamps,
             )
             ds = adapter.get_streaming_dataset()
             adapters.append(adapter)
@@ -201,6 +219,8 @@ def pretrain_from_stream(
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
     num_workers: int = 4,
+    traj_window: int = 20,
+    fps: int = 20,
 ):
     """Contrastive pretraining directly from LeRobot v3 streaming datasets.
 
@@ -224,6 +244,12 @@ def pretrain_from_stream(
         wandb_run: W&B run name.
         enable_wandb: Enable W&B logging.
         num_workers: DataLoader workers.
+        traj_window: Number of past frames fed to trajectory encoder (K_traj).
+                     Higher K captures more motion context (tremor filtering,
+                     approach arc) but increases Transformer attention cost O(K²).
+                     At 20fps: K=10=500ms, K=20=1s, K=30=1.5s.
+        fps: Data sample rate. Used to convert K_traj into delta_timestamps.
+             LIBERO = 20, real teleop typically 30.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     output_dir = Path(output_dir)
@@ -256,17 +282,19 @@ def pretrain_from_stream(
             "max_grad_norm": max_grad_norm,
             "max_steps_per_epoch": max_steps_per_epoch,
             "device": str(device),
+            "traj_window": traj_window,
         },
     ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
     print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
+    print(f"  K_traj:   {traj_window}  (trajectory encoder window size)")
 
     # -- Streaming dataset ──
-    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir)
+    stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir, traj_window=traj_window, fps=fps)
     loader = DataLoader(
         stream_ds,
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=streaming_pretrain_collate,
+        collate_fn=lambda b: streaming_pretrain_collate(b, traj_window=traj_window),
         pin_memory=True,
     )
 
@@ -702,6 +730,8 @@ def run_streaming_pipeline(
     enable_wandb: bool = True,
     num_workers: int = 4,
     max_steps_per_epoch: int = 2000,
+    traj_window: int = 20,
+    fps: int = 20,
 ):
     """Full ALIGN training pipeline using streaming or local data.
 
@@ -744,6 +774,8 @@ def run_streaming_pipeline(
             enable_wandb=enable_wandb,
             num_workers=num_workers,
             max_steps_per_epoch=max_steps_per_epoch,
+            traj_window=traj_window,
+            fps=fps,
         )
     else:
         if pretrained_path is None:
@@ -822,6 +854,14 @@ def main():
                         help="Max steps per epoch (default 2000, set low for testing)")
     parser.add_argument("--data-dir", default=None,
                         help="Path to local data directory (pre-downloaded). Overrides Hub streaming.")
+    parser.add_argument("--traj-window", type=int, default=20,
+                        help="Trajectory encoder window size K_traj — number of past "
+                             "frames fed to the trajectory Transformer. At 20fps: "
+                             "K=10=500ms, K=20=1s, K=30=1.5s. Higher K captures more "
+                             "motion context (approach arc, tremor) at O(K²) cost.")
+    parser.add_argument("--fps", type=int, default=20,
+                        help="Data FPS (LIBERO=20, default real teleop=30). "
+                             "Used to convert traj_window into delta_timestamps.")
 
     args = parser.parse_args()
 
@@ -841,6 +881,8 @@ def main():
         enable_wandb=args.wandb,
         num_workers=args.num_workers,
         max_steps_per_epoch=args.max_steps_per_epoch,
+        traj_window=args.traj_window,
+        fps=args.fps,
     )
 
 

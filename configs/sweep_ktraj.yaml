@@ -1,0 +1,49 @@
+# W&B sweep config for K_traj (trajectory window) ablation study.
+#
+# Hypothesis: K=20 is the sweet spot at 20fps (1s of motion context).
+#
+# Usage:
+#   wandb sweep configs/sweep_ktraj.yaml
+#   wandb agent <sweep_id>
+#
+# Sweep results log to wandb.ai/<entity>/align-ktraj-sweep
+
+program: training/pretrain_streaming.py
+method: bayes
+metric:
+  name: val/loss
+  goal: minimize
+
+parameters:
+  # K_traj ablation — sample at K=5,10,15,20,25,30,35,40,45,50
+  traj_window:
+    distribution: q_log_uniform_values
+    min: 5
+    max: 50
+    q: 5
+
+  # Fixed for fair comparison
+  fps:
+    value: 20
+  epochs-pretrain:
+    value: 20
+  batch-size:
+    value: 32
+  lr:
+    value: 0.0001
+  num-workers:
+    value: 0
+  max-steps-per-epoch:
+    value: 1000
+  wandb:
+    value: true
+  wandb-project:
+    value: align-ktraj-sweep
+  dataset:
+    value: nvidia/LIBERO_LeRobot_v3
+
+early_terminate:
+  type: hyperband
+  min_iter: 5
+  eta: 2
+  s: 3
