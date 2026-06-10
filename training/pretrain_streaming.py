@@ -341,6 +341,7 @@ def pretrain_from_stream(
     log_path = output_dir / "streaming_training_log.jsonl"
     log_fp = open(log_path, "a")
     best_loss = float("inf")
+    total_step = 0
 
     for epoch in range(epochs):
         model.train()
@@ -383,7 +384,7 @@ def pretrain_from_stream(
             epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
             # Progress every 100 steps
-            if (step + 1) % 100 == 0:
+            if (total_step + 1) % 100 == 0:
                 # W&B step logging
                 wandb_trainer.log({
                     "loss": loss.item(),
@@ -391,12 +392,14 @@ def pretrain_from_stream(
                     "cos_vl": stats["avg_cos_vl"].item(),
                     "cos_tl": stats["avg_cos_tl"].item(),
                     "lr": lr,
-                    "step": step + 1,
+                    "total_step": total_step + 1,
                 })
                 print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
                       f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
                       f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
                       flush=True)
+                
+            total_step += 1
 
         avg_loss = float(np.mean(epoch_losses))
         avg_vt = float(np.mean(epoch_cos_vt))
