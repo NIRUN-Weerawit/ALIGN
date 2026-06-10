@@ -124,13 +124,13 @@ class MultiDatasetStream(IterableDataset):
 def streaming_pretrain_collate(batch: list[dict], traj_window: int = 10) -> dict:
     """Collate streaming samples into ALIGN pretraining batch.
 
-    For contrastive pretraining we need (vision, trajectory_window, text) triples.
-    Since streaming gives single frames, we create synthetic trajectory windows
-    by repeating the pose (clean data, zero variance — contrastive learns
-    to align the static pose with the visual scene).
+    If LeRobot returned a real trajectory window (shape (K, D) on 'poses'),
+    use it directly. Otherwise (e.g. adapter didn't request delta_timestamps),
+    fall back to repeating the single pose to fill the window.
 
     For real trajectory windows, delta_timestamps in LeRobotAdapter provides
-    temporal context from the Parquet shards.
+    temporal context from the Parquet shards — e.g. [-0.3, -0.2, -0.1, 0.0]
+    gives a 4-frame window @ 20fps = 200ms of motion history.
     """
     import torch
 
@@ -153,11 +153,22 @@ def streaming_pretrain_collate(batch: list[dict], traj_window: int = 10) -> dict
 
         all_frames.append(frame)
 
-        # Build trajectory window from pose (use first 6 dims for EEF)
-        # LIBERO state is 8D [x,y,z,ax,ay,az,grip,grip], ALIGN expects 6D
-        pose_eef = pose[..., :6] if pose.shape[-1] > 6 else pose
-        traj = pose_eef.unsqueeze(0).repeat(traj_window, 1)  # (K, 6)
-        all_trajs.append(traj)
+        # Build trajectory window from pose.
+        # If LeRobot returned a window (K, D), use it. Else repeat single pose.
+        if pose.dim() == 2 and pose.shape[0] > 1:
+            # Real trajectory window from delta_timestamps
+            # Pose is (K, D_state), take first 6 dims (EEF pos + axis_angle)
+            pose_eef = pose[..., :6] if pose.shape[-1] >= 6 else torch.cat(
+                [pose, torch.zeros(pose.shape[0], 6 - pose.shape[-1], device=pose.device)],
+                dim=-1,
+            )
+            all_trajs.append(pose_eef)
+        else:
+            # Single pose, repeat to window size
+            pose_eef = pose[..., :6] if pose.shape[-1] >= 6 else pose
+            if pose_eef.dim() == 0:
+                pose_eef = pose_eef.unsqueeze(0)
+            all_trajs.append(pose_eef.unsqueeze(0).repeat(traj_window, 1))
 
         all_texts.append(text)
 
