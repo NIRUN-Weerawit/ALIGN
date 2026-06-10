@@ -305,10 +305,16 @@ class ALIGNModel(nn.Module):
         action_dim: int = 6,
         use_text: bool = True,
         device: Optional[str] = None,
+        use_cross_attention: bool = False,
+        mixer_dim: int = 512,
+        num_mixer_blocks: int = 2,
+        mixer_nhead: int = 8,
+        max_traj_len: int = 64,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_text = use_text
+        self.use_cross_attention = use_cross_attention
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.vision_encoder = VisionEncoder(embed_dim=embed_dim)
@@ -321,6 +327,19 @@ class ALIGNModel(nn.Module):
         )
         self.text_encoder = TextEncoder(embed_dim=embed_dim) if use_text else None
 
+        # Cross-attention mixer (opt-in, default off)
+        if use_cross_attention:
+            from models.cross_attention_mixer import CrossAttentionMixer
+            self.cross_attention_mixer = CrossAttentionMixer(
+                enc_dim=embed_dim,
+                mixer_dim=mixer_dim,
+                num_blocks=num_mixer_blocks,
+                nhead=mixer_nhead,
+                max_traj_len=max_traj_len,
+            )
+        else:
+            self.cross_attention_mixer = None
+
         self.decision_head = DecisionHead(latent_dim=embed_dim)
         self.assistant_head = AssistantHead(
             latent_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim
@@ -331,6 +350,16 @@ class ALIGNModel(nn.Module):
 
     def encode_trajectory(self, poses: torch.Tensor) -> torch.Tensor:
         return self.traj_encoder(poses)
+
+    def encode_trajectory_tokens(self, poses: torch.Tensor) -> torch.Tensor:
+        """Return per-token trajectory embeddings (B, K, D) — for the mixer.
+
+        Standard encode_trajectory mean-pools over K. The mixer needs the
+        full K tokens for cross-attention (one per frame).
+        """
+        x = self.traj_encoder.input_proj(poses)  # (B, K, d_model)
+        x = self.traj_encoder.transformer(x)    # (B, K, d_model)
+        return self.traj_encoder.projection(x)   # (B, K, embed_dim)
 
     def encode_text(self, texts: list[str]) -> Optional[torch.Tensor]:
         if self.text_encoder is None:
@@ -358,17 +387,31 @@ class ALIGNModel(nn.Module):
             Dict with 'alpha', 'delta' keys as present.
         """
         z_v = self.encode_vision(frames)
-        z_t = self.encode_trajectory(traj)
+        if self.cross_attention_mixer is not None:
+            z_t = self.encode_trajectory_tokens(traj)  # (B, K, D) for cross-attn
+        else:
+            z_t = self.encode_trajectory(traj)  # (B, D) mean-pooled
         z_text = self.encode_text(texts) if self.use_text and texts is not None else None
         if z_text is None:
             # No text — use zero embedding as neutral fallback
             z_text = torch.zeros_like(z_v)
 
+        # Cross-attention mixer: enriches each modality with cross-modal info
+        # Identity init means pre-trained encoder features are preserved at start.
+        if self.cross_attention_mixer is not None:
+            z_v, z_t, z_text = self.cross_attention_mixer(z_v, z_t, z_text)
+
+        # Heads expect z_t as (B, 256) — mean-pool the K trajectory tokens
+        if z_t.dim() == 3:
+            z_t_for_head = z_t.mean(dim=1)  # (B, K, 256) → (B, 256)
+        else:
+            z_t_for_head = z_t
+
         result: Dict[str, torch.Tensor] = {}
         if compute_decision:
-            result["alpha"] = self.decision_head(z_v, z_t, z_text)
+            result["alpha"] = self.decision_head(z_v, z_t_for_head, z_text)
         if compute_assistant:
-            result["delta"] = self.assistant_head(z_v, z_t, z_text, traj[:, -1])
+            result["delta"] = self.assistant_head(z_v, z_t_for_head, z_text, traj[:, -1])
         return result
 
     def freeze_backbone(self):

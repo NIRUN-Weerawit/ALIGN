@@ -239,6 +239,9 @@ def pretrain_from_stream(
     traj_window: int = 20,
     fps: int = 20,
     chunk_size: int = 5,
+    use_cross_attention: bool = False,
+    mixer_dim: int = 512,
+    num_mixer_blocks: int = 2,
 ):
     """Contrastive pretraining directly from LeRobot v3 streaming datasets.
 
@@ -321,6 +324,9 @@ def pretrain_from_stream(
         embed_dim=embed_dim,
         use_text=True,
         device=str(device),
+        use_cross_attention=use_cross_attention,
+        mixer_dim=mixer_dim,
+        num_mixer_blocks=num_mixer_blocks,
     ).to(device)
 
     # Freeze backbones
@@ -480,6 +486,9 @@ def train_heads_from_stream(
     num_workers: int = 4,
     traj_window: int = 20,
     fps: int = 20,
+    use_cross_attention: bool = False,
+    mixer_dim: int = 512,
+    num_mixer_blocks: int = 2,
 ):
     """Train Decision + Assistant heads from streamed data with on-the-fly noise.
 
@@ -551,6 +560,9 @@ def train_heads_from_stream(
         chunk_size=chunk_size,
         use_text=True,
         device=str(device),
+        use_cross_attention=use_cross_attention,
+        mixer_dim=mixer_dim,
+        num_mixer_blocks=num_mixer_blocks,
     ).to(device)
 
     ckpt = torch.load(pretrained_checkpoint, map_location=device)
@@ -774,6 +786,9 @@ def run_streaming_pipeline(
     traj_window: int = 20,
     fps: int = 20,
     chunk_size: int = 5,
+    use_cross_attention: bool = False,
+    mixer_dim: int = 512,
+    num_mixer_blocks: int = 2,
 ):
     """Full ALIGN training pipeline using streaming or local data.
 
@@ -819,6 +834,9 @@ def run_streaming_pipeline(
             traj_window=traj_window,
             fps=fps,
             chunk_size=chunk_size,
+            use_cross_attention=use_cross_attention,
+            mixer_dim=mixer_dim,
+            num_mixer_blocks=num_mixer_blocks,
         )
     else:
         if pretrained_path is None:
@@ -853,6 +871,9 @@ def run_streaming_pipeline(
             traj_window=traj_window,
             fps=fps,
             chunk_size=chunk_size,
+            use_cross_attention=use_cross_attention,
+            mixer_dim=mixer_dim,
+            num_mixer_blocks=num_mixer_blocks,
         )
     else:
         head_path = str(output_dir / "heads" / "joint_best.pt")
@@ -908,6 +929,14 @@ def main():
     parser.add_argument("--fps", type=int, default=20,
                         help="Data FPS (LIBERO=20, default real teleop=30). "
                              "Used to convert traj_window into delta_timestamps.")
+    parser.add_argument("--use-cross-attention", action="store_true",
+                        help="Enable cross-attention mixer between vision/trajectory/text "
+                             "encoders. Adds 8.7M trainable params. Identity init preserves "
+                             "pretrained features at start. See CROSS_ATTENTION_PROPOSAL.md.")
+    parser.add_argument("--mixer-dim", type=int, default=512,
+                        help="Cross-attention mixer hidden dim (default 512)")
+    parser.add_argument("--num-mixer-blocks", type=int, default=2,
+                        help="Number of cross-attention mixer blocks (default 2)")
 
     args = parser.parse_args()
 
@@ -929,6 +958,9 @@ def main():
         max_steps_per_epoch=args.max_steps_per_epoch,
         traj_window=args.traj_window,
         fps=args.fps,
+        use_cross_attention=args.use_cross_attention,
+        mixer_dim=args.mixer_dim,
+        num_mixer_blocks=args.num_mixer_blocks,
     )
 
 
