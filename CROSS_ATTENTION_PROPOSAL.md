@@ -160,7 +160,27 @@ Trainable ratio: **4.1%** (was 0.8% with concat fusion).
 
 ## 5. Training
 
+The current codebase runs **a single unified training loop** for both
+pretraining and head training. With cross-attention added, the mixer is
+**always in the loop** during pretraining — meaning InfoNCE sees mixed
+embeddings, not raw modality-specific ones. This corrupts the contrastive
+signal (a modality-agnostic ablation is needed to confirm, but the
+math is the same as in Q-Former vs BLIP-2).
+
+**v2 introduces two-stage training** to fix this. Stages A and B are
+new — not present in the current code. They are part of the
+implementation plan (§8), not a precondition.
+
 ### 5.1 Stage A: Encoder pretraining (mixer frozen, 1-2 epochs)
+
+**Why Stage A exists:** Without it, the mixer gradients flow into
+InfoNCE from step 1, and the contrastive loss sees mixed embeddings.
+By freezing the mixer for 1 epoch, the encoders learn their
+alignment using *raw* embeddings, just like before cross-attention
+existed. The mixer's gate is initialized to ~0.7, so its output is
+already close to the input — gradient flow is small anyway, but
+freezing makes it explicit.
+
 ```python
 mixer.eval()  # frozen
 for z_v, z_t, z_text in dataloader:
