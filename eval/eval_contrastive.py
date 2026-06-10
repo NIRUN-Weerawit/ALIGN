@@ -105,23 +105,28 @@ def load_streaming_samples(
     except ImportError:
         raise ImportError("Need lerobot for streaming: pip install lerobot")
 
-    ds = LeRobotDataset(repo_id, root=data_dir, split="train")
+    ds = LeRobotDataset(repo_id, root=data_dir)
     indices = sorted(np.random.choice(len(ds), min(n_samples, len(ds)), replace=False))
 
     frames, trajs, texts = [], [], []
     for idx in indices:
         sample = ds[idx]
-        # Camera frame
-        for key in sample:
-            if "images" in str(key):
-                img = sample[key]
-                if isinstance(img, torch.Tensor):
-                    if img.dim() == 4:   # (T, C, H, W)
-                        img = img[-1]
-                    if img.dim() == 3 and img.shape[0] in (1, 3):
-                        img = img.permute(1, 2, 0)
-                frames.append(img.to(torch.uint8) if img.dtype != torch.uint8 else img)
-                break
+        # Camera frame — use wrist_image
+        img = sample.get("observation.images.wrist_image", sample.get("observation.images.image", None))
+        if img is None:
+            for k in sample:
+                if "images" in str(k):
+                    img = sample[k]
+                    break
+        if img is not None:
+            if isinstance(img, torch.Tensor):
+                if img.dim() == 4:   # (T, C, H, W)
+                    img = img[0]
+                if img.dim() == 3 and img.shape[0] in (1, 3):
+                    img = img.permute(1, 2, 0)  # C,H,W → H,W,C
+                # DINOv2 expects uint8 [0,255] (divide by 255 happens inside model)
+                img = img.mul(255).to(torch.uint8) if img.dtype == torch.float32 else img.to(torch.uint8)
+            frames.append(img)
 
         # State → trajectory window (repeat single frame)
         state = sample.get("observation.state", sample.get("state", None))
@@ -132,7 +137,7 @@ def load_streaming_samples(
             trajs.append(s.unsqueeze(0).repeat(10, 1))  # (K, 6)
 
         # Text
-        task = sample.get("task", sample.get("language_instruction", "pick and place"))
+        task = sample.get("task") if "task" in sample else sample.get("language_instruction", "pick and place")
         texts.append(str(task))
 
     B = len(frames)
