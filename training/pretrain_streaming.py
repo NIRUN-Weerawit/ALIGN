@@ -242,6 +242,7 @@ def pretrain_from_stream(
     use_cross_attention: bool = False,
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
+    freeze_mixer: bool = False,
 ):
     """Contrastive pretraining directly from LeRobot v3 streaming datasets.
 
@@ -271,6 +272,9 @@ def pretrain_from_stream(
                      At 20fps: K=10=500ms, K=20=1s, K=30=1.5s.
         fps: Data sample rate. Used to convert K_traj into delta_timestamps.
              LIBERO = 20, real teleop typically 30.
+        freeze_mixer: If True, freeze the cross-attention mixer (Stage A in
+             two-stage training). Encoders train, mixer is fixed.
+             Default False (mixer is trainable from epoch 1).
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     output_dir = Path(output_dir)
@@ -304,6 +308,10 @@ def pretrain_from_stream(
             "max_steps_per_epoch": max_steps_per_epoch,
             "device": str(device),
             "traj_window": traj_window,
+            "use_cross_attention": use_cross_attention,
+            "mixer_dim": mixer_dim,
+            "num_mixer_blocks": num_mixer_blocks,
+            "freeze_mixer": freeze_mixer,
         },
     ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
     print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
@@ -335,6 +343,14 @@ def pretrain_from_stream(
     if model.text_encoder is not None:
         for p in model.text_encoder.model.parameters():
             p.requires_grad = False
+
+    # Stage A: freeze the mixer (encoder pretraining with cross-modal pass-through)
+    # Stage B (default): mixer is trainable, learns cross-modal features
+    if freeze_mixer and model.cross_attention_mixer is not None:
+        model.set_mixer_trainable(False)
+        print(f"  Stage A: mixer frozen (encoder pretraining only)")
+    elif model.cross_attention_mixer is not None:
+        print(f"  Stage B-style: mixer trainable (8.7M extra params)")
 
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in trainable)
@@ -489,6 +505,9 @@ def train_heads_from_stream(
     use_cross_attention: bool = False,
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
+    head_loss_weight: float = 0.1,
+    modality_dropout: float = 0.0,
+    temperature: float = 0.07,
 ):
     """Train Decision + Assistant heads from streamed data with on-the-fly noise.
 
@@ -570,6 +589,17 @@ def train_heads_from_stream(
     model.freeze_backbone()
     print(f"  Loaded backbone from {pretrained_checkpoint}")
 
+    # Stage B: ensure mixer is trainable (defensive — the user may have
+    # called set_mixer_trainable(False) earlier, e.g. in Stage A pretrain)
+    if use_cross_attention and model.cross_attention_mixer is not None:
+        model.set_mixer_trainable(True)
+        n_mixer = sum(p.numel() for p in model.cross_attention_mixer.parameters() if p.requires_grad)
+        print(f"  Stage B: mixer unfrozen ({n_mixer/1e6:.2f}M trainable)")
+
+    # -- InfoNCE criterion for combined loss in Stage B ──
+    criterion_nce = ContrastiveLoss3Way(temperature=temperature)
+    use_contrastive_loss = use_cross_attention  # only when mixer is in use
+
     # -- Noise injectors (one per config) ──
     injectors = [
         SyntheticNoiseInjector(
@@ -600,7 +630,7 @@ def train_heads_from_stream(
         best = float("inf")
         for epoch in range(epochs):
             model.train()
-            losses, alphas, deltas = [], [], []
+            losses, alphas, deltas, info_losses = [], [], [], []
 
             loader_iter = iter(loader)
             for step in range(max_steps_per_epoch):
@@ -645,25 +675,58 @@ def train_heads_from_stream(
                     ], dim=-1)
                     delta_target[:, 0, :] = clean_6d - noisy_poses[:, :6]
 
-                # Encode
-                with torch.no_grad():
-                    z_v = model.encode_vision(frames)
-                    z_t = model.encode_trajectory(noisy_poses.unsqueeze(1).repeat(1, 10, 1))
+                # Encode (use full forward path if mixer is in use, so the
+                # mixer can learn from this stage's gradient signal)
+                if model.cross_attention_mixer is not None:
+                    # Forward through the model — this runs encoders + mixer.
+                    # Use the noised trajectory as the trajectory input.
+                    out = model(
+                        frames, noisy_poses.unsqueeze(1).repeat(1, traj_window, 1), texts
+                    )
+                    z_v = model.encode_vision(frames)        # re-extract for head inputs
+                    z_t = model.encode_trajectory_tokens(noisy_poses.unsqueeze(1).repeat(1, traj_window, 1))
+                    z_t_for_head = z_t.mean(dim=1)
                     z_text = model.encode_text(texts)
+
+                    # Modality dropout: zero out one modality with probability
+                    # `modality_dropout`. This forces the model to be robust
+                    # to missing modalities and discourages over-reliance on one.
+                    if modality_dropout > 0 and torch.rand(1).item() < modality_dropout:
+                        if torch.rand(1).item() < 0.5:
+                            z_v = torch.zeros_like(z_v)
+                        else:
+                            z_text = torch.zeros_like(z_text)
+                else:
+                    # No mixer — fall back to simple encoder path
+                    with torch.no_grad():
+                        z_v = model.encode_vision(frames)
+                        z_t = model.encode_trajectory(noisy_poses.unsqueeze(1).repeat(1, 10, 1))
+                        z_text = model.encode_text(texts)
+                        z_t_for_head = z_t
+                    out = None
 
                 # No external distances — decision head learns from
                 # visual features + cosines (DINOv2 captures scale/depth).
                 if stage == "decision":
-                    alpha_pred = model.decision_head(z_v, z_t, z_text)
+                    alpha_pred = model.decision_head(z_v, z_t_for_head, z_text)
                     loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target)
                 elif stage == "assistant":
-                    delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_poses[:, :6])
+                    delta_pred = model.assistant_head(z_v, z_t_for_head, z_text, noisy_poses[:, :6])
                     loss = F.mse_loss(delta_pred, delta_target)
                 elif stage == "joint":
-                    alpha_pred = model.decision_head(z_v, z_t, z_text)
-                    delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_poses[:, :6])
-                    loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target) +
-                            0.5 * F.mse_loss(delta_pred, delta_target))
+                    alpha_pred = model.decision_head(z_v, z_t_for_head, z_text)
+                    delta_pred = model.assistant_head(z_v, z_t_for_head, z_text, noisy_poses[:, :6])
+                    head_loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target) +
+                                 0.5 * F.mse_loss(delta_pred, delta_target))
+                    # Stage B: combine head loss with InfoNCE so the mixer
+                    # learns cross-modal features guided by head supervision
+                    if use_contrastive_loss and out is not None:
+                        # Re-encode the mixed outputs (already in z_v, z_t, z_text after mixer)
+                        info_stats = criterion_nce(z_v, z_t_for_head, z_text)
+                        loss = head_loss_weight * head_loss + info_stats["loss"]
+                        info_losses.append(info_stats["loss"].item())
+                    else:
+                        loss = head_loss
 
                 opt.zero_grad()
                 loss.backward()
@@ -678,13 +741,19 @@ def train_heads_from_stream(
 
                 # Progress every 100 steps
                 if (step + 1) % 100 == 0:
+                    extra = f"  nce: {info_losses[-1]:.3f}" if info_losses else ""
                     print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch} "
-                          f"[{stage}] loss: {loss.item():.4f}", flush=True)
+                          f"[{stage}] loss: {loss.item():.4f}{extra}", flush=True)
 
             entry = _head_collate_stats(stage, epoch + 1, losses, alphas, deltas)
             avg = entry["loss"]
+            nce_str = f"  nce: {np.mean(info_losses):.3f}" if info_losses else ""
             print(f"  Epoch {epoch + 1:3d} [{stage}] loss: {avg:.4f}  "
-                  f"α: {entry['alpha_mean']:.3f}  Δ: {entry['delta_mean']:.4f}")
+                  f"α: {entry['alpha_mean']:.3f}  Δ: {entry['delta_mean']:.4f}{nce_str}")
+
+            if use_contrastive_loss and info_losses:
+                wandb_trainer.log({f"info_nce_loss": float(np.mean(info_losses))},
+                                  step=epoch + 1)
 
             # W&B logging
             wandb_trainer.log({
@@ -789,6 +858,10 @@ def run_streaming_pipeline(
     use_cross_attention: bool = False,
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
+    stage_a_epochs: int = 0,
+    head_loss_weight: float = 0.1,
+    modality_dropout: float = 0.0,
+    temperature: float = 0.07,
 ):
     """Full ALIGN training pipeline using streaming or local data.
 
@@ -812,10 +885,40 @@ def run_streaming_pipeline(
 
     pretrained_path = pretrained_checkpoint
 
-    # -- Stage 1: Contrastive Pretraining ──
+    # -- Two-stage training with cross-attention mixer ──
+    # Stage A: pretrain encoders with mixer frozen (InfoNCE only)
+    # Stage B: pretrain (or skip) → joint training of mixer + heads
+    if use_cross_attention and stage_a_epochs > 0:
+        print(f"\n{'='*60}")
+        print(f"[pipeline] Stage A: Encoder pretraining with mixer frozen ({stage_a_epochs} epochs)")
+        print(f"{'='*60}")
+
+        pretrained_path = pretrain_from_stream(
+            repo_ids=repo_ids,
+            output_dir=str(output_dir / "pretrain_stage_a"),
+            epochs=stage_a_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            device=device,
+            data_dir=data_dir,
+            wandb_project=wandb_project,
+            wandb_run=(wandb_run or "streaming") + "-stage-a",
+            enable_wandb=enable_wandb,
+            num_workers=num_workers,
+            max_steps_per_epoch=max_steps_per_epoch,
+            traj_window=traj_window,
+            fps=fps,
+            chunk_size=chunk_size,
+            use_cross_attention=use_cross_attention,
+            mixer_dim=mixer_dim,
+            num_mixer_blocks=num_mixer_blocks,
+            freeze_mixer=True,  # ← Stage A
+        )
+
+    # -- Stage B: Contrastive Pretraining (mixer trainable) ──
     if stages in ("all", "pretrain"):
         print(f"\n{'='*60}")
-        print(f"[pipeline] Stage 1: Streaming Contrastive Pretraining ({epochs_pretrain} epochs)")
+        print(f"[pipeline] Stage B: Streaming Contrastive Pretraining ({epochs_pretrain} epochs)")
         print(f"{'='*60}")
 
         pretrained_path = pretrain_from_stream(
@@ -837,8 +940,10 @@ def run_streaming_pipeline(
             use_cross_attention=use_cross_attention,
             mixer_dim=mixer_dim,
             num_mixer_blocks=num_mixer_blocks,
+            freeze_mixer=False,  # ← Stage B (default)
         )
-    else:
+    elif not (use_cross_attention and stage_a_epochs > 0):
+        # Skip pretrain AND no Stage A — just use the existing checkpoint
         if pretrained_path is None:
             pretrained_path = str(output_dir / "pretrain" / "best.pt")
         if not Path(pretrained_path).exists():
@@ -874,6 +979,9 @@ def run_streaming_pipeline(
             use_cross_attention=use_cross_attention,
             mixer_dim=mixer_dim,
             num_mixer_blocks=num_mixer_blocks,
+            head_loss_weight=head_loss_weight,
+            modality_dropout=modality_dropout,
+            temperature=temperature,
         )
     else:
         head_path = str(output_dir / "heads" / "joint_best.pt")
@@ -937,6 +1045,21 @@ def main():
                         help="Cross-attention mixer hidden dim (default 512)")
     parser.add_argument("--num-mixer-blocks", type=int, default=2,
                         help="Number of cross-attention mixer blocks (default 2)")
+    parser.add_argument("--freeze-mixer", action="store_true",
+                        help="Freeze the cross-attention mixer during pretraining (Stage A). "
+                             "InfoNCE sees raw encoder embeddings. Use for two-stage training: "
+                             "Stage A (frozen mixer) → Stage B (mixer unfrozen, head training).")
+    parser.add_argument("--stage-a-epochs", type=int, default=0,
+                        help="If > 0, prepend Stage A pretraining (mixer frozen) before Stage B. "
+                             "Stage A only runs InfoNCE, no head losses. Total epochs = stage_a + main. "
+                             "Has no effect without --use-cross-attention --freeze-mixer.")
+    parser.add_argument("--stage-b-head-loss-weight", type=float, default=0.1,
+                        help="Weight for head losses (BCE+MSE) added to InfoNCE in Stage B. "
+                             "Default 0.1 — heads guide the mixer but don't dominate InfoNCE.")
+    parser.add_argument("--modality-dropout", type=float, default=0.0,
+                        help="Probability of zeroing out one modality (vision OR text) per batch. "
+                             "0.1 is reasonable for LIBERO-scale data (379 episodes). "
+                             "Has no effect if --use-cross-attention is not set.")
 
     args = parser.parse_args()
 
@@ -961,6 +1084,10 @@ def main():
         use_cross_attention=args.use_cross_attention,
         mixer_dim=args.mixer_dim,
         num_mixer_blocks=args.num_mixer_blocks,
+        stage_a_epochs=args.stage_a_epochs,
+        head_loss_weight=args.stage_b_head_loss_weight,
+        modality_dropout=args.modality_dropout,
+        temperature=0.07,
     )
 
 

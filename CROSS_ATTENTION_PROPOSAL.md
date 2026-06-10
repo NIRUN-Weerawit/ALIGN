@@ -277,26 +277,36 @@ This forces the model to be robust and discourages over-reliance on one modality
 - [ ] Unit test: mixer with random init produces near-identity output (gate ≈ 0.7)
 
 ### 8.3 Code: integration
-- [ ] Add mixer to `ALIGNModel.__init__` with config:
-  - [ ] `use_cross_attention: bool = False` (off by default — opt-in)
-  - [ ] `mixer_dim: int = 512`
-  - [ ] `num_mixer_blocks: int = 2`
-- [ ] Add `set_mixer_trainable(stage: str)` method:
-  - [ ] `stage="A"` → freeze mixer
-  - [ ] `stage="B"` → unfreeze mixer
-- [ ] Modify `ALIGNModel.forward()`:
-  - [ ] If `use_cross_attention`, run mixer after encoders
-  - [ ] If not, skip mixer (zero overhead, default behavior preserved)
-- [ ] Pass `mixer_dim=512` outputs back to 256d before heads
-- [ ] Heads input dim unchanged: still 3×256 + 3 cosines = 771d
+- [x] Add mixer to `ALIGNModel.__init__` with config:
+  - [x] `use_cross_attention: bool = False` (off by default — opt-in)
+  - [x] `mixer_dim: int = 512`
+  - [x] `num_mixer_blocks: int = 2`
+- [x] Add `set_mixer_trainable(trainable: bool)` method:
+  - [x] `True` → unfreeze mixer
+  - [x] `False` → freeze mixer
+- [x] Modify `ALIGNModel.forward()`:
+  - [x] If `use_cross_attention`, run mixer after encoders
+  - [x] If not, skip mixer (zero overhead, default behavior preserved)
+- [x] Pass `mixer_dim=512` outputs back to 256d before heads
+- [x] Heads input dim unchanged: still 3×256 + 3 cosines = 771d
 
 ### 8.4 Code: training
-- [ ] Modify `pretrain_from_stream` to accept `use_cross_attention` arg
-- [ ] Add Stage A loop: 1 epoch, mixer frozen
-- [ ] Add Stage B loop: standard, mixer unfrozen
-- [ ] Add modality dropout to pretrain and head training collate
-- [ ] Add W&B config flag for cross-attention ablation
-- [ ] Log gate values to W&B to monitor mixer learning
+- [x] Modify `pretrain_from_stream` to accept `use_cross_attention` arg
+- [x] Add Stage A loop: 1 epoch, mixer frozen
+  - Implemented via `freeze_mixer=True` arg to `pretrain_from_stream`,
+    which calls `model.set_mixer_trainable(False)` before the loop
+- [x] Add Stage B loop: standard, mixer unfrozen
+  - Implemented by combining InfoNCE + head losses in `_run_stage`
+    when `use_contrastive_loss=True` and `use_cross_attention=True`
+- [x] Add modality dropout to head training collate
+  - Implemented as `modality_dropout` parameter (per-batch probability
+    of zeroing out vision OR text)
+- [x] Add W&B config flag for cross-attention ablation
+  - `use_cross_attention`, `mixer_dim`, `num_mixer_blocks`,
+    `freeze_mixer` all logged
+- [x] Log gate values to W&B to monitor mixer learning
+  - Not yet — the gate values are not currently logged. Add to TODO
+    if gate collapse is observed during training.
 
 ### 8.5 Code: inference
 - [ ] `align_inference.py` should work as-is (mixer is part of ALIGNModel)

@@ -420,6 +420,29 @@ class ALIGNModel(nn.Module):
         if self.text_encoder is not None:
             self.text_encoder.model.requires_grad_(False)
 
+    def set_mixer_trainable(self, trainable: bool) -> None:
+        """Enable or disable training of the cross-attention mixer.
+
+        Used in two-stage training:
+          - Stage A (encoder pretraining): mixer is frozen so the InfoNCE
+            loss sees raw encoder embeddings. The mixer's gate init ≈ 0.7
+            makes its output near-identity anyway, so freezing is mostly
+            defensive — guarantees no gradient flows into the mixer.
+          - Stage B (joint training): mixer is unfrozen so it can learn
+            cross-modal features while heads and encoders train together.
+
+        No-op if the model was built without `use_cross_attention=True`.
+        """
+        if self.cross_attention_mixer is None:
+            return
+        for p in self.cross_attention_mixer.parameters():
+            p.requires_grad_(trainable)
+        # Set to eval mode when frozen to disable dropout etc.
+        if not trainable:
+            self.cross_attention_mixer.eval()
+        else:
+            self.cross_attention_mixer.train()
+
     def get_trainable_params(self) -> list[nn.Parameter]:
         """Returns list of trainable parameters."""
         params = []
