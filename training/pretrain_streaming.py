@@ -392,6 +392,15 @@ def pretrain_from_stream(
                     _now = time.time()
                     _step_time = (_now - _step_start) / 100
                     _remaining = _step_time * (max_steps_per_epoch - step)
+                    wandb_trainer.log({
+                        "phase": "1a_encoder",
+                        "loss": loss.item(),
+                        "cos_vt": stats["avg_cos_vt"].item(),
+                        "cos_vl": stats["avg_cos_vl"].item(),
+                        "cos_tl": stats["avg_cos_tl"].item(),
+                        "lr": lr,
+                        "step": step + 1,
+                    })
                     print(f"  [1a] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
                           f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
                           f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}  "
@@ -499,6 +508,15 @@ def pretrain_from_stream(
                     _now = time.time()
                     _step_time = (_now - _step_start) / 100
                     _remaining = _step_time * (max_steps_per_epoch - step)
+                    wandb_trainer.log({
+                        "phase": "1b_mixer",
+                        "loss": loss.item(),
+                        "cos_vt": stats["avg_cos_vt"].item(),
+                        "cos_vl": stats["avg_cos_vl"].item(),
+                        "cos_tl": stats["avg_cos_tl"].item(),
+                        "lr": lr * 0.5,
+                        "step": step + 1,
+                    })
                     print(f"  [1b] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
                           f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
                           f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}  "
@@ -747,6 +765,12 @@ def train_heads_from_stream(
                 _now = time.time()
                 _step_time = (_now - _step_start) / 100
                 _remaining = _step_time * (max_steps_per_epoch - step)
+                wandb_trainer.log({
+                    "head/loss": loss.item(),
+                    "head/alpha": alpha_pred.mean().item(),
+                    "head/delta": delta_pred.abs().mean().item(),
+                    "step": step + 1,
+                })
                 print(f"  [2] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch} "
                       f"loss: {loss.item():.4f}  α: {alpha_pred.mean().item():.3f}  "
                       f"Δ: {delta_pred.abs().mean().item():.4f}  "
