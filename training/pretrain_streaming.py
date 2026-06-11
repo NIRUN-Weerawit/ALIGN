@@ -115,29 +115,59 @@ class MultiDatasetStream(IterableDataset):
             )
             ds = adapter.get_streaming_dataset()
             adapters.append(adapter)
-            loaders.append(iter(DataLoader(ds, batch_size=1, shuffle=False, collate_fn=_lerobot_align_collate)))
+            loaders.append(iter(ds))  # iterate dataset directly, no nested DataLoader
 
         exhausted: list[bool] = [False] * len(loaders)
 
         while True:
             for i, loader in enumerate(loaders):
                 try:
-                    batch = next(loader)
-                    actions = batch.get("actions", None)
-                    if isinstance(actions, list):
-                        actions = actions[0] if actions else None
+                    sample = next(loader)
+                    # Raw LeRobot sample: frames are (C, H, W) tensors under camera key
+                    # Convert to (H, W, C) uint8 for DINOv2
+                    wrist = sample.get("observation.images.wrist_image", None)
+                    front = sample.get("observation.images.image", None)
+                    frame = wrist if wrist is not None else front
+                    if frame is not None:
+                        if frame.dim() == 3 and frame.shape[0] in (1, 3):
+                            frame = frame.permute(1, 2, 0)  # C,H,W → H,W,C
+                        if frame.dtype == torch.float32 or frame.dtype == torch.float16:
+                            frame = frame.mul(255).to(torch.uint8)
+                        else:
+                            frame = frame.to(torch.uint8)
+
+                    # State — extract EEF pose (first 6 dims, or full state trimmed)
+                    state = sample.get("observation.state", None)
+                    if state is not None:
+                        state = state.float()
+                        if state.dim() == 2:
+                            state = state[-1]  # temporal dim → single frame
+                        pose = state[..., :6] if state.shape[-1] >= 6 else state
+
+                    # Action (future chunk, if requested by delta_timestamps)
+                    action = sample.get("action", None)
+                    if action is not None:
+                        action = action.float()
+
+                    # Text
+                    task = sample.get("task", None)
+                    if task is None:
+                        task = sample.get("language_instruction", "pick and place")
+                    if isinstance(task, torch.Tensor):
+                        task = str(task.item()) if task.numel() == 1 else str(task[0])
+
                     yield {
-                        "frames": batch["frames"][0],
-                        "poses": batch["poses"][0],
-                        "text": batch["texts"][0],
-                        "actions": actions,
+                        "frames": frame,
+                        "poses": pose,
+                        "text": task,
+                        "actions": action,
                     }
                 except StopIteration:
                     exhausted[i] = True
             for i, is_exhausted in enumerate(exhausted):
                 if is_exhausted:
                     ds = adapters[i].get_streaming_dataset()
-                    loaders[i] = iter(DataLoader(ds, batch_size=1, shuffle=False, collate_fn=_lerobot_align_collate))
+                    loaders[i] = iter(ds)  # iterate directly, no nested DataLoader
                     exhausted[i] = False
 
 
