@@ -75,11 +75,26 @@ def check_shadowing():
 
     if shadowed:
         print(f"  ⚠️  ~/.local shadows: {', '.join(shadowed)}")
-        print(f"     Fix: export PYTHONNOUSERSITE=1 before running")
+        print(f"     These stale packages shadow the conda env's torch and cause")
+        print(f"     100× slowdown (CPU instead of GPU).")
+        print()
+        answer = input("     Remove them? [Y/n] ").strip().lower()
+        if answer in ("", "y", "yes"):
+            import shutil
+            for pkg in shadowed:
+                pkg_path = local / pkg
+                if pkg_path.exists():
+                    shutil.rmtree(str(pkg_path))
+                    for info_dir in local.glob(f"{pkg}-*.dist-info"):
+                        shutil.rmtree(str(info_dir))
+                    print(f"     ✓ Removed {pkg} from ~/.local")
+            print(f"     ✓ Done. Rerun this check to verify.")
+        else:
+            print(f"     Skipped. Use export PYTHONNOUSERSITE=1 at runtime instead.")
         return False
-    else:
-        print("  ✓ No shadowing detected")
-        return True
+
+    print("  ✓ No shadowing detected")
+    return True
 
 
 def check_dependencies():
@@ -184,9 +199,16 @@ def main():
         for i, issue in enumerate(issues, 1):
             print(f"     {i}. {issue}")
         print()
-        print("  Quick fix (in most cases):")
+        print("  Quick fix (portable, works on any machine):")
+        print("    # 1. Fix the shadowing permanently:")
+        print(f"    rm -rf ~/.local/lib/python*/site-packages/torch")
+        print(f"    rm -rf ~/.local/lib/python*/site-packages/torchvision")
+        print()
+        print("    # 2. Or at runtime (temporary):")
         print("    export PYTHONNOUSERSITE=1")
-        print("    /home/ucluser/miniconda3/envs/align/bin/python training/pretrain_streaming.py --wandb")
+        print()
+        print("    # 3. Then train:")
+        print("    conda run -n align python training/pretrain_streaming.py --wandb")
     return 0 if not issues else 1
 
 
