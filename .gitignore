@@ -17,3 +17,7 @@ scripts/create_notion_project.py
 
 # Graphify output (regeneratable)
 graphify-out/
+
+# docs
+docs/
+docs/
