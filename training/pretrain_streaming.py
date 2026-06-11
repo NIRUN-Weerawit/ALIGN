@@ -43,6 +43,7 @@ from models.align_model import ALIGNModel
 from training.contrastive_loss import ContrastiveLoss3Way
 from training.wandb_utils import init_wandb
 from data.open_dataset import LeRobotAdapter, _lerobot_align_collate
+from training.train_full_pipeline import SyntheticNoiseInjector
 
 
 # ================================================================
@@ -81,12 +82,10 @@ class MultiDatasetStream(IterableDataset):
         repo_data_dirs = []
         for repo_id in self.repo_ids:
             if self.data_dir:
-                # If data_dir is a direct repo path, use it; otherwise look under data_dir/repo_id
                 candidate = Path(self.data_dir) / repo_id
                 if candidate.exists():
                     repo_data_dirs.append(str(candidate))
                 else:
-                    # data_dir might be the repo dir itself (single dataset)
                     if Path(self.data_dir).exists():
                         repo_data_dirs.append(self.data_dir)
                     else:
@@ -97,18 +96,14 @@ class MultiDatasetStream(IterableDataset):
         # Create loaders for each dataset
         adapters: list[LeRobotAdapter] = []
         loaders: list = []
-        # Build delta_timestamps matching the requested trajectory window.
-        # K frames of history = (K-1) / fps seconds.
         fps = self.fps
         dt_seconds = [(i - (self.traj_window - 1)) / fps for i in range(self.traj_window)]
-        # Also request future actions for the chunk head target.
-        # chunk_size is set on the head — use 5 future steps by default.
         chunk_size = self.chunk_size
         dt_future = [i / fps for i in range(1, chunk_size + 1)]
         delta_timestamps = {
             "observation.state": dt_seconds,
             "observation.images.wrist_image": dt_seconds,
-            "action": dt_future,   # K=chunk_size future actions for Δpose target
+            "action": dt_future,
         }
         for i, repo_id in enumerate(self.repo_ids):
             adapter = LeRobotAdapter(
@@ -122,7 +117,6 @@ class MultiDatasetStream(IterableDataset):
             adapters.append(adapter)
             loaders.append(iter(DataLoader(ds, batch_size=1, shuffle=False, collate_fn=_lerobot_align_collate)))
 
-        # Track which loaders have been exhausted (replace them on exhaustion)
         exhausted: list[bool] = [False] * len(loaders)
 
         while True:
@@ -139,10 +133,7 @@ class MultiDatasetStream(IterableDataset):
                         "actions": actions,
                     }
                 except StopIteration:
-                    # Recreate this loader (streaming datasets are finite;
-                    # we restart from scratch to simulate infinite epochs)
                     exhausted[i] = True
-            # Recreate all exhausted loaders
             for i, is_exhausted in enumerate(exhausted):
                 if is_exhausted:
                     ds = adapters[i].get_streaming_dataset()
@@ -221,7 +212,8 @@ def streaming_pretrain_collate(batch: list[dict], traj_window: int = 10) -> dict
 def pretrain_from_stream(
     repo_ids: list[str],
     output_dir: str,
-    epochs: int = 50,
+    epochs_encoder: int = 40,
+    epochs_mixer: int = 10,
     batch_size: int = 64,
     lr: float = 1e-4,
     weight_decay: float = 1e-4,
@@ -239,55 +231,39 @@ def pretrain_from_stream(
     traj_window: int = 20,
     fps: int = 20,
     chunk_size: int = 5,
-    use_cross_attention: bool = False,
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
-    freeze_mixer: bool = False,
+    encoder_checkpoint: Optional[str] = None,
 ):
-    """Contrastive pretraining directly from LeRobot v3 streaming datasets.
+    """Contrastive pretraining with two sub-phases.
+
+    Phase 1a (encoder pretrain): InfoNCE on raw encoder outputs.
+        Mixer is frozen (identity init ≈ pass-through).
+        Trains: vision_proj, traj_encoder, text_proj.
+
+    Phase 1b (mixer warm-up): InfoNCE on mixer outputs.
+        Mixer unfrozen, learns cross-modal features on converged encoders.
+        Trains: encoders + mixer.
 
     Args:
-        repo_ids: List of Hugging Face dataset repo IDs.
-        output_dir: Checkpoint save directory.
-        epochs: Number of training epochs.
-        batch_size: Batch size.
-        lr: Learning rate.
-        weight_decay: AdamW weight decay.
-        embed_dim: Latent embedding dimension.
-        temperature: InfoNCE temperature.
-        max_grad_norm: Gradient clipping norm.
-        device: Compute device.
-        max_steps_per_epoch: Steps per epoch (streaming is infinite).
-        checkpoint_every: Save checkpoints every N epochs.
-        data_dir: Path to local data directory. If set, reads from disk
-                  instead of streaming from Hub. Compatible with pre-downloaded
-                  datasets from scripts/download_libero.py.
-        wandb_project: W&B project name.
-        wandb_run: W&B run name.
-        enable_wandb: Enable W&B logging.
-        num_workers: DataLoader workers.
-        traj_window: Number of past frames fed to trajectory encoder (K_traj).
-                     Higher K captures more motion context (tremor filtering,
-                     approach arc) but increases Transformer attention cost O(K²).
-                     At 20fps: K=10=500ms, K=20=1s, K=30=1.5s.
-        fps: Data sample rate. Used to convert K_traj into delta_timestamps.
-             LIBERO = 20, real teleop typically 30.
-        freeze_mixer: If True, freeze the cross-attention mixer (Stage A in
-             two-stage training). Encoders train, mixer is fixed.
-             Default False (mixer is trainable from epoch 1).
+        repo_ids: LeRobot v3 dataset IDs.
+        output_dir: Checkpoint directory.
+        epochs_encoder: Phase 1a epochs (default 40).
+        epochs_mixer: Phase 1b epochs (default 10).
+        encoder_checkpoint: Resume Phase 1b from existing encoder checkpoint.
+            If None, runs Phase 1a from scratch.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== ALIGN {'Local' if data_dir else 'Streaming'} Contrastive Pretraining ===")
+    print(f"=== ALIGN Contrastive Pretraining ===")
     print(f"  Datasets: {repo_ids}")
     if data_dir:
         print(f"  Data dir: {data_dir}")
     print(f"  Device:   {device}")
-    print(f"  Epochs:   {epochs}")
-    print(f"  Steps/ep: {max_steps_per_epoch}")
-    print(f"  LR:       {lr}")
+    print(f"  Phase 1a (encoder): {epochs_encoder} epochs")
+    print(f"  Phase 1b (mixer):   {epochs_mixer} epochs")
     print(f"  Output:   {output_dir}")
 
     # -- W&B ──
@@ -295,10 +271,11 @@ def pretrain_from_stream(
         project=wandb_project,
         name=wandb_run,
         config={
-            "model": "align-streaming-pretrain",
+            "model": "align-pretrain",
             "datasets": repo_ids,
             "data_dir": data_dir,
-            "epochs": epochs,
+            "epochs_encoder": epochs_encoder,
+            "epochs_mixer": epochs_mixer,
             "batch_size": batch_size,
             "lr": lr,
             "weight_decay": weight_decay,
@@ -308,14 +285,9 @@ def pretrain_from_stream(
             "max_steps_per_epoch": max_steps_per_epoch,
             "device": str(device),
             "traj_window": traj_window,
-            "use_cross_attention": use_cross_attention,
-            "mixer_dim": mixer_dim,
-            "num_mixer_blocks": num_mixer_blocks,
-            "freeze_mixer": freeze_mixer,
         },
     ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
     print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
-    print(f"  K_traj:   {traj_window}  (trajectory encoder window size)")
 
     # -- Streaming dataset ──
     stream_ds = MultiDatasetStream(repo_ids, data_dir=data_dir, traj_window=traj_window, fps=fps, chunk_size=chunk_size)
@@ -332,147 +304,233 @@ def pretrain_from_stream(
         embed_dim=embed_dim,
         use_text=True,
         device=str(device),
-        use_cross_attention=use_cross_attention,
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
     ).to(device)
+    model.freeze_backbone()
 
-    # Freeze backbones
-    for p in model.vision_encoder.backbone.parameters():
-        p.requires_grad = False
-    if model.text_encoder is not None:
-        for p in model.text_encoder.model.parameters():
-            p.requires_grad = False
-
-    # Stage A: freeze the mixer (encoder pretraining with cross-modal pass-through)
-    # Stage B (default): mixer is trainable, learns cross-modal features
-    if freeze_mixer and model.cross_attention_mixer is not None:
-        model.set_mixer_trainable(False)
-        print(f"  Stage A: mixer frozen (encoder pretraining only)")
-    elif model.cross_attention_mixer is not None:
-        print(f"  Stage B-style: mixer trainable (8.7M extra params)")
-
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    n_params = sum(p.numel() for p in trainable)
-    print(f"  Trainable: {n_params:,}")
-
+    # -- Loss ──
     criterion = ContrastiveLoss3Way(temperature=temperature)
-    optimizer = optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
 
-    # -- Training ──
-    log_path = output_dir / "streaming_training_log.jsonl"
+    # -- Config for checkpoint ──
+    config = {
+        "embed_dim": embed_dim,
+        "traj_window": traj_window,
+        "fps": fps,
+        "chunk_size": chunk_size,
+        "mixer_dim": mixer_dim,
+        "num_mixer_blocks": num_mixer_blocks,
+        "temperature": temperature,
+    }
+
+    log_path = output_dir / "pretrain_log.jsonl"
     log_fp = open(log_path, "a")
-    best_loss = float("inf")
-    total_step = 0
 
-    for epoch in range(epochs):
-        model.train()
-        epoch_losses = []
-        epoch_cos_vt = []
-        epoch_cos_vl = []
-        epoch_cos_tl = []
+    # ================================================================
+    # Phase 1a: Encoder Pretrain (mixer frozen, InfoNCE on raw outputs)
+    # ================================================================
+    if encoder_checkpoint and Path(encoder_checkpoint).exists():
+        print(f"\n  Resuming from encoder checkpoint: {encoder_checkpoint}")
+        ckpt = torch.load(encoder_checkpoint, map_location=device)
+        model.load_trainable_state_dict(ckpt["trainable_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_loss = ckpt.get("loss", float("inf"))
+        print(f"  Resumed at epoch {start_epoch}")
+    else:
+        start_epoch = 0
+        best_loss = float("inf")
 
-        loader_iter = iter(loader)
-        for step in range(max_steps_per_epoch):
-            try:
-                batch = next(loader_iter)
-            except StopIteration:
-                break
+    if epochs_encoder > 0:
+        # Freeze mixer — InfoNCE sees raw encoder outputs
+        model.freeze_mixer()
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        n_params = sum(p.numel() for p in trainable)
+        print(f"\n  Phase 1a — Trainable: {n_params:,}")
+        optimizer = optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
 
-            frames = batch["frames"].to(device)
-            trajs = batch["trajectories"].float().to(device)
-            texts = batch["texts"]
+        for epoch in range(start_epoch, epochs_encoder):
+            model.train()
+            epoch_losses = []
+            epoch_cos_vt = []
+            epoch_cos_vl = []
+            epoch_cos_tl = []
 
-            # Pad trajectories to 6D if needed
-            if trajs.shape[-1] < 6:
-                pad = torch.zeros(*trajs.shape[:-1], 6 - trajs.shape[-1], device=trajs.device)
-                trajs = torch.cat([trajs, pad], dim=-1)
+            loader_iter = iter(loader)
+            for step in range(max_steps_per_epoch):
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    break
 
-            z_v = model.encode_vision(frames)
-            z_t = model.encode_trajectory(trajs)
-            z_text = model.encode_text(texts)
+                frames = batch["frames"].to(device)
+                trajs = batch["trajectories"].float().to(device)
+                texts = batch["texts"]
 
-            stats = criterion(z_v, z_t, z_text)
-            loss = stats["loss"]
+                if trajs.shape[-1] < 6:
+                    pad = torch.zeros(*trajs.shape[:-1], 6 - trajs.shape[-1], device=trajs.device)
+                    trajs = torch.cat([trajs, pad], dim=-1)
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
-            optimizer.step()
+                # Raw encoder outputs (no mixer)
+                raw = model.encode_raw_all(frames, trajs, texts)
+                stats = criterion(raw["z_v"], raw["z_t"], raw["z_text"])
+                loss = stats["loss"]
 
-            epoch_losses.append(loss.item())
-            epoch_cos_vt.append(stats["avg_cos_vt"].item())
-            epoch_cos_vl.append(stats["avg_cos_vl"].item())
-            epoch_cos_tl.append(stats["avg_cos_tl"].item())
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+                optimizer.step()
 
-            # Progress every 100 steps
-            if (total_step + 1) % 100 == 0:
-                # W&B step logging
-                wandb_trainer.log({
-                    "loss": loss.item(),
-                    "cos_vt": stats["avg_cos_vt"].item(),
-                    "cos_vl": stats["avg_cos_vl"].item(),
-                    "cos_tl": stats["avg_cos_tl"].item(),
-                    "lr": lr,
-                    "total_step": total_step + 1,
-                })
-                print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
-                      f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
-                      f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
-                      flush=True)
-                
-            total_step += 1
+                epoch_losses.append(loss.item())
+                epoch_cos_vt.append(stats["avg_cos_vt"].item())
+                epoch_cos_vl.append(stats["avg_cos_vl"].item())
+                epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
-        avg_loss = float(np.mean(epoch_losses))
-        avg_vt = float(np.mean(epoch_cos_vt))
-        avg_vl = float(np.mean(epoch_cos_vl))
-        avg_tl = float(np.mean(epoch_cos_tl))
+                if (step + 1) % 100 == 0:
+                    print(f"  [1a] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
+                          f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
+                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
+                          flush=True)
 
-        print(f"  Epoch {epoch + 1:3d}  loss: {avg_loss:.4f}  "
-              f"cos_vt: {avg_vt:.3f}  cos_vl: {avg_vl:.3f}  cos_tl: {avg_tl:.3f}")
+            avg_loss = float(np.mean(epoch_losses))
+            avg_vt = float(np.mean(epoch_cos_vt))
+            avg_vl = float(np.mean(epoch_cos_vl))
+            avg_tl = float(np.mean(epoch_cos_tl))
 
-        # W&B epoch logging
-        wandb_trainer.log({
-            "epoch": epoch + 1,
-            "loss": avg_loss,
-            "cos_vt": avg_vt,
-            "cos_vl": avg_vl,
-            "cos_tl": avg_tl,
-        }, step=epoch + 1)
+            print(f"  [1a] Epoch {epoch + 1:3d}  loss: {avg_loss:.4f}  "
+                  f"cos_vt: {avg_vt:.3f}  cos_vl: {avg_vl:.3f}  cos_tl: {avg_tl:.3f}")
 
-        # Log
-        log_fp.write(json.dumps({
-            "epoch": epoch + 1,
-            "loss": avg_loss,
-            "cos_vt": avg_vt,
-            "cos_vl": avg_vl,
-            "cos_tl": avg_tl,
-            "timestamp": datetime.now().isoformat(),
-        }) + "\n")
-        log_fp.flush()
-
-        # Checkpoint
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
+            wandb_trainer.log({
+                "phase": "1a_encoder",
+                "epoch": epoch + 1,
                 "loss": avg_loss,
-            }, output_dir / "best.pt")
-            print(f"  -> best checkpoint (loss: {avg_loss:.4f})")
-            wandb_trainer.log({"best_loss": best_loss}, step=epoch + 1)
+                "cos_vt": avg_vt,
+                "cos_vl": avg_vl,
+                "cos_tl": avg_tl,
+            }, step=epoch + 1)
 
-        if (epoch + 1) % checkpoint_every == 0:
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, output_dir / f"epoch_{epoch + 1:04d}.pt")
+            log_fp.write(json.dumps({
+                "phase": "1a", "epoch": epoch + 1, "loss": avg_loss,
+                "cos_vt": avg_vt, "cos_vl": avg_vl, "cos_tl": avg_tl,
+                "timestamp": datetime.now().isoformat(),
+            }) + "\n")
+            log_fp.flush()
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                model.save_pretrain_checkpoint(
+                    str(output_dir / "encoder_best.pt"), epoch, avg_loss,
+                    "encoder", optimizer.state_dict(), config)
+                print(f"  -> encoder_best.pt (loss: {avg_loss:.4f})")
+
+            if (epoch + 1) % checkpoint_every == 0:
+                model.save_pretrain_checkpoint(
+                    str(output_dir / f"encoder_epoch_{epoch + 1:04d}.pt"),
+                    epoch, avg_loss, "encoder", optimizer.state_dict(), config)
+
+        print(f"  Phase 1a complete. Best loss: {best_loss:.4f}")
+
+    # ================================================================
+    # Phase 1b: Mixer Warm-Up (InfoNCE on mixer outputs)
+    # ================================================================
+    if epochs_mixer > 0:
+        # Load best encoder checkpoint if available
+        encoder_ckpt_path = str(output_dir / "encoder_best.pt")
+        if Path(encoder_ckpt_path).exists():
+            ckpt = torch.load(encoder_ckpt_path, map_location=device)
+            model.load_trainable_state_dict(ckpt["trainable_state_dict"])
+            print(f"\n  Loaded encoder checkpoint for Phase 1b")
+
+        # Unfreeze mixer — InfoNCE now flows through mixer
+        model.unfreeze_mixer()
+        trainable = [p for p in model.parameters() if p.requires_grad]
+        n_params = sum(p.numel() for p in trainable)
+        print(f"\n  Phase 1b — Trainable: {n_params:,} (encoders + mixer)")
+        optimizer = optim.AdamW(trainable, lr=lr * 0.5, weight_decay=weight_decay)
+        best_loss = float("inf")
+
+        for epoch in range(epochs_mixer):
+            model.train()
+            epoch_losses = []
+            epoch_cos_vt = []
+            epoch_cos_vl = []
+            epoch_cos_tl = []
+
+            loader_iter = iter(loader)
+            for step in range(max_steps_per_epoch):
+                try:
+                    batch = next(loader_iter)
+                except StopIteration:
+                    break
+
+                frames = batch["frames"].to(device)
+                trajs = batch["trajectories"].float().to(device)
+                texts = batch["texts"]
+
+                if trajs.shape[-1] < 6:
+                    pad = torch.zeros(*trajs.shape[:-1], 6 - trajs.shape[-1], device=trajs.device)
+                    trajs = torch.cat([trajs, pad], dim=-1)
+
+                # Mixer outputs
+                mixed = model.encode_mixed(frames, trajs, texts)
+                stats = criterion(mixed["z_v"], mixed["z_t"], mixed["z_text"])
+                loss = stats["loss"]
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+                optimizer.step()
+
+                epoch_losses.append(loss.item())
+                epoch_cos_vt.append(stats["avg_cos_vt"].item())
+                epoch_cos_vl.append(stats["avg_cos_vl"].item())
+                epoch_cos_tl.append(stats["avg_cos_tl"].item())
+
+                if (step + 1) % 100 == 0:
+                    print(f"  [1b] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
+                          f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
+                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
+                          flush=True)
+
+            avg_loss = float(np.mean(epoch_losses))
+            avg_vt = float(np.mean(epoch_cos_vt))
+            avg_vl = float(np.mean(epoch_cos_vl))
+            avg_tl = float(np.mean(epoch_cos_tl))
+
+            print(f"  [1b] Epoch {epoch + 1:3d}  loss: {avg_loss:.4f}  "
+                  f"cos_vt: {avg_vt:.3f}  cos_vl: {avg_vl:.3f}  cos_tl: {avg_tl:.3f}")
+
+            wandb_trainer.log({
+                "phase": "1b_mixer",
+                "epoch": epoch + 1,
+                "loss": avg_loss,
+                "cos_vt": avg_vt,
+                "cos_vl": avg_vl,
+                "cos_tl": avg_tl,
+            }, step=epochs_encoder + epoch + 1)
+
+            log_fp.write(json.dumps({
+                "phase": "1b", "epoch": epoch + 1, "loss": avg_loss,
+                "cos_vt": avg_vt, "cos_vl": avg_vl, "cos_tl": avg_tl,
+                "timestamp": datetime.now().isoformat(),
+            }) + "\n")
+            log_fp.flush()
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                model.save_pretrain_checkpoint(
+                    str(output_dir / "best.pt"), epoch, avg_loss,
+                    "full", optimizer.state_dict(), config)
+                print(f"  -> best.pt (loss: {avg_loss:.4f})")
+
+            if (epoch + 1) % checkpoint_every == 0:
+                model.save_pretrain_checkpoint(
+                    str(output_dir / f"epoch_{epoch + 1:04d}.pt"),
+                    epoch, avg_loss, "full", optimizer.state_dict(), config)
+
+        print(f"  Phase 1b complete. Best loss: {best_loss:.4f}")
 
     log_fp.close()
-    print(f"\n  Pretraining complete. Best loss: {best_loss:.4f}")
-    print(f"  Logs: {log_path}")
+    print(f"\n  Pretraining complete. Logs: {log_path}")
     wandb_trainer.finish()
     return str(output_dir / "best.pt")
 
@@ -485,9 +543,7 @@ def train_heads_from_stream(
     repo_ids: list[str],
     pretrained_checkpoint: str,
     output_dir: str,
-    epochs_decision: int = 10,
-    epochs_assistant: int = 20,
-    epochs_joint: int = 10,
+    epochs_heads: int = 30,
     batch_size: int = 64,
     lr: float = 1e-4,
     weight_decay: float = 1e-4,
@@ -502,33 +558,22 @@ def train_heads_from_stream(
     num_workers: int = 4,
     traj_window: int = 20,
     fps: int = 20,
-    use_cross_attention: bool = False,
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
-    head_loss_weight: float = 0.1,
-    modality_dropout: float = 0.0,
     temperature: float = 0.07,
 ):
     """Train Decision + Assistant heads from streamed data with on-the-fly noise.
 
-    Synthetic noise is injected into streamed clean poses each batch.
-    α_target and Δpose targets are computed from the noise + clean pair.
+    Single joint loss: BCE(α_pred, α_target) + 0.5 × MSE(Δpred, Δtarget).
+    All encoders + mixer are frozen — only heads train.
 
     Args:
         repo_ids: LeRobot v3 dataset IDs.
-        pretrained_checkpoint: Path to frozen pretrained backbone.
+        pretrained_checkpoint: Path to frozen pretrained backbone (Phase 1b output).
         output_dir: Checkpoint directory.
-        epochs_decision, epochs_assistant, epochs_joint: Stage epochs.
-        batch_size: Batch size.
-        lr: Learning rate.
-        weight_decay: Weight decay.
-        chunk_size: Assistant head chunk size K.
-        max_steps_per_epoch: Steps per epoch.
-        device: Compute device.
+        epochs_heads: Total epochs for joint head training (default 30).
         noise_configs: Noise configs per batch (default: medium noise).
     """
-    from training.train_full_pipeline import SyntheticNoiseInjector
-
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -536,22 +581,21 @@ def train_heads_from_stream(
     if noise_configs is None:
         noise_configs = [{"pos_noise_std": 0.020, "orn_noise_std": 4.0, "label": "medium"}]
 
-    print(f"=== ALIGN Streaming Head Training ===")
+    print(f"=== ALIGN Head Training ===")
     print(f"  Datasets:    {repo_ids}")
     print(f"  Pretrained:  {pretrained_checkpoint}")
     print(f"  Device:      {device}")
+    print(f"  Epochs:      {epochs_heads} (joint BCE + MSE)")
 
     # -- W&B ──
     wandb_trainer = init_wandb(
         project=wandb_project,
         name=wandb_run,
         config={
-            "model": "align-streaming-heads",
+            "model": "align-heads",
             "datasets": repo_ids,
             "pretrained_checkpoint": pretrained_checkpoint,
-            "epochs_decision": epochs_decision,
-            "epochs_assistant": epochs_assistant,
-            "epochs_joint": epochs_joint,
+            "epochs_heads": epochs_heads,
             "batch_size": batch_size,
             "lr": lr,
             "weight_decay": weight_decay,
@@ -579,26 +623,16 @@ def train_heads_from_stream(
         chunk_size=chunk_size,
         use_text=True,
         device=str(device),
-        use_cross_attention=use_cross_attention,
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
     ).to(device)
 
     ckpt = torch.load(pretrained_checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_trainable_state_dict(ckpt["trainable_state_dict"])
     model.freeze_backbone()
+    model.freeze_all_encoders()  # ← explicit: no gradient leaks to encoders or mixer
     print(f"  Loaded backbone from {pretrained_checkpoint}")
-
-    # Stage B: ensure mixer is trainable (defensive — the user may have
-    # called set_mixer_trainable(False) earlier, e.g. in Stage A pretrain)
-    if use_cross_attention and model.cross_attention_mixer is not None:
-        model.set_mixer_trainable(True)
-        n_mixer = sum(p.numel() for p in model.cross_attention_mixer.parameters() if p.requires_grad)
-        print(f"  Stage B: mixer unfrozen ({n_mixer/1e6:.2f}M trainable)")
-
-    # -- InfoNCE criterion for combined loss in Stage B ──
-    criterion_nce = ContrastiveLoss3Way(temperature=temperature)
-    use_contrastive_loss = use_cross_attention  # only when mixer is in use
+    print(f"  All encoders + mixer frozen — only heads train")
 
     # -- Noise injectors (one per config) ──
     injectors = [
@@ -610,190 +644,129 @@ def train_heads_from_stream(
         for i, cfg in enumerate(noise_configs)
     ]
 
-    log_path = output_dir / "streaming_head_log.jsonl"
+    log_path = output_dir / "head_log.jsonl"
     log_fp = open(log_path, "a")
 
-    def _head_collate_stats(stage: str, epoch: int, losses: list, alphas: list, deltas: list):
-        entry = {
-            "stage": stage,
-            "epoch": epoch,
-            "loss": float(np.mean(losses)),
-            "alpha_mean": float(np.mean(alphas)) if alphas else 0,
-            "delta_mean": float(np.mean(deltas)) if deltas else 0,
-            "timestamp": datetime.now().isoformat(),
-        }
-        log_fp.write(json.dumps(entry) + "\n")
-        log_fp.flush()
-        return entry
-
-    def _run_stage(stage: str, opt: optim.Optimizer, epochs: int):
-        best = float("inf")
-        for epoch in range(epochs):
-            model.train()
-            losses, alphas, deltas, info_losses = [], [], [], []
-
-            loader_iter = iter(loader)
-            for step in range(max_steps_per_epoch):
-                try:
-                    batch = next(loader_iter)
-                except StopIteration:
-                    break
-
-                frames = batch["frames"].to(device)
-                clean_poses = batch["poses"].float().to(device)
-                texts = batch["texts"]
-                actions_window = batch.get("actions", None)  # (B, chunk_size, 7) or None
-
-                # Rotate noise injectors
-                injector = injectors[step % len(injectors)]
-                noisy_poses_np = injector.inject(clean_poses.cpu().numpy())
-                noisy_poses = torch.from_numpy(noisy_poses_np).float().to(device)
-
-                # Compute targets on-the-fly
-                # Combine position AND orientation error (orientation matters too)
-                d_max_pos = 0.10
-                d_max_orn = 0.52  # ~30° axis-angle
-                pos_error = torch.norm(noisy_poses[:, :3] - clean_poses[:, :3], dim=1)
-                orn_error = torch.norm(noisy_poses[:, 3:6] - clean_poses[:, 3:6], dim=1)
-                alpha_target = torch.clamp(
-                    torch.maximum(pos_error / d_max_pos, orn_error / d_max_orn),
-                    0.0, 1.0,
-                )
-
-                B, D = clean_poses.shape
-                # Build delta_target from the future action window (real K-step targets).
-                # Action is (B, chunk_size, 7) in LeRobot LIBERO: [x,y,z,ax,ay,az,grip].
-                # Δpose = action[t+i] - noisy_pose[t] for i=0..chunk_size-1.
-                if actions_window is not None and isinstance(actions_window, torch.Tensor) and actions_window.dim() == 3:
-                    # Take first 6 dims (EEF pos + axis-angle)
-                    delta_target = actions_window[:, :chunk_size, :6].to(device).float()
-                else:
-                    # Fallback: single-step delta (no future info)
-                    delta_target = torch.zeros(B, chunk_size, 6, device=device)
-                    clean_6d = clean_poses[:, :6] if D >= 6 else torch.cat([
-                        clean_poses, torch.zeros(B, 6 - D, device=device)
-                    ], dim=-1)
-                    delta_target[:, 0, :] = clean_6d - noisy_poses[:, :6]
-
-                # Encode (use full forward path if mixer is in use, so the
-                # mixer can learn from this stage's gradient signal)
-                if model.cross_attention_mixer is not None:
-                    # Forward through the model — this runs encoders + mixer.
-                    # Use the noised trajectory as the trajectory input.
-                    out = model(
-                        frames, noisy_poses.unsqueeze(1).repeat(1, traj_window, 1), texts
-                    )
-                    z_v = model.encode_vision(frames)        # re-extract for head inputs
-                    z_t = model.encode_trajectory_tokens(noisy_poses.unsqueeze(1).repeat(1, traj_window, 1))
-                    z_t_for_head = z_t.mean(dim=1)
-                    z_text = model.encode_text(texts)
-
-                    # Modality dropout: zero out one modality with probability
-                    # `modality_dropout`. This forces the model to be robust
-                    # to missing modalities and discourages over-reliance on one.
-                    if modality_dropout > 0 and torch.rand(1).item() < modality_dropout:
-                        if torch.rand(1).item() < 0.5:
-                            z_v = torch.zeros_like(z_v)
-                        else:
-                            z_text = torch.zeros_like(z_text)
-                else:
-                    # No mixer — fall back to simple encoder path
-                    with torch.no_grad():
-                        z_v = model.encode_vision(frames)
-                        z_t = model.encode_trajectory(noisy_poses.unsqueeze(1).repeat(1, 10, 1))
-                        z_text = model.encode_text(texts)
-                        z_t_for_head = z_t
-                    out = None
-
-                # No external distances — decision head learns from
-                # visual features + cosines (DINOv2 captures scale/depth).
-                if stage == "decision":
-                    alpha_pred = model.decision_head(z_v, z_t_for_head, z_text)
-                    loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target)
-                elif stage == "assistant":
-                    delta_pred = model.assistant_head(z_v, z_t_for_head, z_text, noisy_poses[:, :6])
-                    loss = F.mse_loss(delta_pred, delta_target)
-                elif stage == "joint":
-                    alpha_pred = model.decision_head(z_v, z_t_for_head, z_text)
-                    delta_pred = model.assistant_head(z_v, z_t_for_head, z_text, noisy_poses[:, :6])
-                    head_loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target) +
-                                 0.5 * F.mse_loss(delta_pred, delta_target))
-                    # Stage B: combine head loss with InfoNCE so the mixer
-                    # learns cross-modal features guided by head supervision
-                    if use_contrastive_loss and out is not None:
-                        # Re-encode the mixed outputs (already in z_v, z_t, z_text after mixer)
-                        info_stats = criterion_nce(z_v, z_t_for_head, z_text)
-                        loss = head_loss_weight * head_loss + info_stats["loss"]
-                        info_losses.append(info_stats["loss"].item())
-                    else:
-                        loss = head_loss
-
-                opt.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
-
-                losses.append(loss.item())
-                if stage in ("decision", "joint"):
-                    alphas.append(alpha_pred.detach().mean().item())
-                if stage in ("assistant", "joint"):
-                    deltas.append(delta_pred.detach().abs().mean().item())
-
-                # Progress every 100 steps
-                if (step + 1) % 100 == 0:
-                    extra = f"  nce: {info_losses[-1]:.3f}" if info_losses else ""
-                    print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch} "
-                          f"[{stage}] loss: {loss.item():.4f}{extra}", flush=True)
-
-            entry = _head_collate_stats(stage, epoch + 1, losses, alphas, deltas)
-            avg = entry["loss"]
-            nce_str = f"  nce: {np.mean(info_losses):.3f}" if info_losses else ""
-            print(f"  Epoch {epoch + 1:3d} [{stage}] loss: {avg:.4f}  "
-                  f"α: {entry['alpha_mean']:.3f}  Δ: {entry['delta_mean']:.4f}{nce_str}")
-
-            if use_contrastive_loss and info_losses:
-                wandb_trainer.log({f"info_nce_loss": float(np.mean(info_losses))},
-                                  step=epoch + 1)
-
-            # W&B logging
-            wandb_trainer.log({
-                f"{stage}/loss": avg,
-                f"{stage}/alpha_mean": entry["alpha_mean"],
-                f"{stage}/delta_mean": entry["delta_mean"],
-                f"{stage}/epoch": epoch + 1,
-            }, step=epoch + 1)
-
-            if avg < best:
-                best = avg
-                torch.save(model.state_dict(), output_dir / f"{stage}_best.pt")
-                # Upload checkpoint to W&B
-                wandb_trainer.save(str(output_dir / f"{stage}_best.pt"))
-        torch.save(model.state_dict(), output_dir / f"{stage}_last.pt")
-        print(f"  [{stage}] best loss: {best:.4f}")
-
-    # -- Stage 1: Decision ──
-    print(f"\n  --- Decision Head ({epochs_decision} epochs) ---")
-    opt_d = optim.AdamW(model.decision_head.parameters(), lr=lr, weight_decay=weight_decay)
-    _run_stage("decision", opt_d, epochs_decision)
-
-    # -- Stage 2: Assistant ──
-    print(f"\n  --- Assistant Head ({epochs_assistant} epochs) ---")
-    opt_a = optim.AdamW(model.assistant_head.parameters(), lr=lr, weight_decay=weight_decay)
-    _run_stage("assistant", opt_a, epochs_assistant)
-
-    # -- Stage 3: Joint ──
-    print(f"\n  --- Joint Fine-Tuning ({epochs_joint} epochs) ---")
-    opt_j = optim.AdamW(
-        [p for p in model.decision_head.parameters()] + [p for p in model.assistant_head.parameters()],
-        lr=lr * 0.5, weight_decay=weight_decay,
+    # -- Single joint head optimizer ──
+    optimizer = optim.AdamW(
+        model.get_head_params(),
+        lr=lr,
+        weight_decay=weight_decay,
     )
-    _run_stage("joint", opt_j, epochs_joint)
+
+    best_loss = float("inf")
+
+    for epoch in range(epochs_heads):
+        model.train()
+        losses = []
+        alphas = []
+        deltas = []
+
+        loader_iter = iter(loader)
+        for step in range(max_steps_per_epoch):
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                break
+
+            frames = batch["frames"].to(device)
+            clean_poses = batch["poses"].float().to(device)
+            texts = batch["texts"]
+            actions_window = batch.get("actions", None)
+
+            # Rotate noise injectors
+            injector = injectors[step % len(injectors)]
+            noisy_poses_np = injector.inject(clean_poses.cpu().numpy())
+            noisy_poses = torch.from_numpy(noisy_poses_np).float().to(device)
+
+            # Compute targets on-the-fly (position + orientation error)
+            d_max_pos = 0.10
+            d_max_orn = 0.52  # ~30° axis-angle
+            pos_error = torch.norm(noisy_poses[:, :3] - clean_poses[:, :3], dim=1)
+            orn_error = torch.norm(noisy_poses[:, 3:6] - clean_poses[:, 3:6], dim=1)
+            alpha_target = torch.clamp(
+                torch.maximum(pos_error / d_max_pos, orn_error / d_max_orn),
+                0.0, 1.0,
+            )
+
+            B, D = clean_poses.shape
+
+            # Build delta_target from future action window
+            if actions_window is not None and isinstance(actions_window, torch.Tensor) and actions_window.dim() == 3:
+                delta_target = actions_window[:, :chunk_size, :6].to(device).float()
+            else:
+                # Fallback: single-step delta
+                delta_target = torch.zeros(B, chunk_size, 6, device=device)
+                clean_6d = clean_poses[:, :6] if D >= 6 else torch.cat([
+                    clean_poses, torch.zeros(B, 6 - D, device=device)
+                ], dim=-1)
+                for i in range(1, chunk_size + 1):
+                    delta_target[:, i - 1, :] = clean_6d - noisy_poses[:, :6]
+
+            # Encode through frozen encoders + mixer
+            with torch.no_grad():
+                mixed = model.encode_mixed(frames, noisy_poses.unsqueeze(1).repeat(1, traj_window, 1), texts)
+                z_v = mixed["z_v"]
+                z_t = mixed["z_t"]
+                z_text = mixed["z_text"]
+
+            # Joint loss: BCE(α) + 0.5 × MSE(Δ)
+            alpha_pred = model.decision_head(z_v, z_t, z_text)
+            delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_poses[:, :6])
+
+            loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target) +
+                    0.5 * F.mse_loss(delta_pred, delta_target))
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.get_head_params(), 1.0)
+            optimizer.step()
+
+            losses.append(loss.item())
+            alphas.append(alpha_pred.detach().mean().item())
+            deltas.append(delta_pred.detach().abs().mean().item())
+
+            if (step + 1) % 100 == 0:
+                print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch} "
+                      f"loss: {loss.item():.4f}  α: {alpha_pred.mean().item():.3f}  "
+                      f"Δ: {delta_pred.abs().mean().item():.4f}", flush=True)
+
+        avg_loss = float(np.mean(losses))
+        avg_alpha = float(np.mean(alphas))
+        avg_delta = float(np.mean(deltas))
+
+        print(f"  Epoch {epoch + 1:3d}  loss: {avg_loss:.4f}  "
+              f"α: {avg_alpha:.3f}  Δ: {avg_delta:.4f}")
+
+        # W&B logging
+        wandb_trainer.log({
+            "head/loss": avg_loss,
+            "head/alpha_mean": avg_alpha,
+            "head/delta_mean": avg_delta,
+            "head/epoch": epoch + 1,
+        }, step=epoch + 1)
+
+        # Log
+        log_fp.write(json.dumps({
+            "stage": "joint", "epoch": epoch + 1,
+            "loss": avg_loss, "alpha_mean": avg_alpha, "delta_mean": avg_delta,
+            "timestamp": datetime.now().isoformat(),
+        }) + "\n")
+        log_fp.flush()
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            model.save_heads_checkpoint(
+                str(output_dir / "best.pt"), epoch, avg_loss,
+                optimizer.state_dict(), {"chunk_size": chunk_size})
+            wandb_trainer.save(str(output_dir / "best.pt"))
+            print(f"  -> best.pt (loss: {avg_loss:.4f})")
 
     log_fp.close()
-    print(f"\n  Head training complete.")
+    print(f"\n  Head training complete. Best loss: {best_loss:.4f}")
     print(f"  Logs: {log_path}")
     wandb_trainer.finish()
-    return str(output_dir / "joint_best.pt")
+    return str(output_dir / "best.pt")
 
 
 def streaming_head_collate(batch: list[dict]) -> dict:
@@ -839,13 +812,15 @@ def streaming_head_collate(batch: list[dict]) -> dict:
 def run_streaming_pipeline(
     repo_ids: list[str],
     output_dir: str,
-    epochs_pretrain: int = 50,
+    epochs_pretrain_encoder: int = 40,
+    epochs_pretrain_mixer: int = 10,
     epochs_heads: int = 30,
     batch_size: int = 64,
     lr: float = 1e-4,
     device: Optional[str] = None,
     stages: str = "all",
     pretrained_checkpoint: Optional[str] = None,
+    encoder_checkpoint: Optional[str] = None,
     data_dir: Optional[str] = None,
     wandb_project: str = "align-streaming",
     wandb_run: Optional[str] = None,
@@ -855,76 +830,45 @@ def run_streaming_pipeline(
     traj_window: int = 20,
     fps: int = 20,
     chunk_size: int = 5,
-    use_cross_attention: bool = False,
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
-    stage_a_epochs: int = 0,
-    head_loss_weight: float = 0.1,
-    modality_dropout: float = 0.0,
     temperature: float = 0.07,
 ):
     """Full ALIGN training pipeline using streaming or local data.
 
+    Three sub-phases:
+      1a. Encoder pretrain (mixer frozen, InfoNCE on raw outputs)
+      1b. Mixer warm-up (InfoNCE on mixer outputs)
+      2.  Head training (BCE + MSE, all encoders frozen)
+
     Args:
         repo_ids: LeRobot v3 dataset IDs.
         output_dir: Base output directory.
-        epochs_pretrain: Epochs for contrastive pretraining.
-        epochs_heads: Total epochs across all head stages.
-        batch_size: Batch size.
-        lr: Learning rate.
-        device: Compute device.
-        stages: 'all', 'pretrain', or 'heads'.
-        pretrained_checkpoint: Skip pretraining, use existing backbone.
-        data_dir: Path to local data. Overrides Hub streaming if set.
-        wandb_project: W&B project name.
-        wandb_run: W&B run name.
-        enable_wandb: Enable W&B logging.
+        epochs_pretrain_encoder: Phase 1a epochs (default 40).
+        epochs_pretrain_mixer: Phase 1b epochs (default 10).
+        epochs_heads: Phase 2 epochs (default 30).
+        stages: 'all', 'pretrain', 'heads', 'encoder'.
+        pretrained_checkpoint: Skip Phase 1, use existing pretrain checkpoint.
+        encoder_checkpoint: Resume Phase 1b from existing encoder checkpoint.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     pretrained_path = pretrained_checkpoint
 
-    # -- Two-stage training with cross-attention mixer ──
-    # Stage A: pretrain encoders with mixer frozen (InfoNCE only)
-    # Stage B: pretrain (or skip) → joint training of mixer + heads
-    if use_cross_attention and stage_a_epochs > 0:
+    # -- Phase 1a + 1b: Contrastive Pretraining ──
+    if stages in ("all", "pretrain", "encoder"):
         print(f"\n{'='*60}")
-        print(f"[pipeline] Stage A: Encoder pretraining with mixer frozen ({stage_a_epochs} epochs)")
-        print(f"{'='*60}")
-
-        pretrained_path = pretrain_from_stream(
-            repo_ids=repo_ids,
-            output_dir=str(output_dir / "pretrain_stage_a"),
-            epochs=stage_a_epochs,
-            batch_size=batch_size,
-            lr=lr,
-            device=device,
-            data_dir=data_dir,
-            wandb_project=wandb_project,
-            wandb_run=(wandb_run or "streaming") + "-stage-a",
-            enable_wandb=enable_wandb,
-            num_workers=num_workers,
-            max_steps_per_epoch=max_steps_per_epoch,
-            traj_window=traj_window,
-            fps=fps,
-            chunk_size=chunk_size,
-            use_cross_attention=use_cross_attention,
-            mixer_dim=mixer_dim,
-            num_mixer_blocks=num_mixer_blocks,
-            freeze_mixer=True,  # ← Stage A
-        )
-
-    # -- Stage B: Contrastive Pretraining (mixer trainable) ──
-    if stages in ("all", "pretrain"):
-        print(f"\n{'='*60}")
-        print(f"[pipeline] Stage B: Streaming Contrastive Pretraining ({epochs_pretrain} epochs)")
+        print(f"[pipeline] Phase 1: Contrastive Pretraining")
+        print(f"  Phase 1a (encoder): {epochs_pretrain_encoder} epochs")
+        print(f"  Phase 1b (mixer):   {epochs_pretrain_mixer} epochs")
         print(f"{'='*60}")
 
         pretrained_path = pretrain_from_stream(
             repo_ids=repo_ids,
             output_dir=str(output_dir / "pretrain"),
-            epochs=epochs_pretrain,
+            epochs_encoder=epochs_pretrain_encoder,
+            epochs_mixer=epochs_pretrain_mixer,
             batch_size=batch_size,
             lr=lr,
             device=device,
@@ -937,13 +881,11 @@ def run_streaming_pipeline(
             traj_window=traj_window,
             fps=fps,
             chunk_size=chunk_size,
-            use_cross_attention=use_cross_attention,
             mixer_dim=mixer_dim,
             num_mixer_blocks=num_mixer_blocks,
-            freeze_mixer=False,  # ← Stage B (default)
+            encoder_checkpoint=encoder_checkpoint,
         )
-    elif not (use_cross_attention and stage_a_epochs > 0):
-        # Skip pretrain AND no Stage A — just use the existing checkpoint
+    else:
         if pretrained_path is None:
             pretrained_path = str(output_dir / "pretrain" / "best.pt")
         if not Path(pretrained_path).exists():
@@ -951,19 +893,17 @@ def run_streaming_pipeline(
             sys.exit(1)
         print(f"[pipeline] Using existing pretrained checkpoint: {pretrained_path}")
 
-    # -- Stage 2: Head Training ──
+    # -- Phase 2: Head Training ──
     if stages in ("all", "heads"):
         print(f"\n{'='*60}")
-        print(f"[pipeline] Stage 2: Streaming Head Training ({epochs_heads} epochs)")
+        print(f"[pipeline] Phase 2: Head Training ({epochs_heads} epochs)")
         print(f"{'='*60}")
 
         head_path = train_heads_from_stream(
             repo_ids=repo_ids,
             pretrained_checkpoint=pretrained_path,
             output_dir=str(output_dir / "heads"),
-            epochs_decision=epochs_heads // 3,
-            epochs_assistant=2 * epochs_heads // 3,
-            epochs_joint=epochs_heads // 3,
+            epochs_heads=epochs_heads,
             batch_size=batch_size,
             lr=lr,
             device=device,
@@ -976,19 +916,16 @@ def run_streaming_pipeline(
             traj_window=traj_window,
             fps=fps,
             chunk_size=chunk_size,
-            use_cross_attention=use_cross_attention,
             mixer_dim=mixer_dim,
             num_mixer_blocks=num_mixer_blocks,
-            head_loss_weight=head_loss_weight,
-            modality_dropout=modality_dropout,
             temperature=temperature,
         )
     else:
-        head_path = str(output_dir / "heads" / "joint_best.pt")
+        head_path = str(output_dir / "heads" / "best.pt")
 
     # -- Summary ──
     print(f"\n{'='*60}")
-    print("[pipeline] Streaming Training Complete! (zero disk used for data)")
+    print("[pipeline] Training Complete!")
     print(f"[pipeline]")
     print(f"[pipeline] Checkpoints:")
     print(f"[pipeline]   Pretrain: {pretrained_path}")
@@ -1007,19 +944,27 @@ def run_streaming_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ALIGN Streaming Pretraining from LeRobot v3 Hub Datasets"
+        description="ALIGN Training Pipeline — 3-phase: encoder pretrain → mixer warm-up → head training"
     )
     parser.add_argument("--dataset", action="append", dest="datasets",
                         default=["nvidia/LIBERO_LeRobot_v3"],
                         help="LeRobot v3 dataset repo ID (repeatable)")
     parser.add_argument("--output-dir", default="./checkpoints/streaming", help="Output directory")
-    parser.add_argument("--epochs-pretrain", type=int, default=50)
-    parser.add_argument("--epochs-heads", type=int, default=30)
+    parser.add_argument("--epochs-pretrain-encoder", type=int, default=40,
+                        help="Phase 1a: encoder pretrain epochs (default 40)")
+    parser.add_argument("--epochs-pretrain-mixer", type=int, default=10,
+                        help="Phase 1b: mixer warm-up epochs (default 10)")
+    parser.add_argument("--epochs-heads", type=int, default=30,
+                        help="Phase 2: joint head training epochs (default 30)")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--stages", default="all", choices=["all", "pretrain", "heads"])
-    parser.add_argument("--pretrained", help="Resume from existing pretrained backbone")
+    parser.add_argument("--stages", default="all",
+                        choices=["all", "pretrain", "heads", "encoder"],
+                        help="Which phases to run: 'all', 'pretrain' (1a+1b), 'heads' (2), 'encoder' (1a only)")
+    parser.add_argument("--pretrained", help="Skip Phase 1, use existing pretrain checkpoint")
+    parser.add_argument("--encoder-checkpoint",
+                        help="Resume Phase 1b from existing encoder checkpoint (skips Phase 1a)")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", default="align-streaming", help="W&B project name")
     parser.add_argument("--wandb-run", default=None, help="W&B run name")
@@ -1030,49 +975,32 @@ def main():
     parser.add_argument("--data-dir", default=None,
                         help="Path to local data directory (pre-downloaded). Overrides Hub streaming.")
     parser.add_argument("--traj-window", type=int, default=20,
-                        help="Trajectory encoder window size K_traj — number of past "
-                             "frames fed to the trajectory Transformer. At 20fps: "
-                             "K=10=500ms, K=20=1s, K=30=1.5s. Higher K captures more "
-                             "motion context (approach arc, tremor) at O(K²) cost.")
+                        help="Trajectory encoder window size K_traj")
     parser.add_argument("--fps", type=int, default=20,
-                        help="Data FPS (LIBERO=20, default real teleop=30). "
-                             "Used to convert traj_window into delta_timestamps.")
-    parser.add_argument("--use-cross-attention", action="store_true",
-                        help="Enable cross-attention mixer between vision/trajectory/text "
-                             "encoders. Adds 8.7M trainable params. Identity init preserves "
-                             "pretrained features at start. See CROSS_ATTENTION_PROPOSAL.md.")
+                        help="Data FPS (LIBERO=20, default real teleop=30)")
+    parser.add_argument("--chunk-size", type=int, default=5,
+                        help="Assistant head chunk size K (default 5)")
     parser.add_argument("--mixer-dim", type=int, default=512,
                         help="Cross-attention mixer hidden dim (default 512)")
     parser.add_argument("--num-mixer-blocks", type=int, default=2,
                         help="Number of cross-attention mixer blocks (default 2)")
-    parser.add_argument("--freeze-mixer", action="store_true",
-                        help="Freeze the cross-attention mixer during pretraining (Stage A). "
-                             "InfoNCE sees raw encoder embeddings. Use for two-stage training: "
-                             "Stage A (frozen mixer) → Stage B (mixer unfrozen, head training).")
-    parser.add_argument("--stage-a-epochs", type=int, default=0,
-                        help="If > 0, prepend Stage A pretraining (mixer frozen) before Stage B. "
-                             "Stage A only runs InfoNCE, no head losses. Total epochs = stage_a + main. "
-                             "Has no effect without --use-cross-attention --freeze-mixer.")
-    parser.add_argument("--stage-b-head-loss-weight", type=float, default=0.1,
-                        help="Weight for head losses (BCE+MSE) added to InfoNCE in Stage B. "
-                             "Default 0.1 — heads guide the mixer but don't dominate InfoNCE.")
-    parser.add_argument("--modality-dropout", type=float, default=0.0,
-                        help="Probability of zeroing out one modality (vision OR text) per batch. "
-                             "0.1 is reasonable for LIBERO-scale data (379 episodes). "
-                             "Has no effect if --use-cross-attention is not set.")
+    parser.add_argument("--temperature", type=float, default=0.07,
+                        help="InfoNCE temperature (default 0.07)")
 
     args = parser.parse_args()
 
     run_streaming_pipeline(
         repo_ids=args.datasets,
         output_dir=args.output_dir,
-        epochs_pretrain=args.epochs_pretrain,
+        epochs_pretrain_encoder=args.epochs_pretrain_encoder,
+        epochs_pretrain_mixer=args.epochs_pretrain_mixer,
         epochs_heads=args.epochs_heads,
         batch_size=args.batch_size,
         lr=args.lr,
         device=args.device,
         stages=args.stages,
         pretrained_checkpoint=args.pretrained,
+        encoder_checkpoint=args.encoder_checkpoint,
         data_dir=args.data_dir,
         wandb_project=args.wandb_project,
         wandb_run=args.wandb_run,
@@ -1081,13 +1009,10 @@ def main():
         max_steps_per_epoch=args.max_steps_per_epoch,
         traj_window=args.traj_window,
         fps=args.fps,
-        use_cross_attention=args.use_cross_attention,
+        chunk_size=args.chunk_size,
         mixer_dim=args.mixer_dim,
         num_mixer_blocks=args.num_mixer_blocks,
-        stage_a_epochs=args.stage_a_epochs,
-        head_loss_weight=args.stage_b_head_loss_weight,
-        modality_dropout=args.modality_dropout,
-        temperature=0.07,
+        temperature=args.temperature,
     )
 
 

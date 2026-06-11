@@ -10,19 +10,6 @@ wandb/
 __pycache__/
 *.pyc
 
-# Documents (except README)
-ARCHITECTURE.md
-BASELINE_RESEARCH.md
-CONTRIBUTION.md
-CONVERSATION_LOG.md
-DESIGN_DECISIONS.md
-INITIAL_PLAN.md
-LITERATURE_REVIEW.md
-PRESENTATION.md
-PROFESSOR_QA.md
-TASK_PLAN.md
-TRAINING_PIPELINE.md
-CONTRASTIVE_TRAINING_AUDIT.md
 # Admin scripts (Notion debug, etc.)
 scripts/check_notion_*.py
 scripts/check_projects_db.py
