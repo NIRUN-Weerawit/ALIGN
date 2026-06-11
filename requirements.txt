@@ -1,11 +1,16 @@
 # ALIGN — pip requirements
 # Install: pip install -r requirements.txt
-# For GPU support, use: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 #
-# Recommended approach:
-#   pip install -r requirements.txt
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-#   python scripts/check_deps.py
+# PyTorch + CUDA must be installed separately with the correct index URL.
+# Verified working combo (both local and helios):
+#
+#   pip install torch==2.10.0 torchvision==0.25.0 \
+#       --index-url https://download.pytorch.org/whl/cu128
+#   pip install torchcodec==0.10.0 \
+#       --index-url https://download.pytorch.org/whl/cu128 --no-deps
+#
+# Other CUDA versions (cu118, cu121, cu124) also work — just match the index URL.
+# See https://pytorch.org/get-started/locally/ for available combos.
 
 # ── Core ML & data ──────────────────────────────────────────────
 numpy

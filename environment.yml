@@ -4,6 +4,16 @@
 # Activate: conda activate align
 # Verify:  PYTHONNOUSERSITE=1 which python  # should be miniconda3/envs/align/bin/python
 #          python scripts/check_deps.py
+#
+# PyTorch + CUDA are installed via pip (not conda) to avoid channel conflicts.
+# Verified working combo (both local and helios):
+#
+#   pip install torch==2.10.0 torchvision==0.25.0 \
+#       --index-url https://download.pytorch.org/whl/cu128
+#   pip install torchcodec==0.10.0 \
+#       --index-url https://download.pytorch.org/whl/cu128 --no-deps
+#
+# Other CUDA versions (cu118, cu121, cu124) also work — just match the index URL.
 name: align
 channels:
   - conda-forge
