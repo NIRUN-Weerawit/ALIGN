@@ -15,15 +15,19 @@ conda activate align
 # Option B — pip / venv
 python3 -m venv align-env
 source align-env/bin/activate
+pip install torch==2.10.0 torchvision==0.25.0 torchcodec==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+pip install xformers --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
-pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu121
-pip install xformers==0.0.28 --index-url https://download.pytorch.org/whl/cu121 --no-deps
 
 # Option C — auto-setup script (detects conda/pip)
 ./setup.sh
 
-# 2. Run streaming pretraining (zero disk — pulls data from Hugging Face Hub)
-python training/pretrain_streaming.py --epochs-pretrain 10
+# 2. Run streaming pretraining (zero disk, data streams from Hugging Face Hub)
+python training/pretrain_streaming.py \
+    --epochs-pretrain-encoder 40 \
+    --epochs-pretrain-mixer 10 \
+    --epochs-heads 30
 ```
 
 See [`environment.yml`](environment.yml) for the full conda env, [`requirements.txt`](requirements.txt) for pip, or [`setup.sh`](setup.sh) for the auto-installer.
@@ -67,20 +71,33 @@ LIBERO is the ideal match: same Franka Panda robot, egocentric wrist camera, ric
 ### Three Training Pathways
 
 ```bash
-# 1. STREAMING (zero disk, recommended for pretraining)
-# Requires: pip install lerobot torchcodec
-python training/pretrain_streaming.py --epochs-pretrain 50
+# 1. STREAMING (zero disk, recommended — single entry point)
+#    Phase 1a: encoder pretrain → Phase 1b: mixer warm-up → Phase 2: heads
+python training/pretrain_streaming.py \
+    --epochs-pretrain-encoder 40 \
+    --epochs-pretrain-mixer 10 \
+    --epochs-heads 30
+
+# 1a (streaming, Phase 1 only — pretrain step)
+python training/pretrain_streaming.py --stages pretrain
+
+# 1b (streaming, Phase 2 only — head step with existing pretrain)
+python training/pretrain_streaming.py \
+    --stages heads \
+    --pretrained ./checkpoints/streaming/pretrain/best.pt
 
 # 2. LOCAL DATA (own Phase 1 collection + converted open datasets)
 python -m data.open_dataset --dataset robomimic --data-dir ./robomimic_data --task lift
-python training/pretrain.py --data align.h5 --epochs 50
+python training/pretrain.py --data align.h5
 python training/train_heads.py --data align.h5 --pretrained checkpoints/pretrain/best.pt
 
 # 3. FULL PIPELINE (open datasets → synthetic noise → heads)
 python training/train_full_pipeline.py --robomimic-dir ./robomimic_data
 
 # Inference
-python inference/align_inference.py --checkpoint checkpoints/heads/joint_best.pt --task "pick up the red mug"
+python inference/align_inference.py \
+    --checkpoint checkpoints/streaming/heads/best.pt \
+    --task "pick up the red mug"
 ```
 
 ### Key Design Decisions

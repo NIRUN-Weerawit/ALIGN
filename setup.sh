@@ -92,21 +92,14 @@ CORE_CONDA=(
 )
 
 # Pip core — install these via pip even in conda, because conda-forge
-# versions lag behind or are missing
+# versions lag behind or are missing. xformers is NOT here — it's installed
+# separately after PyTorch to avoid dependency conflicts.
 CORE_PIP=(
     "open-clip-torch"
     "lerobot"
     "torchcodec"
-    "xformers"
     "transformers"
     "PyAV"
-)
-
-# PyTorch is special — install via pip with CUDA index, not conda
-# This avoids channel conflicts and version lag
-TORCH_PIP=(
-    "torch"
-    "torchvision"
 )
 
 # Optional: data collection / Isaac Sim / VR deps
@@ -129,8 +122,12 @@ install_conda() {
     conda install -y -n "$env_name" "${CORE_CONDA[@]}" -c conda-forge
 
     info "Installing PyTorch + CUDA (latest, via pip)..."
-    conda run -n "$env_name" pip install "${TORCH_PIP[@]}" \
-        --index-url https://download.pytorch.org/whl/cu124
+    conda run -n "$env_name" pip install torch==2.10.0 torchvision==0.25.0 torchcodec==0.10.0 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+    info "Installing xformers (separately — avoids dependency conflicts)..."
+    conda run -n "$env_name" pip install xformers \
+        --index-url https://download.pytorch.org/whl/cu128
 
     info "Installing core ML deps via pip..."
     conda run -n "$env_name" pip install "${CORE_PIP[@]}"
@@ -165,9 +162,12 @@ print('All deps OK')
 }
 
 install_pip() {
-    info "Installing PyTorch + CUDA (latest)..."
-    pip install "${TORCH_PIP[@]}" \
-        --index-url https://download.pytorch.org/whl/cu124
+    info "Installing PyTorch + CUDA..."
+    pip install torch==2.10.0 torchvision==0.25.0 torchcodec==0.10.0 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+    info "Installing xformers (separately — avoids dependency conflicts)..."
+    pip install xformers --index-url https://download.pytorch.org/whl/cu128
 
     info "Installing core deps..."
     pip install numpy scipy h5py Pillow wandb tqdm requests
