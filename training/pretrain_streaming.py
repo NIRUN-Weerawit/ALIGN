@@ -354,6 +354,9 @@ def pretrain_from_stream(
             epoch_cos_vt = []
             epoch_cos_vl = []
             epoch_cos_tl = []
+            import time
+            _epoch_start = time.time()
+            _step_start = time.time()
 
             loader_iter = iter(loader)
             for step in range(max_steps_per_epoch):
@@ -386,10 +389,15 @@ def pretrain_from_stream(
                 epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
                 if (step + 1) % 100 == 0:
+                    _now = time.time()
+                    _step_time = (_now - _step_start) / 100
+                    _remaining = _step_time * (max_steps_per_epoch - step)
                     print(f"  [1a] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
                           f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
-                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
+                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}  "
+                          f"{_step_time*1000:.0f}ms/step  ETA:{_remaining/60:.1f}min",
                           flush=True)
+                    _step_start = _now
 
             avg_loss = float(np.mean(epoch_losses))
             avg_vt = float(np.mean(epoch_cos_vt))
@@ -454,6 +462,8 @@ def pretrain_from_stream(
             epoch_cos_vt = []
             epoch_cos_vl = []
             epoch_cos_tl = []
+            import time
+            _step_start = time.time()
 
             loader_iter = iter(loader)
             for step in range(max_steps_per_epoch):
@@ -486,10 +496,15 @@ def pretrain_from_stream(
                 epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
                 if (step + 1) % 100 == 0:
+                    _now = time.time()
+                    _step_time = (_now - _step_start) / 100
+                    _remaining = _step_time * (max_steps_per_epoch - step)
                     print(f"  [1b] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
                           f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
-                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
+                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}  "
+                          f"{_step_time*1000:.0f}ms/step  ETA:{_remaining/60:.1f}min",
                           flush=True)
+                    _step_start = _now
 
             avg_loss = float(np.mean(epoch_losses))
             avg_vt = float(np.mean(epoch_cos_vt))
@@ -661,6 +676,8 @@ def train_heads_from_stream(
         losses = []
         alphas = []
         deltas = []
+        import time
+        _step_start = time.time()
 
         loader_iter = iter(loader)
         for step in range(max_steps_per_epoch):
@@ -727,9 +744,14 @@ def train_heads_from_stream(
             deltas.append(delta_pred.detach().abs().mean().item())
 
             if (step + 1) % 100 == 0:
-                print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch} "
+                _now = time.time()
+                _step_time = (_now - _step_start) / 100
+                _remaining = _step_time * (max_steps_per_epoch - step)
+                print(f"  [2] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch} "
                       f"loss: {loss.item():.4f}  α: {alpha_pred.mean().item():.3f}  "
-                      f"Δ: {delta_pred.abs().mean().item():.4f}", flush=True)
+                      f"Δ: {delta_pred.abs().mean().item():.4f}  "
+                      f"{_step_time*1000:.0f}ms/step  ETA:{_remaining/60:.1f}min", flush=True)
+                _step_start = _now
 
         avg_loss = float(np.mean(losses))
         avg_alpha = float(np.mean(alphas))
