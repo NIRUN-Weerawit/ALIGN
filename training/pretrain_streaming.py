@@ -143,9 +143,14 @@ class MultiDatasetStream(IterableDataset):
                     state = sample.get("observation.state", None)
                     if state is not None:
                         state = state.float()
-                        if state.dim() == 2:
-                            state = state[-1]  # temporal dim → single frame
-                        pose = state[..., :6] if state.shape[-1] >= 6 else state
+                        # With delta_timestamps, state is (K, D) — keep full window
+                        if state.dim() == 2 and state.shape[0] > 1:
+                            pose = state[:, :6] if state.shape[-1] >= 6 else state
+                        else:
+                            # Single frame — will be repeated by collate
+                            if state.dim() == 2:
+                                state = state[-1]
+                            pose = state[..., :6] if state.shape[-1] >= 6 else state
 
                     # Action (future chunk, if requested by delta_timestamps)
                     action = sample.get("action", None)
