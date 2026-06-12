@@ -28,19 +28,28 @@ except ImportError:
     sys.exit(1)
 
 
-def write_ep_to_hdf5(f, ep_idx, camera_key, frames, states, text):
-    """Write a single episode buffer to the HDF5 file."""
+def write_ep_to_hdf5(f, ep_idx, img_keys_data, states, text):
+    """Write a single episode buffer to the HDF5 file.
+    
+    Args:
+        f: h5py File handler.
+        ep_idx: Episode index.
+        img_keys_data: dict mapping camera_key -> list of frame tensors.
+        states: list of state tensors.
+        text: task description string.
+    """
     gr = f.create_group(f"ep_{ep_idx:06d}")
-
-    # Stack frames (T, H, W, 3) and cast to uint8 if needed
-    stacked = torch.stack(frames).permute(0, 2, 3, 1)
-    if stacked.dtype != torch.uint8:
-        max_val = stacked.max().item()
-        if max_val <= 1.0:
-            stacked = (stacked * 255.0).byte()
-        else:
-            stacked = stacked.byte()
-    gr.create_dataset(f"frames/{camera_key}", data=stacked.numpy())
+    
+    # Write frames for each camera angle
+    for cam, frames in img_keys_data.items():
+        stacked = torch.stack(frames).permute(0, 2, 3, 1)
+        if stacked.dtype != torch.uint8:
+            max_val = stacked.max().item()
+            if max_val <= 1.0:
+                stacked = (stacked * 255.0).byte()
+            else:
+                stacked = stacked.byte()
+        gr.create_dataset(f"frames/{cam}", data=stacked.numpy())
 
     # Stack states (T, D) and cast to float32
     s_stack = torch.stack(states).float()
@@ -69,39 +78,40 @@ def main():
     ds = LeRobotDataset("nvidia/LIBERO_LeRobot_v3", root=args.data_dir)
 
     # Detect keys
-    img_key = [k for k in ds.meta.features if "images" in k and "wrist" not in k]
-    img_key = img_key[0] if len(img_key) > 0 else None
+    img_keys = [k for k in ds.meta.features if "images" in k]
     state_key = [k for k in ds.meta.features if k.startswith("observation.state")]
     state_key = state_key[0] if len(state_key) > 0 else None
 
-    if not img_key or not state_key:
+    if not img_keys or not state_key:
         raise ValueError(f"Could not find image or state keys. Found: {list(ds.meta.features.keys())}")
 
-    print(f"[2/4] Dataset keys -> Image: '{img_key}', State: '{state_key}'")
+    # Extract clean camera names (e.g., 'agentview', 'wrist_image')
+    cameras = [k.split(".")[-1] for k in img_keys]
+    print(f"[2/4] Detected cameras: {cameras}, State: '{state_key}'")
 
     # Group rows into episodes on disk
-    ep_buffer = {"frames": [], "states": [], "task": None}
+    ep_buffer = {cam: [] for cam in cameras}  # dict of lists
+    ep_buffer["states"] = []
+    ep_buffer["task"] = None
     cur_ep_id = None
     episodes_processed = 0
     total_rows = len(ds.hf_dataset)
     
-    print(f"[3/4] Decoding videos & writing HDF5 (this takes a while)...")
-    pbar = tqdm(total=total_rows, desc="Decoding frames", unit="frame", postfix={"ep": 0})
+    print(f"[3/4] Decoding videos & writing HDF5 for {len(cameras)} cameras...")
+    pbar = tqdm(total=total_rows, desc="Decoding frames", unit="frame")
 
     with h5py.File(args.output, "w") as f:
         f.create_group("meta")
-        f["meta/camera"] = img_key.split(".")[-1]
+        f["meta/cameras"] = json.dumps(cameras)
         f["meta/source"] = "nvidia/LIBERO_LeRobot_v3"
         
         for row_idx in range(total_rows):
             sample = ds[row_idx]
 
-            # Find the episode index key (varies by LeRobot version)
             ep_keys = [k for k in sample.keys() if "episode" in k.lower()]
             if not ep_keys:
-                raise ValueError("Could not find an 'episode' key in sample! Available keys: " + str(list(sample.keys())))
+                raise ValueError("Could not find an 'episode' key. Available keys: " + str(list(sample.keys())))
             
-            # Handle both integer strings and floats
             raw_ep_id = sample[ep_keys[0]]
             if hasattr(raw_ep_id, 'item'):
                 raw_ep_id = raw_ep_id.item()
@@ -109,23 +119,28 @@ def main():
 
             # Detect episode boundary & flush previous 
             if cur_ep_id is not None and ep_id != cur_ep_id:
-                write_ep_to_hdf5(f, cur_ep_id, img_key.split(".")[-1], ep_buffer["frames"], 
-                                 ep_buffer["states"], ep_buffer["task"])
+                cam_data = {k: v for k, v in ep_buffer.items() if k in cameras}
+                write_ep_to_hdf5(f, cur_ep_id, cam_data, ep_buffer["states"], ep_buffer["task"])
                 
                 episodes_processed += 1
                 pbar.set_postfix({"episodes written": episodes_processed})
-                ep_buffer = {"frames": [], "states": [], "task": None}
+                # Reset buffers
+                for cam in cameras:
+                    ep_buffer[cam] = []
 
-            # Accumulate data for current timestep
-            frame_tensor = sample[img_key]
-            if hasattr(frame_tensor, 'dim') and frame_tensor.dim() == 4:  # (T, C, H, W) -> take last T=1 or flatten
-                frame_tensor = frame_tensor[-1]
-            ep_buffer["frames"].append(frame_tensor)
+            # Accumulate frames for ALL detected camera keys
+            for k in img_keys:
+                cam_name = k.split(".")[-1]
+                frame_tensor = sample[k]
+                if hasattr(frame_tensor, 'dim') and frame_tensor.dim() == 4:
+                    frame_tensor = frame_tensor[-1]
+                ep_buffer[cam_name].append(frame_tensor)
 
+            # Accumulate state info (same across cameras for this timestep)
             state_tensor = sample[state_key]
             if hasattr(state_tensor, 'dim') and state_tensor.dim() == 2:
                 if state_tensor.size(0) > 1:
-                     state_tensor = state_tensor[0] # typically T=1 here per row 
+                     state_tensor = state_tensor[0]
                 else:
                      state_tensor = state_tensor[-1]
             ep_buffer["states"].append(state_tensor)
@@ -137,11 +152,10 @@ def main():
 
             cur_ep_id = ep_id
             pbar.update(1)
-            pbar.set_postfix({"episodes written": episodes_processed})
 
         # Flush final episode
-        write_ep_to_hdf5(f, cur_ep_id, img_key.split(".")[-1], ep_buffer["frames"], 
-                         ep_buffer["states"], ep_buffer["task"])
+        cam_data = {k: v for k, v in ep_buffer.items() if k in cameras}
+        write_ep_to_hdf5(f, cur_ep_id, cam_data, ep_buffer["states"], ep_buffer["task"])
         episodes_processed += 1
 
     pbar.close()
