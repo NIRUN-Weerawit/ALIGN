@@ -273,12 +273,12 @@ def pretrain_hdf5(
                 # Update progress bar display
                 gpu = _get_gpu_stats() if str(device) == "cuda" else None
                 pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    vt=f"{stats['avg_cos_vt'].item():.3f}",
-                    vl=f"{stats['avg_cos_vl'].item():.3f}",
-                    tl=f"{stats['avg_cos_tl'].item():.3f}",
-                    gpu=f"{gpu['gpu_util']:.0f}%" if gpu else "?%",
-                    mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
+                    L=f"{loss.item():.4f}",
+                    vt="{:.3f}".format(stats['avg_cos_vt'].item()),
+                    vl="{:.3f}".format(stats['avg_cos_vl'].item()),
+                    tl="{:.3f}".format(stats['avg_cos_tl'].item()),
+                    gpu=f"{gpu['gpu_util']}" if gpu else "?",
+                    mem="{:.1f}G".format(gpu['mem_gb']) if gpu else "?G",
                 )
 
                 # Per-step logging (W&B + local JSONL)
@@ -437,12 +437,12 @@ def pretrain_hdf5(
 
                 gpu = _get_gpu_stats() if str(device) == "cuda" else None
                 pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    vt=f"{stats['avg_cos_vt'].item():.3f}",
-                    vl=f"{stats['avg_cos_vl'].item():.3f}",
-                    tl=f"{stats['avg_cos_tl'].item():.3f}",
-                    gpu=f"{gpu['gpu_util']:.0f}%" if gpu else "?%",
-                    mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
+                    L=f"{loss.item():.4f}",
+                    vt="{:.3f}".format(stats['avg_cos_vt'].item()),
+                    vl="{:.3f}".format(stats['avg_cos_vl'].item()),
+                    tl="{:.3f}".format(stats['avg_cos_tl'].item()),
+                    gpu=f"{gpu['gpu_util']}" if gpu else "?",
+                    mem="{:.1f}G".format(gpu['mem_gb']) if gpu else "?G",
                 )
 
                 # Per-step logging (W&B + local JSONL)
