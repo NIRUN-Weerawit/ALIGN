@@ -35,6 +35,7 @@ import numpy as np
 import torch
 from torch import optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -202,9 +203,15 @@ def pretrain_hdf5(
             epoch_cos_vt = []
             epoch_cos_vl = []
             epoch_cos_tl = []
-            _step_start = time.time()
+            # Tqdm progress bar (Phase 1a)
+            pbar = tqdm(
+                enumerate(train_loader),
+                total=min(max_steps_per_epoch, len(train_loader)),
+                desc=f"[1a] Ep {epoch + 1}",
+                leave=False,
+            )
 
-            for step, batch in enumerate(train_loader):
+            for step, batch in pbar:
                 if step >= max_steps_per_epoch:
                     break
 
@@ -219,7 +226,6 @@ def pretrain_hdf5(
                 # Raw encoder outputs (no mixer), BF16 autocast
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     raw = model.encode_raw_all(frames, trajs, texts)
-                raw = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
                 stats = criterion(raw["z_v"], raw["z_t"], raw["z_text"])
                 loss = stats["loss"]
 
@@ -233,18 +239,16 @@ def pretrain_hdf5(
                 epoch_cos_vl.append(stats["avg_cos_vl"].item())
                 epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
-                if (step + 1) % 100 == 0:
-                    _now = time.time()
-                    _step_ms = (_now - _step_start) / (step + 1) * 1000
-                    print(f"  [1a] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
-                          f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
-                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}  "
-                          f"{_step_ms:.0f}ms/step", flush=True)
-                    wandb_trainer.log({
-                        "loss": loss.item(), "cos_vt": stats["avg_cos_vt"].item(),
-                        "cos_vl": stats["avg_cos_vl"].item(), "cos_tl": stats["avg_cos_tl"].item(),
-                        "lr": lr,
-                    }, step=epoch * max_steps_per_epoch + step)
+                # Update progress bar display
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    vt=f"{stats['avg_cos_vt'].item():.3f}",
+                    vl=f"{stats['avg_cos_vl'].item():.3f}",
+                    tl=f"{stats['avg_cos_tl'].item():.3f}",
+                )
+
+            pbar.close()
+
 
             avg_loss = float(np.mean(epoch_losses))
             avg_vt = float(np.mean(epoch_cos_vt))
@@ -283,7 +287,7 @@ def pretrain_hdf5(
                 model.eval()
                 val_losses, val_vt, val_vl, val_tl = [], [], [], []
                 with torch.no_grad():
-                    for batch in val_loader:
+                    for batch in tqdm(val_loader, desc="[1a] Val", leave=False):
                         frames = torch.from_numpy(batch["frames"]).to(device)
                         trajs = torch.from_numpy(batch["trajectories"]).float().to(device)
                         texts = batch["texts"]
@@ -338,7 +342,14 @@ def pretrain_hdf5(
             epoch_cos_vl = []
             epoch_cos_tl = []
 
-            for step, batch in enumerate(train_loader):
+            pbar = tqdm(
+                enumerate(train_loader),
+                total=min(max_steps_per_epoch, len(train_loader)),
+                desc=f"[1b] Ep {epoch + 1}",
+                leave=False,
+            )
+
+            for step, batch in pbar:
                 if step >= max_steps_per_epoch:
                     break
 
@@ -353,7 +364,6 @@ def pretrain_hdf5(
                 # Mixer outputs, BF16 autocast
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     mixed = model.encode_mixed(frames, trajs, texts)
-                mixed = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in mixed.items()}
                 stats = criterion(mixed["z_v"], mixed["z_t"], mixed["z_text"])
                 loss = stats["loss"]
 
@@ -367,12 +377,14 @@ def pretrain_hdf5(
                 epoch_cos_vl.append(stats["avg_cos_vl"].item())
                 epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
-                if (step + 1) % 100 == 0:
-                    print(f"  [1b] Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
-                          f"loss: {loss.item():.4f}  vt: {stats['avg_cos_vt'].item():.3f}  "
-                          f"vl: {stats['avg_cos_vl'].item():.3f}  tl: {stats['avg_cos_tl'].item():.3f}",
-                          flush=True)
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    vt=f"{stats['avg_cos_vt'].item():.3f}",
+                    vl=f"{stats['avg_cos_vl'].item():.3f}",
+                    tl=f"{stats['avg_cos_tl'].item():.3f}",
+                )
 
+            pbar.close()
             avg_loss = float(np.mean(epoch_losses))
             avg_vt = float(np.mean(epoch_cos_vt))
             avg_vl = float(np.mean(epoch_cos_vl))

@@ -94,6 +94,47 @@ class ALIGNDataset(Dataset):
         else:
             self._single_episode = False
 
+        # Auto-detect camera key from actual HDF5 structure
+        first_ep = self._episode_keys[0]
+        frames_group = self._h5[f"{first_ep}/frames"]
+        available_cameras = list(frames_group.keys())
+        if self.camera in available_cameras:
+            pass
+        elif "wrist_image" in available_cameras and self.camera in ("wrist", ""):
+            self.camera = "wrist_image"
+        elif len(available_cameras) == 1:
+            self.camera = available_cameras[0]
+        else:
+            raise ValueError(f"Camera {self.camera} not found. Available: {available_cameras}")
+
+        # Detect if noisy_poses are cumulative across episodes (LIBERO v3 quirk)
+        # and pre-compute per-episode frame lengths + pose offsets
+        self._ep_frame_lengths: List[int] = []
+        self._ep_pose_offsets: List[int] = []
+
+        for ep_idx in range(len(self._episode_keys)):
+            key = self._episode_keys[ep_idx]
+            # Frame length is per-episode and authoritative
+            try:
+                n_frames = len(self._h5[f"{key}/frames/{self.camera}"])
+            except KeyError:
+                n_frames = len(self._h5[f"{key}/noisy_poses"])
+            self._ep_frame_lengths.append(n_frames)
+
+            # Pose offset: in cumulative HDF5, ep_N starts AFTER all previous episodes
+            n_poses = len(self._h5[f"{key}/noisy_poses"])
+            if n_poses == n_frames:
+                # Non-cumulative — pose aligns with frames directly
+                self._ep_pose_offsets.append(0)
+            elif ep_idx > 0:
+                # Cumulative — offset = sum of all previous frame lengths
+                self._ep_pose_offsets.append(sum(self._ep_frame_lengths[:-1]))
+            else:
+                self._ep_pose_offsets.append(0)
+
+        # Warn if cumulative detected
+        if any(o > 0 for o in self._ep_pose_offsets):
+            print("  NOTE: Detected cumulative noisy_poses — using per-episode offsets")
         # Build index: list of (ep_idx, start_frame, n_frames) for each valid window
         self._index: List[Tuple[int, int, int]] = []
         for ep_idx in range(len(self._episode_keys)):
@@ -107,7 +148,7 @@ class ALIGNDataset(Dataset):
         key = self._episode_keys[ep_idx]
         if self._single_episode:
             return len(self._h5["noisy_poses"])
-        return len(self._h5[f"{key}/noisy_poses"])
+        return self._ep_frame_lengths[ep_idx]
 
     def _read_frames(self, ep_idx: int, start: int, count: int) -> np.ndarray:
         key = self._episode_keys[ep_idx]
@@ -121,14 +162,48 @@ class ALIGNDataset(Dataset):
         key = self._episode_keys[ep_idx]
         if self._single_episode:
             return self._h5["noisy_poses"][start:start + count]
-        return self._h5[f"{key}/noisy_poses"][start:start + count]
+        # Handle cumulative noisy_poses (LIBERO v3 quirk)
+        offset = self._ep_pose_offsets[ep_idx]
+        abs_start = offset + start
+        raw = self._h5[f"{key}/noisy_poses"][abs_start:abs_start + count]
+        # Pad if fewer items than requested (episode boundary)
+        if len(raw) < count:
+            pad = np.zeros((count - len(raw), raw.shape[1]), dtype=raw.dtype)
+            raw = np.concatenate([raw, pad], axis=0)
+        return raw
 
     def _read_text(self, ep_idx: int) -> str:
+        key = self._episode_keys[ep_idx]
         if self._single_episode:
-            meta = json.loads(self._h5["meta"][()])
+            try:
+                raw = self._h5["meta"][()]
+                meta = json.loads(raw) if isinstance(raw, (bytes, str)) else {}
+            except (KeyError, ValueError):
+                return "pick and place"
             return meta.get("task_description", "pick and place")
-        meta = json.loads(self._h5[f"{self._episode_keys[ep_idx]}/meta"][()])
-        return meta.get("task_description", "pick and place")
+
+        # Try /ep_XXX/texts first (JSON array as bytes), then /ep_XXX/meta
+        ep_group = self._h5[key]
+        try:
+            raw = ep_group["texts"][()]
+            if isinstance(raw, bytes):
+                texts = json.loads(raw)
+            elif isinstance(raw, str):
+                texts = json.loads(raw)
+            else:
+                texts = [str(t) for t in list(raw)]
+            if texts and isinstance(texts, list):
+                return texts[0]
+        except (KeyError, ValueError):
+            pass
+
+        try:
+            meta = json.loads(ep_group["meta"][()])
+            return meta.get("task_description", "pick and place")
+        except (KeyError, ValueError):
+            pass
+
+        return "pick and place"
 
     def __len__(self) -> int:
         return len(self._index)
