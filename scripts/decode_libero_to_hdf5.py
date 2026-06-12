@@ -2,86 +2,55 @@
 """Pre-decode LIBERO LeRobot dataset into HDF5 for fast multiprocess training.
 
 Converts local LIBERO data (MP4 videos + Parquet metadata) into HDF5 files
-with pre-decoded JPEG frames, so the DataLoader can read frames directly
+with pre-decoded frames, so the DataLoader can read frames directly
 without FFmpeg/video decoding. This:
   - Enables num_workers > 0 (no video decoder contention)
   - Speeds up training ~3-5x (no per-step video decode)
   - Adds ~5-15GB per LIBERO subtask (libero_10, libero_90, etc.)
 
+Both wrist and front cameras are saved by default.
+
 Usage:
-    # Convert one subtask
+    # Convert one subtask (both cameras)
     python scripts/decode_libero_to_hdf5.py \
         --data-dir /path/to/libero_10 \
         --output ./data/libero_10.h5
 
-    # Convert multiple subtasks (merged into one HDF5)
+    # Limit to 50 episodes
     python scripts/decode_libero_to_hdf5.py \
-        --data-dir /path/to/libero_10 --data-dir /path/to/libero_90 \
-        --output ./data/libero_all.h5
-
-    # Limit episodes or frames per episode
-    python scripts/decode_libero_to_hdf5.py \
-        --data-dir /path/to/libero_10 --max-eps 50 --max-frames 100
+        --data-dir /path/to/libero_10 --max-eps 50
 
 After conversion, train with:
-    python training/pretrain.py --data ./data/libero_10.h5 --epochs 50
     python training/pretrain_streaming.py \
-        --data-dir /path/to/data/libero_10.h5 \
+        --data-dir ./data/libero_10.h5 \
         --epochs-pretrain-encoder 10
 """
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
 import h5py
 import numpy as np
-from PIL import Image
+from PIL import Image as PILImage
 from tqdm import tqdm
 
 
-# ================================================================
-# Constants
-# ================================================================
-
-DEFAULT_SIZE = (224, 224)  # resize frames to this
-DEFAULT_CAMERA = "wrist_image"
-TRAJ_WINDOW = 20  # K — trajectory window size used during training
-MAX_FRAMES_PER_EP = 2000  # cap episode length
+DEFAULT_SIZE = (224, 224)
+MAX_FRAMES_PER_EP = 2000
 
 
 def decode_libero_to_hdf5(
     data_dirs: list[str],
     output_path: str,
-    camera: str = DEFAULT_CAMERA,
+    camera: str = "both",
     image_size: tuple = DEFAULT_SIZE,
     max_eps: int = 0,
     max_frames: int = MAX_FRAMES_PER_EP,
     skip_existing: bool = True,
 ) -> str:
-    """Decode LIBERO episodes from multiple data directories into HDF5.
-
-    Each data_dir should be a LIBERO sub-task directory (e.g. libero_10/)
-    containing the standard LeRobot v3 structure:
-        meta/info.json, meta/tasks.parquet, meta/episodes/
-        data/chunk-XXX/file-XXX.parquet
-        videos/observation.images.wrist_image/chunk-XXX/file-XXX.mp4
-        videos/observation.images.image/chunk-XXX/file-XXX.mp4
-
-    Args:
-        data_dirs: List of paths to LIBERO sub-task directories.
-        output_path: Output .h5 file path.
-        camera: Camera view ('wrist_image' or 'image').
-        image_size: Resize frames to (H, W).
-        max_eps: Max episodes to process (0 = all).
-        max_frames: Max frames per episode.
-        skip_existing: Skip if output file already exists.
-
-    Returns:
-        Path to created HDF5 file.
-    """
+    """Decode LIBERO episodes from multiple data directories into HDF5."""
     output_path = Path(output_path)
     if skip_existing and output_path.exists():
         print(f"Output exists: {output_path}")
@@ -91,6 +60,7 @@ def decode_libero_to_hdf5(
             return str(output_path)
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    import torch  # noqa: F401
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     total_eps = 0
@@ -99,9 +69,7 @@ def decode_libero_to_hdf5(
         for data_dir in data_dirs:
             data_path = Path(data_dir)
             print(f"\nProcessing: {data_path}")
-            print(f"  Camera:   {camera}")
 
-            # Load LeRobot dataset (reads MP4s + parquet, uses pyav)
             ds = LeRobotDataset(
                 repo_id="nvidia/LIBERO_LeRobot_v3",
                 root=str(data_path.parent),
@@ -111,22 +79,32 @@ def decode_libero_to_hdf5(
             n_process = min(n_total, max_eps) if max_eps > 0 else n_total
             print(f"  Episodes: {n_process} / {n_total}")
 
-            # Camera key in LeRobot dataset
-            cam_key = f"observation.images.{camera}"
-            if cam_key not in ds.features:
-                # Fall back to front camera
-                alt = f"observation.images.image"
-                print(f"  WARNING: '{cam_key}' not found, using '{alt}'")
-                cam_key = alt
+            # Camera keys
+            if camera == "both":
+                cam_keys = [
+                    k for k in ["observation.images.wrist_image", "observation.images.image"]
+                    if k in ds.features
+                ]
+                if not cam_keys:
+                    raise ValueError("No camera keys found in dataset features")
+                print(f"  Cameras:  {cam_keys}")
+            else:
+                cam_key = f"observation.images.{camera}"
+                if cam_key not in ds.features:
+                    alt = "observation.images.image"
+                    print(f"  WARNING: '{cam_key}' not found, using '{alt}'")
+                    cam_key = alt
+                cam_keys = [cam_key]
+                print(f"  Camera:   {cam_key}")
 
-            # Track current episode boundaries
-            ep_indices = {}  # ep_idx → list of sample indices
+            # Build episode index
+            ep_indices = {}
             for idx in range(n_process):
                 sample = ds[idx]
                 ep_idx = sample.get("episode_index", idx // 200)
                 if isinstance(ep_idx, np.ndarray):
                     ep_idx = ep_idx.item()
-                elif isinstance(ep_idx, torch.Tensor):
+                elif hasattr(ep_idx, "item"):
                     ep_idx = ep_idx.item()
                 ep_indices.setdefault(int(ep_idx), []).append(idx)
 
@@ -138,38 +116,37 @@ def decode_libero_to_hdf5(
                 indices = ep_indices[ep_key]
                 ep_name = f"ep_{total_eps + ep_i:05d}"
                 group = h5.create_group(ep_name)
-                n_frames = min(len(indices), max_frames)
 
-                frames_list = []
+                frames_per_cam = {ck: [] for ck in cam_keys}
                 poses_list = []
                 text = "pick and place"
 
-                for j, idx in enumerate(indices[:max_frames]):
+                for idx in indices[:max_frames]:
                     sample = ds[idx]
 
-                    # --- Frame ---
-                    img = sample.get(cam_key)
-                    if img is None:
-                        continue
-                    if hasattr(img, "dim"):
-                        if img.dim() == 4:
-                            img = img[-1]
-                        if img.dim() == 3 and img.shape[0] in (1, 3):
-                            img = img.permute(1, 2, 0)
-                        if img.dtype == torch.float32 or img.dtype == torch.float16:
-                            img = img.mul(255).clamp(0, 255).to(torch.uint8)
-                        elif img.dtype != torch.uint8:
-                            img = img.to(torch.uint8)
-                    img_np = img.cpu().numpy() if hasattr(img, "cpu") else np.array(img)
+                    # Frames from each camera
+                    for ck in cam_keys:
+                        img = sample.get(ck)
+                        if img is None:
+                            frames_per_cam[ck].append(
+                                np.zeros((*image_size, 3), dtype=np.uint8)
+                            )
+                            continue
+                        if hasattr(img, "dim"):
+                            if img.dim() == 4:
+                                img = img[-1]
+                            if img.dim() == 3 and img.shape[0] in (1, 3):
+                                img = img.permute(1, 2, 0)
+                            if img.dtype == torch.float32 or img.dtype == torch.float16:
+                                img = img.mul(255).clamp(0, 255).to(torch.uint8)
+                            elif img.dtype != torch.uint8:
+                                img = img.to(torch.uint8)
+                        img_np = img.cpu().numpy() if hasattr(img, "cpu") else np.array(img)
+                        if img_np.shape[:2] != image_size:
+                            img_np = np.array(PILImage.fromarray(img_np).resize(image_size))
+                        frames_per_cam[ck].append(img_np)
 
-                    # Resize if needed
-                    if img_np.shape[:2] != image_size:
-                        from PIL import Image as PILImage
-                        img_np = np.array(PILImage.fromarray(img_np).resize(image_size))
-
-                    frames_list.append(img_np)
-
-                    # --- Pose (EEF position + axis-angle) ---
+                    # Pose (EEF position + axis-angle)
                     state = sample.get("observation.state")
                     if state is not None:
                         if hasattr(state, "cpu"):
@@ -181,7 +158,7 @@ def decode_libero_to_hdf5(
                         pose = np.zeros(6, dtype=np.float32)
                     poses_list.append(pose)
 
-                    # --- Text ---
+                    # Text
                     task = sample.get("task", sample.get("language_instruction", None))
                     if task is not None:
                         if isinstance(task, bytes):
@@ -194,64 +171,49 @@ def decode_libero_to_hdf5(
                             task = str(task)
                         text = task
 
-                if not frames_list:
+                if not frames_per_cam[cam_keys[0]]:
                     continue
 
-                # Write to HDF5
-                frames_arr = np.stack(frames_list).astype(np.uint8)
-                poses_arr = np.stack(poses_list).astype(np.float32)
+                # Write frames per camera
+                for ck in cam_keys:
+                    frames_arr = np.stack(frames_per_cam[ck]).astype(np.uint8)
+                    cam_name = ck.split(".")[-1]
+                    group.create_dataset(
+                        f"frames/{cam_name}", data=frames_arr,
+                        chunks=(1, *image_size[0], *image_size[1], 3),
+                        compression="lzf",
+                    )
 
-                group.create_dataset(
-                    f"frames/{camera}", data=frames_arr,
-                    chunks=(1, *frames_arr.shape[1:]),
-                    compression="lzf",
-                )
-                group.create_dataset(
-                    "noisy_poses", data=poses_arr,
-                    compression="gzip",
-                )
+                # Write poses
+                poses_arr = np.stack(poses_list).astype(np.float32)
+                group.create_dataset("noisy_poses", data=poses_arr, compression="gzip")
 
                 # Text variants
-                text_variants = [
-                    text,
-                    f"pick and place",  # generic
-                    f"grasp and move",
-                    "complete the task",
-                ]
+                text_variants = [text, "pick and place", "grasp and move"]
                 group.create_dataset("texts", data=json.dumps(text_variants))
                 group.create_dataset("meta", data=json.dumps({"task": text}))
 
                 if (ep_i + 1) % 50 == 0:
                     elapsed = time.time() - start_time
                     eps_per_sec = (ep_i + 1) / elapsed
-                    remaining = (len(ep_keys) - ep_i - 1) / eps_per_sec
+                    remaining = (len(ep_keys) - ep_i - 1) / eps_per_sec if eps_per_sec > 0 else 0
                     print(f"  {ep_i + 1}/{len(ep_keys)}  "
                           f"{eps_per_sec:.1f} eps/s  "
                           f"ETA {remaining:.0f}s")
 
             total_eps += len(ep_keys)
 
-        # Write metadata
         h5["meta/total_episodes"] = total_eps
-        h5["meta/camera"] = camera
+        h5["meta/camera"] = "both" if len(cam_keys) > 1 else cam_keys[0]
         h5["meta/source"] = json.dumps(data_dirs)
+        h5["meta/state_dim"] = 6
 
-    # Report size
     size_mb = output_path.stat().st_size / 1e6
     print(f"\nDone: {output_path}")
     print(f"  Episodes: {total_eps}")
+    print(f"  Cameras:  {len(cam_keys)}")
     print(f"  Size:     {size_mb:.0f} MB")
-    print(f"\nTrain with:")
-    print(f"  python training/pretrain.py --data {output_path} --epochs 50")
-    print(f"  python training/train_heads.py --data {output_path} "
-          f"--pretrained checkpoints/pretrain/best.pt")
 
-    return str(output_path)
-
-
-# ================================================================
-# CLI
-# ================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -259,11 +221,10 @@ def main():
     )
     parser.add_argument("--data-dir", required=True, action="append",
                         help="LIBERO sub-task directory (repeatable)")
-    parser.add_argument("--output", required=True,
-                        help="Output .h5 file path")
-    parser.add_argument("--camera", default=DEFAULT_CAMERA,
-                        choices=["wrist_image", "image"],
-                        help="Camera view")
+    parser.add_argument("--output", required=True, help="Output .h5 file path")
+    parser.add_argument("--camera", default="both",
+                        choices=["wrist_image", "image", "both"],
+                        help="Camera view (default: both)")
     parser.add_argument("--image-size", type=int, nargs=2,
                         default=list(DEFAULT_SIZE),
                         help="Resize to H W (default: 224 224)")
@@ -287,7 +248,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Torch is imported lazily (inside the function) to avoid import order
-    # issues with the rdt/align conda environment
-    import torch  # noqa: F401 — ensures torch is available for lerobot
     main()
