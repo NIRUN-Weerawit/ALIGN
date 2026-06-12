@@ -279,12 +279,19 @@ def pretrain_hdf5(
                     mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
                 )
 
-                # Per-step W&B logging
+                # Per-step logging (W&B + local JSONL)
                 wandb_trainer.log({
                     "loss": loss.item(), "cos_vt": stats["avg_cos_vt"].item(),
                     "cos_vl": stats["avg_cos_vl"].item(), "cos_tl": stats["avg_cos_tl"].item(),
                     "lr": lr,
                 }, step=epoch * max_steps_per_epoch + step)
+
+                log_fp.write(json.dumps({
+                    "phase": "1a_step", "epoch": epoch + 1, "step": step + 1,
+                    "loss": loss.item(), "cos_vt": stats["avg_cos_vt"].item(),
+                    "cos_vl": stats["avg_cos_vl"].item(), "cos_tl": stats["avg_cos_tl"].item(),
+                    "timestamp": datetime.now().isoformat(),
+                }) + "\n")
 
             pbar.close()
 
@@ -352,6 +359,16 @@ def pretrain_hdf5(
                     "val_loss": avg_val_loss, "val_cos_vt": float(np.mean(val_vt)),
                     "val_cos_vl": float(np.mean(val_vl)), "val_cos_tl": float(np.mean(val_tl)),
                 }, step=epoch + 1)
+
+                # Log validation to JSONL
+                log_fp.write(json.dumps({
+                    "phase": "1a_val", "epoch": epoch + 1,
+                    "loss": avg_val_loss,
+                    "cos_vt": float(np.mean(val_vt)), "cos_vl": float(np.mean(val_vl)),
+                    "cos_tl": float(np.mean(val_tl)),
+                    "timestamp": datetime.now().isoformat(),
+                }) + "\n")
+                log_fp.flush()
 
         print(f"  Phase 1a complete. Best loss: {best_loss:.4f}")
 
@@ -426,12 +443,19 @@ def pretrain_hdf5(
                     mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
                 )
 
-                # Per-step W&B logging (Phase 1b)
+                # Per-step logging (W&B + local JSONL)
                 wandb_trainer.log({
                     "loss": loss.item(), "cos_vt": stats["avg_cos_vt"].item(),
                     "cos_vl": stats["avg_cos_vl"].item(), "cos_tl": stats["avg_cos_tl"].item(),
                     "lr": lr * 0.5,
                 }, step=epochs_encoder + epoch * max_steps_per_epoch + step)
+
+                log_fp.write(json.dumps({
+                    "phase": "1b_step", "epoch": epoch + 1, "step": step + 1,
+                    "loss": loss.item(), "cos_vt": stats["avg_cos_vt"].item(),
+                    "cos_vl": stats["avg_cos_vl"].item(), "cos_tl": stats["avg_cos_tl"].item(),
+                    "timestamp": datetime.now().isoformat(),
+                }) + "\n")
 
             pbar.close()
             avg_loss = float(np.mean(epoch_losses))
