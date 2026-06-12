@@ -749,8 +749,15 @@ def train_heads_from_stream(
 
             # Rotate noise injectors
             injector = injectors[step % len(injectors)]
-            noisy_poses_np = injector.inject(clean_poses.cpu().numpy())
-            noisy_poses = torch.from_numpy(noisy_poses_np).float().to(device)
+            # Flatten batch+time dims for noise injection, reshape back
+            clean_np = clean_poses.cpu().numpy()
+            orig_shape = clean_np.shape
+            if clean_np.ndim == 3:
+                clean_np = clean_np.reshape(-1, clean_np.shape[-1])
+            noisy_np = injector.inject(clean_np)
+            if len(orig_shape) == 3:
+                noisy_np = noisy_np.reshape(orig_shape)
+            noisy_poses = torch.from_numpy(noisy_np).float().to(device)
 
             # Compute targets on-the-fly (position + orientation error)
             d_max_pos = 0.10
