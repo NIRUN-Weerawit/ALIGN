@@ -24,11 +24,9 @@ Usage:
 """
 import argparse
 import json
-import re
 import subprocess
 import sys
 import time
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -58,9 +56,11 @@ def _get_gpu_stats() -> Optional[dict]:
                 timeout=2, stderr=subprocess.DEVNULL,
             ).decode().strip()
             parts = out.split(",")
+            gpu_util_str = parts[0].replace("%", "").strip()
+            mem_str = parts[1].replace("MiB", "").replace("GiB", "").strip()
             _gpu_stats_cache = {
-                "gpu_util": int(parts[0].replace("%", "")),
-                "mem_gb": round(int(parts[1]) / 1024, 1),
+                "gpu_util": int(gpu_util_str),
+                "mem_gb": round(int(mem_str) / 1024, 1),
             }
         except Exception:
             _gpu_stats_cache = None
@@ -205,7 +205,6 @@ def pretrain_hdf5(
 
     log_path = output_dir / "pretrain_log.jsonl"
     log_fp = open(log_path, "a")
-    _step_start = time.time()
 
     # ================================================================
     # Phase 1a: Encoder Pretrain (mixer frozen, InfoNCE on raw outputs)
@@ -227,8 +226,6 @@ def pretrain_hdf5(
         n_params = sum(p.numel() for p in trainable)
         print(f"\n  Phase 1a — Trainable: {n_params:,}")
         optimizer = optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
-
-        val_epochs = max(1, epochs_encoder // val_every)
 
         for epoch in range(start_epoch, epochs_encoder):
             model.train()
