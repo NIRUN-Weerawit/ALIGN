@@ -279,6 +279,13 @@ def pretrain_hdf5(
                     mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
                 )
 
+                # Per-step W&B logging
+                wandb_trainer.log({
+                    "loss": loss.item(), "cos_vt": stats["avg_cos_vt"].item(),
+                    "cos_vl": stats["avg_cos_vl"].item(), "cos_tl": stats["avg_cos_tl"].item(),
+                    "lr": lr,
+                }, step=epoch * max_steps_per_epoch + step)
+
             pbar.close()
 
 
@@ -418,6 +425,13 @@ def pretrain_hdf5(
                     gpu=f"{gpu['gpu_util']:.0f}%" if gpu else "?%",
                     mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
                 )
+
+                # Per-step W&B logging (Phase 1b)
+                wandb_trainer.log({
+                    "loss": loss.item(), "cos_vt": stats["avg_cos_vt"].item(),
+                    "cos_vl": stats["avg_cos_vl"].item(), "cos_tl": stats["avg_cos_tl"].item(),
+                    "lr": lr * 0.5,
+                }, step=epochs_encoder + epoch * max_steps_per_epoch + step)
 
             pbar.close()
             avg_loss = float(np.mean(epoch_losses))
