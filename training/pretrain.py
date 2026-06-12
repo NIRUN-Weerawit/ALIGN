@@ -57,7 +57,8 @@ def _get_gpu_stats() -> Optional[dict]:
             ).decode().strip()
             parts = out.split(",")
             gpu_util_str = parts[0].replace("%", "").strip()
-            mem_str = parts[1].replace("MiB", "").replace("GiB", "").strip()
+            # Memory may have internal commas (e.g. "14,256 MiB") — rebuild from remaining parts
+            mem_str = "".join(parts[1:]).replace("MiB", "").replace("GiB", "").replace(",", "").strip()
             _gpu_stats_cache = {
                 "gpu_util": int(gpu_util_str),
                 "mem_gb": round(int(mem_str) / 1024, 1),
