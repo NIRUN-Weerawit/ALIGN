@@ -113,10 +113,23 @@ def pretrain_hdf5(
     """Contrastive pretraining from HDF5 data with two sub-phases."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    # Derive subdirectory from dataset name: e.g. --output-dir checkpoints/pretrain_local
-    # + --data libero_align.h5 → checkpoints/pretrain_local/libero_align/
+    # Derive subdirectory: checkpoints/pretrain_local/libero_align/run_N/
     ds_name = Path(data_path).stem
-    output_dir = Path(output_dir) / ds_name
+    base_dir = Path(output_dir) / ds_name
+
+    # Find next available run number
+    existing = sorted(base_dir.glob("run_*")) if base_dir.exists() else []
+    max_run = 0
+    for d in existing:
+        try:
+            n = int(d.name.split("_")[-1])
+            if n > max_run:
+                max_run = n
+        except (ValueError, IndexError):
+            pass
+    next_run = max_run + 1
+
+    output_dir = base_dir / f"run_{next_run}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"=== ALIGN Contrastive Pretraining (HDF5) ===")
