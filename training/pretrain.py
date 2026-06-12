@@ -22,11 +22,13 @@ Usage:
         --encoder-checkpoint ./checkpoints/pretrain/encoder_best.pt \\
         --epochs-mixer 10
 """
-
 import argparse
 import json
+import re
+import subprocess
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -38,6 +40,33 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# -- Lightweight GPU monitor (cached, non-blocking) ----------
+_gpu_stats_cache: Optional[dict] = None
+_gpu_sample_interval = 5  # seconds between samples
+_gpu_last_sample_time = 0.0
+
+
+def _get_gpu_stats() -> Optional[dict]:
+    """Sample nvidia-smi every few seconds (cached)."""
+    global _gpu_stats_cache, _gpu_last_sample_time
+    now = time.time()
+    if now - _gpu_last_sample_time >= _gpu_sample_interval:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "-u", ",", "--format=csv,noheader"],
+                timeout=2, stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            parts = out.split(",")
+            _gpu_stats_cache = {
+                "gpu_util": int(parts[0].replace("%", "")),
+                "mem_gb": round(int(parts[1]) / 1024, 1),
+            }
+        except Exception:
+            _gpu_stats_cache = None
+        _gpu_last_sample_time = now
+    return _gpu_stats_cache
+
 
 from models.align_model import ALIGNModel
 from training.contrastive_loss import ContrastiveLoss3Way
@@ -240,11 +269,14 @@ def pretrain_hdf5(
                 epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
                 # Update progress bar display
+                gpu = _get_gpu_stats() if str(device) == "cuda" else None
                 pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     vt=f"{stats['avg_cos_vt'].item():.3f}",
                     vl=f"{stats['avg_cos_vl'].item():.3f}",
                     tl=f"{stats['avg_cos_tl'].item():.3f}",
+                    gpu=f"{gpu['gpu_util']:.0f}%" if gpu else "?%",
+                    mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
                 )
 
             pbar.close()
@@ -377,11 +409,14 @@ def pretrain_hdf5(
                 epoch_cos_vl.append(stats["avg_cos_vl"].item())
                 epoch_cos_tl.append(stats["avg_cos_tl"].item())
 
+                gpu = _get_gpu_stats() if str(device) == "cuda" else None
                 pbar.set_postfix(
                     loss=f"{loss.item():.4f}",
                     vt=f"{stats['avg_cos_vt'].item():.3f}",
                     vl=f"{stats['avg_cos_vl'].item():.3f}",
                     tl=f"{stats['avg_cos_tl'].item():.3f}",
+                    gpu=f"{gpu['gpu_util']:.0f}%" if gpu else "?%",
+                    mem=f"{gpu['mem_gb']:.1f}G" if gpu else "?G",
                 )
 
             pbar.close()
