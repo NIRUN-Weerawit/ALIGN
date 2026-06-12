@@ -129,6 +129,9 @@ class MultiDatasetStream(IterableDataset):
                     front = sample.get("observation.images.image", None)
                     frame = wrist if wrist is not None else front
                     if frame is not None:
+                        # With delta_timestamps, frame may be (T, C, H, W) — take last frame
+                        if frame.dim() == 4:
+                            frame = frame[-1]  # most recent timestamp
                         if frame.dim() == 3 and frame.shape[0] in (1, 3):
                             frame = frame.permute(1, 2, 0)  # C,H,W → H,W,C
                         if frame.dtype == torch.float32 or frame.dtype == torch.float16:
