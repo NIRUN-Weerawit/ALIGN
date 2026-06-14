@@ -259,7 +259,7 @@ class ALIGNDataset(Dataset):
 # Head Training Utilities
 # ================================================================
 
-NOISE_STD = 0.015 # 1.5cm positional noise for synthetic human deviation
+NOISE_STD = 0.020 # 2cm positional noise for synthetic human deviation
 D_MAX = 0.10      # Max drift before full assist (alpha=1)
 
 def inject_kinematic_noise(pos: np.ndarray, rng: "np.random.Generator", std: float = NOISE_STD) -> np.ndarray:
