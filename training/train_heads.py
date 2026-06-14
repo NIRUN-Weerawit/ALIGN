@@ -190,29 +190,17 @@ def train_heads_hdf5(
             alpha_need = torch.from_numpy(batch["alpha_need"]).float().to(device)
             traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
 
-            # Frozen encodings via mixer
+            # Frozen encodings via mixer (needed for decision head input)
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, traj_view, texts)
                 z_v = mixed["z_v"].float()
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
 
-            # Compute consistency from cosine similarities of frozen embeddings
-            z_v_n = F.normalize(z_v, dim=-1)
-            z_t_n = F.normalize(z_t, dim=-1)
-            z_text_n = F.normalize(z_text, dim=-1)
+            # alpha_target = need * 1.0 (capability computed at inference time from embeddings)
+            alpha_target = alpha_need
 
-            cos_vt = (z_v_n * z_t_n).sum(dim=-1).clamp(min=0.0)  # (B,)
-            cos_vl = (z_v_n * z_text_n).sum(dim=-1).clamp(min=0.0) # (B,)
-            cos_tl = (z_text_n * z_t_n).sum(dim=-1).clamp(min=0.0) # (B,)
-
-            consistency = 1.0 # Placeholder for consistency — we dont need to train model to output this, it can be computed directly from the frozen encoders. --- IGNORE ---
-            # consistency = torch.stack([cos_vt, cos_vl, cos_tl], dim=-1).mean(dim=-1)  # Mean of the 3 sims
-
-            # Dynamic Target: Need (kinematic error) * Consistency (cosine similarity of frozen embeddings)
-            alpha_target = alpha_need * consistency
-
-            # Decision loss only (BCE against dynamic target)
+            # Decision loss only (BCE against kinematic error)
             alpha_pred = model.decision_head(z_v, z_t, z_text)
             loss_bce = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target)
 

@@ -96,16 +96,21 @@ class ALIGNDataset(Dataset):
 
         # Auto-detect camera key from actual HDF5 structure
         first_ep = self._episode_keys[0]
-        frames_group = self._h5[f"{first_ep}/frames"]
-        available_cameras = list(frames_group.keys())
-        if self.camera in available_cameras:
-            pass
-        elif "wrist_image" in available_cameras and self.camera in ("wrist", ""):
-            self.camera = "wrist_image"
-        elif len(available_cameras) == 1:
-            self.camera = available_cameras[0]
+        frames_obj = self._h5[f"{first_ep}/frames"]
+        if isinstance(frames_obj, h5py.Dataset):
+            # Frames is a single (N, H, W, 3) array — no camera subgroups
+            self.camera = None
         else:
-            raise ValueError(f"Camera {self.camera} not found. Available: {available_cameras}")
+            # Frames is a group with camera sub-datasets (e.g., frames/wrist_image)
+            available_cameras = list(frames_obj.keys())
+            if self.camera in available_cameras:
+                pass
+            elif "wrist_image" in available_cameras and self.camera in ("wrist", ""):
+                self.camera = "wrist_image"
+            elif len(available_cameras) == 1:
+                self.camera = available_cameras[0]
+            else:
+                raise ValueError(f"Camera {self.camera} not found. Available: {available_cameras}")
 
         # Detect if noisy_poses are cumulative across episodes (LIBERO v3 quirk)
         # and pre-compute per-episode frame lengths + pose offsets
@@ -114,11 +119,15 @@ class ALIGNDataset(Dataset):
 
         for ep_idx in range(len(self._episode_keys)):
             key = self._episode_keys[ep_idx]
-            # Frame length is per-episode and authoritative
-            try:
-                n_frames = len(self._h5[f"{key}/frames/{self.camera}"])
-            except KeyError:
-                n_frames = len(self._h5[f"{key}/noisy_poses"])
+            # Frame length (handle both framedataset structures)
+            if self.camera is None:
+                # frames = Dataset — single array
+                n_frames = len(self._h5[f"{key}/frames"])
+            else:
+                try:
+                    n_frames = len(self._h5[f"{key}/frames/{self.camera}"])
+                except KeyError:
+                    n_frames = len(self._h5[f"{key}/noisy_poses"])
             self._ep_frame_lengths.append(n_frames)
 
             # Pose offset: in cumulative HDF5, ep_N starts AFTER all previous episodes
@@ -154,6 +163,9 @@ class ALIGNDataset(Dataset):
         key = self._episode_keys[ep_idx]
         if self._single_episode:
             frames = self._h5["frames"][start:start + count]
+        elif self.camera is None:
+            # Frames is a single Dataset (N, H, W, 3)
+            frames = self._h5[f"{key}/frames"][start:start + count]
         else:
             frames = self._h5[f"{key}/frames/{self.camera}"][start:start + count]
         return frames
@@ -349,18 +361,18 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
 
     for item in batch:
         frames = item["frames"]
-        poses_clean = item["poses"]  # Ground truth expert demonstrations from HDF5
+        poses_clean = item["poses"][..., :6]  # Ensure 6D (drop quaternion if 7D)
         texts_raw = item["text"] if isinstance(item["text"], list) else item["text"]
 
         N = len(poses_clean)
         max_t = N - chunk_size
-        t = np.random.randint(0, max_t + 1) if max_t >= 0 else 0
+        t = rng.integers(0, min(max(max_t + 1, 1), N)) if max_t >= 0 else min(rng.integers(0, 2), N - 1)
 
-        # --- Past Trajectory Window (Clean for encoding) ---
-        past_start = max(0, t - chunk_size)
-        traj_window = poses_clean[past_start:t + 1]
+        # --- Past Trajectory Window (Clean for encoding) — fixed to always be chunk_size ---
+        start = max(0, t - chunk_size + 1)
+        traj_window = poses_clean[start:t + 1]
         if len(traj_window) < chunk_size:
-            pad = np.zeros((chunk_size - len(traj_window), poses_clean.shape[1]), dtype=poses_clean.dtype)
+            pad = np.zeros((chunk_size - len(traj_window), 6), dtype=np.float32)
             traj_window = np.concatenate([pad, traj_window], axis=0)
 
         # --- Inject Noise for Current Pose ---
