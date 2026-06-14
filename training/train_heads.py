@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ALIGN head training script — single joint stage.
+"""ALIGN head training — independent stages so neither head interferes.
 
-Phase 2: Trains Decision + Assistant heads with joint loss on frozen
-encoder+mixer embeddings.
+Phase 2a (Decision): Train alpha prediction with BCE only.
+Phase 2b (Assistant): Train delta-pose correction with MSE only.
 
 Usage:
-    python training/train_heads.py --data ./align.h5 \\
-        --pretrained ./checkpoints/pretrain/best.pt \\
-        --output-dir ./checkpoints/heads \\
-        --epochs-heads 30
+    # Both stages in sequence (default)
+    python training/train_heads.py \\\n        --data ./align.h5 \\\n        --pretrained ./checkpoints/pretrain/best.pt \\\n        --output-dir ./checkpoints/heads \\\n        --epochs-decision 10 \\\n        --epochs-assistant 10
+
+    # Decision head only
+    python training/train_heads.py --data ./align.h5 \\\n        --pretrained ./checkpoints/pretrain/best.pt \\\n        --stage decision \\\n        --epochs-decision 10
 """
 
 import argparse
 import json
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -33,13 +33,35 @@ from training.wandb_utils import init_wandb
 from data.align_dataset import ALIGNDataset, head_collate
 
 
+# ================================================================
+# Common helper to freeze / unfreeze individual heads
+# ================================================================
+
+def _freeze_module(module):
+    """Freeze all parameters in a module."""
+    for p in module.parameters():
+        p.requires_grad = False
+
+
+def _unfreeze_module(module):
+    """Unfreeze all parameters in a module."""
+    for p in module.parameters():
+        p.requires_grad = True
+
+
+# ================================================================
+# Training
+# ================================================================
+
 def train_heads_hdf5(
     data_path: str,
     pretrained_checkpoint: str,
     output_dir: str,
-    epochs_heads: int = 30,
+    epochs_decision: int = 10,
+    epochs_assistant: int = 10,
     batch_size: int = 64,
-    lr: float = 1e-4,
+    lr_decision: float = 5e-4,
+    lr_assistant: float = 1e-3,
     weight_decay: float = 1e-4,
     chunk_size: int = 5,
     val_split: float = 0.1,
@@ -53,36 +75,44 @@ def train_heads_hdf5(
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
     use_bf16: bool = True,
-):
-    """Train heads from HDF5 data — single joint loss, all encoders frozen."""
-    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+) -> str:
+    """Train Decision and Assistant heads independently.
 
-    print(f"=== ALIGN Head Training (HDF5) ===")
-    print(f"  Data:       {data_path}")
-    print(f"  Pretrained: {pretrained_checkpoint}")
-    print(f"  Device:     {device}")
-    print(f"  Epochs:     {epochs_heads} (joint BCE + MSE)")
+    Phase 2a: BCE on alpha (freezes assistant).
+    Phase 2b: MSE on delta (freezes decision).
+    Neither head gradient affects the other.
+    """
+    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"=== ALIGN Head Training (independent stages) ===")
+    print(f"  Data:         {data_path}")
+    print(f"  Pretrained:   {pretrained_checkpoint}")
+    print(f"  Device:       {device}")
+    print(f"  Stage A (α):  {epochs_decision} epochs, lr={lr_decision}")
+    print(f"  Stage B (Δ):  {epochs_assistant} epochs, lr={lr_assistant}")
 
     # -- W&B ──
     wandb_trainer = init_wandb(
         project=wandb_project,
         name=wandb_run,
         config={
-            "model": "align-heads-hdf5",
+            "model": "align-heads-independent",
             "data": str(data_path),
             "pretrained_checkpoint": pretrained_checkpoint,
-            "epochs_heads": epochs_heads,
+            "epochs_decision": epochs_decision,
+            "epochs_assistant": epochs_assistant,
             "batch_size": batch_size,
-            "lr": lr,
+            "lr_decision": lr_decision,
+            "lr_assistant": lr_assistant,
             "weight_decay": weight_decay,
             "chunk_size": chunk_size,
             "device": str(device),
             "use_bf16": use_bf16,
         },
     ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
-    print(f"  W&B:         {'enabled' if wandb_trainer.enabled else 'disabled'}")
+    print(f"  W&B:          {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Dataset ──
     full_ds = ALIGNDataset(data_path, mode="head", traj_window=traj_window)
@@ -122,114 +152,208 @@ def train_heads_hdf5(
 
     ckpt = torch.load(pretrained_checkpoint, map_location=device)
     model.load_trainable_state_dict(ckpt["trainable_state_dict"])
+    
+    # Freeze backbones + encoders + mixer permanently
     model.freeze_backbone()
-    model.freeze_all_encoders()  # explicit: no gradient leaks to encoders or mixer
+    model.freeze_all_encoders()  
     print(f"  Loaded pretrained backbone from {pretrained_checkpoint}")
     print(f"  All encoders + mixer frozen — only heads train")
 
-    # -- Single joint head optimizer ──
-    optimizer = optim.AdamW(
-        model.get_head_params(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    log_path = out_dir / "head_log.jsonl"
+    log_fp = open(log_path, "w")
 
-    log_path = output_dir / "head_log.jsonl"
-    log_fp = open(log_path, "a")
-    best_loss = float("inf")
-    _step_start = time.time()
+    # ================================================================
+    # Phase 2a: Decision head (alpha) — BCE only
+    # ================================================================
+    print("\n=== Stage A: Training Decision Head (α) ===")
+    
+    # Freeze assistant, unfreeze decision
+    _freeze_module(model.assistant_head)
+    _unfreeze_module(model.decision_head)
+    
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(f"  Trainable params: {sum(p.numel() for p in trainable):,}")
+    
+    opt_a = optim.AdamW(trainable, lr=lr_decision, weight_decay=weight_decay)
+    best_loss_a = float("inf")
 
-    for epoch in range(epochs_heads):
+    for epoch in range(epochs_decision):
         model.train()
-        losses, alphas, deltas = [], [], []
+        losses_a, alphas_pred = [], []
 
         for step, batch in enumerate(train_loader):
             if step >= max_steps_per_epoch:
                 break
 
             frames = torch.from_numpy(batch["frames"]).to(device)
-            poses = torch.from_numpy(batch["noisy_pose"]).float().to(device)
             texts = batch["texts"]
             alpha_t = torch.from_numpy(batch["alpha_target"]).float().to(device)
-            delta_t = torch.from_numpy(batch["delta_target"]).float().to(device)
+            traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
 
-            # Encode through frozen encoders + mixer
-            with torch.no_grad():
-                traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
+            # Frozen encodings
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, traj_view, texts)
                 z_v = mixed["z_v"].float()
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
 
-            # Joint loss: BCE(α) + 0.5 × MSE(Δ)
+            # Decision loss only
             alpha_pred = model.decision_head(z_v, z_t, z_text)
-            delta_pred = model.assistant_head(z_v, z_t, z_text, poses)
+            loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_t)
 
-            loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_t) +
-                    0.5 * F.mse_loss(delta_pred, delta_t))
-
-            optimizer.zero_grad()
+            opt_a.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.get_head_params(), 1.0)
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            opt_a.step()
 
-            losses.append(loss.item())
-            alphas.append(alpha_pred.detach().mean().item())
-            deltas.append(delta_pred.detach().abs().mean().item())
+            losses_a.append(loss.item())
+            alphas_pred.append(alpha_pred.detach().mean().item())
 
-            if (step + 1) % 100 == 0:
-                _now = time.time()
-                print(f"  Epoch {epoch + 1}, step {step + 1}/{max_steps_per_epoch}  "
-                      f"loss: {loss.item():.4f}  α: {alpha_pred.mean().item():.3f}  "
-                      f"Δ: {delta_pred.abs().mean().item():.4f}", flush=True)
+        avg_loss = float(np.mean(losses_a))
+        av_alpha = float(np.mean(alphas_pred))
 
-        avg_loss = float(np.mean(losses))
-        avg_alpha = float(np.mean(alphas))
-        avg_delta = float(np.mean(deltas))
+        print(f"  [α] Epoch {epoch+1:3d}/{epochs_decision}  loss: {avg_loss:.4f}  α_mean: {av_alpha:.3f}")
 
-        print(f"  Epoch {epoch + 1:3d}  loss: {avg_loss:.4f}  "
-              f"α: {avg_alpha:.3f}  Δ: {avg_delta:.4f}")
-
-        # W&B logging
         wandb_trainer.log({
-            "head/loss": avg_loss,
-            "head/alpha_mean": avg_alpha,
-            "head/delta_mean": avg_delta,
-            "head/epoch": epoch + 1,
+            "stage": "decision",
+            "loss": avg_loss,
+            "alpha_mean": av_alpha,
+            "epoch": epoch + 1,
         }, step=epoch + 1)
 
         log_fp.write(json.dumps({
-            "stage": "joint", "epoch": epoch + 1,
-            "loss": avg_loss, "alpha_mean": avg_alpha, "delta_mean": avg_delta,
+            "stage": "decision", "epoch": epoch + 1,
+            "loss": avg_loss, "alpha_mean": av_alpha,
             "timestamp": datetime.now().isoformat(),
         }) + "\n")
         log_fp.flush()
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if avg_loss < best_loss_a:
+            best_loss_a = avg_loss
             model.save_heads_checkpoint(
-                str(output_dir / "best.pt"), epoch, avg_loss,
-                optimizer.state_dict(), {"chunk_size": chunk_size})
-            wandb_trainer.save(str(output_dir / "best.pt"))
-            print(f"  -> best.pt (loss: {avg_loss:.4f})")
+                str(out_dir / "decision_best.pt"), epoch, avg_loss,
+                opt_a.state_dict(), {"chunk_size": chunk_size})
+            print(f"  -> decision_best.pt (loss: {avg_loss:.4f})")
+
+    print(f"\n  Stage A complete. Best loss: {best_loss_a:.4f}")
+
+    # ================================================================
+    # Phase 2b: Assistant head (delta pose) — MSE only
+    # ================================================================
+    print("\n=== Stage B: Training Assistant Head (Δpose) ===")
+
+    # Freeze decision, unfreeze assistant
+    _freeze_module(model.decision_head)
+    _unfreeze_module(model.assistant_head)
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(f"  Trainable params: {sum(p.numel() for p in trainable):,}")
+
+    opt_b = optim.AdamW(trainable, lr=lr_assistant, weight_decay=weight_decay)
+    best_loss_b = float("inf")
+
+    for epoch in range(epochs_assistant):
+        model.train()
+        losses_b, deltas_pred = [], []
+
+        for step, batch in enumerate(train_loader):
+            if step >= max_steps_per_epoch:
+                break
+
+            frames = torch.from_numpy(batch["frames"]).to(device)
+            noisy_pose = torch.from_numpy(batch["noisy_pose"]).float().to(device)
+            texts = batch["texts"]
+            delta_t = torch.from_numpy(batch["delta_target"]).float().to(device)
+            traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
+
+            # Frozen encodings
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                mixed = model.encode_mixed(frames, traj_view, texts)
+                z_v = mixed["z_v"].float()
+                z_t = mixed["z_t"].float()
+                z_text = mixed["z_text"].float()
+
+            # Assistant loss only
+            delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_pose)
+            loss = F.mse_loss(delta_pred, delta_t)
+
+            opt_b.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            opt_b.step()
+
+            losses_b.append(loss.item())
+            deltas_pred.append(delta_pred.detach().abs().mean().item())
+
+        avg_loss = float(np.mean(losses_b))
+        av_delta = float(np.mean(deltas_pred))
+
+        print(f"  [Δ] Epoch {epoch+1:3d}/{epochs_assistant}  MSE: {avg_loss:.4f}  Δ_mean: {av_delta:.4f}")
+
+        wandb_trainer.log({
+            "stage": "assistant",
+            "loss": avg_loss,
+            "delta mean": av_delta,
+            "epoch": epoch + 1,
+        }, step=epochs_decision + epoch + 1)
+
+        log_fp.write(json.dumps({
+            "stage": "assistant", "epoch": epoch + 1,
+            "loss": avg_loss, "delta_mean": av_delta,
+            "timestamp": datetime.now().isoformat(),
+        }) + "\n")
+        log_fp.flush()
+
+        if avg_loss < best_loss_b:
+            best_loss_b = avg_loss
+            model.save_heads_checkpoint(
+                str(out_dir / "assistant_best.pt"), epoch, avg_loss,
+                opt_b.state_dict(), {"chunk_size": chunk_size})
+            print(f"  -> assistant_best.pt (loss: {avg_loss:.4f})")
+
+    print(f"\n  Stage B complete. Best loss: {best_loss_b:.4f}")
+
+    # ================================================================
+    # Save final combined checkpoint (both heads ready for inference)
+    # ================================================================
+    model.train()  # unfreeze everything for a proper save
+    _unfreeze_module(model.decision_head)
+    _unfreeze_module(model.assistant_head)
+    
+    model.save_heads_checkpoint(
+        str(out_dir / "heads_best.pt"), epochs_decision + epochs_assistant - 1,
+        best_loss_a + best_loss_b, opt_b.state_dict(), {"chunk_size": chunk_size})
 
     log_fp.close()
-    print(f"\n  Head training complete. Best loss: {best_loss:.4f}")
-    print(f"  Logs: {log_path}")
-    wandb_trainer.finish()
-    return str(output_dir / "best.pt")
+    print(f"\n  Head training complete.")
+    print(f"    Decision:   {out_dir / 'decision_best.pt'}")
+    print(f"    Assistant:  {out_dir / 'assistant_best.pt'}")
+    print(f"    Combined:   {out_dir / 'heads_best.pt'}")
+    print(f"    Logs:       {log_path}")
 
+    wandb_trainer.finish()
+    return str(out_dir / "heads_best.pt")
+
+
+# ================================================================
+# CLI
+# ================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ALIGN Head Training (HDF5, single joint stage)")
+    parser = argparse.ArgumentParser(
+        description="ALIGN Head Training (independent stages: Decision → Assistant)")
     parser.add_argument("--data", required=True, help="Path to align.h5 dataset")
-    parser.add_argument("--pretrained", required=True, help="Path to Phase 1 pretrained checkpoint")
+    parser.add_argument("--pretrained", required=True, help="Phase 1 pretrained checkpoint")
     parser.add_argument("--output-dir", default="./checkpoints/heads")
-    parser.add_argument("--epochs-heads", type=int, default=30,
-                        help="Total joint head training epochs (default 30)")
+    parser.add_argument("--epochs-decision", type=int, default=10,
+                        help="Decision (alpha) training epochs")
+    parser.add_argument("--epochs-assistant", type=int, default=10,
+                        help="Assistant (delta-pose) training epochs")
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-decision", type=float, default=5e-4,
+                        help="Learning rate for Decision head")
+    parser.add_argument("--lr-assistant", type=float, default=1e-3,
+                        help="Learning rate for Assistant head")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--chunk-size", type=int, default=5)
     parser.add_argument("--val-split", type=float, default=0.1)
@@ -253,9 +377,11 @@ def main():
         data_path=args.data,
         pretrained_checkpoint=args.pretrained,
         output_dir=args.output_dir,
-        epochs_heads=args.epochs_heads,
+        epochs_decision=args.epochs_decision,
+        epochs_assistant=args.epochs_assistant,
         batch_size=args.batch_size,
-        lr=args.lr,
+        lr_decision=args.lr_decision,
+        lr_assistant=args.lr_assistant,
         weight_decay=args.weight_decay,
         chunk_size=args.chunk_size,
         val_split=args.val_split,
