@@ -244,6 +244,21 @@ class ALIGNDataset(Dataset):
 
 
 # ================================================================
+# Head Training Utilities
+# ================================================================
+
+NOISE_STD = 0.015 # 1.5cm positional noise for synthetic human deviation
+D_MAX = 0.10      # Max drift before full assist (alpha=1)
+
+def inject_kinematic_noise(pos: np.ndarray, rng: np.random.RandomState, std: float = NOISE_STD) -> np.ndarray:
+    """Inject zero-mean Gaussian noise on position [x, y, z]."""
+    pos_noisy = pos.copy()
+    if len(pos) >= 3:
+        pos_noisy[:3] += rng.randn(3).astype(np.float32) * std
+    return pos_noisy
+
+
+# ================================================================
 # Collate function for contrastive pretraining
 # ================================================================
 
@@ -302,78 +317,84 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
 
 
 def head_collate(batch: list, chunk_size: int = 5) -> dict:
-    """Collate batch for head training.
+    """Collate batch for head training with on-the-fly noise injection.
 
-    Returns sequential chunks for Decision + Assistant supervision.
+    Returns sequential chunks for Decision (α = need × capability) + Assistant supervision.
 
-    Note: distances were removed from the Decision head — DINOv2
-    visual features implicitly encode scale/depth, so explicit
-    distance features are not needed (and hard to obtain at deploy).
+    Note: The 'capability' part (cosine similarity of embeddings) is calculated 
+    during the forward pass in train_heads.py using frozen encoders. This collate
+    function provides the 'need' component via kinematic error from noisy poses.
 
     Returns:
         {
             "frames": (B, H, W, 3) uint8,
-            "noisy_pose": (B, 6) float32 — current frame pose,
-            "trajectory": (B, K, 6) float32 — past window,
-            "alpha_target": (B,) float32,
-            "delta_target": (B, chunk_size, 6) float32,
-            "texts": list of strings,
+            "noisy_pose": (B, 6) float32 — corrupted pose for input,
+            "clean_pose":  (B, 6) float32 — ground truth pose from HDF5,
+            "trajectory":  (B, K, 6) float32 — past window of clean poses,
+            "alpha_need":  (B,) float32    — kinematic error part of alpha_target,
+            "delta_target":(B, chunk_size, 6) float32,
+            "texts":       list of strings,
         }
     """
     all_frames = []
     all_noisy = []
+    all_clean = []
     all_trajs = []
-    all_alphas = []
+    all_needs = []
     all_deltas = []
     all_texts = []
 
+    # Use a fixed seed for noise injection in the batch so it's reproducible
+    rng = np.random.RandomState(42) 
+
     for item in batch:
         frames = item["frames"]
-        poses = item["poses"]
-        texts = item["text"] if isinstance(item["text"], list) else item["text"]
+        poses_clean = item["poses"]  # Ground truth expert demonstrations from HDF5
+        texts_raw = item["text"] if isinstance(item["text"], list) else item["text"]
 
-        N = len(poses)
-        # Pick a random valid position for chunk extraction
+        N = len(poses_clean)
         max_t = N - chunk_size
-        if max_t >= 0:
-            t = np.random.randint(0, max_t)
-        else:
-            t = 0
+        t = np.random.randint(0, max(max_t, 1)) if max_t > 0 else 0
 
-        # Past trajectory window
+        # --- Past Trajectory Window (Clean for encoding) ---
         past_start = max(0, t - chunk_size)
-        traj_window = poses[past_start:t + 1]  # could be < K, pad if needed
+        traj_window = poses_clean[past_start:t + 1]
         if len(traj_window) < chunk_size:
-            pad = np.zeros((chunk_size - len(traj_window), poses.shape[1]), dtype=poses.dtype)
+            pad = np.zeros((chunk_size - len(traj_window), poses_clean.shape[1]), dtype=poses_clean.dtype)
             traj_window = np.concatenate([pad, traj_window], axis=0)
 
-        # Future delta target
+        # --- Inject Noise for Current Pose ---
+        current_clean_pose = poses_clean[t]
+        noisy_pose = inject_kinematic_noise(current_clean_pose, rng)
+
+        # --- Compute "Need" (Kinematic Error / D_MAX) ---
+        pos_error = np.linalg.norm(current_clean_pose[:3] - noisy_pose[:3])
+        need = min(pos_error / D_MAX, 1.0)
+
+        # --- Compute Future Delta Target (Correction from Noisy to Clean) ---
         delta = np.zeros((chunk_size, 6), dtype=np.float32)
         for i in range(1, chunk_size + 1):
             if t + i < N:
-                delta[i - 1] = poses[t + i, :6] - poses[t, :6]
-
-        # α_target placeholder — to be overwritten after GT generation
-        alpha_target = 0.5  # placeholder
+                # The correction needed is the delta between future clean and current noisy
+                delta[i - 1] = poses_clean[t + i, :6] - noisy_pose[:6]
 
         # Text variant
-        if isinstance(texts, list):
-            text = texts[np.random.randint(len(texts))]
-        else:
-            text = texts
+        text = texts_raw if isinstance(texts_raw, str) else texts_raw[rng.randint(len(texts_raw))]
 
         all_frames.append(frames[t])
-        all_noisy.append(poses[t, :6])
+        all_noisy.append(noisy_pose[:6])
+        all_clean.append(current_clean_pose[:6])
         all_trajs.append(traj_window[:, :6])
-        all_alphas.append(alpha_target)
+        all_needs.append(need)
         all_deltas.append(delta)
         all_texts.append(text)
 
     return {
         "frames": np.stack(all_frames, axis=0),
         "noisy_pose": np.stack(all_noisy, axis=0).astype(np.float32),
+        "clean_pose": np.stack(all_clean, axis=0).astype(np.float32),
         "trajectory": np.stack(all_trajs, axis=0).astype(np.float32),
-        "alpha_target": np.array(all_alphas, dtype=np.float32),
+        "alpha_need": np.array(all_needs, dtype=np.float32),
         "delta_target": np.stack(all_deltas, axis=0).astype(np.float32),
         "texts": all_texts,
     }

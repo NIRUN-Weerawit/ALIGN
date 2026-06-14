@@ -187,26 +187,40 @@ def train_heads_hdf5(
 
             frames = torch.from_numpy(batch["frames"]).to(device)
             texts = batch["texts"]
-            alpha_t = torch.from_numpy(batch["alpha_target"]).float().to(device)
+            alpha_need = torch.from_numpy(batch["alpha_need"]).float().to(device)
             traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
 
-            # Frozen encodings
+            # Frozen encodings via mixer
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, traj_view, texts)
                 z_v = mixed["z_v"].float()
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
 
-            # Decision loss only
+            # Compute CAPABILITY from cosine similarities of frozen embeddings
+            z_v_n = F.normalize(z_v, dim=-1)
+            z_t_n = F.normalize(z_t, dim=-1)
+            z_text_n = F.normalize(z_text, dim=-1)
+
+            cos_vt = (z_v_n * z_t_n).sum(dim=-1).clamp(min=0.0)  # (B,)
+            cos_vl = (z_v_n * z_text_n).sum(dim=-1).clamp(min=0.0) # (B,)
+            cos_tl = (z_text_n * z_t_n).sum(dim=-1).clamp(min=0.0) # (B,)
+
+            capability = torch.stack([cos_vt, cos_vl, cos_tl], dim=-1).mean(dim=-1)  # Mean of the 3 sims
+
+            # Dynamic Target: Need (kinematic error) * Capability (encoder confidence)
+            alpha_target = alpha_need * capability
+
+            # Decision loss only (BCE against dynamic target)
             alpha_pred = model.decision_head(z_v, z_t, z_text)
-            loss = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_t)
+            loss_bce = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target)
 
             opt_a.zero_grad()
-            loss.backward()
+            loss_bce.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt_a.step()
 
-            losses_a.append(loss.item())
+            losses_a.append(loss_bce.item())
             alphas_pred.append(alpha_pred.detach().mean().item())
 
         avg_loss = float(np.mean(losses_a))
@@ -266,23 +280,23 @@ def train_heads_hdf5(
             delta_t = torch.from_numpy(batch["delta_target"]).float().to(device)
             traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
 
-            # Frozen encodings
+            # Frozen encodings via mixer
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, traj_view, texts)
                 z_v = mixed["z_v"].float()
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
 
-            # Assistant loss only
+            # Assistant loss only (MSE against dynamic delta target)
             delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_pose)
-            loss = F.mse_loss(delta_pred, delta_t)
+            loss_mse = F.mse_loss(delta_pred, delta_t)
 
             opt_b.zero_grad()
-            loss.backward()
+            loss_mse.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt_b.step()
 
-            losses_b.append(loss.item())
+            losses_b.append(loss_mse.item())
             deltas_pred.append(delta_pred.detach().abs().mean().item())
 
         avg_loss = float(np.mean(losses_b))
