@@ -197,7 +197,7 @@ def train_heads_hdf5(
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
 
-            # Compute CAPABILITY from cosine similarities of frozen embeddings
+            # Compute consistency from cosine similarities of frozen embeddings
             z_v_n = F.normalize(z_v, dim=-1)
             z_t_n = F.normalize(z_t, dim=-1)
             z_text_n = F.normalize(z_text, dim=-1)
@@ -206,10 +206,11 @@ def train_heads_hdf5(
             cos_vl = (z_v_n * z_text_n).sum(dim=-1).clamp(min=0.0) # (B,)
             cos_tl = (z_text_n * z_t_n).sum(dim=-1).clamp(min=0.0) # (B,)
 
-            capability = torch.stack([cos_vt, cos_vl, cos_tl], dim=-1).mean(dim=-1)  # Mean of the 3 sims
+            consistency = 1.0 # Placeholder for consistency — we dont need to train model to output this, it can be computed directly from the frozen encoders. --- IGNORE ---
+            # consistency = torch.stack([cos_vt, cos_vl, cos_tl], dim=-1).mean(dim=-1)  # Mean of the 3 sims
 
-            # Dynamic Target: Need (kinematic error) * Capability (encoder confidence)
-            alpha_target = alpha_need * capability
+            # Dynamic Target: Need (kinematic error) * Consistency (cosine similarity of frozen embeddings)
+            alpha_target = alpha_need * consistency
 
             # Decision loss only (BCE against dynamic target)
             alpha_pred = model.decision_head(z_v, z_t, z_text)

@@ -250,11 +250,11 @@ class ALIGNDataset(Dataset):
 NOISE_STD = 0.015 # 1.5cm positional noise for synthetic human deviation
 D_MAX = 0.10      # Max drift before full assist (alpha=1)
 
-def inject_kinematic_noise(pos: np.ndarray, rng: np.random.RandomState, std: float = NOISE_STD) -> np.ndarray:
+def inject_kinematic_noise(pos: np.ndarray, rng: "np.random.Generator", std: float = NOISE_STD) -> np.ndarray:
     """Inject zero-mean Gaussian noise on position [x, y, z]."""
     pos_noisy = pos.copy()
     if len(pos) >= 3:
-        pos_noisy[:3] += rng.randn(3).astype(np.float32) * std
+        pos_noisy[:3] += rng.standard_normal(3).astype(np.float32) * std
     return pos_noisy
 
 
@@ -319,9 +319,9 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
 def head_collate(batch: list, chunk_size: int = 5) -> dict:
     """Collate batch for head training with on-the-fly noise injection.
 
-    Returns sequential chunks for Decision (α = need × capability) + Assistant supervision.
+    Returns sequential chunks for Decision (α = need × consistency) + Assistant supervision.
 
-    Note: The 'capability' part (cosine similarity of embeddings) is calculated 
+    Note: The 'consistency' part (cosine similarity of embeddings) is calculated 
     during the forward pass in train_heads.py using frozen encoders. This collate
     function provides the 'need' component via kinematic error from noisy poses.
 
@@ -345,7 +345,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
     all_texts = []
 
     # Use a fixed seed for noise injection in the batch so it's reproducible
-    rng = np.random.RandomState(42) 
+    rng = np.random.default_rng()
 
     for item in batch:
         frames = item["frames"]
@@ -354,7 +354,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
 
         N = len(poses_clean)
         max_t = N - chunk_size
-        t = np.random.randint(0, max(max_t, 1)) if max_t > 0 else 0
+        t = np.random.randint(0, max_t + 1) if max_t >= 0 else 0
 
         # --- Past Trajectory Window (Clean for encoding) ---
         past_start = max(0, t - chunk_size)
@@ -371,15 +371,23 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         pos_error = np.linalg.norm(current_clean_pose[:3] - noisy_pose[:3])
         need = min(pos_error / D_MAX, 1.0)
 
-        # --- Compute Future Delta Target (Correction from Noisy to Clean) ---
+        # --- Option B: Recovery + Incremental Expert Trajectory Targets ---
+        # Step 0: Immediate recovery from deviation toward expert path
+        # Steps 1..N-1: Smooth continuation along expert motion increments
         delta = np.zeros((chunk_size, 6), dtype=np.float32)
-        for i in range(1, chunk_size + 1):
+
+        if t + 1 < N:
+            delta[0] = poses_clean[t + 1, :6] - noisy_pose[:6]  # Recovery correction
+
+        for i in range(2, chunk_size + 1):
             if t + i < N:
-                # The correction needed is the delta between future clean and current noisy
-                delta[i - 1] = poses_clean[t + i, :6] - noisy_pose[:6]
+                delta[i - 1] = poses_clean[t + i, :6] - poses_clean[t + i - 1, :6]  # Expert increment
 
         # Text variant
-        text = texts_raw if isinstance(texts_raw, str) else texts_raw[rng.randint(len(texts_raw))]
+        if isinstance(texts_raw, list):
+            text = texts_raw[rng.integers(0, len(texts_raw))]
+        else:
+            text = texts_raw
 
         all_frames.append(frames[t])
         all_noisy.append(noisy_pose[:6])
