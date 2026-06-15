@@ -32,6 +32,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -203,7 +204,16 @@ def record_episode_video(
             z_v = mixed["z_v"]
             z_t = mixed["z_t"]
 
-            alpha = model.decision_head(z_v, z_t, z_text)
+            # Full gating signal: α = need × consistency
+            alpha_raw = model.decision_head(z_v, z_t, z_text)
+            z_v_n = F.normalize(z_v, dim=-1)
+            z_t_n = F.normalize(z_t, dim=-1)
+            z_text_n = F.normalize(z_text, dim=-1)
+            cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)
+            cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)
+            cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)
+            consistency = torch.min(torch.min(cos_vt, cos_vl), cos_tl)
+            alpha = alpha_raw * consistency
             alpha_val = float(alpha.squeeze().cpu())
 
             noisy_t = torch.from_numpy(raw_pose).unsqueeze(0).float().to(device)
@@ -333,7 +343,16 @@ def run_episode(
             z_v = mixed["z_v"]
             z_t = mixed["z_t"]
 
-            alpha = model.decision_head(z_v, z_t, z_text)
+            # Full gating signal: α = need × consistency
+            alpha_raw = model.decision_head(z_v, z_t, z_text)
+            z_v_n = F.normalize(z_v, dim=-1)
+            z_t_n = F.normalize(z_t, dim=-1)
+            z_text_n = F.normalize(z_text, dim=-1)
+            cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)
+            cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)
+            cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)
+            consistency = torch.min(torch.min(cos_vt, cos_vl), cos_tl)
+            alpha = alpha_raw * consistency
             alpha_val = float(alpha.squeeze().cpu())
 
             noisy_t = torch.from_numpy(raw_pose).unsqueeze(0).float().to(device)

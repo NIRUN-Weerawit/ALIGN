@@ -46,12 +46,13 @@ class ALIGNInference:
         traj_window: int = 20,
         chunk_size: int = 10,
         device: Optional[str] = None,
+        encoder_checkpoint: Optional[str] = None,
     ):
         self.traj_window = traj_window
         self.chunk_size = chunk_size
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Load checkpoint first to detect chunk_size
+        # Load heads checkpoint first to detect chunk_size
         ckpt = torch.load(checkpoint_path, map_location=self.device)
         cfg = ckpt.get("config", {})
         if cfg.get("chunk_size"):
@@ -66,7 +67,16 @@ class ALIGNInference:
             device=self.device,
         ).to(self.device)
 
-        # Load checkpoint — handle all save formats
+        # Load encoder backbone (Phase 1 checkpoint) if provided
+        if encoder_checkpoint:
+            enc_ckpt = torch.load(encoder_checkpoint, map_location=self.device)
+            if "trainable_state_dict" in enc_ckpt:
+                self.model.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
+            print(f"[ALIGN] Loaded encoder backbone: {encoder_checkpoint}")
+        else:
+            print("[ALIGN] WARNING: No encoder checkpoint provided. Encoders are randomly initialized!")
+
+        # Load heads on top (overwrites head params from encoder checkpoint if any)
         if "trainable_state_dict" in ckpt:
             self.model.load_trainable_state_dict(ckpt["trainable_state_dict"])
         elif "model_state_dict" in ckpt:
@@ -75,7 +85,7 @@ class ALIGNInference:
             self.model.load_state_dict(ckpt, strict=False)
 
         self.model.eval()
-        print(f"[ALIGN] Loaded: {checkpoint_path}  (phase={ckpt.get('phase','?')}, "
+        print(f"[ALIGN] Loaded heads: {checkpoint_path}  (phase={ckpt.get('phase','?')}, "
               f"epoch={ckpt.get('epoch','?')})")
 
         # Precompute text embedding (cached for episode)
