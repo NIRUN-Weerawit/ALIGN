@@ -398,6 +398,7 @@ def evaluate_suite(
     n_episodes: int = 3,
     max_steps: int = 500,
     record_video: bool = False,
+    encoder_checkpoint: str = None,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(output_dir) / suite_name
@@ -410,6 +411,16 @@ def evaluate_suite(
         embed_dim=256, chunk_size=chunk_size, use_text=True, device=device,
     ).to(device)
 
+    # Load encoder backbone first if provided
+    if encoder_checkpoint:
+        enc_ckpt = torch.load(encoder_checkpoint, map_location=device)
+        if "trainable_state_dict" in enc_ckpt:
+            model.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
+        print(f"  Loaded encoder backbone: {encoder_checkpoint}")
+    else:
+        print("  WARNING: No encoder checkpoint — encoders are randomly initialized!")
+
+    # Load heads on top
     if "trainable_state_dict" in ckpt:
         model.load_trainable_state_dict(ckpt["trainable_state_dict"])
     elif "model_state_dict" in ckpt:
@@ -524,6 +535,8 @@ def main():
                         help="Run only one suite (default: all)")
     parser.add_argument("--record-video", action="store_true",
                         help="Record MP4 videos of episodes")
+    parser.add_argument("--encoder-checkpoint", default=None,
+                        help="Phase 1 pretrained backbone checkpoint (required for proper inference)")
     args = parser.parse_args()
 
     suites_to_run = [args.suite] if args.suite else list(LIBERO_TASK_MAP.keys())
@@ -545,6 +558,7 @@ def main():
             n_episodes=args.n_episodes,
             max_steps=args.max_steps,
             record_video=args.record_video,
+            encoder_checkpoint=args.encoder_checkpoint,
         )
         if result:
             all_summaries[suite_name] = result
