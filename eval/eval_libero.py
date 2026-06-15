@@ -65,11 +65,19 @@ _benchmark_file = _os.path.join(
 if _os.path.exists(_benchmark_file):
     import importlib.util as _util
     _spec = _util.spec_from_file_location("_libero_task_map", _benchmark_file)
-    _mod = _util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    for suite_key, suite_name in LIBERO_TASK_MAP.items():
-        if hasattr(_mod, 'libero_task_map') and suite_key in _mod.libero_task_map:
-            SUITE_TASK_LISTS[suite_key] = _mod.libero_task_map[suite_key]
+    if _spec and _spec.loader:
+        _mod = _util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        for suite_key, suite_name in LIBERO_TASK_MAP.items():
+            if hasattr(_mod, 'libero_task_map') and suite_key in _mod.libero_task_map:
+                SUITE_TASK_LISTS[suite_key] = _mod.libero_task_map[suite_key]
+
+
+def get_bddl_path(suite_name: str, task_name: str) -> str:
+    """Get the full path to a BDDL file for a given suite and task."""
+    from libero.libero import get_libero_path
+    bddl_dir = get_libero_path("bddl_files")
+    return _os.path.join(bddl_dir, suite_name, f"{task_name}.bddl")
 
 
 def get_env_meta(suite_name: str):
@@ -269,11 +277,13 @@ def evaluate_suite(
                 # Precompute text embedding
                 z_text = model.encode_text([task_name])
 
-                env = env_meta(
-                    suite_name=suite_name,
-                    task_name=task_name,
-                    has_renderer=False,
-                    has_offscreen_renderer=True,
+                bddl_path = get_bddl_path(suite_name, task_name)
+                if not _os.path.exists(bddl_path):
+                    print(f"    WARNING: BDDL not found: {bddl_path}")
+                    continue
+
+                env = OffScreenRenderEnv(
+                    bddl_file_name=bddl_path,
                     use_camera_obs=True,
                     camera_names=["agentview"],
                     camera_widths=224,
