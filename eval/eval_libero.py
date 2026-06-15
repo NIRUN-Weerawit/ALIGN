@@ -99,7 +99,7 @@ def _overlay_text(frame: np.ndarray, text: str, pos=(10, 10), color=(0, 255, 0))
     img = Image.fromarray(frame)
     draw = ImageDraw.Draw(img)
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
     except (OSError, IOError):
         font = ImageFont.load_default()
     draw.text(pos, text, fill=color, font=font)
