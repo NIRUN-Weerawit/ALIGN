@@ -127,6 +127,7 @@ def main():
                 # Reset buffers
                 for cam in cameras:
                     ep_buffer[cam] = []
+                ep_buffer["task"] = None
 
             # Accumulate frames for ALL detected camera keys
             for k in img_keys:
