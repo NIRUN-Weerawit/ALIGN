@@ -55,6 +55,12 @@ def evaluate(
     model.eval()
     print(f"  Phase from checkpoint: {ckpt.get('phase', 'N/A')}, Epoch: {ckpt.get('epoch', '?')}")
 
+    # Detect chunk_size from checkpoint config
+    cfg = ckpt.get("config", {})
+    if cfg.get("chunk_size"):
+        chunk_size = cfg["chunk_size"]
+        print(f"  Detected chunk_size={chunk_size} from checkpoint config")
+
     #  -- Dataset (use the last val_split as validation)
     ds = ALIGNDataset(data_path, mode="head", traj_window=traj_window)
     n_total = len(ds)
