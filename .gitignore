@@ -1,6 +1,7 @@
 # Data
 align_data/
 h5_data/
+data/*.h5
 
 # Training artifacts
 checkpoints/
