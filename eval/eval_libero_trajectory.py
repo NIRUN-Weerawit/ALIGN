@@ -468,6 +468,7 @@ def evaluate_suite(
                     camera_heights=224,
                     reward_shaping=True,
                     control_freq=20,
+                    initialization_noise=None,
                 )
 
                 result = run_episode_in_sim(
