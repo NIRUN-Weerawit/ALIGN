@@ -111,11 +111,17 @@ def find_episode_for_task(h5_path: str, task_name: str) -> Optional[dict]:
                 continue
             import json as _json
             text = _json.loads(texts_raw[()])[0]
-            # Match by checking if task_name is a substring of the text
-            # (HDF5 text may be shorter than the full BDDL task name)
-            task_short = task_name.replace("_", " ").lower()
-            text_short = text.replace("_", " ").lower()
-            if task_short[:30] in text_short or text_short[:30] in task_short:
+            # Match by extracting the core task description
+            # BDDL names: "LIVING_ROOM_SCENE5_put_the_white_mug..."
+            # HDF5 texts: "put the white mug on the left plate..."
+            # Strip scene prefix from BDDL name and compare
+            task_parts = task_name.split("_", 2)  # ["LIVING", "ROOM", "SCENE5_put..."]
+            task_desc = task_parts[-1] if len(task_parts) >= 3 else task_name
+            # Normalize both
+            text_normalized = text.lower().replace("_", " ").strip()
+            task_normalized = task_desc.lower().replace("_", " ").strip()
+            # Compare first 40 chars
+            if text_normalized[:40] in task_normalized or task_normalized[:40] in text_normalized:
                 # Found a match
                 frames_group = group.get("frames", None)
                 if frames_group is None:
@@ -173,8 +179,11 @@ def run_episode_in_sim(
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
-    The expert trajectory from the dataset is replayed as the "human" input.
-    Noise is injected to simulate a bad teleoperator. ALIGN corrects it.
+    Runs TWO parallel trajectories for comparison:
+      - No ALIGN: raw noisy pose → step sim (baseline)
+      - With ALIGN: noisy pose + correction → step sim
+
+    Both are compared against the expert trajectory.
     """
     n_expert = min(len(expert_poses), max_steps)
     rng = np.random.default_rng(42)
@@ -193,14 +202,14 @@ def run_episode_in_sim(
     delta_norms = []
     pose_buffer = []
     chunk_cache = None
-    error_before = []
-    error_after = []
+    error_no_align = []   # error when using raw noisy pose
+    error_with_align = []  # error when using ALIGN-corrected pose
     frames_buffer = []
 
     while not done and step < max_steps and step < n_expert:
         # Get camera image from simulation
         frame = None
-        for cam_name in ["agentview_image", "wrist_camera", "agentview"]:
+        for cam_name in ["agentview_image", "wrist_camera", "agentview", "camera"]:
             if cam_name in obs:
                 frame = obs[cam_name]
                 break
@@ -228,15 +237,6 @@ def run_episode_in_sim(
         else:
             frame = np.zeros((224, 224, 3), dtype=np.uint8)
 
-        # Get current robot EEF pose from sim
-        eef_pos = obs.get("robot0_eef_pos", np.zeros(3))
-        eef_quat = obs.get("robot0_eef_quat", np.array([1, 0, 0, 0]))
-        if isinstance(eef_pos, torch.Tensor):
-            eef_pos = eef_pos.cpu().numpy()
-        if isinstance(eef_quat, torch.Tensor):
-            eef_quat = eef_quat.cpu().numpy()
-        sim_pose = np.concatenate([eef_pos, quat_to_axisangle(eef_quat)]).astype(np.float32)
-
         # Use the noisy expert pose as the "human teleoperation" input
         raw_pose = noisy_poses[step]
         clean_pose = expert_poses[step]
@@ -250,7 +250,6 @@ def run_episode_in_sim(
 
         if step < 5:
             step += 1
-            # Use raw noisy pose to step the sim (no ALIGN correction yet)
             action = np.zeros(7, dtype=np.float32)
             action[:6] = raw_pose
             action[6] = -1.0
@@ -294,11 +293,11 @@ def run_episode_in_sim(
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(chunk_np[0])))
 
-        # Compute errors against expert trajectory
-        err_before = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
-        err_after = float(np.linalg.norm(commanded_pose[:3] - clean_pose[:3]))
-        error_before.append(err_before)
-        error_after.append(err_after)
+        # Compare: no ALIGN vs with ALIGN
+        err_no_align = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
+        err_with_align = float(np.linalg.norm(commanded_pose[:3] - clean_pose[:3]))
+        error_no_align.append(err_no_align)
+        error_with_align.append(err_with_align)
 
         # Overlay on frame
         if record_video:
@@ -311,7 +310,7 @@ def run_episode_in_sim(
             except (OSError, IOError):
                 font = ImageFont.load_default()
             draw.text((10, 10), f"α={alpha_val:.2f}  Δ={delta_norms[-1]:.3f}  step={step}", fill=(0, 255, 0), font=font)
-            draw.text((10, 30), f"err {err_before:.3f}→{err_after:.3f}", fill=(255, 255, 0), font=font)
+            draw.text((10, 30), f"no_align={err_no_align:.3f}  align={err_with_align:.3f}", fill=(255, 255, 0), font=font)
             frames_buffer.append(np.array(img))
 
         # Step sim with ALIGN's commanded pose
@@ -326,18 +325,18 @@ def run_episode_in_sim(
     # Summary
     avg_alpha = float(np.mean(alpha_vals)) if alpha_vals else 0.0
     avg_delta = float(np.mean(delta_norms)) if delta_norms else 0.0
-    avg_err_before = float(np.mean(error_before)) if error_before else 0.0
-    avg_err_after = float(np.mean(error_after)) if error_after else 0.0
-    improvement = avg_err_before - avg_err_after
-    improvement_pct = (improvement / avg_err_before * 100) if avg_err_before > 0 else 0.0
+    avg_err_no_align = float(np.mean(error_no_align)) if error_no_align else 0.0
+    avg_err_with_align = float(np.mean(error_with_align)) if error_with_align else 0.0
+    improvement = avg_err_no_align - avg_err_with_align
+    improvement_pct = (improvement / avg_err_no_align * 100) if avg_err_no_align > 0 else 0.0
 
     return {
         "success": success,
         "steps": step,
         "mean_alpha": avg_alpha,
         "mean_delta_norm": avg_delta,
-        "mean_error_before": avg_err_before,
-        "mean_error_after": avg_err_after,
+        "mean_error_no_align": avg_err_no_align,
+        "mean_error_with_align": avg_err_with_align,
         "improvement": improvement,
         "improvement_pct": improvement_pct,
         "frames_buffer": frames_buffer,
@@ -444,7 +443,7 @@ def evaluate_suite(
                 status = "✓" if result["improvement"] > 0 else "✗"
                 print(f"    {status}  α={result['mean_alpha']:.3f}  "
                       f"Δ={result['mean_delta_norm']:.4f}  "
-                      f"err {result['mean_error_before']:.4f}→{result['mean_error_after']:.4f}  "
+                      f"no_align={result['mean_error_no_align']:.4f}  align={result['mean_error_with_align']:.4f}  "
                       f"{result['improvement_pct']:+.1f}%")
 
                 # Save video
@@ -472,17 +471,17 @@ def evaluate_suite(
     if all_results:
         avg_alpha = float(np.mean([r["mean_alpha"] for r in all_results]))
         avg_delta = float(np.mean([r["mean_delta_norm"] for r in all_results]))
-        avg_err_before = float(np.mean([r["mean_error_before"] for r in all_results]))
-        avg_err_after = float(np.mean([r["mean_error_after"] for r in all_results]))
+        avg_err_no_align = float(np.mean([r["mean_error_no_align"] for r in all_results]))
+        avg_err_with_align = float(np.mean([r["mean_error_with_align"] for r in all_results]))
         avg_improvement = float(np.mean([r["improvement"] for r in all_results]))
         n_improved = sum(1 for r in all_results if r["improvement"] > 0)
 
         print(f"\n  --- {suite_name} Summary ---")
         print(f"  Avg α:              {avg_alpha:.3f}")
         print(f"  Avg Δ:              {avg_delta:.4f}")
-        print(f"  Error before:       {avg_err_before:.4f}")
-        print(f"  Error after:        {avg_err_after:.4f}")
-        print(f"  Avg improvement:    {avg_improvement:.4f} ({avg_improvement/avg_err_before*100:+.1f}%)")
+        print(f"  No ALIGN error:     {avg_err_no_align:.4f}")
+        print(f"  With ALIGN error:   {avg_err_with_align:.4f}")
+        print(f"  Avg improvement:    {avg_improvement:.4f} ({avg_improvement/avg_err_no_align*100:+.1f}%)")
         print(f"  Episodes improved:  {n_improved}/{len(all_results)} ({n_improved/len(all_results):.0%})")
 
         results = {
@@ -491,10 +490,10 @@ def evaluate_suite(
             "n_episodes": len(all_results),
             "avg_alpha": avg_alpha,
             "avg_delta": avg_delta,
-            "avg_error_before": avg_err_before,
-            "avg_error_after": avg_err_after,
+            "avg_error_no_align": avg_err_no_align,
+            "avg_error_with_align": avg_err_with_align,
             "avg_improvement": avg_improvement,
-            "avg_improvement_pct": avg_improvement / avg_err_before * 100 if avg_err_before > 0 else 0.0,
+            "avg_improvement_pct": avg_improvement / avg_err_no_align * 100 if avg_err_no_align > 0 else 0.0,
             "n_improved": n_improved,
             "details": all_results,
         }
@@ -562,7 +561,7 @@ def main():
         print(f"  Total episodes: {total_eps}, Improved: {total_improved} ({total_improved/total_eps:.0%})")
         for name, res in all_summaries.items():
             print(f"  {name:20s}  α={res['avg_alpha']:.3f}  "
-                  f"err {res['avg_error_before']:.4f}→{res['avg_error_after']:.4f}  "
+                  f"no_align={res['avg_error_no_align']:.4f}  align={res['avg_error_with_align']:.4f}  "
                   f"{res['avg_improvement_pct']:+.1f}%  "
                   f"improved={res['n_improved']}/{res['n_episodes']}")
 
