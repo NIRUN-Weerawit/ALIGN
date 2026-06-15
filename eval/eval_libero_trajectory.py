@@ -335,7 +335,10 @@ def run_episode_in_sim(
         n_frames = min(len(frames_no_align), len(frames_with_align))
         side_by_side = []
         for i in range(n_frames):
-            combined = np.concatenate([frames_no_align[i], frames_with_align[i]], axis=1)
+            # Ensure frames are right-side up (flip if needed)
+            f_no = np.flipud(frames_no_align[i]) if frames_no_align[i][0, :, 0].mean() < frames_no_align[i][-1, :, 0].mean() else frames_no_align[i]
+            f_with = np.flipud(frames_with_align[i]) if frames_with_align[i][0, :, 0].mean() < frames_with_align[i][-1, :, 0].mean() else frames_with_align[i]
+            combined = np.concatenate([f_no, f_with], axis=1)
             side_by_side.append(combined)
         h, w = frames_no_align[0].shape[:2]
         for i in range(n_frames):
