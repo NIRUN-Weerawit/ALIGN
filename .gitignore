@@ -7,6 +7,10 @@ data/*.h5
 checkpoints/
 wandb/
 
+# Eval artifacts (regeneratable)
+eval/libero_results/
+eval/*.mp4
+
 # Python
 __pycache__/
 *.pyc
