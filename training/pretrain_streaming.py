@@ -5,11 +5,13 @@
 Zero disk, zero download. Data streams from Hugging Face during training.
 
 Usage:
-    # Pretrain from LIBERO (Franka sim — best match)
+    # Full training (3 phases)
     python training/pretrain_streaming.py \\
         --dataset nvidia/LIBERO_LeRobot_v3 \\
         --output-dir ./checkpoints/pretrain \\
-        --epochs 50
+        --epochs-pretrain-encoder 40 \\
+        --epochs-pretrain-mixer 10 \\
+        --epochs-heads 30
 
     # Pretrain from BridgeData (real WidowX — diversity)
     python training/pretrain_streaming.py \\
@@ -273,6 +275,8 @@ def pretrain_from_stream(
     num_mixer_blocks: int = 2,
     encoder_checkpoint: Optional[str] = None,
     use_bf16: bool = True,
+    val_every: int = 5,
+    val_steps: int = 100,
 ):
     """Contrastive pretraining with two sub-phases.
 
@@ -413,11 +417,10 @@ def pretrain_from_stream(
                     trajs = torch.cat([trajs, pad], dim=-1)
 
                 # Raw encoder outputs (no mixer)
-                # BF16 autocast: ~2.5x faster on RTX 4060, no quality loss for
-                # the frozen DINOv2/CLIP backbones.
+                # Under autocast, encoder matmuls run in BF16 for ~2.5x speedup.
+                # No explicit .float() — autocast handles precision of individual ops.
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     raw = model.encode_raw_all(frames, trajs, texts)
-                raw = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
                 stats = criterion(raw["z_v"], raw["z_t"], raw["z_text"])
                 loss = stats["loss"]
 
@@ -487,6 +490,45 @@ def pretrain_from_stream(
                     str(output_dir / f"encoder_epoch_{epoch + 1:04d}.pt"),
                     epoch, avg_loss, "encoder", optimizer.state_dict(), config)
 
+            # Validation (only every val_every epochs)
+            if (epoch + 1) % val_every == 0:
+                model.eval()
+                val_losses, val_vt, val_vl, val_tl = [], [], [], []
+                val_iter = iter(loader)
+                with torch.no_grad():
+                    for _ in range(val_steps):
+                        try:
+                            batch = next(val_iter)
+                        except StopIteration:
+                            break
+                        f_val = batch["frames"].to(device)
+                        t_val = batch["trajectories"].float().to(device)
+                        txt_val = batch["texts"]
+                        if t_val.shape[-1] < 6:
+                            pad = torch.zeros(*t_val.shape[:-1], 6 - t_val.shape[-1], device=t_val.device)
+                            t_val = torch.cat([t_val, pad], dim=-1)
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                            raw_val = model.encode_raw_all(f_val, t_val, txt_val)
+                        s_val = criterion(raw_val["z_v"], raw_val["z_t"], raw_val["z_text"])
+                        val_losses.append(s_val["loss"].item())
+                        val_vt.append(s_val["avg_cos_vt"].item())
+                        val_vl.append(s_val["avg_cos_vl"].item())
+                        val_tl.append(s_val["avg_cos_tl"].item())
+
+                avg_val_loss = float(np.mean(val_losses))
+                print(f"  [1a val] Epoch {epoch + 1:3d}  loss: {avg_val_loss:.4f}  "
+                      f"cos_vt: {float(np.mean(val_vt)):.3f}  "
+                      f"cos_vl: {float(np.mean(val_vl)):.3f}  "
+                      f"cos_tl: {float(np.mean(val_tl)):.3f}")
+                wandb_trainer.log({
+                    "val/loss": avg_val_loss,
+                    "val/cos_vt": float(np.mean(val_vt)),
+                    "val/cos_vl": float(np.mean(val_vl)),
+                    "val/cos_tl": float(np.mean(val_tl)),
+                    "phase": "1a_encoder",
+                }, step=epoch + 1)
+                model.train()
+
         print(f"  Phase 1a complete. Best loss: {best_loss:.4f}")
 
     # ================================================================
@@ -535,7 +577,6 @@ def pretrain_from_stream(
                 # Mixer outputs
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     mixed = model.encode_mixed(frames, trajs, texts)
-                mixed = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in mixed.items()}
                 stats = criterion(mixed["z_v"], mixed["z_t"], mixed["z_text"])
                 loss = stats["loss"]
 
@@ -605,6 +646,45 @@ def pretrain_from_stream(
                     str(output_dir / f"epoch_{epoch + 1:04d}.pt"),
                     epoch, avg_loss, "full", optimizer.state_dict(), config)
 
+            # Validation (only every val_every epochs)
+            if (epoch + 1) % val_every == 0:
+                model.eval()
+                val_losses, val_vt, val_vl, val_tl = [], [], [], []
+                val_iter = iter(loader)
+                with torch.no_grad():
+                    for _ in range(val_steps):
+                        try:
+                            batch = next(val_iter)
+                        except StopIteration:
+                            break
+                        f_val = batch["frames"].to(device)
+                        t_val = batch["trajectories"].float().to(device)
+                        txt_val = batch["texts"]
+                        if t_val.shape[-1] < 6:
+                            pad = torch.zeros(*t_val.shape[:-1], 6 - t_val.shape[-1], device=t_val.device)
+                            t_val = torch.cat([t_val, pad], dim=-1)
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                            mixed_val = model.encode_mixed(f_val, t_val, txt_val)
+                        s_val = criterion(mixed_val["z_v"], mixed_val["z_t"], mixed_val["z_text"])
+                        val_losses.append(s_val["loss"].item())
+                        val_vt.append(s_val["avg_cos_vt"].item())
+                        val_vl.append(s_val["avg_cos_vl"].item())
+                        val_tl.append(s_val["avg_cos_tl"].item())
+
+                avg_val_loss = float(np.mean(val_losses))
+                print(f"  [1b val] Epoch {epoch + 1:3d}  loss: {avg_val_loss:.4f}  "
+                      f"cos_vt: {float(np.mean(val_vt)):.3f}  "
+                      f"cos_vl: {float(np.mean(val_vl)):.3f}  "
+                      f"cos_tl: {float(np.mean(val_tl)):.3f}")
+                wandb_trainer.log({
+                    "val/loss": avg_val_loss,
+                    "val/cos_vt": float(np.mean(val_vt)),
+                    "val/cos_vl": float(np.mean(val_vl)),
+                    "val/cos_tl": float(np.mean(val_tl)),
+                    "phase": "1b_mixer",
+                }, step=epochs_encoder + epoch + 1)
+                model.train()
+
         print(f"  Phase 1b complete. Best loss: {best_loss:.4f}")
 
     log_fp.close()
@@ -640,6 +720,8 @@ def train_heads_from_stream(
     num_mixer_blocks: int = 2,
     temperature: float = 0.07,
     use_bf16: bool = True,
+    val_every: int = 5,
+    val_steps: int = 100,
 ):
     """Train Decision + Assistant heads from streamed data with on-the-fly noise.
 
@@ -796,9 +878,9 @@ def train_heads_from_stream(
             # frozen, so no gradient quality loss.
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, noisy_poses.unsqueeze(1).repeat(1, traj_window, 1), texts)
-                z_v = mixed["z_v"].float()
-                z_t = mixed["z_t"].float()
-                z_text = mixed["z_text"].float()
+                z_v = mixed["z_v"]
+                z_t = mixed["z_t"]
+                z_text = mixed["z_text"]
 
             # Joint loss: BCE(α) + 0.5 × MSE(Δ)
             alpha_pred = model.decision_head(z_v, z_t, z_text)
@@ -862,6 +944,68 @@ def train_heads_from_stream(
                 optimizer.state_dict(), {"chunk_size": chunk_size})
             wandb_trainer.save(str(output_dir / "best.pt"))
             print(f"  -> best.pt (loss: {avg_loss:.4f})")
+
+        # Validation (only every val_every epochs)
+        if (epoch + 1) % val_every == 0:
+            model.eval()
+            val_losses, val_alphas, val_deltas = [], [], []
+            val_iter = iter(loader)
+            with torch.no_grad():
+                for _ in range(val_steps):
+                    try:
+                        batch = next(val_iter)
+                    except StopIteration:
+                        break
+                    f_val = batch["frames"].to(device)
+                    p_val = batch["poses"].float().to(device)
+                    txt_val = batch["texts"]
+                    act_val = batch.get("actions", None)
+
+                    injector = injectors[0]  # use first noise config for val
+                    p_np = p_val.cpu().numpy()
+                    if p_np.ndim == 3:
+                        p_np = p_np.reshape(-1, p_np.shape[-1])
+                    val_noisy_np = injector.inject(p_np)
+                    if p_val.dim() == 3:
+                        val_noisy_np = val_noisy_np.reshape(p_val.shape)
+                    val_noisy = torch.from_numpy(val_noisy_np).float().to(device)
+
+                    pos_err = torch.norm(val_noisy[:, :3] - p_val[:, :3], dim=1)
+                    orn_err = torch.norm(val_noisy[:, 3:6] - p_val[:, 3:6], dim=1)
+                    val_alpha_t = torch.clamp(
+                        torch.maximum(pos_err / 0.10, orn_err / 0.52), 0.0, 1.0)
+
+                    B_val, D_val = p_val.shape
+                    if act_val is not None and isinstance(act_val, torch.Tensor) and act_val.dim() == 3:
+                        val_delta_t = act_val[:, :chunk_size, :6].to(device).float()
+                    else:
+                        val_delta_t = torch.zeros(B_val, chunk_size, 6, device=device)
+                        clean_6d = p_val[:, :6] if D_val >= 6 else torch.cat(
+                            [p_val, torch.zeros(B_val, 6 - D_val, device=device)], dim=-1)
+                        for i in range(1, chunk_size + 1):
+                            val_delta_t[:, i - 1, :] = clean_6d - val_noisy[:, :6]
+
+                    with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                        val_mixed = model.encode_mixed(
+                            f_val, val_noisy.unsqueeze(1).repeat(1, traj_window, 1), txt_val)
+                    v_alpha = model.decision_head(val_mixed["z_v"], val_mixed["z_t"], val_mixed["z_text"])
+                    v_delta = model.assistant_head(val_mixed["z_v"], val_mixed["z_t"], val_mixed["z_text"], val_noisy[:, :6])
+                    v_loss = (F.binary_cross_entropy(v_alpha.squeeze(-1), val_alpha_t) +
+                              0.5 * F.mse_loss(v_delta, val_delta_t))
+                    val_losses.append(v_loss.item())
+                    val_alphas.append(v_alpha.mean().item())
+                    val_deltas.append(v_delta.abs().mean().item())
+
+            avg_val_loss = float(np.mean(val_losses))
+            print(f"  [val] Epoch {epoch + 1:3d}  loss: {avg_val_loss:.4f}  "
+                  f"α: {float(np.mean(val_alphas)):.3f}  Δ: {float(np.mean(val_deltas)):.4f}")
+            wandb_trainer.log({
+                "val/loss": avg_val_loss,
+                "val/alpha": float(np.mean(val_alphas)),
+                "val/delta": float(np.mean(val_deltas)),
+                "head/epoch": epoch + 1,
+            }, step=epoch + 1)
+            model.train()
 
     log_fp.close()
     print(f"\n  Head training complete. Best loss: {best_loss:.4f}")
@@ -935,6 +1079,8 @@ def run_streaming_pipeline(
     num_mixer_blocks: int = 2,
     temperature: float = 0.07,
     use_bf16: bool = True,
+    val_every: int = 5,
+    val_steps: int = 100,
 ):
     """Full ALIGN training pipeline using streaming or local data.
 
@@ -987,6 +1133,8 @@ def run_streaming_pipeline(
             num_mixer_blocks=num_mixer_blocks,
             encoder_checkpoint=encoder_checkpoint,
             use_bf16=use_bf16,
+            val_every=val_every,
+            val_steps=val_steps,
         )
     else:
         if pretrained_path is None:
@@ -1023,6 +1171,8 @@ def run_streaming_pipeline(
             num_mixer_blocks=num_mixer_blocks,
             temperature=temperature,
             use_bf16=use_bf16,
+            val_every=val_every,
+            val_steps=val_steps,
         )
     else:
         head_path = str(output_dir / "heads" / "best.pt")
@@ -1096,6 +1246,10 @@ def main():
                              "On by default — disable only for debugging.")
     parser.add_argument("--no-bf16", dest="bf16", action="store_false",
                         help="Disable BF16 autocast (use FP32).")
+    parser.add_argument("--val-every", type=int, default=5,
+                        help="Run validation every N epochs (default 5)")
+    parser.add_argument("--val-steps", type=int, default=100,
+                        help="Number of validation steps per val run (default 100)")
 
     args = parser.parse_args()
 
@@ -1124,6 +1278,8 @@ def main():
         num_mixer_blocks=args.num_mixer_blocks,
         temperature=args.temperature,
         use_bf16=args.bf16,
+        val_every=args.val_every,
+        val_steps=args.val_steps,
     )
 
 

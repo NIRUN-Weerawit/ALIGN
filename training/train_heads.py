@@ -83,10 +83,28 @@ def train_heads_hdf5(
     Neither head gradient affects the other.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    out_dir = Path(output_dir)
+
+    # Derive subdirectory: checkpoints/heads_local/libero_align/run_N/
+    ds_name = Path(data_path).stem
+    base_dir = Path(output_dir) / ds_name
+
+    # Find next available run number
+    existing = sorted(base_dir.glob("run_*")) if base_dir.exists() else []
+    max_run = 0
+    for d in existing:
+        try:
+            n = int(d.name.split("_")[-1])
+            if n > max_run:
+                max_run = n
+        except (ValueError, IndexError):
+            pass
+    next_run = max_run + 1
+
+    out_dir = base_dir / f"run_{next_run}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"=== ALIGN Head Training (independent stages) ===")
+    print(f"  Run:          {out_dir}")
     print(f"  Data:         {data_path}")
     print(f"  Pretrained:   {pretrained_checkpoint}")
     print(f"  Device:       {device}")

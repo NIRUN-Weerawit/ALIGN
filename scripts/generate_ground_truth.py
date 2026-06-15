@@ -433,13 +433,13 @@ def compute_alpha_target(
 ) -> np.ndarray:
     """Compute α_target for Decision head.
 
-    α_target = need × capability
+    α_target = need × consistency
 
     need = clip(||noisy - smooth|| / D_MAX, 0, 1)
-    capability = 1.0 (placeholder — will be replaced by cos_sim after Phase 2)
+    consistency = 1.0 (placeholder — will be replaced by cos_sim after Phase 2)
 
-    For standalone ground truth generation, capability defaults to 1.0.
-    After contrastive pretraining (Phase 2), capability is recomputed as
+    For standalone ground truth generation, consistency defaults to 1.0.
+    After contrastive pretraining (Phase 2), consistency is recomputed as
     min(cos_vt, cos_vl, cos_tl) using the trained encoders.
 
     Args:
@@ -457,7 +457,7 @@ def compute_alpha_target(
         need = min(pos_error / D_MAX, 1.0)
         needs[i] = need
 
-    # capability = 1.0 (placeholder — updated after contrastive pretraining)
+    # consistency = 1.0 (placeholder — updated after contrastive pretraining)
     # Gradient clip safety: if smooth_poses == noisy_poses, need is ~0 → α=0
     alpha_target = needs * 1.0
 

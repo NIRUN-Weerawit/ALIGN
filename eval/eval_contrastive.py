@@ -286,7 +286,8 @@ def print_report(results: dict, texts: List[str], prefix: str = ""):
     cos_vt = results["cos_vt"].cpu().numpy()
     cos_vl = results["cos_vl"].cpu().numpy()
     cos_tl = results["cos_tl"].cpu().numpy()
-    alphas = np.minimum(np.minimum(cos_vt, cos_vl), cos_tl)
+    # alphas = np.minimum(np.minimum(cos_vt, cos_vl), cos_tl)
+    alphas = np.mean(cos_vt, cos_vl, cos_tl)
 
     print(f"\n{'='*70}")
     print(f"{prefix}COSINE SIMILARITIES REPORT")
