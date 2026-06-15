@@ -1,0 +1,38 @@
+{
+  "data_path": "/media/ucluser/PortableSSD/lerobot/nvidia/LIBERO_LeRobot_v3/libero_10/libero_align.h5",
+  "checkpoint": "./checkpoints/heads_libero_helios/heads_best.pt",
+  "encoder_checkpoint": "./checkpoints/pretrain_haruka/libero_spatial/run_3/best.pt",
+  "noise_std": 0.001,
+  "n_episodes": 2,
+  "avg_alpha": 0.0024574567777837586,
+  "avg_delta": 0.015666265873273837,
+  "avg_error_before": 0.0015854672809951713,
+  "avg_error_after": 0.001646412366192868,
+  "avg_improvement": -6.094508519769674e-05,
+  "avg_improvement_pct": -3.84398252352723,
+  "n_improved": 0,
+  "details": [
+    {
+      "episode": 0,
+      "text": "put the white mug on the left plate and put the yellow and w",
+      "n_steps": 209,
+      "mean_alpha": -0.0036067463669231196,
+      "mean_delta_norm": 0.014662101510555694,
+      "mean_error_before": 0.0015583301171087816,
+      "mean_error_after": 0.001581662425642686,
+      "improvement": -2.333230853390441e-05,
+      "improvement_pct": -1.4972635308617133
+    },
+    {
+      "episode": 1,
+      "text": "put the white mug on the left plate and put the yellow and w",
+      "n_steps": 279,
+      "mean_alpha": 0.008521659922490637,
+      "mean_delta_norm": 0.016670430235991983,
+      "mean_error_before": 0.0016126044448815607,
+      "mean_error_after": 0.0017111623067430498,
+      "improvement": -9.855786186148906e-05,
+      "improvement_pct": -6.111719595857107
+    }
+  ]
+}

@@ -184,6 +184,7 @@ def run_episode_in_sim(
       - With ALIGN: noisy pose + correction → step sim
 
     Both are compared against the expert trajectory.
+    When record_video is True, saves a side-by-side MP4.
     """
     n_expert = min(len(expert_poses), max_steps)
     rng = np.random.default_rng(42)
@@ -194,54 +195,53 @@ def run_episode_in_sim(
     else:
         noisy_poses = expert_poses[:n_expert].copy()
 
+    # ── Run "No ALIGN" trajectory first ──
     obs = env.reset()
     step = 0
     done = False
-
-    alpha_vals = []
-    delta_norms = []
-    pose_buffer = []
-    chunk_cache = None
-    error_no_align = []   # error when using raw noisy pose
-    error_with_align = []  # error when using ALIGN-corrected pose
-    frames_buffer = []
+    frames_no_align = []
 
     while not done and step < max_steps and step < n_expert:
-        # Get camera image from simulation
-        frame = None
-        for cam_name in ["agentview_image", "wrist_camera", "agentview", "camera"]:
-            if cam_name in obs:
-                frame = obs[cam_name]
-                break
-        if frame is None:
-            for k in obs:
-                if "image" in k.lower() or "rgb" in k.lower():
-                    frame = obs[k]
-                    break
-
-        if frame is not None:
-            if isinstance(frame, torch.Tensor):
-                frame = frame.cpu().numpy()
-            if frame.dtype != np.uint8:
-                if frame.max() <= 1.0:
-                    frame = (frame * 255).astype(np.uint8)
-                else:
-                    frame = frame.astype(np.uint8)
-            if frame.ndim == 4:
-                frame = frame[0]
-            if frame.shape[0] in (1, 3) and frame.ndim == 3:
-                frame = frame.transpose(1, 2, 0)
-            if frame.shape[:2] != (224, 224):
-                from PIL import Image
-                frame = np.array(Image.fromarray(frame).resize((224, 224)))
-        else:
-            frame = np.zeros((224, 224, 3), dtype=np.uint8)
-
-        # Use the noisy expert pose as the "human teleoperation" input
+        frame = _get_sim_frame(obs)
         raw_pose = noisy_poses[step]
         clean_pose = expert_poses[step]
 
-        # Fill buffer with noisy poses (simulating human input)
+        if step < 5:
+            step += 1
+            action = np.zeros(7, dtype=np.float32)
+            action[:6] = raw_pose
+            action[6] = -1.0
+            obs, reward, done, info = env.step(action)
+            continue
+
+        err = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
+        if record_video:
+            display = _overlay_text(frame, f"NO ALIGN  step={step}  err={err:.3f}", color=(255, 0, 0))
+            frames_no_align.append(display)
+
+        action = np.zeros(7, dtype=np.float32)
+        action[:6] = raw_pose
+        action[6] = -1.0
+        obs, reward, done, info = env.step(action)
+        step += 1
+
+    # ── Run "With ALIGN" trajectory ──
+    obs = env.reset()
+    step = 0
+    done = False
+    pose_buffer = []
+    chunk_cache = None
+    alpha_vals = []
+    delta_norms = []
+    error_no_align = []
+    error_with_align = []
+    frames_with_align = []
+
+    while not done and step < max_steps and step < n_expert:
+        frame = _get_sim_frame(obs)
+        raw_pose = noisy_poses[step]
+        clean_pose = expert_poses[step]
+
         pose_buffer.append(raw_pose.copy())
         if len(pose_buffer) > traj_window:
             pose_buffer.pop(0)
@@ -267,7 +267,6 @@ def run_episode_in_sim(
             z_v = mixed["z_v"]
             z_t = mixed["z_t"]
 
-            # Full gating signal
             alpha_raw = model.decision_head(z_v, z_t, z_text)
             z_v_n = F.normalize(z_v, dim=-1)
             z_t_n = F.normalize(z_t, dim=-1)
@@ -293,27 +292,16 @@ def run_episode_in_sim(
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(chunk_np[0])))
 
-        # Compare: no ALIGN vs with ALIGN
         err_no_align = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
         err_with_align = float(np.linalg.norm(commanded_pose[:3] - clean_pose[:3]))
         error_no_align.append(err_no_align)
         error_with_align.append(err_with_align)
 
-        # Overlay on frame
         if record_video:
-            from PIL import Image, ImageDraw, ImageFont
-            display = np.array(frame)
-            img = Image.fromarray(display)
-            draw = ImageDraw.Draw(img)
-            try:
-                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-            except (OSError, IOError):
-                font = ImageFont.load_default()
-            draw.text((10, 10), f"α={alpha_val:.2f}  Δ={delta_norms[-1]:.3f}  step={step}", fill=(0, 255, 0), font=font)
-            draw.text((10, 30), f"no_align={err_no_align:.3f}  align={err_with_align:.3f}", fill=(255, 255, 0), font=font)
-            frames_buffer.append(np.array(img))
+            display = _overlay_text(frame, f"WITH ALIGN  α={alpha_val:.2f}  step={step}", color=(0, 255, 0))
+            display = _overlay_text(display, f"err={err_with_align:.3f}", pos=(10, 30), color=(0, 255, 0))
+            frames_with_align.append(display)
 
-        # Step sim with ALIGN's commanded pose
         action = np.zeros(7, dtype=np.float32)
         action[:6] = commanded_pose
         action[6] = -1.0
@@ -330,7 +318,7 @@ def run_episode_in_sim(
     improvement = avg_err_no_align - avg_err_with_align
     improvement_pct = (improvement / avg_err_no_align * 100) if avg_err_no_align > 0 else 0.0
 
-    return {
+    result = {
         "success": success,
         "steps": step,
         "mean_alpha": avg_alpha,
@@ -339,8 +327,67 @@ def run_episode_in_sim(
         "mean_error_with_align": avg_err_with_align,
         "improvement": improvement,
         "improvement_pct": improvement_pct,
-        "frames_buffer": frames_buffer,
+        "frames_buffer": None,
     }
+
+    # ── Create side-by-side video ──
+    if record_video and frames_no_align and frames_with_align:
+        n_frames = min(len(frames_no_align), len(frames_with_align))
+        side_by_side = []
+        for i in range(n_frames):
+            combined = np.concatenate([frames_no_align[i], frames_with_align[i]], axis=1)
+            side_by_side.append(combined)
+        h, w = frames_no_align[0].shape[:2]
+        for i in range(n_frames):
+            side_by_side[i][:, w-2:w+2] = [255, 255, 255]
+        result["frames_buffer"] = side_by_side
+
+    return result
+
+
+def _get_sim_frame(obs: dict) -> np.ndarray:
+    """Extract and preprocess a camera frame from sim observation."""
+    frame = None
+    for cam_name in ["agentview_image", "wrist_camera", "agentview", "camera"]:
+        if cam_name in obs:
+            frame = obs[cam_name]
+            break
+    if frame is None:
+        for k in obs:
+            if "image" in k.lower() or "rgb" in k.lower():
+                frame = obs[k]
+                break
+    if frame is not None:
+        if isinstance(frame, torch.Tensor):
+            frame = frame.cpu().numpy()
+        if frame.dtype != np.uint8:
+            if frame.max() <= 1.0:
+                frame = (frame * 255).astype(np.uint8)
+            else:
+                frame = frame.astype(np.uint8)
+        if frame.ndim == 4:
+            frame = frame[0]
+        if frame.shape[0] in (1, 3) and frame.ndim == 3:
+            frame = frame.transpose(1, 2, 0)
+        if frame.shape[:2] != (224, 224):
+            from PIL import Image
+            frame = np.array(Image.fromarray(frame).resize((224, 224)))
+    else:
+        frame = np.zeros((224, 224, 3), dtype=np.uint8)
+    return frame
+
+
+def _overlay_text(frame: np.ndarray, text: str, pos=(10, 10), color=(0, 255, 0)):
+    """Draw text overlay on a frame."""
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+    except (OSError, IOError):
+        font = ImageFont.load_default()
+    draw.text(pos, text, fill=color, font=font)
+    return np.array(img)
 
 
 # ================================================================
