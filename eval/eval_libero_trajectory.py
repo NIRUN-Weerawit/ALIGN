@@ -184,7 +184,8 @@ def run_episode_in_sim(
       - With ALIGN: noisy pose + correction → step sim
 
     Both are compared against the expert trajectory.
-    When record_video is True, saves a side-by-side MP4.
+    When record_video is True, saves a 3-panel MP4:
+      [DATASET GT] | [NO ALIGN] | [WITH ALIGN]
     """
     n_expert = min(len(expert_poses), max_steps)
     rng = np.random.default_rng(42)
@@ -330,19 +331,35 @@ def run_episode_in_sim(
         "frames_buffer": None,
     }
 
-    # ── Create side-by-side video ──
+    # ── Create 3-panel video: [DATASET GT] | [NO ALIGN] | [WITH ALIGN] ──
     if record_video and frames_no_align and frames_with_align:
         n_frames = min(len(frames_no_align), len(frames_with_align))
         side_by_side = []
         for i in range(n_frames):
-            # Ensure frames are right-side up (flip if needed)
+            # Dataset ground truth frame (resized to match sim)
+            gt_idx = i + 5  # skip first 5 warmup steps
+            if gt_idx < len(expert_frames):
+                gt = expert_frames[gt_idx]
+                if gt.shape[:2] != (224, 224):
+                    from PIL import Image as _PIL
+                    gt = np.array(_PIL.fromarray(gt).resize((224, 224)))
+                gt_display = _overlay_text(gt, f"DATASET GT  step={gt_idx}", color=(255, 255, 255))
+            else:
+                gt_display = np.zeros((224, 224, 3), dtype=np.uint8)
+
+            # Ensure sim frames are right-side up
             f_no = np.flipud(frames_no_align[i]) if frames_no_align[i][0, :, 0].mean() < frames_no_align[i][-1, :, 0].mean() else frames_no_align[i]
             f_with = np.flipud(frames_with_align[i]) if frames_with_align[i][0, :, 0].mean() < frames_with_align[i][-1, :, 0].mean() else frames_with_align[i]
-            combined = np.concatenate([f_no, f_with], axis=1)
+
+            combined = np.concatenate([gt_display, f_no, f_with], axis=1)
             side_by_side.append(combined)
-        h, w = frames_no_align[0].shape[:2]
+
+        # White divider lines
+        w = frames_no_align[0].shape[1]
         for i in range(n_frames):
             side_by_side[i][:, w-2:w+2] = [255, 255, 255]
+            side_by_side[i][:, 2*w-2:2*w+2] = [255, 255, 255]
+
         result["frames_buffer"] = side_by_side
 
     return result
