@@ -99,13 +99,14 @@ CORE_PIP=(
     "lerobot"
     "torchcodec"
     "transformers"
-    "PyAV"
+    # "PyAV"
 )
 
 # Optional: data collection / Isaac Sim / VR deps
 OPTIONAL_PIP=(
     "paho-mqtt"
     "tensorflow-datasets"
+    "libero"
 )
 
 # =============================================================================
@@ -153,7 +154,7 @@ install_conda() {
 import open_clip; print(f'  open_clip:   {open_clip.__version__}')
 import xformers; print(f'  xformers:    {xformers.__version__}')
 import lerobot; print(f'  lerobot:     {lerobot.__version__}')
-import av; print(f'  pyav:        {av.__version__}')
+import libero; print(f'  libero:     {libero.__version__}')
 import torch; print(f'  torch:       {torch.__version__}  CUDA:{torch.cuda.is_available()}')
 import transformers; print(f'  transformers:{transformers.__version__}')
 import wandb; print(f'  wandb:       {wandb.__version__}')

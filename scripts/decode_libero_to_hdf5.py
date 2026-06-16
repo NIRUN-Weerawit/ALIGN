@@ -28,7 +28,7 @@ except ImportError:
     sys.exit(1)
 
 
-def write_ep_to_hdf5(f, ep_idx, img_keys_data, states, text):
+def write_ep_to_hdf5(f, ep_idx, img_keys_data, states, actions, text):
     """Write a single episode buffer to the HDF5 file.
     
     Args:
@@ -36,6 +36,7 @@ def write_ep_to_hdf5(f, ep_idx, img_keys_data, states, text):
         ep_idx: Episode index.
         img_keys_data: dict mapping camera_key -> list of frame tensors.
         states: list of state tensors.
+        actions: list of action tensors (will be stored as (T,6) float32)
         text: task description string.
     """
     gr = f.create_group(f"ep_{ep_idx:06d}")
@@ -60,6 +61,16 @@ def write_ep_to_hdf5(f, ep_idx, img_keys_data, states, text):
         s_stack = torch.cat([s_stack, pad], dim=1)
     gr.create_dataset("noisy_poses", data=s_stack.numpy().astype(np.float32))
 
+    # Write actions if provided (same formatting as states, forced to 6 dims)
+    if actions is not None and len(actions) > 0:
+        a_stack = torch.stack(actions).float()
+        if a_stack.shape[-1] > 6:
+            a_stack = a_stack[:, :6]
+        elif a_stack.shape[-1] < 6:
+            pad = torch.zeros(a_stack.size(0), 6 - a_stack.shape[-1], device=a_stack.device)
+            a_stack = torch.cat([a_stack, pad], dim=1)
+        gr.create_dataset("actions", data=a_stack.numpy().astype(np.float32))
+
     # Metadata for this episode
     variant_text = text.strip() if text else "pick and place"
     gr.create_dataset(
@@ -81,17 +92,21 @@ def main():
     img_keys = [k for k in ds.meta.features if "images" in k]
     state_key = [k for k in ds.meta.features if k.startswith("observation.state")]
     state_key = state_key[0] if len(state_key) > 0 else None
+    action_key = [k for k in ds.meta.features if "action" in k]
+    action_key = action_key[0] if len(action_key) > 0 else None
 
     if not img_keys or not state_key:
         raise ValueError(f"Could not find image or state keys. Found: {list(ds.meta.features.keys())}")
 
     # Extract clean camera names (e.g., 'agentview', 'wrist_image')
     cameras = [k.split(".")[-1] for k in img_keys]
-    print(f"[2/4] Detected cameras: {cameras}, State: '{state_key}'")
+    
+    print(f"[2/4] Detected cameras: {cameras}, State: '{state_key}', Action: '{action_key}'")
 
     # Group rows into episodes on disk
     ep_buffer = {cam: [] for cam in cameras}  # dict of lists
     ep_buffer["states"] = []
+    ep_buffer["actions"] = []
     ep_buffer["task"] = None
     cur_ep_id = None
     episodes_processed = 0
@@ -120,7 +135,7 @@ def main():
             # Detect episode boundary & flush previous 
             if cur_ep_id is not None and ep_id != cur_ep_id:
                 cam_data = {k: v for k, v in ep_buffer.items() if k in cameras}
-                write_ep_to_hdf5(f, cur_ep_id, cam_data, ep_buffer["states"], ep_buffer["task"])
+                write_ep_to_hdf5(f, cur_ep_id, cam_data, ep_buffer["states"], ep_buffer["actions"], ep_buffer["task"])
                 
                 episodes_processed += 1
                 pbar.set_postfix({"episodes written": episodes_processed})
@@ -146,6 +161,16 @@ def main():
                      state_tensor = state_tensor[-1]
             ep_buffer["states"].append(state_tensor)
 
+            # Accumulate action info if available
+            if action_key is not None and action_key in sample:
+                action_tensor = sample[action_key]
+                if hasattr(action_tensor, 'dim') and action_tensor.dim() == 2:
+                    if action_tensor.size(0) > 1:
+                        action_tensor = action_tensor[0]
+                    else:
+                        action_tensor = action_tensor[-1]
+                ep_buffer["actions"].append(action_tensor)
+
             # Grab task instruction once for the episode
             if "task" in sample and ep_buffer["task"] is None:
                 t = sample["task"]
@@ -156,7 +181,7 @@ def main():
 
         # Flush final episode
         cam_data = {k: v for k, v in ep_buffer.items() if k in cameras}
-        write_ep_to_hdf5(f, cur_ep_id, cam_data, ep_buffer["states"], ep_buffer["task"])
+        write_ep_to_hdf5(f, cur_ep_id, cam_data, ep_buffer["states"], ep_buffer["actions"], ep_buffer["task"])
         episodes_processed += 1
 
     pbar.close()

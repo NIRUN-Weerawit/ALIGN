@@ -139,7 +139,7 @@ def find_episode_for_task(h5_path: str, task_name: str) -> Optional[dict]:
                 if cam_name is None:
                     cam_name = list(frames_group.keys())[0]
                 frames = frames_group[cam_name][:]
-                poses = group["noisy_poses"][:, :6]
+                poses = group["actions"][:, :6]
                 return {
                     "frames": frames,
                     "poses": poses,

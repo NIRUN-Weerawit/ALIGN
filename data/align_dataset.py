@@ -52,6 +52,7 @@ class ALIGNDataset(Dataset):
         /meta/              — json strings with episode metadata
         /ep_XXX/frames/     — (N, H, W, 3) uint8 frames
         /ep_XXX/noisy_poses — (N, 6) or (N, 7) float32
+        /ep_XXX/actions     — (N, 6) float32 (optional)
         /ep_XXX/gripper     — (N,) float32
         /ep_XXX/texts       — list of text variant strings
 
@@ -117,6 +118,16 @@ class ALIGNDataset(Dataset):
         self._ep_frame_lengths: List[int] = []
         self._ep_pose_offsets: List[int] = []
 
+        # Detect optional actions dataset
+        try:
+            first_ep = self._episode_keys[0]
+            if self._single_episode:
+                self._has_actions = "actions" in self._h5
+            else:
+                self._has_actions = "actions" in self._h5[first_ep]
+        except Exception:
+            self._has_actions = False
+
         for ep_idx in range(len(self._episode_keys)):
             key = self._episode_keys[ep_idx]
             # Frame length (handle both framedataset structures)
@@ -144,6 +155,9 @@ class ALIGNDataset(Dataset):
         # Warn if cumulative detected
         if any(o > 0 for o in self._ep_pose_offsets):
             print("  NOTE: Detected cumulative noisy_poses — using per-episode offsets")
+
+        if self._has_actions:
+            print("  NOTE: Detected 'actions' dataset — will load actions when available")
         # Build index: list of (ep_idx, start_frame, n_frames) for each valid window
         self._index: List[Tuple[int, int, int]] = []
         for ep_idx in range(len(self._episode_keys)):
@@ -183,6 +197,42 @@ class ALIGNDataset(Dataset):
             pad = np.zeros((count - len(raw), raw.shape[1]), dtype=raw.dtype)
             raw = np.concatenate([raw, pad], axis=0)
         return raw
+
+    def _read_actions(self, ep_idx: int, start: int, count: int) -> np.ndarray:
+        """Read actions for an episode window. Returns array shaped (count, 6).
+
+        If actions are missing, returns zeros. Handles cumulative actions similarly
+        to `noisy_poses` using the precomputed offsets.
+        """
+        key = self._episode_keys[ep_idx]
+        if self._single_episode:
+            try:
+                raw = self._h5["actions"][start:start + count]
+            except Exception:
+                return np.zeros((count, 6), dtype=np.float32)
+            if len(raw) < count:
+                pad = np.zeros((count - len(raw), raw.shape[1]), dtype=raw.dtype)
+                raw = np.concatenate([raw, pad], axis=0)
+        else:
+            if not self._has_actions:
+                return np.zeros((count, 6), dtype=np.float32)
+            offset = self._ep_pose_offsets[ep_idx]
+            abs_start = offset + start
+            try:
+                raw = self._h5[f"{key}/actions"][abs_start:abs_start + count]
+            except Exception:
+                return np.zeros((count, 6), dtype=np.float32)
+            if len(raw) < count:
+                pad = np.zeros((count - len(raw), raw.shape[1]), dtype=raw.dtype)
+                raw = np.concatenate([raw, pad], axis=0)
+
+        # Ensure 6 dims: trim or pad as needed
+        if raw.shape[1] > 6:
+            raw = raw[:, :6]
+        elif raw.shape[1] < 6:
+            pad = np.zeros((raw.shape[0], 6 - raw.shape[1]), dtype=raw.dtype)
+            raw = np.concatenate([raw, pad], axis=1)
+        return raw.astype(np.float32)
 
     def _read_text(self, ep_idx: int) -> str:
         key = self._episode_keys[ep_idx]
@@ -245,11 +295,13 @@ class ALIGNDataset(Dataset):
         ep_idx, start, count = self._index[idx]
         frames = self._read_frames(ep_idx, start, count + self.traj_window)
         poses = self._read_poses(ep_idx, start, count + self.traj_window)
+        actions = self._read_actions(ep_idx, start, count + self.traj_window) if getattr(self, '_has_actions', False) else np.zeros((count + self.traj_window, 6), dtype=np.float32)
         text = self._read_text(ep_idx)
 
         return {
             "frames": frames,
             "poses": poses,
+            "actions": actions,
             "text": text,
             "ep_idx": ep_idx,
         }
