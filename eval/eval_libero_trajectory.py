@@ -201,6 +201,7 @@ def run_episode_in_sim(
     step = 0
     done = False
     frames_no_align = []
+    prev_pose = None
 
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(obs)
@@ -213,7 +214,25 @@ def run_episode_in_sim(
             action[:6] = raw_pose
             action[6] = -1.0
             obs, reward, done, info = env.step(action)
+            prev_pose = raw_pose
             continue
+
+        # Command delta from previous pose (replay relative movement)
+        if prev_pose is not None:
+            delta = raw_pose - prev_pose
+            # Get current sim EEF pose and add delta
+            sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
+            sim_quat = obs.get("robot0_eef_quat", np.array([1, 0, 0, 0]))
+            if isinstance(sim_eef, torch.Tensor):
+                sim_eef = sim_eef.cpu().numpy()
+            if isinstance(sim_quat, torch.Tensor):
+                sim_quat = sim_quat.cpu().numpy()
+            sim_axisangle = quat_to_axisangle(sim_quat)
+            sim_pose = np.concatenate([sim_eef, sim_axisangle]).astype(np.float32)
+            commanded = sim_pose + delta
+        else:
+            commanded = raw_pose
+        prev_pose = raw_pose
 
         err = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
         if record_video:
@@ -221,7 +240,7 @@ def run_episode_in_sim(
             frames_no_align.append(display)
 
         action = np.zeros(7, dtype=np.float32)
-        action[:6] = raw_pose
+        action[:6] = commanded
         action[6] = -1.0
         obs, reward, done, info = env.step(action)
         step += 1
@@ -237,6 +256,7 @@ def run_episode_in_sim(
     error_no_align = []
     error_with_align = []
     frames_with_align = []
+    prev_pose = None
 
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(obs)
@@ -255,6 +275,7 @@ def run_episode_in_sim(
             action[:6] = raw_pose
             action[6] = -1.0
             obs, reward, done, info = env.step(action)
+            prev_pose = raw_pose
             continue
 
         # ALIGN inference
@@ -287,11 +308,26 @@ def run_episode_in_sim(
                 corrective = 0.7 * chunk_np[0] + 0.3 * chunk_cache[-1]
             else:
                 corrective = chunk_np[0]
-            commanded_pose = raw_pose + alpha_val * corrective
             chunk_cache = chunk_np
 
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(chunk_np[0])))
+
+        # Command delta from previous pose + ALIGN correction
+        if prev_pose is not None:
+            delta = raw_pose - prev_pose
+            sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
+            sim_quat = obs.get("robot0_eef_quat", np.array([1, 0, 0, 0]))
+            if isinstance(sim_eef, torch.Tensor):
+                sim_eef = sim_eef.cpu().numpy()
+            if isinstance(sim_quat, torch.Tensor):
+                sim_quat = sim_quat.cpu().numpy()
+            sim_axisangle = quat_to_axisangle(sim_quat)
+            sim_pose = np.concatenate([sim_eef, sim_axisangle]).astype(np.float32)
+            commanded_pose = sim_pose + delta + alpha_val * corrective
+        else:
+            commanded_pose = raw_pose
+        prev_pose = raw_pose
 
         err_no_align = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
         err_with_align = float(np.linalg.norm(commanded_pose[:3] - clean_pose[:3]))
