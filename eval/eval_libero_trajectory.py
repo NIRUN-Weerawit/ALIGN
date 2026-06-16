@@ -32,12 +32,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# Force CUDA init before MuJoCo/EGL to avoid cuDNN context conflicts
+# MuJoCo EGL corrupts PyTorch's cuDNN state. Run model on CPU for inference.
 os.environ.setdefault("MUJOCO_GPU_RENDERING", "0")
-if torch.cuda.is_available():
-    _ = torch.zeros(1, device="cuda")
-    torch.cuda.synchronize()
-    torch.backends.cudnn.benchmark = False
+DEVICE = "cpu"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -479,8 +476,8 @@ def evaluate_suite(
     chunk_size = ckpt.get("config", {}).get("chunk_size", 10)
 
     model = ALIGNModel(
-        embed_dim=256, chunk_size=chunk_size, use_text=True, device=device,
-    ).to(device)
+        embed_dim=256, chunk_size=chunk_size, use_text=True, device=DEVICE,
+    ).to(DEVICE)
 
     if encoder_checkpoint:
         enc_ckpt = torch.load(encoder_checkpoint, map_location=device)
@@ -539,8 +536,13 @@ def evaluate_suite(
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
+                # Re-init CUDA after MuJoCo/EGL grabs GPU context
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
                 result = run_episode_in_sim(
-                    env=env, model=model, device=device,
+                    env=env, model=model, device=DEVICE,
                     expert_frames=expert["frames"],
                     expert_poses=expert["poses"],
                     task_description=task_name,
