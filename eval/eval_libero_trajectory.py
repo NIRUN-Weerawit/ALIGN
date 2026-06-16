@@ -32,9 +32,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-# MuJoCo EGL corrupts PyTorch's cuDNN state. Run model on CPU for inference.
+# MuJoCo EGL corrupts PyTorch's cuDNN state. Re-init CUDA after env creation.
 os.environ.setdefault("MUJOCO_GPU_RENDERING", "0")
-DEVICE = "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -535,11 +535,11 @@ def evaluate_suite(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
-
-                # Re-init CUDA after MuJoCo/EGL grabs GPU context
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                    # Force cuDNN re-initialization with a small conv
+                    _ = torch.nn.functional.conv2d(
+                        torch.zeros(1, 3, 10, 10, device="cuda"),
+                        torch.zeros(3, 3, 3, 3, device="cuda"),
+                    )
 
                 result = run_episode_in_sim(
                     env=env, model=model, device=DEVICE,
