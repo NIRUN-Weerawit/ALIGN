@@ -32,6 +32,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# Force CUDA init before MuJoCo/EGL to avoid cuDNN context conflicts
+if torch.cuda.is_available():
+    _ = torch.zeros(1, device="cuda")
+    torch.cuda.synchronize()
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.align_model import ALIGNModel
