@@ -172,6 +172,7 @@ def get_head_predictions(
     frames: torch.Tensor,
     trajs: torch.Tensor,
     texts: List[str],
+    actions: Optional[torch.Tensor] = None,
 ) -> dict:
     """Run full forward pass through heads — Phase 2 style.
 
@@ -179,6 +180,9 @@ def get_head_predictions(
         frames: (B, H, W, 3) uint8.
         trajs: (B, K, 6) trajectory windows.
         texts: list of str, length B.
+        actions: (B, 6) current actions (delta) for the Assistant head.
+                 Optional — falls back to last pose if not provided (for
+                 backward-compat with tests that don't have actions).
 
     Returns:
         dict with 'alpha' (B, 1), 'delta' (B, K, 6), and
@@ -192,7 +196,10 @@ def get_head_predictions(
     z_text_n = F.normalize(z_text, dim=-1)
 
     alpha = model.decision_head(z_v, z_t, z_text)
-    delta = model.assistant_head(z_v, z_t, z_text, trajs[:, -1])
+    if actions is None:
+        # Backward-compat fallback: use last pose in the trajectory window
+        actions = trajs[:, -1]
+    delta = model.assistant_head(z_v, z_t, z_text, actions)
 
     return {
         "alpha": alpha.detach(),

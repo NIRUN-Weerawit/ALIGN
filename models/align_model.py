@@ -227,7 +227,18 @@ class DecisionHead(nn.Module):
 # ================================================================
 
 class AssistantHead(nn.Module):
-    """MLP predicting chunk of K corrective Δposes from shared embeddings."""
+    """MLP predicting chunk of K corrective Δposes from shared embeddings.
+
+    Input layout: cat([z_v, z_t, z_text, current_action], dim=-1)
+      - z_v: vision embedding (256D)
+      - z_t: pose trajectory embedding (256D) — past K poses
+      - z_text: text embedding (256D)
+      - current_action: the human teleoperator's current delta-pose command
+        (6D OSC_POSE). At inference, this comes directly from the VR
+        controller; the current EEF pose is already encoded in z_t.
+
+    Output: (B, K, 6) — K corrective deltas to add to the human's actions.
+    """
 
     def __init__(self, latent_dim: int = 256, chunk_size: int = 5, action_dim: int = 6):
         super().__init__()
@@ -247,9 +258,9 @@ class AssistantHead(nn.Module):
         z_v: torch.Tensor,
         z_t: torch.Tensor,
         z_text: torch.Tensor,
-        noisy_pose: torch.Tensor,
+        current_action: torch.Tensor,
     ) -> torch.Tensor:
-        x = torch.cat([z_v, z_t, z_text, noisy_pose], dim=-1)
+        x = torch.cat([z_v, z_t, z_text, current_action], dim=-1)
         out = self.mlp(x)
         return out.reshape(-1, self.chunk_size, self.action_dim)
 
@@ -466,7 +477,12 @@ class ALIGNModel(nn.Module):
         if compute_decision:
             result["alpha"] = self.decision_head(z_v, z_t, z_text)
         if compute_assistant:
-            # Use last pose from trajectory window as current noisy pose
+            # Backward-compat: when no current_action is supplied, use the
+            # last pose in the trajectory window. NOTE: this is no longer
+            # semantically correct — the Assistant head should see the
+            # current ACTION (delta), not the current pose. The pose is
+            # already encoded in z_t. Callers should pass `current_action`
+            # explicitly for the new design.
             result["delta"] = self.assistant_head(z_v, z_t, z_text, traj[:, -1])
         return result
 

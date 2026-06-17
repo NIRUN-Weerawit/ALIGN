@@ -59,7 +59,7 @@ def write_ep_to_hdf5(f, ep_idx, img_keys_data, states, actions, text):
     elif s_stack.shape[-1] < 6:
         pad = torch.zeros(s_stack.size(0), 6 - s_stack.shape[-1], device=s_stack.device)
         s_stack = torch.cat([s_stack, pad], dim=1)
-    gr.create_dataset("noisy_poses", data=s_stack.numpy().astype(np.float32))
+    gr.create_dataset("poses", data=s_stack.numpy().astype(np.float32))
 
     # Write actions if provided (7 dim)
     if actions is not None and len(actions) > 0:
@@ -138,7 +138,7 @@ def main():
                 # Previously only cameras + task were reset, causing
                 # ep_buffer["states"] and ep_buffer["actions"] to accumulate
                 # across episodes. This made every episode's actions and
-                # noisy_poses start with the same prefix as episode 0.
+                # poses start with the same prefix as episode 0.
                 for k in list(ep_buffer.keys()):
                     if k in cameras or k in ("states", "actions", "task"):
                         ep_buffer[k] = [] if k != "task" else None

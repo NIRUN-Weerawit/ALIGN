@@ -103,8 +103,9 @@ def evaluate(
             alpha_pred = model.decision_head(z_v, z_t, z_text).squeeze(-1)  # (B,)
             alpha_errors.extend((alpha_pred - alpha_need).abs().cpu().tolist())
 
-            # Assistant head
-            delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_pose)  # (B, K, 6)
+            # Assistant head: input is current action, not pose
+            current_action = batch.get("current_action", noisy_pose).float().to(device)
+            delta_pred = model.assistant_head(z_v, z_t, z_text, current_action)  # (B, K, 6)
             rmse_per_batch = (delta_pred - delta_t).pow(2).mean(dim=[1, 2]).sqrt()
             delta_rmses.extend(rmse_per_batch.cpu().tolist())
 

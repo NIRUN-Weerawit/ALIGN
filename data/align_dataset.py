@@ -385,24 +385,28 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
 
     Returns sequential chunks for Decision (α = need × consistency) + Assistant supervision.
 
-    Note: The 'consistency' part (cosine similarity of embeddings) is calculated 
+    Note: The 'consistency' part (cosine similarity of embeddings) is calculated
     during the forward pass in train_heads.py using frozen encoders. This collate
     function provides the 'need' component via kinematic error from noisy poses.
 
     Returns:
         {
             "frames": (B, H, W, 3) uint8,
-            "noisy_pose": (B, 6) float32 — corrupted pose for input,
-            "clean_pose":  (B, 6) float32 — ground truth pose from HDF5,
-            "trajectory":  (B, K, 6) float32 — past window of clean poses,
-            "alpha_need":  (B,) float32    — kinematic error part of alpha_target,
+            "noisy_pose": (B, 6) float32 — corrupted pose (for alpha target),
+            "clean_pose": (B, 6) float32 — ground truth pose (for alpha target),
+            "current_action": (B, 6) float32 — the human's delta-pose command at
+                              this timestep (input to Assistant head). Sourced
+                              from the dataset's `actions` field.
+            "trajectory": (B, K, 6) float32 — past window of clean poses,
+            "alpha_need": (B,) float32 — kinematic error part of alpha_target,
             "delta_target":(B, chunk_size, 6) float32,
-            "texts":       list of strings,
+            "texts": list of strings,
         }
     """
     all_frames = []
     all_noisy = []
     all_clean = []
+    all_actions = []
     all_trajs = []
     all_needs = []
     all_deltas = []
@@ -414,6 +418,9 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
     for item in batch:
         frames = item["frames"]
         poses_clean = item["poses"][..., :6]  # Ensure 6D (drop quaternion if 7D)
+        # Stored actions (7D OSC_POSE: 6D delta + gripper). Use the first 6
+        # dims for the Assistant head's explicit action input.
+        item_actions = item.get("actions")
         texts_raw = item["text"] if isinstance(item["text"], list) else item["text"]
 
         N = len(poses_clean)
@@ -430,6 +437,16 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         # --- Inject Noise for Current Pose ---
         current_clean_pose = poses_clean[t]
         noisy_pose = inject_kinematic_noise(current_clean_pose, rng)
+
+        # --- Current action (the human's command at this timestep) ---
+        if item_actions is not None and t < len(item_actions):
+            current_action = item_actions[t, :6].astype(np.float32)
+        elif t > 0:
+            # Fallback: derive action from pose difference if dataset
+            # has no actions field
+            current_action = (poses_clean[t, :6] - poses_clean[t - 1, :6]).astype(np.float32)
+        else:
+            current_action = np.zeros(6, dtype=np.float32)
 
         # --- Compute "Need" (Kinematic Error / D_MAX) ---
         pos_error = np.linalg.norm(current_clean_pose[:3] - noisy_pose[:3])
@@ -456,6 +473,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         all_frames.append(frames[t])
         all_noisy.append(noisy_pose[:6])
         all_clean.append(current_clean_pose[:6])
+        all_actions.append(current_action)
         all_trajs.append(traj_window[:, :6])
         all_needs.append(need)
         all_deltas.append(delta)
@@ -465,6 +483,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         "frames": np.stack(all_frames, axis=0),
         "noisy_pose": np.stack(all_noisy, axis=0).astype(np.float32),
         "clean_pose": np.stack(all_clean, axis=0).astype(np.float32),
+        "current_action": np.stack(all_actions, axis=0).astype(np.float32),
         "trajectory": np.stack(all_trajs, axis=0).astype(np.float32),
         "alpha_need": np.array(all_needs, dtype=np.float32),
         "delta_target": np.stack(all_deltas, axis=0).astype(np.float32),

@@ -320,8 +320,10 @@ def run_episode_in_sim(
             alpha = alpha_raw * consistency
             alpha_val = float(alpha.squeeze().cpu())
 
-            noisy_t = torch.from_numpy(raw_pose).unsqueeze(0).float().to(device)
-            chunk = model.assistant_head(z_v, z_t, z_text, noisy_t)
+            # Assistant head: input is the current human action (delta),
+            # not the current pose. The current EEF pose is encoded in z_t.
+            current_action_t = torch.from_numpy(base_action[:6]).unsqueeze(0).float().to(device)
+            chunk = model.assistant_head(z_v, z_t, z_text, current_action_t)
             chunk_np = chunk.squeeze(0).cpu().numpy()
 
             if chunk_cache is not None:

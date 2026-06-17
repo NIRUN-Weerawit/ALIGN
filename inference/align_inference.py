@@ -106,6 +106,7 @@ class ALIGNInference:
         self.chunk_cache = None
         self.alpha_history = []
         self.step_count = 0
+        self._prev_pose = None  # for delta computation
         if task_description is not None:
             self.z_text = self.model.encode_text([task_description])
 
@@ -116,12 +117,22 @@ class ALIGNInference:
         Args:
             frame: (H, W, 3) uint8 RGB camera image (ideally wrist).
             raw_pose: (6,) noisy teleoperation EEF pose [x,y,z,rx,ry,rz].
+                      This is the ABSOLUTE pose, not a delta — the delta
+                      is computed internally as (raw_pose - prev_pose).
 
         Returns:
             dict with 'commanded_pose' (6,), 'alpha' (float), 'chunk' (K,6).
         """
         if self.step_count == 0:
             self.pose_buffer = [raw_pose.copy() for _ in range(self.traj_window)]
+            self._prev_pose = raw_pose.copy()
+
+        # Compute the current action (delta) from pose change.
+        # The Assistant head is trained to see the human's delta command,
+        # not the absolute pose. At inference, we derive the delta by
+        # differencing the current vs previous pose.
+        current_action = raw_pose - self._prev_pose
+        self._prev_pose = raw_pose.copy()
 
         # Update buffer (ring buffer)
         self.pose_buffer.append(raw_pose.copy())
@@ -143,9 +154,10 @@ class ALIGNInference:
         alpha = self.model.decision_head(z_v, z_t, z_text)
         alpha_val = float(alpha.squeeze().cpu())
 
-        # Assistant head
-        noisy_t = torch.from_numpy(raw_pose).unsqueeze(0).float().to(self.device)
-        chunk = self.model.assistant_head(z_v, z_t, z_text, noisy_t)
+        # Assistant head: input is the current ACTION (delta), not the pose.
+        # The current EEF pose is already encoded in z_t.
+        action_t = torch.from_numpy(current_action).unsqueeze(0).float().to(self.device)
+        chunk = self.model.assistant_head(z_v, z_t, z_text, action_t)
         chunk_np = chunk.squeeze(0).cpu().numpy()
 
         # Blend: commanded = raw + α × corrective delta

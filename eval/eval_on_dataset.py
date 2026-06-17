@@ -210,6 +210,12 @@ def evaluate_on_dataset(
             raw_pose = noisy_poses[step]
             clean_pose = clean_poses[step]
 
+            # Current action = pose diff (or zero at first step)
+            if step > 0:
+                current_action = raw_pose - noisy_poses[step - 1]
+            else:
+                current_action = np.zeros_like(raw_pose)
+
             # Fill buffer
             pose_buffer.append(raw_pose.copy())
             if len(pose_buffer) > traj_window:
@@ -243,8 +249,10 @@ def evaluate_on_dataset(
                 alpha = alpha_raw * consistency
                 alpha_val = float(alpha.squeeze().cpu())
 
-                noisy_t = torch.from_numpy(raw_pose).unsqueeze(0).float().to(device)
-                chunk = model.assistant_head(z_v, z_t, z_text, noisy_t)
+                # Assistant head: input is the current action, not the pose.
+                # The current pose is encoded in z_t.
+                action_t = torch.from_numpy(current_action).unsqueeze(0).float().to(device)
+                chunk = model.assistant_head(z_v, z_t, z_text, action_t)
                 chunk_np = chunk.squeeze(0).cpu().numpy()
 
                 if chunk_cache is not None:

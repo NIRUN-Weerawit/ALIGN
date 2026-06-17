@@ -883,8 +883,17 @@ def train_heads_from_stream(
                 z_text = mixed["z_text"]
 
             # Joint loss: BCE(α) + 0.5 × MSE(Δ)
+            # Assistant head input: the current human ACTION (delta from
+            # the actions_window), not the pose. The pose is encoded in z_t.
+            if actions_window is not None and isinstance(actions_window, torch.Tensor):
+                # Take the first step of the actions window as the "current" action
+                current_action = actions_window[:, 0, :6].to(device).float()
+            else:
+                # Fallback: use the noisy pose diff (still 6D, but suboptimal)
+                current_action = noisy_poses[:, :6]
+
             alpha_pred = model.decision_head(z_v, z_t, z_text)
-            delta_pred = model.assistant_head(z_v, z_t, z_text, noisy_poses[:, :6])
+            delta_pred = model.assistant_head(z_v, z_t, z_text, current_action)
 
             loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target) +
                     0.5 * F.mse_loss(delta_pred, delta_target))
@@ -989,6 +998,7 @@ def train_heads_from_stream(
                         val_mixed = model.encode_mixed(
                             f_val, val_noisy.unsqueeze(1).repeat(1, traj_window, 1), txt_val)
                     v_alpha = model.decision_head(val_mixed["z_v"], val_mixed["z_t"], val_mixed["z_text"])
+                    # Val loop doesn't have actions_window — pass pose as fallback
                     v_delta = model.assistant_head(val_mixed["z_v"], val_mixed["z_t"], val_mixed["z_text"], val_noisy[:, :6])
                     v_loss = (F.binary_cross_entropy(v_alpha.squeeze(-1), val_alpha_t) +
                               0.5 * F.mse_loss(v_delta, val_delta_t))
