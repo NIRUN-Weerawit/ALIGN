@@ -428,7 +428,7 @@ def create_sim_env(bddl_file: Path, camera_name: str = "agentview"):
     from libero.libero.envs import OffScreenRenderEnv
     env = OffScreenRenderEnv(
         bddl_file_name=str(bddl_file),
-        cameras=[camera_name, "robot0_eye_in_hand"],
+        camera_names=[camera_name, "robot0_eye_in_hand"],
         camera_widths=128,
         camera_heights=128,
         has_renderer=False,
