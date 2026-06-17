@@ -127,17 +127,21 @@ def main():
                 raw_ep_id = raw_ep_id.item()
             ep_id = int(float(raw_ep_id))
 
-            # Detect episode boundary & flush previous 
+            # Detect episode boundary & flush previous
             if cur_ep_id is not None and ep_id != cur_ep_id:
                 cam_data = {k: v for k, v in ep_buffer.items() if k in cameras}
                 write_ep_to_hdf5(f, cur_ep_id, cam_data, ep_buffer["states"], ep_buffer["actions"], ep_buffer["task"])
-                
+
                 episodes_processed += 1
                 pbar.set_postfix({"episodes written": episodes_processed})
-                # Reset buffers
-                for cam in cameras:
-                    ep_buffer[cam] = []
-                ep_buffer["task"] = None
+                # Reset ALL buffer keys (cameras + states + actions + task).
+                # Previously only cameras + task were reset, causing
+                # ep_buffer["states"] and ep_buffer["actions"] to accumulate
+                # across episodes. This made every episode's actions and
+                # noisy_poses start with the same prefix as episode 0.
+                for k in list(ep_buffer.keys()):
+                    if k in cameras or k in ("states", "actions", "task"):
+                        ep_buffer[k] = [] if k != "task" else None
 
             # Accumulate frames for ALL detected camera keys
             for k in img_keys:

@@ -261,9 +261,9 @@ def run_episode_in_sim(
         # Remap gripper: dataset 0/1 → LIBERO env -1/1
         if len(action) >= 7:
             if action[6] <= 0.5:
-                action[6] = -1.0
-            else:
                 action[6] = 1.0
+            else:
+                action[6] = -1.0
         obs, reward, done, info = env.step(action)
         step += 1
 
