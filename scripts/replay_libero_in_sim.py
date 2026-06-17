@@ -209,29 +209,21 @@ def find_bddl_for_task(
     if bddl_root is not None and bddl_root.exists():
         for f in bddl_root.rglob("*.bddl"):
             stem = f.stem.lower()
-            # The BDDL stem is like 'KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it'
+            # Normalize both to underscores for comparison
+            stem_norm = stem.replace(" ", "_")
+            instr_norm = instr_no_punct.replace(" ", "_")
+            # The BDDL stem is like 'LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate...'
             # We want to match the descriptive part after the scene prefix
-            parts = stem.split("_", 3)  # KITCHEN, SCENE3, ... rest
+            parts = stem_norm.split("_", 3)  # LIVING, ROOM, SCENE5, ... rest
             if len(parts) >= 4:
                 descr = parts[3]
             else:
-                descr = stem
-            if descr in instr_no_punct or instr_no_punct in descr:
+                descr = stem_norm
+            if descr in instr_norm or instr_norm in descr:
                 print(f"    Local BDDL match: {f}")
                 return f
 
-    # Step 2: try fetching from GitHub using known patterns
-    if cache_dir is None:
-        cache_dir = Path.home() / ".cache" / "libero_bddl"
-
-    # Try the BDDL stem constructed from the language instruction
-    # This is a heuristic — the actual mapping requires the task_index, but
-    # we'll attempt a few common patterns.
-    print(f"    No local BDDL found. Trying GitHub for '{language_instruction[:50]}...'")
-    candidates = [
-        f"{instr_no_punct}.bddl".replace(" ", "_"),
-    ]
-    # Also try fetching via the LIBERO package's own path resolution
+    # Step 2: try the installed libero package's BDDL directory
     try:
         from libero.libero import get_libero_path
         libero_bddl = Path(get_libero_path("bddl_files")) / suite_name
@@ -239,16 +231,27 @@ def find_bddl_for_task(
             print(f"    Found LIBERO package BDDL dir: {libero_bddl}")
             for f in libero_bddl.rglob("*.bddl"):
                 stem = f.stem.lower()
-                parts = stem.split("_", 3)
+                stem_norm = stem.replace(" ", "_")
+                instr_norm = instr_no_punct.replace(" ", "_")
+                parts = stem_norm.split("_", 3)
                 if len(parts) >= 4:
                     descr = parts[3]
                 else:
-                    descr = stem
-                if descr in instr_no_punct or instr_no_punct in descr:
+                    descr = stem_norm
+                if descr in instr_norm or instr_norm in descr:
                     print(f"    LIBERO package BDDL match: {f}")
                     return f
     except Exception:
         pass
+
+    # Step 3: try fetching from GitHub using known patterns
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "libero_bddl"
+
+    print(f"    No local BDDL found. Trying GitHub for '{language_instruction[:50]}...'")
+    candidates = [
+        f"{instr_no_punct}.bddl".replace(" ", "_"),
+    ]
 
     for cand in candidates:
         path = fetch_bddl_from_github(suite_name, cand, cache_dir)
