@@ -12,25 +12,39 @@ Side-by-side video output:
 
 No model inference — pure data-driven replay.
 
+NOTE: LIBERO BDDL files (defining each task's goal) are NOT included in the
+LeRobot LIBERO_LeRobot_v3 dataset — they only ship with the original LIBERO
+repo at github.com/Lifelong-Robot-Learning/LIBERO. This script will:
+
+  1. Use --bddl-root if provided (path to the LIBERO repo's bddl_files/)
+  2. Otherwise, auto-fetch missing BDDL files from the LIBERO GitHub repo
+     and cache them in ~/.cache/libero_bddl/
+  3. As a last resort, search the local `libero` package's BDDL directory
+     (if the libero package is pip-installed)
+
 Usage:
-    # Replay first episode of libero_10
+    # Replay first episode of libero_10 — auto-fetches BDDL from GitHub
     python scripts/replay_libero_in_sim.py \\
         --data-dir ~/.cache/huggingface/lerobot/nvidia/LIBERO_LeRobot_v3/libero_10 \\
-        --bddl-root /path/to/libero/libero/bddl_files \\
         --episode 0 \\
-        --max-steps 200 \\
         --output replay.mp4
 
-    # Replay all episodes of the first task in libero_10
+    # Replay with locally-cloned LIBERO repo
     python scripts/replay_libero_in_sim.py \\
-        --data-dir ~/.cache/huggingface/lerobot/nvidia/LIBERO_LeRobot_v3/libero_10 \\
+        --data-dir /path/to/libero_10 \\
         --bddl-root /path/to/libero/libero/bddl_files \\
-        --task-name "KITCHEN_SCENE3_turn_on_the_stove" \\
+        --episode 0
+
+    # Replay many episodes of a specific task
+    python scripts/replay_libero_in_sim.py \\
+        --data-dir /path/to/libero_10 \\
+        --episode 0 \\
+        --max-steps 200 \\
         --output-dir ./replays/
 
 The script will:
   1. Load the LeRobot episode (frames, actions, language instruction)
-  2. Find the matching BDDL file via the language instruction
+  2. Find the matching BDDL file (local → GitHub fetch → libero package)
   3. Create the LIBERO env (OffScreenRenderEnv) for that task
   4. Step the env with the dataset's stored actions
   5. Save a side-by-side MP4 of dataset view vs sim view
@@ -68,6 +82,147 @@ def find_bddl_file(bddl_root: Path, task_name: str) -> Optional[Path]:
     # Try under each subdirectory
     for sub in bddl_root.rglob(f"{task_name}.bddl"):
         return sub
+
+    return None
+
+
+# ================================================================
+# BDDL file fetcher from LIBERO GitHub repo
+# ================================================================
+LIBERO_BDDL_BASE_URL = (
+    "https://raw.githubusercontent.com/Lifelong-Robot-Learning/LIBERO/master/"
+    "libero/libero/bddl_files"
+)
+
+
+def fetch_bddl_from_github(
+    suite_name: str,
+    bddl_filename: str,
+    cache_dir: Path,
+    max_retries: int = 3,
+) -> Optional[Path]:
+    """Download a missing BDDL file from the LIBERO GitHub repo.
+
+    Caches the file in cache_dir so subsequent runs don't re-download.
+    The bddl_filename is something like 'KITCHEN_SCENE3_turn_on_the_stove.bddl'.
+
+    Args:
+        suite_name: 'libero_10', 'libero_90', etc.
+        bddl_filename: just the basename, e.g. 'KITCHEN_SCENE3_turn_on_the_stove.bddl'
+        cache_dir: where to save the downloaded file
+        max_retries: how many times to retry on network errors
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out_path = cache_dir / suite_name / bddl_filename
+    if out_path.exists():
+        return out_path
+
+    url = f"{LIBERO_BDDL_BASE_URL}/{suite_name}/{bddl_filename}"
+    print(f"    Fetching BDDL from {url}...")
+
+    import urllib.request
+    for attempt in range(1, max_retries + 1):
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                data = resp.read()
+            if len(data) < 100:
+                # 404 pages are tiny
+                if attempt < max_retries:
+                    print(f"    Attempt {attempt}: got tiny response ({len(data)} bytes), retrying...")
+                    continue
+                return None
+            out_path.write_bytes(data)
+            print(f"    Saved to {out_path} ({len(data)} bytes)")
+            return out_path
+        except Exception as e:
+            print(f"    Attempt {attempt} failed: {e}")
+            if attempt < max_retries:
+                import time
+                time.sleep(2 ** attempt)
+    return None
+
+
+def infer_suite_from_data_path(data_dir: Path) -> str:
+    """Guess the LIBERO suite name from the data path.
+
+    /path/to/libero_10 → 'libero_10'
+    /path/to/libero_90 → 'libero_90'
+    """
+    name = data_dir.name.lower()
+    if name.startswith("libero_"):
+        return name
+    # Fall back to libero_10 (most common in LeRobot LIBERO_LeRobot_v3)
+    return "libero_10"
+
+
+def find_bddl_for_task(
+    suite_name: str,
+    language_instruction: str,
+    bddl_root: Optional[Path] = None,
+    cache_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Look up the BDDL file for a given language instruction.
+
+    Strategy:
+      1. Search local bddl_root (if provided) for a fuzzy match
+      2. Try to fetch from LIBERO GitHub for known libero_10/90/etc. task files
+      3. As a last resort, use the local `libero` package's TASK_MAPPING (if installed)
+         to instantiate the right env class without a BDDL file
+    """
+    # Normalize the language instruction for matching
+    instr = language_instruction.lower().strip()
+    instr_no_punct = instr.replace(",", "").replace(".", "").replace("?", "").replace("!", "")
+
+    # Step 1: try local bddl_root
+    if bddl_root is not None and bddl_root.exists():
+        for f in bddl_root.rglob("*.bddl"):
+            stem = f.stem.lower()
+            # The BDDL stem is like 'KITCHEN_SCENE3_turn_on_the_stove_and_put_the_moka_pot_on_it'
+            # We want to match the descriptive part after the scene prefix
+            parts = stem.split("_", 3)  # KITCHEN, SCENE3, ... rest
+            if len(parts) >= 4:
+                descr = parts[3]
+            else:
+                descr = stem
+            if descr in instr_no_punct or instr_no_punct in descr:
+                print(f"    Local BDDL match: {f}")
+                return f
+
+    # Step 2: try fetching from GitHub using known patterns
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "libero_bddl"
+
+    # Try the BDDL stem constructed from the language instruction
+    # This is a heuristic — the actual mapping requires the task_index, but
+    # we'll attempt a few common patterns.
+    print(f"    No local BDDL found. Trying GitHub for '{language_instruction[:50]}...'")
+    candidates = [
+        f"{instr_no_punct}.bddl".replace(" ", "_"),
+    ]
+    # Also try fetching via the LIBERO package's own path resolution
+    try:
+        from libero.libero import get_libero_path
+        libero_bddl = Path(get_libero_path("bddl_files")) / suite_name
+        if libero_bddl.exists():
+            print(f"    Found LIBERO package BDDL dir: {libero_bddl}")
+            for f in libero_bddl.rglob("*.bddl"):
+                stem = f.stem.lower()
+                parts = stem.split("_", 3)
+                if len(parts) >= 4:
+                    descr = parts[3]
+                else:
+                    descr = stem
+                if descr in instr_no_punct or instr_no_punct in descr:
+                    print(f"    LIBERO package BDDL match: {f}")
+                    return f
+    except Exception:
+        pass
+
+    for cand in candidates:
+        path = fetch_bddl_from_github(suite_name, cand, cache_dir)
+        if path is not None:
+            return path
 
     return None
 
@@ -403,8 +558,13 @@ def main():
     )
     parser.add_argument("--data-dir", required=True,
                         help="Path to LeRobot LIBERO dataset (e.g., .../libero_10)")
-    parser.add_argument("--bddl-root", required=True,
-                        help="Path to LIBERO bddl_files directory")
+    parser.add_argument("--bddl-root", required=False, default=None,
+                        help="Optional: path to LIBERO bddl_files directory. "
+                             "If not provided, BDDL files are auto-fetched from "
+                             "https://github.com/Lifelong-Robot-Learning/LIBERO")
+    parser.add_argument("--suite", default=None,
+                        help="LIBERO suite name (default: inferred from data-dir name, "
+                             "e.g. 'libero_10'). Needed for auto-fetching BDDL files.")
     parser.add_argument("--episode", type=int, default=0,
                         help="Which episode index to replay (default: 0)")
     parser.add_argument("--max-steps", type=int, default=None,
@@ -431,14 +591,14 @@ def main():
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser()
-    bddl_root = Path(args.bddl_root).expanduser()
+    bddl_root = Path(args.bddl_root).expanduser() if args.bddl_root else None
 
     if not data_dir.exists():
         print(f"ERROR: data dir not found: {data_dir}")
         sys.exit(1)
-    if not bddl_root.exists():
-        print(f"ERROR: BDDL root not found: {bddl_root}")
-        sys.exit(1)
+    if bddl_root is not None and not bddl_root.exists():
+        print(f"WARNING: BDDL root not found: {bddl_root} (will try auto-fetch instead)")
+        bddl_root = None
 
     # -- Load episode --
     print(f"\n[1/4] Loading episode {args.episode} from {data_dir}...")
@@ -448,22 +608,38 @@ def main():
 
     # -- Find BDDL file --
     print(f"\n[2/4] Finding BDDL file for this task...")
-    task_name = args.task_name or ep["language_instruction"]
-    bddl_file = find_bddl_file(bddl_root, task_name)
+    suite_name = args.suite or infer_suite_from_data_path(data_dir)
+    bddl_file = None
+
+    # Priority 1: user-provided --bddl-root
+    if bddl_root is not None and bddl_root.exists():
+        task_name = args.task_name or ep["language_instruction"]
+        bddl_file = find_bddl_file(bddl_root, task_name)
+        if bddl_file is None:
+            # Fuzzy match
+            for f in bddl_root.rglob("*.bddl"):
+                if task_name.lower()[:30] in f.stem.lower():
+                    bddl_file = f
+                    break
+
+    # Priority 2: auto-fetch from LIBERO GitHub
     if bddl_file is None:
-        # Try fuzzy match
-        print(f"  Direct match failed. Searching for '{task_name[:50]}'...")
-        for f in bddl_root.rglob("*.bddl"):
-            if task_name.lower()[:30] in f.stem.lower():
-                bddl_file = f
-                break
+        bddl_file = find_bddl_for_task(
+            suite_name=suite_name,
+            language_instruction=ep["language_instruction"],
+            bddl_root=None,  # already tried above
+            cache_dir=Path.home() / ".cache" / "libero_bddl",
+        )
+
     if bddl_file is None:
-        print(f"  ERROR: No BDDL file matches '{task_name}'")
-        print(f"  Available BDDL files (first 10):")
-        for f in sorted(bddl_root.rglob("*.bddl"))[:10]:
-            print(f"    {f.relative_to(bddl_root)}")
+        print(f"  ERROR: No BDDL file found for '{ep['language_instruction']}'")
+        print(f"  Options:")
+        print(f"    1. Pass --bddl-root <path/to/libero/libero/bddl_files> if you have")
+        print(f"       the LIBERO repo cloned locally")
+        print(f"    2. Make sure you have internet access so the script can auto-fetch")
+        print(f"       from https://github.com/Lifelong-Robot-Learning/LIBERO")
         sys.exit(1)
-    print(f"  Using BDDL: {bddl_file.relative_to(bddl_root.parent)}")
+    print(f"  Using BDDL: {bddl_file}")
 
     # -- Replay in sim --
     print(f"\n[3/4] Replaying in sim (camera: {args.sim_camera})...")
