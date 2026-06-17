@@ -216,17 +216,18 @@ def run_episode_in_sim(
         # Remap gripper: dataset 0/1 → LIBERO env -1/1
         if len(action) >= 7:
             if action[6] <= 0.5:
-                action[6] = -1.0
-            else:
                 action[6] = 1.0
+            else:
+                action[6] = -1.0
         obs, reward, done, info = env.step(action)
         step += 1
 
         # Capture frame AFTER stepping (so it shows the result of this action)
         frame_post = _get_sim_frame(env)
         if record_video:
-            display = _overlay_text(frame_post, f"NO ALIGN  step={step}", color=(255, 0, 0))
-            frames_no_align.append(display)
+            # Store raw frame (text drawn in the video assembly section
+            # AFTER flipping, so text isn't flipped)
+            frames_no_align.append(frame_post.copy())
 
     # ── Run "With ALIGN" trajectory ──
     obs = env.reset()
@@ -295,9 +296,9 @@ def run_episode_in_sim(
         action[:6] = base_action[:6] + alpha_val * corrective[:6]
         # Remap gripper
         if action[6] <= 0.5:
-            action[6] = -1.0
-        else:
             action[6] = 1.0
+        else:
+            action[6] = -1.0
 
         obs, reward, done, info = env.step(action)
         step += 1
@@ -315,9 +316,9 @@ def run_episode_in_sim(
         error_with_align.append(err_with_align)
 
         if record_video:
-            display = _overlay_text(frame_post, f"WITH ALIGN  a={alpha_val:.2f}  step={step}", color=(0, 255, 0))
-            display = _overlay_text(display, f"err={err_with_align:.3f}", pos=(10, 30), color=(0, 255, 0))
-            frames_with_align.append(display)
+            # Store raw frame (text drawn AFTER flipping in video assembly
+            # so text isn't flipped)
+            frames_with_align.append(frame_post.copy())
 
     # The 'info' dict was last returned by env.step() in the ALIGN run
     success = False
@@ -352,27 +353,47 @@ def run_episode_in_sim(
         h, w = frames_no_align[0].shape[:2]
 
         for i in range(n_frames):
-            # Dataset ground truth frame
+            # Dataset ground truth frame (raw, no text — we'll add text after flip)
             gt_idx = i
             if gt_idx < len(expert_frames):
                 gt = expert_frames[gt_idx]
                 if gt.shape[:2] != (h, w):
                     from PIL import Image as _PIL
                     gt = np.array(_PIL.fromarray(gt).resize((w, h)))
-                gt_display = _overlay_text(gt, f"GT  step={gt_idx}", color=(255, 255, 255))
+                gt_raw = gt
             else:
-                gt_display = np.zeros((h, w, 3), dtype=np.uint8)
+                gt_raw = np.zeros((h, w, 3), dtype=np.uint8)
 
             f_no = frames_no_align[i]
             f_with = frames_with_align[i]
 
-            # Apply flip if requested
+            # Apply flip if requested (BEFORE drawing text so text isn't flipped)
             if not no_flip_vertical:
-                f_no = np.flipud(f_no)
-                f_with = np.flipud(f_with)
+                f_no = np.flipud(f_no).copy()
+                f_with = np.flipud(f_with).copy()
             if not no_flip_horizontal:
-                f_no = np.fliplr(f_no)
-                f_with = np.fliplr(f_with)
+                f_no = np.fliplr(f_no).copy()
+                f_with = np.fliplr(f_with).copy()
+
+            # Now draw text on the flipped frames (text will appear right-side up)
+            f_no = _overlay_text(f_no, f"NO ALIGN  step={i+1}", color=(255, 0, 0))
+            # Include the per-step metrics in the WITH ALIGN panel
+            step_idx = i + 5  # warmup offset used in the run loop
+            if i < len(error_with_align) and i < len(alpha_vals):
+                f_with = _overlay_text(
+                    f_with,
+                    f"WITH ALIGN  a={alpha_vals[i]:.2f}  step={i+1}",
+                    color=(0, 255, 0),
+                )
+                f_with = _overlay_text(
+                    f_with,
+                    f"err={error_with_align[i]:.3f}",
+                    pos=(10, 30),
+                    color=(0, 255, 0),
+                )
+            else:
+                f_with = _overlay_text(f_with, f"WITH ALIGN  step={i+1}", color=(0, 255, 0))
+            gt_display = _overlay_text(gt_raw, f"GT  step={gt_idx}", color=(255, 255, 255))
 
             combined = np.concatenate([gt_display, f_no, f_with], axis=1)
             side_by_side.append(combined)
@@ -500,8 +521,8 @@ def evaluate_suite(
                     bddl_file_name=bddl_path,
                     use_camera_obs=True,
                     camera_names=["agentview", "robot0_eye_in_hand"],
-                    camera_widths=args.render_size,
-                    camera_heights=args.render_size,
+                    camera_widths=render_size,
+                    camera_heights=render_size,
                     reward_shaping=True,
                     control_freq=20,
                     initialization_noise=None,
