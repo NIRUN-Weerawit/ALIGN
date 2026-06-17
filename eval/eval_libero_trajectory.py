@@ -246,6 +246,13 @@ def run_episode_in_sim(
     done = False
     frames_no_align = []
 
+    # Inject noise into expert poses to simulate a noisy human teleoperator
+    rng = np.random.default_rng(42)
+    if noise_std > 0:
+        noisy_poses = inject_noise(expert_poses[:n_expert], std=noise_std, rng=rng)
+    else:
+        noisy_poses = expert_poses[:n_expert].copy()
+
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(env)
 
@@ -254,9 +261,9 @@ def run_episode_in_sim(
         # Remap gripper: dataset 0/1 → LIBERO env -1/1
         if len(action) >= 7:
             if action[6] <= 0.5:
-                action[6] = 1.0
-            else:
                 action[6] = -1.0
+            else:
+                action[6] = 1.0
         obs, reward, done, info = env.step(action)
         step += 1
 
@@ -266,7 +273,6 @@ def run_episode_in_sim(
             # Store raw frame (text drawn in the video assembly section
             # AFTER flipping, so text isn't flipped)
             frames_no_align.append(frame_post.copy())
-
     # ── Run "With ALIGN" trajectory ──
     obs = env.reset()
     step = 0
@@ -281,8 +287,8 @@ def run_episode_in_sim(
 
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(env)
-        raw_pose = expert_poses[step]
-        clean_pose = expert_poses[step]
+        raw_pose = noisy_poses[step]  # the noised version for sim input
+        clean_pose = expert_poses[step]  # the ground truth for comparison
         base_action = expert_actions[step]  # the dataset's stored delta
 
         # Build pose buffer for trajectory encoder
@@ -537,7 +543,7 @@ def evaluate_suite(
 
     for task_idx, task_name in enumerate(task_list):
         for ep in range(n_episodes):
-            print(f"  [{task_idx+1}/{len(task_list)}] {task_name[:60]}  ep {ep+1}/{n_episodes}")
+            print(f"  [{task_idx+1}/{len(task_list)}] {task_name[:100]}  ep {ep+1}/{n_episodes}")
 
             try:
                 # Find matching episode in HDF5
@@ -548,6 +554,8 @@ def evaluate_suite(
                 if expert is None:
                     print(f"    WARNING: No matching episode found in HDF5")
                     continue
+                # Debug: print which episode was matched
+                print(f"    [match] {expert['text'][:60]} (frames: {expert['frames'].shape[0]})")
 
                 # Precompute text embedding
                 z_text = model.encode_text([task_name])
