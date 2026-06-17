@@ -128,8 +128,26 @@ class ALIGNDataset(Dataset):
         except Exception:
             self._has_actions = False
 
+        # Determine the pose field name per episode. Older HDF5 files use
+        # "noisy_poses" (misnomer — actually contains clean poses).
+        # Newer files use "poses". Store the resolved name per episode.
+        self._pose_keys: List[str] = []
         for ep_idx in range(len(self._episode_keys)):
             key = self._episode_keys[ep_idx]
+            ep_group = self._h5[key]
+            if "poses" in ep_group:
+                self._pose_keys.append("poses")
+            elif "noisy_poses" in ep_group:
+                self._pose_keys.append("noisy_poses")
+            else:
+                raise KeyError(
+                    f"Episode {key} has neither 'poses' nor 'noisy_poses' field"
+                )
+
+        for ep_idx in range(len(self._episode_keys)):
+            key = self._episode_keys[ep_idx]
+            pose_key = self._pose_keys[ep_idx]
+
             # Frame length (handle both framedataset structures)
             if self.camera is None:
                 # frames = Dataset — single array
@@ -138,11 +156,11 @@ class ALIGNDataset(Dataset):
                 try:
                     n_frames = len(self._h5[f"{key}/frames/{self.camera}"])
                 except KeyError:
-                    n_frames = len(self._h5[f"{key}/noisy_poses"])
+                    n_frames = len(self._h5[f"{key}/{pose_key}"])
             self._ep_frame_lengths.append(n_frames)
 
             # Pose offset: in cumulative HDF5, ep_N starts AFTER all previous episodes
-            n_poses = len(self._h5[f"{key}/noisy_poses"])
+            n_poses = len(self._h5[f"{key}/{pose_key}"])
             if n_poses == n_frames:
                 # Non-cumulative — pose aligns with frames directly
                 self._ep_pose_offsets.append(0)
@@ -187,11 +205,13 @@ class ALIGNDataset(Dataset):
     def _read_poses(self, ep_idx: int, start: int, count: int) -> np.ndarray:
         key = self._episode_keys[ep_idx]
         if self._single_episode:
-            return self._h5["noisy_poses"][start:start + count]
-        # Handle cumulative noisy_poses (LIBERO v3 quirk)
+            pose_key = getattr(self, "_pose_keys", ["noisy_poses"])[0]
+            return self._h5[pose_key][start:start + count]
+        # Handle cumulative poses (LIBERO v3 quirk)
         offset = self._ep_pose_offsets[ep_idx]
         abs_start = offset + start
-        raw = self._h5[f"{key}/noisy_poses"][abs_start:abs_start + count]
+        pose_key = self._pose_keys[ep_idx]
+        raw = self._h5[f"{key}/{pose_key}"][abs_start:abs_start + count]
         # Pad if fewer items than requested (episode boundary)
         if len(raw) < count:
             pad = np.zeros((count - len(raw), raw.shape[1]), dtype=raw.dtype)
