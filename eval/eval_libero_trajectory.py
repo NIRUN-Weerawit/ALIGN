@@ -101,11 +101,35 @@ def axisangle_to_quat(axisangle: np.ndarray) -> np.ndarray:
 # Load expert trajectory from HDF5
 # ================================================================
 
-def find_episode_for_task(h5_path: str, task_name: str) -> Optional[dict]:
+def find_episode_for_task(h5_path: str, task_name: str,
+                            use_first: bool = True) -> Optional[dict]:
     """Find a matching episode in the HDF5 for a given task name.
 
-    Returns dict with frames, poses, text, or None if not found.
+    Args:
+        h5_path: Path to the HDF5 dataset.
+        task_name: LIBERO task name (BDDL stem, e.g.
+                   "LIVING_ROOM_SCENE5_put_the_white_mug..." or
+                   "pick_up_the_black_bowl_on_the_cookie_box..." for libero_spatial).
+        use_first: If True, return the first matching episode. If False, return
+                   the best match (most word overlap).
+
+    Returns dict with frames, poses, actions, text, or None if not found.
     """
+    # Use the full BDDL name (don't strip scene prefix). This works for
+    # both naming conventions:
+    #   - libero_10/90: "LIVING_ROOM_SCENE5_put_the_white_mug_..."
+    #     Text doesn't have the scene prefix words, so the overlap score
+    #     is lower but still high enough to match correctly.
+    #   - libero_spatial: "pick_up_the_black_bowl_..."
+    #     Text has all the same words, so overlap is 100%.
+    task_words = set(task_name.lower().replace("_", " ").split())
+
+    best_match = None
+    best_score = -1
+    task_words = set(task_name.lower().replace("_", " ").split())
+    # Normalize the task name for exact comparison
+    task_normalized = task_name.lower().replace("_", " ").strip()
+
     with h5py.File(h5_path, "r") as h5:
         ep_keys = sorted([k for k in h5.keys() if k.startswith("ep_")])
         for ep_key in ep_keys:
@@ -115,44 +139,58 @@ def find_episode_for_task(h5_path: str, task_name: str) -> Optional[dict]:
                 continue
             import json as _json
             text = _json.loads(texts_raw[()])[0]
-            # Match by extracting the core task description
-            # BDDL names: "LIVING_ROOM_SCENE5_put_the_white_mug..."
-            # HDF5 texts: "put the white mug on the left plate..."
-            # Strip scene prefix from BDDL name and compare
-            task_parts = task_name.split("_", 2)  # ["LIVING", "ROOM", "SCENE5_put..."]
-            task_desc = task_parts[-1] if len(task_parts) >= 3 else task_name
-            # Normalize both
-            text_normalized = text.lower().replace("_", " ").strip()
-            task_normalized = task_desc.lower().replace("_", " ").strip()
-            # Compare first 40 chars
-            if text_normalized[:40] in task_normalized or task_normalized[:40] in text_normalized:
-                # Found a match
-                frames_group = group.get("frames", None)
-                if frames_group is None:
-                    continue
-                # Try wrist first, then front
-                cam_name = None
-                for c in ["wrist_image", "image"]:
-                    if c in frames_group:
-                        cam_name = c
-                        break
-                if cam_name is None:
-                    cam_name = list(frames_group.keys())[0]
-                frames = frames_group[cam_name][:]
-                # Use the stored actions (already in OSC_POSE delta format)
-                # Fall back to noisy_poses for backward compat
-                if "actions" in group:
-                    poses = group["actions"][:, :6]
-                else:
-                    poses = group["noisy_poses"][:]
-                return {
-                    "frames": frames,
-                    "poses": poses,
-                    "actions": group["actions"][:],
-                    "text": text,
-                    "cam_name": cam_name,
-                }
-    return None
+            text_normalized = text.lower().replace(",", "").replace(".", "").strip()
+
+            # Tier 1: Exact match (after normalization). BDDL names like
+            # "pick_up_the_black_bowl_next_to_the_plate..." should match
+            # exactly to the stored text.
+            if text_normalized == task_normalized:
+                return _extract_episode(group, text)
+
+            # Tier 2: Word overlap. For libero_10/90 with scene prefixes,
+            # the text won't have those prefix words, so we use overlap
+            # of task words IN the text. Require 95% to disambiguate
+            # between similar tasks (e.g. "next_to_plate" vs
+            # "next_to_cookie_box").
+            text_words = set(text_normalized.split())
+            if not task_words or not text_words:
+                continue
+            overlap = len(task_words & text_words)
+            score = overlap / len(task_words)
+            if use_first and score >= 0.95:
+                return _extract_episode(group, text)
+            elif score > best_score and score >= 0.95:
+                best_score = score
+                best_match = _extract_episode(group, text)
+    return best_match
+
+
+def _extract_episode(group, text: str) -> Optional[dict]:
+    """Extract frames, poses, actions from a HDF5 episode group."""
+    frames_group = group.get("frames", None)
+    if frames_group is None:
+        return None
+    # Try wrist first, then front
+    cam_name = None
+    for c in ["wrist_image", "image"]:
+        if c in frames_group:
+            cam_name = c
+            break
+    if cam_name is None:
+        cam_name = list(frames_group.keys())[0]
+    frames = frames_group[cam_name][:]
+    # Use the stored actions (already in OSC_POSE delta format)
+    if "actions" in group:
+        poses = group["actions"][:, :6]
+    else:
+        poses = group["noisy_poses"][:]
+    return {
+        "frames": frames,
+        "poses": poses,
+        "actions": group["actions"][:],
+        "text": text,
+        "cam_name": cam_name,
+    }
 
 
 # ================================================================
@@ -503,7 +541,10 @@ def evaluate_suite(
 
             try:
                 # Find matching episode in HDF5
-                expert = find_episode_for_task(data_path, task_name)
+                # Use best-match (most word overlap) — not first-match.
+                # First-match can return an unrelated task if its first 40
+                # chars happen to overlap with the requested task.
+                expert = find_episode_for_task(data_path, task_name, use_first=False)
                 if expert is None:
                     print(f"    WARNING: No matching episode found in HDF5")
                     continue
