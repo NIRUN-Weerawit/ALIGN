@@ -49,6 +49,31 @@ The script will:
   4. Step the env with the dataset's stored actions
   5. Save a side-by-side MP4 of dataset view vs sim view
   6. Report success rate, reward, action mismatches
+
+CAN THE DATASET ALONE REPRODUCE THE SIMULATION RESULTS?
+=======================================================
+Partially. The LeRobot LIBERO_LeRobot_v3 dataset contains:
+  ✓ Per-frame: wrist_image, agentview_image (256x256, 20fps)
+  ✓ Per-step:  action (7D scaled deltas, OSC_POSE controller format)
+  ✓ Per-step:  observation.state (8D: ee_pos(3) + ee_axis_angle(3) + gripper(2))
+  ✓ Per-ep:    language instruction, task_index
+  ✗ BDDL file  (defines scene, objects, init, success predicate) — must fetch
+                from the LIBERO GitHub repo or supply --bddl-root
+  ✗ Initial state (the simulator has random init noise controlled by the BDDL's
+                init regions; this means replay may diverge from the original
+                demonstration even with the same actions)
+  ✗ Episode index → task name mapping (must be reconstructed from BDDL filenames
+                or from meta/tasks.parquet's __index_level_0__ column)
+
+What gets reproduced:
+  - The robot's EEF trajectory (the stored actions drive the OSC_POSE controller)
+  - The first-person views (the dataset's wrist + agentview images)
+What may diverge:
+  - Object positions in the scene (random init noise means objects start in
+    slightly different places each reset)
+  - The exact reward curve (success depends on object init randomness)
+  - Final success/failure (likely still succeeds if the action sequence was
+    robust to the random init)
 """
 
 import argparse
