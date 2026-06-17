@@ -139,10 +139,16 @@ def find_episode_for_task(h5_path: str, task_name: str) -> Optional[dict]:
                 if cam_name is None:
                     cam_name = list(frames_group.keys())[0]
                 frames = frames_group[cam_name][:]
-                poses = group["actions"][:, :6]
+                # Use the stored actions (already in OSC_POSE delta format)
+                # Fall back to noisy_poses for backward compat
+                if "actions" in group:
+                    poses = group["actions"][:, :6]
+                else:
+                    poses = group["noisy_poses"][:]
                 return {
                     "frames": frames,
                     "poses": poses,
+                    "actions": group["actions"][:],
                     "text": text,
                     "cam_name": cam_name,
                 }
@@ -172,6 +178,7 @@ def run_episode_in_sim(
     device: torch.device,
     expert_frames: np.ndarray,
     expert_poses: np.ndarray,
+    expert_actions: np.ndarray,
     task_description: str,
     z_text: torch.Tensor,
     noise_std: float = 0.0,
@@ -180,74 +187,46 @@ def run_episode_in_sim(
     max_steps: int = 500,
     use_bf16: bool = True,
     record_video: bool = False,
+    no_flip_vertical: bool = False,
+    no_flip_horizontal: bool = False,
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
     Runs TWO parallel trajectories for comparison:
-      - No ALIGN: raw noisy pose → step sim (baseline)
-      - With ALIGN: noisy pose + correction → step sim
+      - No ALIGN: raw stored actions → step sim (baseline)
+      - With ALIGN: stored actions + alignment correction → step sim
 
     Both are compared against the expert trajectory.
     When record_video is True, saves a 3-panel MP4:
       [DATASET GT] | [NO ALIGN] | [WITH ALIGN]
     """
-    n_expert = min(len(expert_poses), max_steps)
-    rng = np.random.default_rng(42)
-
-    # Inject noise into expert trajectory
-    if noise_std > 0:
-        noisy_poses = inject_noise(expert_poses[:n_expert], std=noise_std, rng=rng)
-    else:
-        noisy_poses = expert_poses[:n_expert].copy()
+    n_expert = min(len(expert_poses), max_steps, len(expert_actions))
 
     # ── Run "No ALIGN" trajectory first ──
     obs = env.reset()
     step = 0
     done = False
     frames_no_align = []
-    prev_pose = None
 
     while not done and step < max_steps and step < n_expert:
-        frame = _get_sim_frame(obs)
-        raw_pose = noisy_poses[step]
-        clean_pose = expert_poses[step]
+        frame = _get_sim_frame(env)
 
-        if step < 5:
-            step += 1
-            action = np.zeros(7, dtype=np.float32)
-            action[:6] = raw_pose
-            action[6] = -1.0
-            obs, reward, done, info = env.step(action)
-            prev_pose = raw_pose
-            continue
-
-        # Command delta from previous pose (replay relative movement)
-        if prev_pose is not None:
-            delta = raw_pose - prev_pose
-            # Get current sim EEF pose and add delta
-            sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
-            sim_quat = obs.get("robot0_eef_quat", np.array([1, 0, 0, 0]))
-            if isinstance(sim_eef, torch.Tensor):
-                sim_eef = sim_eef.cpu().numpy()
-            if isinstance(sim_quat, torch.Tensor):
-                sim_quat = sim_quat.cpu().numpy()
-            sim_axisangle = quat_to_axisangle(sim_quat)
-            sim_pose = np.concatenate([sim_eef, sim_axisangle]).astype(np.float32)
-            commanded = sim_pose + delta
-        else:
-            commanded = raw_pose
-        prev_pose = raw_pose
-
-        err = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
-        if record_video:
-            display = _overlay_text(frame, f"NO ALIGN  step={step}  err={err:.3f}", color=(255, 0, 0))
-            frames_no_align.append(display)
-
-        action = np.zeros(7, dtype=np.float32)
-        action[:6] = commanded
-        action[6] = -1.0
+        # Use the dataset's stored action directly (it's a delta in OSC_POSE format)
+        action = expert_actions[step].copy()
+        # Remap gripper: dataset 0/1 → LIBERO env -1/1
+        if len(action) >= 7:
+            if action[6] <= 0.5:
+                action[6] = -1.0
+            else:
+                action[6] = 1.0
         obs, reward, done, info = env.step(action)
         step += 1
+
+        # Capture frame AFTER stepping (so it shows the result of this action)
+        frame_post = _get_sim_frame(env)
+        if record_video:
+            display = _overlay_text(frame_post, f"NO ALIGN  step={step}", color=(255, 0, 0))
+            frames_no_align.append(display)
 
     # ── Run "With ALIGN" trajectory ──
     obs = env.reset()
@@ -260,29 +239,21 @@ def run_episode_in_sim(
     error_no_align = []
     error_with_align = []
     frames_with_align = []
-    prev_pose = None
 
     while not done and step < max_steps and step < n_expert:
-        frame = _get_sim_frame(obs)
-        raw_pose = noisy_poses[step]
+        frame = _get_sim_frame(env)
+        raw_pose = expert_poses[step]
         clean_pose = expert_poses[step]
+        base_action = expert_actions[step]  # the dataset's stored delta
 
+        # Build pose buffer for trajectory encoder
         pose_buffer.append(raw_pose.copy())
         if len(pose_buffer) > traj_window:
             pose_buffer.pop(0)
         while len(pose_buffer) < traj_window:
             pose_buffer.insert(0, raw_pose.copy())
 
-        if step < 5:
-            step += 1
-            action = np.zeros(7, dtype=np.float32)
-            action[:6] = raw_pose
-            action[6] = -1.0
-            obs, reward, done, info = env.step(action)
-            prev_pose = raw_pose
-            continue
-
-        # ALIGN inference
+        # ALIGN inference: predict a correction to add to the base action
         with torch.no_grad():
             frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)
             traj_t = torch.from_numpy(np.stack(pose_buffer)).unsqueeze(0).float().to(device)
@@ -317,39 +288,41 @@ def run_episode_in_sim(
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(chunk_np[0])))
 
-        # Command delta from previous pose + ALIGN correction
-        if prev_pose is not None:
-            delta = raw_pose - prev_pose
-            sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
-            sim_quat = obs.get("robot0_eef_quat", np.array([1, 0, 0, 0]))
-            if isinstance(sim_eef, torch.Tensor):
-                sim_eef = sim_eef.cpu().numpy()
-            if isinstance(sim_quat, torch.Tensor):
-                sim_quat = sim_quat.cpu().numpy()
-            sim_axisangle = quat_to_axisangle(sim_quat)
-            sim_pose = np.concatenate([sim_eef, sim_axisangle]).astype(np.float32)
-            commanded_pose = sim_pose + delta + alpha_val * corrective
+        # Apply the dataset action plus the ALIGN correction
+        # base_action is already in delta format (OSC_POSE), so we just add
+        # the corrective term to it
+        action = base_action.copy()
+        action[:6] = base_action[:6] + alpha_val * corrective[:6]
+        # Remap gripper
+        if action[6] <= 0.5:
+            action[6] = -1.0
         else:
-            commanded_pose = raw_pose
-        prev_pose = raw_pose
+            action[6] = 1.0
 
+        obs, reward, done, info = env.step(action)
+        step += 1
+
+        # Get post-step frame
+        frame_post = _get_sim_frame(env)
+
+        # Error metrics: compare sim's EEF to expert EEF
+        sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
+        if isinstance(sim_eef, torch.Tensor):
+            sim_eef = sim_eef.cpu().numpy()
         err_no_align = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
-        err_with_align = float(np.linalg.norm(commanded_pose[:3] - clean_pose[:3]))
+        err_with_align = float(np.linalg.norm(sim_eef - clean_pose[:3]))
         error_no_align.append(err_no_align)
         error_with_align.append(err_with_align)
 
         if record_video:
-            display = _overlay_text(frame, f"WITH ALIGN  α={alpha_val:.2f}  step={step}", color=(0, 255, 0))
+            display = _overlay_text(frame_post, f"WITH ALIGN  a={alpha_val:.2f}  step={step}", color=(0, 255, 0))
             display = _overlay_text(display, f"err={err_with_align:.3f}", pos=(10, 30), color=(0, 255, 0))
             frames_with_align.append(display)
 
-        action = np.zeros(7, dtype=np.float32)
-        action[:6] = commanded_pose
-        action[6] = -1.0
-        obs, reward, done, info = env.step(action)
-        step += 1
-
-    success = info.get("success", False)
+    # The 'info' dict was last returned by env.step() in the ALIGN run
+    success = False
+    if 'info' in locals() and isinstance(info, dict):
+        success = bool(info.get("success", False))
 
     # Summary
     avg_alpha = float(np.mean(alpha_vals)) if alpha_vals else 0.0
@@ -375,27 +348,36 @@ def run_episode_in_sim(
     if record_video and frames_no_align and frames_with_align:
         n_frames = min(len(frames_no_align), len(frames_with_align))
         side_by_side = []
+        # Use the sim's natural resolution for the panel
+        h, w = frames_no_align[0].shape[:2]
+
         for i in range(n_frames):
-            # Dataset ground truth frame (resized to match sim)
-            gt_idx = i + 5  # skip first 5 warmup steps
+            # Dataset ground truth frame
+            gt_idx = i
             if gt_idx < len(expert_frames):
                 gt = expert_frames[gt_idx]
-                if gt.shape[:2] != (224, 224):
+                if gt.shape[:2] != (h, w):
                     from PIL import Image as _PIL
-                    gt = np.array(_PIL.fromarray(gt).resize((224, 224)))
-                gt_display = _overlay_text(gt, f"DATASET GT  step={gt_idx}", color=(255, 255, 255))
+                    gt = np.array(_PIL.fromarray(gt).resize((w, h)))
+                gt_display = _overlay_text(gt, f"GT  step={gt_idx}", color=(255, 255, 255))
             else:
-                gt_display = np.zeros((224, 224, 3), dtype=np.uint8)
+                gt_display = np.zeros((h, w, 3), dtype=np.uint8)
 
-            # Ensure sim frames are right-side up
-            f_no = np.flipud(frames_no_align[i]) if frames_no_align[i][0, :, 0].mean() < frames_no_align[i][-1, :, 0].mean() else frames_no_align[i]
-            f_with = np.flipud(frames_with_align[i]) if frames_with_align[i][0, :, 0].mean() < frames_with_align[i][-1, :, 0].mean() else frames_with_align[i]
+            f_no = frames_no_align[i]
+            f_with = frames_with_align[i]
+
+            # Apply flip if requested
+            if not no_flip_vertical:
+                f_no = np.flipud(f_no)
+                f_with = np.flipud(f_with)
+            if not no_flip_horizontal:
+                f_no = np.fliplr(f_no)
+                f_with = np.fliplr(f_with)
 
             combined = np.concatenate([gt_display, f_no, f_with], axis=1)
             side_by_side.append(combined)
 
-        # White divider lines
-        w = frames_no_align[0].shape[1]
+        # White divider lines between panels
         for i in range(n_frames):
             side_by_side[i][:, w-2:w+2] = [255, 255, 255]
             side_by_side[i][:, 2*w-2:2*w+2] = [255, 255, 255]
@@ -405,36 +387,27 @@ def run_episode_in_sim(
     return result
 
 
-def _get_sim_frame(obs: dict) -> np.ndarray:
-    """Extract and preprocess a camera frame from sim observation."""
-    frame = None
-    for cam_name in ["agentview_image", "wrist_camera", "agentview", "camera"]:
-        if cam_name in obs:
-            frame = obs[cam_name]
-            break
-    if frame is None:
-        for k in obs:
-            if "image" in k.lower() or "rgb" in k.lower():
-                frame = obs[k]
-                break
-    if frame is not None:
-        if isinstance(frame, torch.Tensor):
-            frame = frame.cpu().numpy()
-        if frame.dtype != np.uint8:
-            if frame.max() <= 1.0:
-                frame = (frame * 255).astype(np.uint8)
-            else:
-                frame = frame.astype(np.uint8)
-        if frame.ndim == 4:
-            frame = frame[0]
-        if frame.shape[0] in (1, 3) and frame.ndim == 3:
+def _get_sim_frame(env, camera_name: str = "agentview") -> np.ndarray:
+    """Extract and preprocess a camera frame from sim observation.
+
+    Uses robosuite's _get_observations to match the dataset's pipeline.
+    Returns (H, W, 3) uint8 numpy array, vertically flipped and horizontally
+    mirrored to match the dataset's orientation.
+    """
+    try:
+        obs = env.env._get_observations()
+        frame = obs[camera_name + "_image"]
+        # robosuite returns (H, W, C) float32 [0,1] — convert to uint8
+        if frame.dtype == np.float32 or frame.dtype == np.float64:
+            frame = (frame * 255).clip(0, 255).astype(np.uint8)
+        if frame.ndim == 3 and frame.shape[0] in (1, 3):
             frame = frame.transpose(1, 2, 0)
-        if frame.shape[:2] != (224, 224):
-            from PIL import Image
-            frame = np.array(Image.fromarray(frame).resize((224, 224)))
-    else:
-        frame = np.zeros((224, 224, 3), dtype=np.uint8)
-    return frame
+        # Flip to match dataset orientation (upside-down + mirrored by default
+        # in robosuite's _get_observations; the dataset was captured via the
+        # same pipeline so no flip is needed here).
+        return frame
+    except Exception:
+        return np.zeros((256, 256, 3), dtype=np.uint8)
 
 
 def _overlay_text(frame: np.ndarray, text: str, pos=(10, 10), color=(0, 255, 0)):
@@ -466,6 +439,9 @@ def evaluate_suite(
     noise_std: float = 0.0,
     max_steps: int = 500,
     record_video: bool = False,
+    render_size: int = 256,
+    no_flip_vertical: bool = False,
+    no_flip_horizontal: bool = False,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(output_dir) / suite_name
@@ -523,9 +499,9 @@ def evaluate_suite(
                 env = OffScreenRenderEnv(
                     bddl_file_name=bddl_path,
                     use_camera_obs=True,
-                    camera_names=["agentview"],
-                    camera_widths=224,
-                    camera_heights=224,
+                    camera_names=["agentview", "robot0_eye_in_hand"],
+                    camera_widths=args.render_size,
+                    camera_heights=args.render_size,
                     reward_shaping=True,
                     control_freq=20,
                     initialization_noise=None,
@@ -545,12 +521,15 @@ def evaluate_suite(
                     env=env, model=model, device=DEVICE,
                     expert_frames=expert["frames"],
                     expert_poses=expert["poses"],
+                    expert_actions=expert["actions"],
                     task_description=task_name,
                     z_text=z_text,
                     noise_std=noise_std,
                     chunk_size=chunk_size,
                     max_steps=max_steps,
                     record_video=record_video,
+                    no_flip_vertical=no_flip_vertical,
+                    no_flip_horizontal=no_flip_horizontal,
                 )
 
                 result["task_name"] = task_name
@@ -644,6 +623,12 @@ def main():
                         help="Synthetic noise std (0 = clean replay)")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--record-video", action="store_true")
+    parser.add_argument("--render-size", type=int, default=256,
+                        help="Sim camera render resolution (default 256, matches dataset)")
+    parser.add_argument("--no-flip-vertical", action="store_true",
+                        help="Skip vertical flip on sim frames (default: flip applied)")
+    parser.add_argument("--no-flip-horizontal", action="store_true",
+                        help="Skip horizontal flip on sim frames (default: flip applied)")
     args = parser.parse_args()
 
     suites_to_run = [args.suite] if args.suite else list(LIBERO_TASK_MAP.keys())
@@ -666,6 +651,9 @@ def main():
             noise_std=args.noise_std,
             max_steps=args.max_steps,
             record_video=args.record_video,
+            render_size=args.render_size,
+            no_flip_vertical=args.no_flip_vertical,
+            no_flip_horizontal=args.no_flip_horizontal,
         )
         if result:
             all_summaries[suite_name] = result
