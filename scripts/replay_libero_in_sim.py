@@ -444,6 +444,7 @@ def replay_episode(
     render_width: int = 256,
     render_height: int = 256,
     camera_name: str = "agentview",
+    no_flip_vertical: bool = False,
 ) -> dict:
     """Replay actions in the sim and capture frames + rewards.
 
@@ -469,11 +470,14 @@ def replay_episode(
         try:
             obs = env.env._get_observations()
             frame = obs[camera_name + "_image"]
-            # robosuite returns (C, H, W) float32 [0,1] — convert to (H, W, C) uint8
+            # robosuite returns (H, W, C) float32 [0,1] — convert to uint8
             if frame.dtype == np.float32 or frame.dtype == np.float64:
                 frame = (frame * 255).clip(0, 255).astype(np.uint8)
             if frame.ndim == 3 and frame.shape[0] in (1, 3):
                 frame = frame.transpose(1, 2, 0)
+            # Vertical flip to match dataset orientation
+            if not no_flip_vertical:
+                frame = frame[::-1].copy()
             sim_frames.append(frame)
         except Exception:
             sim_frames.append(np.zeros((render_height, render_width, 3), dtype=np.uint8))
@@ -544,18 +548,32 @@ def make_side_by_side_video(
     else:
         cv2_writer = False
 
-    # Resize to match
-    if dataset_frames.shape[1:3] != sim_frames.shape[1:3]:
-        from PIL import Image
-        target_hw = sim_frames.shape[1:3]
-        resized_dataset = np.stack([
+    # Resize to match the dataset resolution (typically 256x256)
+    from PIL import Image
+    target_hw = dataset_frames.shape[1:3]
+    if sim_frames.shape[1:3] != target_hw:
+        resized_sim = np.stack([
             np.array(Image.fromarray(f).resize((target_hw[1], target_hw[0])))
-            for f in dataset_frames
+            for f in sim_frames
         ])
     else:
-        resized_dataset = dataset_frames
+        resized_sim = sim_frames
 
-    T = min(len(resized_dataset), len(sim_frames))
+    T = min(len(dataset_frames), len(resized_sim))
+    h, w = target_hw
+
+    # Use a font that scales with image size to avoid huge text on small images
+    font_size = max(12, h // 24)  # ~24px on 256x256, scales down for smaller
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except Exception:
+        try:
+            from PIL import ImageFont
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
     for t in range(T):
         if rewards is not None and t < len(rewards):
             r = rewards[t]
@@ -565,20 +583,25 @@ def make_side_by_side_video(
             label = f"step={t:3d}"
 
         # Stack side-by-side with a thin black divider
-        h, w = sim_frames[t].shape[:2]
         divider = np.zeros((h, 4, 3), dtype=np.uint8)
-        combined = np.hstack([resized_dataset[t], divider, sim_frames[t]])
+        combined = np.hstack([dataset_frames[t], divider, resized_sim[t]])
 
-        # Add text overlay at top
+        # Add text overlay
         try:
-            from PIL import Image, ImageDraw, ImageFont
+            from PIL import Image, ImageDraw
             img_pil = Image.fromarray(combined)
             draw = ImageDraw.Draw(img_pil)
-            # Top: task name; bottom-left: dataset; bottom-right: sim
-            draw.text((5, 5), f"TASK: {task_name[:60]}", fill=(255, 255, 0))
-            draw.text((5, h - 20), "DATASET", fill=(255, 255, 0))
-            draw.text((w + 10, h - 20), "SIM", fill=(0, 255, 0))
-            draw.text((5, 25), label, fill=(255, 255, 255))
+            # Top: task name
+            if font is not None:
+                draw.text((5, 5), f"TASK: {task_name[:60]}", fill=(255, 255, 0), font=font)
+                draw.text((5, h - font_size - 5), "DATASET", fill=(255, 255, 0), font=font)
+                draw.text((w + 10, h - font_size - 5), "SIM", fill=(0, 255, 0), font=font)
+                draw.text((5, 5 + font_size + 2), label, fill=(255, 255, 255), font=font)
+            else:
+                draw.text((5, 5), f"TASK: {task_name[:60]}", fill=(255, 255, 0))
+                draw.text((5, h - 20), "DATASET", fill=(255, 255, 0))
+                draw.text((w + 10, h - 20), "SIM", fill=(0, 255, 0))
+                draw.text((5, 25), label, fill=(255, 255, 255))
             combined = np.array(img_pil)
         except Exception:
             pass
@@ -631,6 +654,9 @@ def main():
                         help="Sim render resolution (default: 256x256)")
     parser.add_argument("--no-video", action="store_true",
                         help="Skip video output, just print metrics")
+    parser.add_argument("--no-flip-vertical", action="store_true",
+                        help="Skip the vertical flip on sim frames. Use this if "
+                             "the sim frames look correct (not upside-down) already.")
     parser.add_argument("--trajectory-only", action="store_true", default=True,
                         help="(Default) Only verify trajectory reproduction; "
                              "ignore success outcome (which depends on init randomness).")
@@ -704,6 +730,7 @@ def main():
         render_width=args.render_size,
         render_height=args.render_size,
         camera_name=args.sim_camera,
+        no_flip_vertical=args.no_flip_vertical,
     )
     print(f"  Replayed {sim_result['n_steps']} steps")
     print(f"  Total reward: {sim_result['total_reward']:.2f}")
