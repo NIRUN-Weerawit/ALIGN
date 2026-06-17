@@ -418,19 +418,22 @@ def load_episode(
     }
 
 
-def create_sim_env(bddl_file: Path, camera_name: str = "agentview"):
+def create_sim_env(bddl_file: Path, camera_name: str = "agentview",
+                   camera_width: int = 256, camera_height: int = 256):
     """Create a LIBERO OffScreenRenderEnv from a BDDL file.
 
     Args:
         bddl_file: Path to .bddl file
         camera_name: Which camera to render. LIBERO has 'agentview' and 'robot0_eye_in_hand'.
+        camera_width: Render width (default 256, matches LIBERO LeRobot dataset)
+        camera_height: Render height (default 256)
     """
     from libero.libero.envs import OffScreenRenderEnv
     env = OffScreenRenderEnv(
         bddl_file_name=str(bddl_file),
         camera_names=[camera_name, "robot0_eye_in_hand"],
-        camera_widths=128,
-        camera_heights=128,
+        camera_widths=camera_width,
+        camera_heights=camera_height,
         has_renderer=False,
         has_offscreen_renderer=True,
     )
@@ -445,6 +448,7 @@ def replay_episode(
     render_height: int = 256,
     camera_name: str = "agentview",
     no_flip_vertical: bool = False,
+    no_flip_horizontal: bool = False,
 ) -> dict:
     """Replay actions in the sim and capture frames + rewards.
 
@@ -456,7 +460,8 @@ def replay_episode(
             success: bool — task succeeded at end
             total_reward: float
     """
-    env = create_sim_env(bddl_file, camera_name=camera_name)
+    env = create_sim_env(bddl_file, camera_name=camera_name,
+                          camera_width=render_width, camera_height=render_height)
     sim_frames = []
     rewards = []
     dones = []
@@ -478,6 +483,11 @@ def replay_episode(
             # Vertical flip to match dataset orientation
             if not no_flip_vertical:
                 frame = frame[::-1].copy()
+            # Horizontal flip if needed (mirror mode)
+            if no_flip_horizontal:
+                pass
+            else:
+                frame = frame[:, ::-1].copy()
             sim_frames.append(frame)
         except Exception:
             sim_frames.append(np.zeros((render_height, render_width, 3), dtype=np.uint8))
@@ -657,6 +667,9 @@ def main():
     parser.add_argument("--no-flip-vertical", action="store_true",
                         help="Skip the vertical flip on sim frames. Use this if "
                              "the sim frames look correct (not upside-down) already.")
+    parser.add_argument("--no-flip-horizontal", action="store_true",
+                        help="Skip the horizontal (left-right) flip on sim frames. "
+                             "By default sim frames are mirrored to match the dataset.")
     parser.add_argument("--trajectory-only", action="store_true", default=True,
                         help="(Default) Only verify trajectory reproduction; "
                              "ignore success outcome (which depends on init randomness).")
@@ -731,6 +744,7 @@ def main():
         render_height=args.render_size,
         camera_name=args.sim_camera,
         no_flip_vertical=args.no_flip_vertical,
+        no_flip_horizontal=args.no_flip_horizontal,
     )
     print(f"  Replayed {sim_result['n_steps']} steps")
     print(f"  Total reward: {sim_result['total_reward']:.2f}")
