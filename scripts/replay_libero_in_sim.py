@@ -464,23 +464,33 @@ def replay_episode(
     T = max_steps or len(actions)
 
     for t in range(T):
-        # Render current state (BEFORE stepping, so we see the same thing the dataset recorded)
-        # Some LIBERO versions return obs[cam] as the rendered frame; otherwise render explicitly
+        # Render current state using the same pipeline as the dataset
+        # (robosuite's _get_observations, not raw MuJoCo sim.render)
         try:
-            frame = env.sim.render(
-                width=render_width,
-                height=render_height,
-                camera_name=camera_name,
-            )[::-1]  # flip vertically (mujoco is bottom-up)
-            sim_frames.append(frame.copy())
+            obs = env.env._get_observations()
+            frame = obs[camera_name + "_image"]
+            # robosuite returns (C, H, W) float32 [0,1] — convert to (H, W, C) uint8
+            if frame.dtype == np.float32 or frame.dtype == np.float64:
+                frame = (frame * 255).clip(0, 255).astype(np.uint8)
+            if frame.ndim == 3 and frame.shape[0] in (1, 3):
+                frame = frame.transpose(1, 2, 0)
+            sim_frames.append(frame)
         except Exception:
             sim_frames.append(np.zeros((render_height, render_width, 3), dtype=np.uint8))
 
         # Step the env with the stored action
-        action = actions[t]
+        action = actions[t].copy()
         if len(action) < 7:
             # Pad to 7D if dataset only stored 6D
             action = np.concatenate([action, np.array([0.0])])
+
+        # Remap gripper: dataset stores 0=open / 1=close, but LIBERO env
+        # expects -1=open / 1=close (0=stay). Map 0→-1, 1→1.
+        if len(action) >= 7:
+            if action[6] <= 0.5:
+                action[6] = 1.0  # close
+            else:
+                action[6] = -1.0   # open
 
         try:
             obs, reward, done, info = env.step(action)

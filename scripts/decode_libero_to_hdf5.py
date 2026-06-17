@@ -61,14 +61,9 @@ def write_ep_to_hdf5(f, ep_idx, img_keys_data, states, actions, text):
         s_stack = torch.cat([s_stack, pad], dim=1)
     gr.create_dataset("noisy_poses", data=s_stack.numpy().astype(np.float32))
 
-    # Write actions if provided (same formatting as states, forced to 6 dims)
+    # Write actions if provided (7 dim)
     if actions is not None and len(actions) > 0:
         a_stack = torch.stack(actions).float()
-        if a_stack.shape[-1] > 6:
-            a_stack = a_stack[:, :6]
-        elif a_stack.shape[-1] < 6:
-            pad = torch.zeros(a_stack.size(0), 6 - a_stack.shape[-1], device=a_stack.device)
-            a_stack = torch.cat([a_stack, pad], dim=1)
         gr.create_dataset("actions", data=a_stack.numpy().astype(np.float32))
 
     # Metadata for this episode
