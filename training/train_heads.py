@@ -75,11 +75,18 @@ def train_heads_hdf5(
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
     use_bf16: bool = True,
+    decision_noise_std: float = 0.02,
 ) -> str:
     """Train Decision and Assistant heads independently.
 
-    Phase 2a: BCE on alpha (freezes assistant).
-    Phase 2b: MSE on delta (freezes decision).
+    Phase 2a (Stage A): Future Prediction (cosine loss) — freezes assistant.
+      Past trajectory is noised with decision_noise_std to simulate
+      human deviation. Future trajectory is clean (the target).
+      The model learns to predict the clean future from the noised past.
+      When the past is heavily noised, prediction error is high → α is low
+      (model abstains). When the past matches the optimal, prediction is
+      accurate → α is high (model helps fully).
+    Phase 2b (Stage B): MSE on delta (freezes decision).
     Neither head gradient affects the other.
     """
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -159,6 +166,8 @@ def train_heads_hdf5(
     )
 
     # -- Model ──
+    # decision_K is matched to chunk_size so the future prediction head
+    # receives exactly K past embeddings (matching what the dataset provides).
     model = ALIGNModel(
         embed_dim=256,
         chunk_size=chunk_size,
@@ -166,6 +175,7 @@ def train_heads_hdf5(
         device=str(device),
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
+        decision_K=chunk_size,
     ).to(device)
 
     ckpt = torch.load(pretrained_checkpoint, map_location=device)
@@ -208,10 +218,28 @@ def train_heads_hdf5(
             traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
             traj_future = torch.from_numpy(batch["trajectory_future"]).float().to(device)
 
+            # ── Inject noise into the past trajectory ──
+            # This simulates a noisy human teleoperator. The model must
+            # learn to predict the CLEAN future from the NOISED past.
+            # When the past is heavily noised, prediction is hard → α is low
+            # (model abstains). When the past matches the optimal, prediction
+            # is easy → α is high (model helps fully).
+            if decision_noise_std > 0:
+                # Per-step Gaussian noise on position; rotation noise scaled
+                # to match the libero_spatial action scale.
+                noise = torch.randn_like(traj_view) * decision_noise_std
+                # Position dims (0-2): noise as-is (meters)
+                # Orientation dims (3-5): scale up to match rotation noise
+                noise[:, :, 3:6] *= 10.0  # 0.02m → 0.2 rad of axis-angle
+                traj_view_noisy = traj_view + noise
+            else:
+                traj_view_noisy = traj_view
+
             # Frozen encodings via mixer. We need per-token trajectory
             # embeddings (z_t_tokens) for the future prediction head.
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                mixed = model.encode_mixed(frames, traj_view, texts)
+                # Encode the NOISED past (input to the model)
+                mixed = model.encode_mixed(frames, traj_view_noisy, texts)
                 z_v = mixed["z_v"].float()           # (B, D) — current vision
                 z_t_tokens = mixed["z_t_tokens"].float()  # (B, K, D) — per-step
                 z_text = mixed["z_text"].float()     # (B, D)
@@ -422,6 +450,10 @@ def main():
                         help="Use BF16 autocast (on by default)")
     parser.add_argument("--no-bf16", dest="bf16", action="store_false",
                         help="Disable BF16 autocast")
+    parser.add_argument("--decision-noise-std", type=float, default=0.02,
+                        help="Std of noise injected into the past trajectory "
+                             "when training the Decision (future prediction) head. "
+                             "Simulates human deviation. 0 = no noise.")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="align-heads")
     parser.add_argument("--wandb-run", default=None)
@@ -450,6 +482,7 @@ def main():
         mixer_dim=args.mixer_dim,
         num_mixer_blocks=args.num_mixer_blocks,
         use_bf16=args.bf16,
+        decision_noise_std=args.decision_noise_std,
     )
 
 

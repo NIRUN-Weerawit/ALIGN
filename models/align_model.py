@@ -205,9 +205,9 @@ class FuturePredictionHeadMLP(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.K = K
-        # Input: K * (2 * embed_dim) — flattened (z_v, z_t) at K timesteps
+        # Input: K * (3 * embed_dim) — flattened (z_v, z_t, z_text) at K timesteps
         # Output: K * (2 * embed_dim) — predicted (z_v, z_t) at K timesteps
-        input_dim = K * 2 * embed_dim
+        input_dim = K * 3 * embed_dim
         output_dim = K * 2 * embed_dim
 
         layers = []
@@ -314,12 +314,6 @@ class FuturePredictionHeadTransformer(nn.Module):
         predicted_z_t = out[:, :, D:]
         return predicted_z_v, predicted_z_t
 
-
-# Backward-compat alias: the old "DecisionHead" name is preserved so
-# existing checkpoints load. The semantics are completely different
-# (it now predicts future embeddings, not alpha), but downstream
-# code that only needs the network to exist still works.
-DecisionHead = FuturePredictionHeadTransformer
 
 
 # ================================================================
@@ -433,7 +427,7 @@ class ALIGNModel(nn.Module):
         mixer_nhead: int = 8,
         max_traj_len: int = 64,
         decision_K: int = 10,
-        decision_arch: str = "transformer",
+        decision_arch: str = "mlp",
     ):
         super().__init__()
         self.embed_dim = embed_dim

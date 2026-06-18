@@ -201,6 +201,8 @@ def pretrain_hdf5(
         device=str(device),
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
+        # Default decision_K=10 matches pretrain's traj_window default
+        decision_K=10,
     ).to(device)
     model.freeze_backbone()
 
