@@ -177,6 +177,7 @@ def train_heads_hdf5(
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
         decision_K=chunk_size,
+        decision_arch='transformer',
     ).to(device)
 
     ckpt = torch.load(pretrained_checkpoint, map_location=device)
