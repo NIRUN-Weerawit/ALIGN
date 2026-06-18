@@ -217,6 +217,9 @@ def evaluate_on_dataset(
                 current_action = np.zeros_like(raw_pose)
 
             # Fill buffer
+            # Buffer size = model.decision_K so the future prediction head
+            # receives exactly K past embeddings.
+            traj_window = model.decision_K
             pose_buffer.append(raw_pose.copy())
             if len(pose_buffer) > traj_window:
                 pose_buffer.pop(0)
@@ -226,28 +229,49 @@ def evaluate_on_dataset(
             if step < 5:
                 continue
 
-            # ALIGN inference
+            # ALIGN inference: future prediction (Decision) + corrective delta (Assistant)
             with torch.no_grad():
                 frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)
                 traj_t = torch.from_numpy(np.stack(pose_buffer)).unsqueeze(0).float().to(device)
 
+                # Get the actual future K clean poses as prediction targets
+                K = model.decision_K
+                future_start = min(step + 1, len(clean_poses) - 1)
+                future_end = min(step + 1 + K, len(clean_poses))
+                future_poses = clean_poses[future_start:future_end]
+                if len(future_poses) < K:
+                    pad = np.tile(future_poses[-1], (K - len(future_poses), 1))
+                    future_poses = np.concatenate([future_poses, pad], axis=0)
+                traj_future_t = torch.from_numpy(future_poses).unsqueeze(0).float().to(device)
+
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    # Encode current (noised) trajectory
                     mixed = model.encode_mixed(frame_t, traj_t, [""])
+                    z_v = mixed["z_v"]
+                    z_t_tokens = mixed["z_t_tokens"]
+                    z_text = mixed["z_text"]
+                    # Encode the actual future (clean) trajectory
+                    mixed_future = model.encode_mixed(frame_t, traj_future_t, [""])
+                    z_t_future_tokens = mixed_future["z_t_tokens"]
 
-                z_v = mixed["z_v"]
-                z_t = mixed["z_t"]
+            # Decision head: predict K future embeddings from K past
+            z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)
+            z_v_target = z_v.unsqueeze(1).expand(-1, K, -1)
+            predicted_z_v, predicted_z_t = model.decision_head(
+                z_v_window, z_t_tokens, z_text
+            )
 
-                # Full gating signal
-                alpha_raw = model.decision_head(z_v, z_t, z_text)
-                z_v_n = F.normalize(z_v, dim=-1)
-                z_t_n = F.normalize(z_t, dim=-1)
-                z_text_n = F.normalize(z_text, dim=-1)
-                cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)
-                cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)
-                cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)
-                consistency = torch.min(torch.min(cos_vt, cos_vl), cos_tl)
-                alpha = alpha_raw * consistency
-                alpha_val = float(alpha.squeeze().cpu())
+            # α from prediction error
+            alpha = ALIGNModel.compute_alpha_from_predictions(
+                predicted_z_v, predicted_z_t,
+                z_v_target, z_t_future_tokens,
+                aggregation="weighted_mean", decay=0.7,
+            )
+            alpha_val = float(alpha.squeeze().cpu())
+
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                # Assistant head needs mean-pooled z_t
+                z_t = z_t_tokens.mean(dim=1)
 
                 # Assistant head: input is the current action, not the pose.
                 # The current pose is encoded in z_t.

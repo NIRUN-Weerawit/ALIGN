@@ -187,6 +187,7 @@ def record_episode_video(
             current_action = np.zeros(6, dtype=np.float32)
 
         # Fill buffer
+        traj_window = model.decision_K
         pose_buffer.append(raw_pose.copy())
         if len(pose_buffer) > traj_window:
             pose_buffer.pop(0)
@@ -210,17 +211,14 @@ def record_episode_video(
             z_v = mixed["z_v"]
             z_t = mixed["z_t"]
 
-            # Full gating signal: α = need × consistency
-            alpha_raw = model.decision_head(z_v, z_t, z_text)
-            z_v_n = F.normalize(z_v, dim=-1)
-            z_t_n = F.normalize(z_t, dim=-1)
-            z_text_n = F.normalize(z_text, dim=-1)
-            cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)
-            cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)
-            cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)
-            consistency = torch.min(torch.min(cos_vt, cos_vl), cos_tl)
-            alpha = alpha_raw * consistency
-            alpha_val = float(alpha.squeeze().cpu())
+            # NOTE: The Decision head is now a future prediction head.
+            # At inference, we don't have access to the future (the sim
+            # hasn't stepped yet). We use a fixed α = 1.0 (full intervention)
+            # and let the Assistant head's output magnitude control the
+            # actual intervention strength. The Decision head's value
+            # comes from the dataset-driven eval (where the future is
+            # available from the dataset).
+            alpha_val = 1.0
 
             # Assistant head: input is the current action, not the pose.
             # The current pose is encoded in z_t.
@@ -357,17 +355,11 @@ def run_episode(
             z_v = mixed["z_v"]
             z_t = mixed["z_t"]
 
-            # Full gating signal: α = need × consistency
-            alpha_raw = model.decision_head(z_v, z_t, z_text)
-            z_v_n = F.normalize(z_v, dim=-1)
-            z_t_n = F.normalize(z_t, dim=-1)
-            z_text_n = F.normalize(z_text, dim=-1)
-            cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)
-            cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)
-            cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)
-            consistency = torch.min(torch.min(cos_vt, cos_vl), cos_tl)
-            alpha = alpha_raw * consistency
-            alpha_val = float(alpha.squeeze().cpu())
+            # See note in the first loop: at inference, we don't have
+            # access to the future, so we use a fixed α = 1.0. The
+            # Decision head's value is only used in the dataset-driven
+            # eval (eval_libero_trajectory.py).
+            alpha_val = 1.0
 
             # Assistant head: input is the current action, not the pose.
             # The current pose is encoded in z_t.

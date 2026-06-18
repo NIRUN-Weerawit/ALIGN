@@ -221,7 +221,7 @@ def run_episode_in_sim(
     z_text: torch.Tensor,
     noise_std: float = 0.0,
     chunk_size: int = 10,
-    traj_window: int = 20,
+    traj_window: int = 10,  # overridden by model.decision_K at runtime
     max_steps: int = 500,
     use_bf16: bool = True,
     record_video: bool = False,
@@ -292,38 +292,61 @@ def run_episode_in_sim(
         base_action = expert_actions[step]  # the dataset's stored delta
 
         # Build pose buffer for trajectory encoder
+        # Buffer size = model.decision_K so the future prediction head
+        # receives exactly K past embeddings.
+        traj_window = model.decision_K
         pose_buffer.append(raw_pose.copy())
         if len(pose_buffer) > traj_window:
             pose_buffer.pop(0)
         while len(pose_buffer) < traj_window:
             pose_buffer.insert(0, raw_pose.copy())
 
-        # ALIGN inference: predict a correction to add to the base action
+        # ALIGN inference: future prediction (Decision head) + corrective delta (Assistant head)
         with torch.no_grad():
             frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)
             traj_t = torch.from_numpy(np.stack(pose_buffer)).unsqueeze(0).float().to(device)
 
+            # Get the actual future K poses (ground truth, what we want to predict)
+            # These are the CLEAN expert poses from the dataset (the "true" future)
+            K = model.decision_K
+            future_start = min(step + 1, n_expert - 1)
+            future_end = min(step + 1 + K, n_expert)
+            future_poses = expert_poses[future_start:future_end]  # (K, 6) clean
+            if len(future_poses) < K:
+                # Pad with the last available pose
+                pad = np.tile(future_poses[-1], (K - len(future_poses), 1))
+                future_poses = np.concatenate([future_poses, pad], axis=0)
+            traj_future_t = torch.from_numpy(future_poses).unsqueeze(0).float().to(device)
+
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                # Encode current (noised) trajectory
                 mixed = model.encode_mixed(frame_t, traj_t, [""])
+                z_v = mixed["z_v"]
+                z_t_tokens = mixed["z_t_tokens"]  # (1, K, D)
+                z_text = mixed["z_text"]
+                # Encode the actual future (clean) trajectory as targets
+                mixed_future = model.encode_mixed(frame_t, traj_future_t, [""])
+                z_t_future_tokens = mixed_future["z_t_tokens"]  # (1, K, D)
 
-            z_v = mixed["z_v"]
-            z_t = mixed["z_t"]
+            # Decision head: predict K future embeddings from K past
+            z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)  # (1, K, D)
+            z_v_target = z_v.unsqueeze(1).expand(-1, K, -1)  # (1, K, D) — same as input
+            predicted_z_v, predicted_z_t = model.decision_head(
+                z_v_window, z_t_tokens, z_text
+            )
 
-            alpha_raw = model.decision_head(z_v, z_t, z_text)
-            z_v_n = F.normalize(z_v, dim=-1)
-            z_t_n = F.normalize(z_t, dim=-1)
-            z_text_n = F.normalize(z_text, dim=-1)
-            cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)
-            cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)
-            cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)
-            consistency = torch.min(torch.min(cos_vt, cos_vl), cos_tl)
-            alpha = alpha_raw * consistency
+            # Compute α from prediction error (no future data needed at inference)
+            alpha = ALIGNModel.compute_alpha_from_predictions(
+                predicted_z_v, predicted_z_t,
+                z_v_target, z_t_future_tokens,
+                aggregation="weighted_mean", decay=0.7,
+            )
             alpha_val = float(alpha.squeeze().cpu())
 
             # Assistant head: input is the current human action (delta),
             # not the current pose. The current EEF pose is encoded in z_t.
             current_action_t = torch.from_numpy(base_action[:6]).unsqueeze(0).float().to(device)
-            chunk = model.assistant_head(z_v, z_t, z_text, current_action_t)
+            chunk = model.assistant_head(z_v, z_t_tokens.mean(dim=1), z_text, current_action_t)
             chunk_np = chunk.squeeze(0).cpu().numpy()
 
             if chunk_cache is not None:
