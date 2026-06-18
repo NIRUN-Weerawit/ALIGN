@@ -181,23 +181,23 @@ def train_heads_hdf5(
     log_fp = open(log_path, "w")
 
     # ================================================================
-    # Phase 2a: Decision head (alpha) — BCE only
+    # Phase 2a: Decision head (Future Prediction) — cosine loss only
     # ================================================================
-    print("\n=== Stage A: Training Decision Head (α) ===")
-    
+    print("\n=== Stage A: Training Decision Head (Future Prediction) ===")
+
     # Freeze assistant, unfreeze decision
     _freeze_module(model.assistant_head)
     _unfreeze_module(model.decision_head)
-    
+
     trainable = [p for p in model.parameters() if p.requires_grad]
     print(f"  Trainable params: {sum(p.numel() for p in trainable):,}")
-    
+
     opt_a = optim.AdamW(trainable, lr=lr_decision, weight_decay=weight_decay)
     best_loss_a = float("inf")
 
     for epoch in range(epochs_decision):
         model.train()
-        losses_a, alphas_pred = [], []
+        losses_a, errors_v, errors_t = [], [], []
 
         for step, batch in enumerate(train_loader):
             if step >= max_steps_per_epoch:
@@ -205,46 +205,78 @@ def train_heads_hdf5(
 
             frames = torch.from_numpy(batch["frames"]).to(device)
             texts = batch["texts"]
-            alpha_need = torch.from_numpy(batch["alpha_need"]).float().to(device)
             traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
+            traj_future = torch.from_numpy(batch["trajectory_future"]).float().to(device)
 
-            # Frozen encodings via mixer (needed for decision head input)
+            # Frozen encodings via mixer. We need per-token trajectory
+            # embeddings (z_t_tokens) for the future prediction head.
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, traj_view, texts)
-                z_v = mixed["z_v"].float()
-                z_t = mixed["z_t"].float()
-                z_text = mixed["z_text"].float()
+                z_v = mixed["z_v"].float()           # (B, D) — current vision
+                z_t_tokens = mixed["z_t_tokens"].float()  # (B, K, D) — per-step
+                z_text = mixed["z_text"].float()     # (B, D)
 
-            # alpha_target = need * 1.0 (capability computed at inference time from embeddings)
-            alpha_target = alpha_need
+            # For the future prediction head:
+            #   Input: K past (z_v, z_t) embeddings + z_text
+            #   Output: K predicted (z_v, z_t) embeddings
+            #   Target: actual next K (z_v, z_t) embeddings
+            B, K, D = z_t_tokens.shape
+            z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)  # (B, K, D) — current vision, broadcast
+            z_t_target_tokens = z_t_tokens  # (B, K, D) — past K traj tokens (we'll encode future separately)
 
-            # Decision loss only (BCE against kinematic error)
-            alpha_pred = model.decision_head(z_v, z_t, z_text)
-            loss_bce = F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target)
+            # We also need the actual FUTURE trajectory embeddings as targets.
+            # Encode the future trajectory through the frozen encoder+mixer.
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                # Encode future trajectory separately
+                mixed_future = model.encode_mixed(frames, traj_future, texts)
+                z_t_future_tokens = mixed_future["z_t_tokens"].float()  # (B, K, D)
+
+            # Vision target is the current vision (broadcast) — since we
+            # only have one frame, the model learns to "copy" it
+            z_v_target = z_v.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
+
+            # Run the future prediction head
+            predicted_z_v, predicted_z_t = model.decision_head(
+                z_v_window, z_t_tokens, z_text
+            )
+
+            # Cosine loss (bounded [0, 2])
+            loss = ALIGNModel.future_prediction_loss(
+                predicted_z_v, predicted_z_t, z_v_target, z_t_future_tokens
+            )
 
             opt_a.zero_grad()
-            loss_bce.backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt_a.step()
 
-            losses_a.append(loss_bce.item())
-            alphas_pred.append(alpha_pred.detach().mean().item())
+            losses_a.append(loss.item())
+            with torch.no_grad():
+                err_v = (1 - F.cosine_similarity(predicted_z_v, z_v_target, dim=-1)).mean().item()
+                err_t = (1 - F.cosine_similarity(predicted_z_t, z_t_future_tokens, dim=-1)).mean().item()
+            errors_v.append(err_v)
+            errors_t.append(err_t)
 
         avg_loss = float(np.mean(losses_a))
-        av_alpha = float(np.mean(alphas_pred))
+        av_err_v = float(np.mean(errors_v))
+        av_err_t = float(np.mean(errors_t))
 
-        print(f"  [α] Epoch {epoch+1:3d}/{epochs_decision}  loss: {avg_loss:.4f}  α_mean: {av_alpha:.3f}")
+        print(
+            f"  [α-future] Epoch {epoch+1:3d}/{epochs_decision}  "
+            f"loss: {avg_loss:.4f}  err_v: {av_err_v:.3f}  err_t: {av_err_t:.3f}"
+        )
 
         wandb_trainer.log({
             "stage": "decision",
             "loss": avg_loss,
-            "alpha_mean": av_alpha,
+            "err_v": av_err_v,
+            "err_t": av_err_t,
             "epoch": epoch + 1,
         }, step=epoch + 1)
 
         log_fp.write(json.dumps({
             "stage": "decision", "epoch": epoch + 1,
-            "loss": avg_loss, "alpha_mean": av_alpha,
+            "loss": avg_loss, "err_v": av_err_v, "err_t": av_err_t,
             "timestamp": datetime.now().isoformat(),
         }) + "\n")
         log_fp.flush()
@@ -253,7 +285,8 @@ def train_heads_hdf5(
             best_loss_a = avg_loss
             model.save_heads_checkpoint(
                 str(out_dir / "decision_best.pt"), epoch, avg_loss,
-                opt_a.state_dict(), {"chunk_size": chunk_size})
+                opt_a.state_dict(), {"chunk_size": chunk_size, "decision_K": model.decision_K}
+            )
             print(f"  -> decision_best.pt (loss: {avg_loss:.4f})")
 
     print(f"\n  Stage A complete. Best loss: {best_loss_a:.4f}")

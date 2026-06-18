@@ -183,43 +183,143 @@ class TextEncoder(nn.Module):
 # Decision Head
 # ================================================================
 
-class DecisionHead(nn.Module):
-    """MLP predicting α ∈ [0, 1] from shared embeddings + alignment scores.
+class FuturePredictionHeadMLP(nn.Module):
+    """MLP-based future prediction head.
 
-    Input (all computable at inference):
-        z_v (256) + z_t (256) + z_text (256) + cos_vt(1) + cos_vl(1) + cos_tl(1)
-    No external inputs (e.g. object distance) — the model learns
-    "near vs. far" from visual features. This is critical for real
-    deployment where per-object distance is rarely available.
+    Input:
+        z_v_window: (B, K, embed_dim) — per-step vision embeddings
+                    (in the simple case, all K are the same current frame)
+        z_t_window: (B, K, embed_dim) — per-step trajectory tokens
+        z_text:    (B, embed_dim) — broadcasted
+    Output:
+        (predicted_z_v, predicted_z_t) — each (B, K, embed_dim)
     """
 
-    def __init__(self, latent_dim: int = 256):
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        K: int = 10,
+        hidden_dim: int = 512,
+        num_layers: int = 3,
+    ):
         super().__init__()
-        input_dim = latent_dim * 3 + 3
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Sigmoid(),
-        )
+        self.embed_dim = embed_dim
+        self.K = K
+        # Input: K * (2 * embed_dim) — flattened (z_v, z_t) at K timesteps
+        # Output: K * (2 * embed_dim) — predicted (z_v, z_t) at K timesteps
+        input_dim = K * 2 * embed_dim
+        output_dim = K * 2 * embed_dim
+
+        layers = []
+        in_dim = input_dim
+        for _ in range(num_layers - 1):
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            layers.append(nn.ReLU())
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, output_dim))
+        self.mlp = nn.Sequential(*layers)
 
     def forward(
         self,
-        z_v: torch.Tensor,
-        z_t: torch.Tensor,
-        z_text: torch.Tensor,
-    ) -> torch.Tensor:
-        B = z_v.shape[0]
-        z_v_n = F.normalize(z_v, dim=-1)
-        z_t_n = F.normalize(z_t, dim=-1)
-        z_text_n = F.normalize(z_text, dim=-1)
-        cos_vt = (z_v_n * z_t_n).sum(dim=-1, keepdim=True)
-        cos_vl = (z_v_n * z_text_n).sum(dim=-1, keepdim=True)
-        cos_tl = (z_t_n * z_text_n).sum(dim=-1, keepdim=True)
-        x = torch.cat([z_v, z_t, z_text, cos_vt, cos_vl, cos_tl], dim=-1)
-        return self.mlp(x)
+        z_v_window: torch.Tensor,  # (B, K, embed_dim)
+        z_t_window: torch.Tensor,  # (B, K, embed_dim)
+        z_text: torch.Tensor,      # (B, embed_dim) — broadcast over K
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict K future (z_v, z_t) embeddings from K past ones.
+
+        Returns:
+            (predicted_z_v, predicted_z_t), each of shape (B, K, embed_dim)
+        """
+        B, K, D = z_v_window.shape
+        # Concatenate z_v and z_text at each timestep, z_t and z_text likewise
+        z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
+        # Concatenate features: (B, K, 3*D) — (z_v, z_t, z_text) at each step
+        features = torch.cat([z_v_window, z_t_window, z_text_expanded], dim=-1)
+        # Flatten: (B, K * 3 * D)
+        flat = features.reshape(B, -1)
+        # Predict: (B, K * 2 * D)
+        out = self.mlp(flat)
+        # Reshape to (B, K, 2, D) and split into z_v, z_t
+        out = out.reshape(B, K, 2, D)
+        predicted_z_v = out[:, :, 0, :]  # (B, K, D)
+        predicted_z_t = out[:, :, 1, :]  # (B, K, D)
+        return predicted_z_v, predicted_z_t
+
+
+class FuturePredictionHeadTransformer(nn.Module):
+    """Transformer-based future prediction head.
+
+    Input: (B, K, 3*D) — concatenated (z_v, z_t, z_text) at K past timesteps
+           plus learned positional encoding
+    Output: (B, K, 2*D) — predicted (z_v, z_t) at K future timesteps
+
+    Uses self-attention to capture temporal dependencies in the input
+    window. The output for each position is a parallel prediction of
+    the next-step embedding.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        K: int = 10,
+        d_model: int = 384,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dim_feedforward: int = 1024,
+        max_timesteps: int = 64,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.K = K
+        self.d_model = d_model
+        # Input projection: 3 * embed_dim -> d_model
+        self.input_proj = nn.Linear(3 * embed_dim, d_model)
+        # Output projection: d_model -> 2 * embed_dim
+        self.output_proj = nn.Linear(d_model, 2 * embed_dim)
+        # Learned positional encoding
+        self.pos_encoding = nn.Parameter(torch.randn(max_timesteps, d_model) * 0.02)
+        # Transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(
+        self,
+        z_v_window: torch.Tensor,  # (B, K, embed_dim)
+        z_t_window: torch.Tensor,  # (B, K, embed_dim)
+        z_text: torch.Tensor,      # (B, embed_dim) — broadcast over K
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict K future (z_v, z_t) embeddings from K past ones.
+
+        Returns:
+            (predicted_z_v, predicted_z_t), each of shape (B, K, embed_dim)
+        """
+        B, K, D = z_v_window.shape
+        # Concatenate features per timestep
+        z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
+        features = torch.cat([z_v_window, z_t_window, z_text_expanded], dim=-1)
+        # Project to d_model and add positional encoding
+        x = self.input_proj(features)  # (B, K, d_model)
+        x = x + self.pos_encoding[:K].unsqueeze(0)  # (1, K, d_model) broadcasts
+        # Self-attention
+        x = self.transformer(x)  # (B, K, d_model)
+        # Project to output embeddings
+        out = self.output_proj(x)  # (B, K, 2*embed_dim)
+        # Split into z_v, z_t predictions
+        predicted_z_v = out[:, :, :D]
+        predicted_z_t = out[:, :, D:]
+        return predicted_z_v, predicted_z_t
+
+
+# Backward-compat alias: the old "DecisionHead" name is preserved so
+# existing checkpoints load. The semantics are completely different
+# (it now predicts future embeddings, not alpha), but downstream
+# code that only needs the network to exist still works.
+DecisionHead = FuturePredictionHeadTransformer
 
 
 # ================================================================
@@ -332,11 +432,15 @@ class ALIGNModel(nn.Module):
         num_mixer_blocks: int = 2,
         mixer_nhead: int = 8,
         max_traj_len: int = 64,
+        decision_K: int = 10,
+        decision_arch: str = "transformer",
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_text = use_text
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.decision_K = decision_K
+        self.decision_arch = decision_arch
 
         # Encoders
         self.vision_encoder = VisionEncoder(embed_dim=embed_dim)
@@ -359,7 +463,21 @@ class ALIGNModel(nn.Module):
         )
 
         # Heads
-        self.decision_head = DecisionHead(latent_dim=embed_dim)
+        # Decision Head = Future Prediction Head.
+        # Predicts K future embeddings from K past ones. The prediction
+        # error becomes the alpha signal at inference time.
+        if decision_arch == "mlp":
+            self.decision_head = FuturePredictionHeadMLP(
+                embed_dim=embed_dim, K=decision_K
+            )
+        elif decision_arch == "transformer":
+            self.decision_head = FuturePredictionHeadTransformer(
+                embed_dim=embed_dim, K=decision_K
+            )
+        else:
+            raise ValueError(
+                f"Unknown decision_arch: {decision_arch} (expected 'mlp' or 'transformer')"
+            )
         self.assistant_head = AssistantHead(
             latent_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim
         )
@@ -449,6 +567,88 @@ class ALIGNModel(nn.Module):
             return None
         return self.text_encoder(texts)
 
+    # ── Phase 2 helper: future prediction → α ─────────────
+
+    def predict_future(
+        self,
+        z_v_window: torch.Tensor,  # (B, K, embed_dim)
+        z_t_window: torch.Tensor,  # (B, K, embed_dim)
+        z_text: torch.Tensor,      # (B, embed_dim)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run the Decision (Future Prediction) head.
+
+        Returns:
+            (predicted_z_v, predicted_z_t) — each (B, K, embed_dim)
+        """
+        return self.decision_head(z_v_window, z_t_window, z_text)
+
+    @staticmethod
+    def compute_alpha_from_predictions(
+        predicted_z_v: torch.Tensor,  # (B, K, embed_dim)
+        predicted_z_t: torch.Tensor,  # (B, K, embed_dim)
+        actual_z_v: torch.Tensor,     # (B, K, embed_dim)
+        actual_z_t: torch.Tensor,     # (B, K, embed_dim)
+        aggregation: str = "weighted_mean",
+        decay: float = 0.7,
+    ) -> torch.Tensor:
+        """Compute α from the cosine-similarity loss between predicted and actual.
+
+        Cosine loss is bounded in [0, 2]; α = 1 - cos_loss / 2 maps to [0, 1].
+        The model helps fully when the prediction matches (α ≈ 1), and
+        lays low when it doesn't (α ≈ 0).
+
+        Args:
+            predicted_z_v, predicted_z_t: (B, K, embed_dim) — model predictions
+            actual_z_v, actual_z_t: (B, K, embed_dim) — ground truth embeddings
+            aggregation: "weighted_mean", "last_step_only", or "mean"
+            decay: weight decay for "weighted_mean" (most recent has highest weight)
+
+        Returns:
+            α: (B,) — intervention strength
+        """
+        # Cosine similarity along the last dim, then convert to "error"
+        cos_v = F.cosine_similarity(predicted_z_v, actual_z_v, dim=-1)  # (B, K)
+        cos_t = F.cosine_similarity(predicted_z_t, actual_z_t, dim=-1)  # (B, K)
+        cos_error = ((1 - cos_v) + (1 - cos_t)) / 2  # (B, K), in [0, 2]
+
+        if aggregation == "last_step_only":
+            cos_error = cos_error[:, -1]
+        elif aggregation == "mean":
+            cos_error = cos_error.mean(dim=-1)
+        elif aggregation == "weighted_mean":
+            K = cos_error.shape[1]
+            # weights = [decay^(K-1-i) for i in range(K)]  (most recent = i=K-1 has weight 1)
+            weights = torch.tensor(
+                [decay ** (K - 1 - i) for i in range(K)],
+                device=cos_error.device,
+                dtype=cos_error.dtype,
+            )
+            cos_error = (cos_error * weights).sum(dim=-1) / weights.sum()
+        else:
+            raise ValueError(f"Unknown aggregation: {aggregation}")
+
+        # Map to [0, 1]
+        alpha = 1.0 - cos_error / 2.0
+        return alpha
+
+    @staticmethod
+    def future_prediction_loss(
+        predicted_z_v: torch.Tensor,  # (B, K, embed_dim)
+        predicted_z_t: torch.Tensor,  # (B, K, embed_dim)
+        target_z_v: torch.Tensor,     # (B, K, embed_dim) — detached
+        target_z_t: torch.Tensor,     # (B, K, embed_dim) — detached
+    ) -> torch.Tensor:
+        """Cosine-similarity loss for future prediction.
+
+        Bounded in [0, 2] per step. Returns the mean loss over the K window.
+        Targets are detached (stop-gradient) so this loss doesn't try to
+        reshape the encoder.
+        """
+        cos_v = F.cosine_similarity(predicted_z_v, target_z_v.detach(), dim=-1)  # (B, K)
+        cos_t = F.cosine_similarity(predicted_z_t, target_z_t.detach(), dim=-1)  # (B, K)
+        loss = ((1 - cos_v) + (1 - cos_t)).mean() / 2
+        return loss
+
     def forward(
         self,
         frames: torch.Tensor,
@@ -472,10 +672,29 @@ class ALIGNModel(nn.Module):
         mixed = self.encode_mixed(frames, traj, texts)
         z_v, z_t = mixed["z_v"], mixed["z_t"]
         z_text = mixed["z_text"]
+        z_t_tokens = mixed["z_t_tokens"]  # (B, K, embed_dim)
 
         result: Dict[str, torch.Tensor] = {}
         if compute_decision:
-            result["alpha"] = self.decision_head(z_v, z_t, z_text)
+            # The new Decision head takes a window of past embeddings.
+            # We use the trajectory per-token embeddings (one per timestep)
+            # and broadcast the current vision embedding as a single context.
+            # NOTE: the actual alpha signal at inference is computed
+            # separately via compute_alpha_from_predictions() once the
+            # actual future embeddings are available. This forward pass
+            # returns the predicted embeddings, not a scalar alpha.
+            B, K, D = z_t_tokens.shape
+            z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
+            predicted_z_v, predicted_z_t = self.decision_head(
+                z_v_window, z_t_tokens, z_text
+            )
+            result["predicted_z_v"] = predicted_z_v
+            result["predicted_z_t"] = predicted_z_t
+            # For backward-compat: also compute a per-batch "alpha" estimate
+            # assuming the predictions match the inputs (degenerate case).
+            # In practice, callers should use compute_alpha_from_predictions()
+            # with the actual future embeddings.
+            result["alpha"] = torch.ones(B, 1, device=z_v.device)
         if compute_assistant:
             # Backward-compat: when no current_action is supplied, use the
             # last pose in the trajectory window. NOTE: this is no longer

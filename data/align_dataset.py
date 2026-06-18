@@ -418,6 +418,8 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
                               this timestep (input to Assistant head). Sourced
                               from the dataset's `actions` field.
             "trajectory": (B, K, 6) float32 — past window of clean poses,
+            "trajectory_future": (B, K, 6) float32 — NEXT K poses after the
+                              current timestep (targets for future prediction).
             "alpha_need": (B,) float32 — kinematic error part of alpha_target,
             "delta_target":(B, chunk_size, 6) float32,
             "texts": list of strings,
@@ -428,6 +430,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
     all_clean = []
     all_actions = []
     all_trajs = []
+    all_trajs_future = []
     all_needs = []
     all_deltas = []
     all_texts = []
@@ -484,6 +487,16 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
             if t + i < N:
                 delta[i - 1] = poses_clean[t + i, :6] - poses_clean[t + i - 1, :6]  # Expert increment
 
+        # --- Future trajectory window (K poses after current timestep) ---
+        # Used as targets for the future-prediction (Decision) head.
+        # Window is anchored at t+1: [t+1, t+2, ..., t+K]
+        future_start = t + 1
+        future_end = t + 1 + chunk_size
+        traj_future = poses_clean[future_start:future_end, :6]
+        if len(traj_future) < chunk_size:
+            pad = np.zeros((chunk_size - len(traj_future), 6), dtype=np.float32)
+            traj_future = np.concatenate([traj_future, pad], axis=0)
+
         # Text variant
         if isinstance(texts_raw, list):
             text = texts_raw[rng.integers(0, len(texts_raw))]
@@ -495,6 +508,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         all_clean.append(current_clean_pose[:6])
         all_actions.append(current_action)
         all_trajs.append(traj_window[:, :6])
+        all_trajs_future.append(traj_future)
         all_needs.append(need)
         all_deltas.append(delta)
         all_texts.append(text)
@@ -505,6 +519,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         "clean_pose": np.stack(all_clean, axis=0).astype(np.float32),
         "current_action": np.stack(all_actions, axis=0).astype(np.float32),
         "trajectory": np.stack(all_trajs, axis=0).astype(np.float32),
+        "trajectory_future": np.stack(all_trajs_future, axis=0).astype(np.float32),
         "alpha_need": np.array(all_needs, dtype=np.float32),
         "delta_target": np.stack(all_deltas, axis=0).astype(np.float32),
         "texts": all_texts,
