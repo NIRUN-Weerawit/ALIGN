@@ -44,6 +44,7 @@ from typing import Optional, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -239,7 +240,8 @@ def load_libero_samples(
     indices = sorted(np.random.choice(len(ds), min(n_samples, len(ds)), replace=False))
 
     frames, trajs, texts = [], [], []
-    for idx in indices:
+    print(f"[load] Loading {len(indices)} samples from {data_dir}...")
+    for idx in tqdm(indices, desc="Loading samples", unit="sample"):
         sample = ds[idx]
 
         # Camera frame — prefer wrist, fall back to front
@@ -392,7 +394,7 @@ def main():
             print(f"\n{'='*70}")
             print("MULTI-TEXT COMPARISON: first sample against all texts")
             print(f"{'='*70}")
-            for t in alt_texts:
+            for t in tqdm(alt_texts, desc="Comparing texts", unit="text"):
                 if args.eval_heads:
                     r = get_head_predictions(model, frames[:1], trajs[:1], [t])
                 else:

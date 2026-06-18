@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -209,7 +210,20 @@ def train_heads_hdf5(
         model.train()
         losses_a, errors_v, errors_t = [], [], []
 
-        for step, batch in enumerate(train_loader):
+        # Wrap loader with tqdm for progress display
+        progress = train_loader
+        if max_steps_per_epoch and max_steps_per_epoch < len(train_loader):
+            progress = (
+                p for p, _ in zip(train_loader, range(max_steps_per_epoch))
+            )
+        progress_bar = tqdm(
+            progress,
+            total=min(max_steps_per_epoch, len(train_loader)) if max_steps_per_epoch else len(train_loader),
+            desc=f"[Decision] Epoch {epoch+1}/{epochs_decision}",
+            unit="step",
+        )
+
+        for step, batch in enumerate(progress_bar):
             if step >= max_steps_per_epoch:
                 break
 
@@ -285,6 +299,14 @@ def train_heads_hdf5(
             errors_v.append(err_v)
             errors_t.append(err_t)
 
+            # Update progress bar
+            if step % 10 == 0:
+                progress_bar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    err_v=f"{err_v:.3f}",
+                    err_t=f"{err_t:.3f}",
+                )
+
         avg_loss = float(np.mean(losses_a))
         av_err_v = float(np.mean(errors_v))
         av_err_t = float(np.mean(errors_t))
@@ -338,7 +360,20 @@ def train_heads_hdf5(
         model.train()
         losses_b, deltas_pred = [], []
 
-        for step, batch in enumerate(train_loader):
+        # Wrap loader with tqdm for progress display
+        progress = train_loader
+        if max_steps_per_epoch and max_steps_per_epoch < len(train_loader):
+            progress = (
+                p for p, _ in zip(train_loader, range(max_steps_per_epoch))
+            )
+        progress_bar = tqdm(
+            progress,
+            total=min(max_steps_per_epoch, len(train_loader)) if max_steps_per_epoch else len(train_loader),
+            desc=f"[Assistant] Epoch {epoch+1}/{epochs_assistant}",
+            unit="step",
+        )
+
+        for step, batch in enumerate(progress_bar):
             if step >= max_steps_per_epoch:
                 break
 
@@ -367,6 +402,13 @@ def train_heads_hdf5(
 
             losses_b.append(loss_mse.item())
             deltas_pred.append(delta_pred.detach().abs().mean().item())
+
+            # Update progress bar
+            if step % 10 == 0:
+                progress_bar.set_postfix(
+                    mse=f"{loss_mse.item():.5f}",
+                    d_mean=f"{delta_pred.detach().abs().mean().item():.4f}",
+                )
 
         avg_loss = float(np.mean(losses_b))
         av_delta = float(np.mean(deltas_pred))
