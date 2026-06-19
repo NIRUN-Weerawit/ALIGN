@@ -240,24 +240,31 @@ def run_episode_in_sim(
     """
     n_expert = min(len(expert_poses), max_steps, len(expert_actions))
 
+    # ── Inject noise into expert poses / actions for BOTH branches ──
+    # This ensures the comparison is fair: both branches start from the
+    # SAME noised input. The "No ALIGN" baseline just ignores the noise.
+    rng = np.random.default_rng(42)
+    if noise_std > 0:
+        noisy_poses = inject_noise(expert_poses[:n_expert], std=noise_std, rng=rng)
+        # Also inject noise into the actions (delta in OSC_POSE format)
+        # Noise on actions = noise on the intended motion
+        noisy_actions = inject_noise(expert_actions[:n_expert], std=noise_std, rng=rng)
+    else:
+        noisy_poses = expert_poses[:n_expert].copy()
+        noisy_actions = expert_actions[:n_expert].copy()
+
     # ── Run "No ALIGN" trajectory first ──
+    # Uses the SAME noised actions as "With ALIGN" — fair comparison
     obs = env.reset()
     step = 0
     done = False
     frames_no_align = []
 
-    # Inject noise into expert poses to simulate a noisy human teleoperator
-    rng = np.random.default_rng(42)
-    if noise_std > 0:
-        noisy_poses = inject_noise(expert_poses[:n_expert], std=noise_std, rng=rng)
-    else:
-        noisy_poses = expert_poses[:n_expert].copy()
-
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(env)
 
-        # Use the dataset's stored action directly (it's a delta in OSC_POSE format)
-        action = expert_actions[step].copy()
+        # Use the noised action (not the clean expert action)
+        action = noisy_actions[step].copy()
         # Remap gripper: dataset 0/1 → LIBERO env -1/1
         if len(action) >= 7:
             if action[6] <= 0.5:
@@ -289,7 +296,7 @@ def run_episode_in_sim(
         frame = _get_sim_frame(env)
         raw_pose = noisy_poses[step]  # the noised version for sim input
         clean_pose = expert_poses[step]  # the ground truth for comparison
-        base_action = expert_actions[step]  # the dataset's stored delta
+        base_action = noisy_actions[step]  # the noised delta (same noise as "No ALIGN")
 
         # Build pose buffer for trajectory encoder
         # Buffer size = model.decision_K so the future prediction head
