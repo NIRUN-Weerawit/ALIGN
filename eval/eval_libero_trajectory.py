@@ -227,7 +227,7 @@ def run_episode_in_sim(
     record_video: bool = False,
     no_flip_vertical: bool = False,
     no_flip_horizontal: bool = False,
-    force_alpha_one: bool = False,
+    fixed_alpha: float = None,
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
@@ -358,9 +358,9 @@ def run_episode_in_sim(
                 z_v_window, z_t_tokens, z_text
             )
 
-            # Compute α from prediction error (no future data needed at inference)
-            if force_alpha_one:
-                alpha_val = 1.0
+            # Compute α from prediction error, or use fixed value if specified
+            if fixed_alpha is not None:
+                alpha_val = fixed_alpha
             else:
                 alpha = ALIGNModel.compute_alpha_from_predictions(
                     predicted_z_v, predicted_z_t,
@@ -562,7 +562,7 @@ def evaluate_suite(
     render_size: int = 256,
     no_flip_vertical: bool = False,
     no_flip_horizontal: bool = False,
-    force_alpha_one: bool = False,
+    fixed_alpha: float = None,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(output_dir) / suite_name
@@ -613,7 +613,8 @@ def evaluate_suite(
     print(f"\n{'='*60}")
     print(f"Suite: {suite_name} ({len(task_list)} tasks)")
     print(f"  Noise std: {noise_std}")
-    print(f"  α forced to 1: {force_alpha_one}")
+    if fixed_alpha is not None:
+        print(f"  Fixed α: {fixed_alpha} (bypassed Decision head)")
     print(f"{'='*60}")
 
     all_results = []
@@ -677,7 +678,7 @@ def evaluate_suite(
                     record_video=record_video,
                     no_flip_vertical=no_flip_vertical,
                     no_flip_horizontal=no_flip_horizontal,
-                    force_alpha_one=force_alpha_one,
+                    fixed_alpha=fixed_alpha,
                 )
 
                 result["task_name"] = task_name
@@ -771,8 +772,9 @@ def main():
                         help="Synthetic noise std (0 = clean replay)")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--record-video", action="store_true")
-    parser.add_argument("--force-alpha-one", action="store_true",
-                        help="Force α=1 (isolate Assistant head, skip Decision head)")
+    parser.add_argument("--fixed-alpha", type=float, default=None,
+                        help="Override α to a fixed value (e.g. 0.5, 1.0). "
+                             "Omit to use Decision head's prediction.")
     parser.add_argument("--render-size", type=int, default=256,
                         help="Sim camera render resolution (default 256, matches dataset)")
     parser.add_argument("--no-flip-vertical", action="store_true",
@@ -804,7 +806,7 @@ def main():
             render_size=args.render_size,
             no_flip_vertical=args.no_flip_vertical,
             no_flip_horizontal=args.no_flip_horizontal,
-            force_alpha_one=args.force_alpha_one,
+            fixed_alpha=args.fixed_alpha,
         )
         if result:
             all_summaries[suite_name] = result
