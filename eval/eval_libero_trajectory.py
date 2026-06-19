@@ -227,6 +227,7 @@ def run_episode_in_sim(
     record_video: bool = False,
     no_flip_vertical: bool = False,
     no_flip_horizontal: bool = False,
+    force_alpha_one: bool = False,
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
@@ -358,12 +359,15 @@ def run_episode_in_sim(
             )
 
             # Compute α from prediction error (no future data needed at inference)
-            alpha = ALIGNModel.compute_alpha_from_predictions(
-                predicted_z_v, predicted_z_t,
-                z_v_target, z_t_future_tokens,
-                aggregation="weighted_mean", decay=0.7,
-            )
-            alpha_val = float(alpha.squeeze().cpu())
+            if force_alpha_one:
+                alpha_val = 1.0
+            else:
+                alpha = ALIGNModel.compute_alpha_from_predictions(
+                    predicted_z_v, predicted_z_t,
+                    z_v_target, z_t_future_tokens,
+                    aggregation="weighted_mean", decay=0.7,
+                )
+                alpha_val = float(alpha.squeeze().cpu())
 
             # Assistant head: input is the current human action (delta),
             # not the current pose. The current EEF pose is encoded in z_t.
@@ -558,6 +562,7 @@ def evaluate_suite(
     render_size: int = 256,
     no_flip_vertical: bool = False,
     no_flip_horizontal: bool = False,
+    force_alpha_one: bool = False,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(output_dir) / suite_name
@@ -608,6 +613,7 @@ def evaluate_suite(
     print(f"\n{'='*60}")
     print(f"Suite: {suite_name} ({len(task_list)} tasks)")
     print(f"  Noise std: {noise_std}")
+    print(f"  α forced to 1: {force_alpha_one}")
     print(f"{'='*60}")
 
     all_results = []
@@ -671,6 +677,7 @@ def evaluate_suite(
                     record_video=record_video,
                     no_flip_vertical=no_flip_vertical,
                     no_flip_horizontal=no_flip_horizontal,
+                    force_alpha_one=force_alpha_one,
                 )
 
                 result["task_name"] = task_name
@@ -764,6 +771,8 @@ def main():
                         help="Synthetic noise std (0 = clean replay)")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--record-video", action="store_true")
+    parser.add_argument("--force-alpha-one", action="store_true",
+                        help="Force α=1 (isolate Assistant head, skip Decision head)")
     parser.add_argument("--render-size", type=int, default=256,
                         help="Sim camera render resolution (default 256, matches dataset)")
     parser.add_argument("--no-flip-vertical", action="store_true",
@@ -795,6 +804,7 @@ def main():
             render_size=args.render_size,
             no_flip_vertical=args.no_flip_vertical,
             no_flip_horizontal=args.no_flip_horizontal,
+            force_alpha_one=args.force_alpha_one,
         )
         if result:
             all_summaries[suite_name] = result
