@@ -173,7 +173,10 @@ def evaluate(
 
             # Assistant head: input is current action, not pose
             z_t = z_t_tokens.mean(dim=1)  # mean-pool for assistant head
-            current_action = batch.get("current_action", noisy_pose).float().to(device)
+            _ca = batch.get("current_action", noisy_pose)
+            if not isinstance(_ca, torch.Tensor):
+                _ca = torch.tensor(_ca, dtype=torch.float32)
+            current_action = _ca.to(device)
             delta_pred = model.assistant_head(z_v, z_t, z_text, current_action)  # (B, K, 6)
             rmse_per_batch = (delta_pred - delta_t).pow(2).mean(dim=[1, 2]).sqrt()
             delta_rmses.extend(rmse_per_batch.cpu().tolist())
