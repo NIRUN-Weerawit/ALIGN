@@ -25,7 +25,8 @@ from data.align_dataset import ALIGNDataset, head_collate
 
 def evaluate(
     data_path: str,
-    checkpoint_path: str,
+    heads_checkpoint: str,
+    encoder_checkpoint: str = None,
     batch_size: int = 64,
     traj_window: int = 20,
     chunk_size: int = 5,
@@ -35,31 +36,78 @@ def evaluate(
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Detect chunk_size from checkpoint before creating the model
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    print(f"  Loading: {checkpoint_path}")
-    cfg = ckpt.get("config", {})
+    # Load the HEADS checkpoint (decision_head + assistant_head only)
+    heads_ckpt = torch.load(heads_checkpoint, map_location=device)
+    print(f"  Loading heads: {heads_checkpoint}")
+    cfg = heads_ckpt.get("config", {})
     if cfg.get("chunk_size"):
         chunk_size = cfg["chunk_size"]
-        print(f"  Detected chunk_size={chunk_size} from checkpoint config")
+        print(f"  Detected chunk_size={chunk_size} from heads checkpoint config")
+    if cfg.get("decision_K"):
+        decision_K = cfg["decision_K"]
+    else:
+        decision_K = chunk_size
 
-    # -- Model (load both heads from the combined checkpoint)
+    # Load the ENCODER checkpoint (vision_proj + traj_encoder + text_encoder + mixer).
+    # This is the Phase 1b best.pt.
+    enc_ckpt = None
+    if encoder_checkpoint is not None and Path(encoder_checkpoint).exists():
+        enc_ckpt = torch.load(encoder_checkpoint, map_location=device)
+        print(f"  Loading encoder: {encoder_checkpoint}")
+    else:
+        # Try to auto-detect in standard location
+        heads_path = Path(heads_checkpoint)
+        candidate = heads_path.parent.parent / "pretrain" / heads_path.parent.name / "run_2" / "best.pt"
+        if candidate.exists():
+            encoder_checkpoint = str(candidate)
+            enc_ckpt = torch.load(encoder_checkpoint, map_location=device)
+            print(f"  Auto-found encoder checkpoint: {encoder_checkpoint}")
+        else:
+            print("  WARNING: No encoder checkpoint provided.")
+            print("           The encoders will be randomly initialized.")
+            print("           Eval results will be meaningless. Pass --encoder-checkpoint to fix.")
+
+    # -- Model
     model = ALIGNModel(
-        embed_dim=256, chunk_size=chunk_size, use_text=True, device=device
+        embed_dim=256,
+        chunk_size=chunk_size,
+        use_text=True,
+        device=device,
+        decision_K=decision_K,
     ).to(device)
     model.freeze_backbone()
     model.freeze_all_encoders()
-    
-    if "trainable_state_dict" in ckpt:
-        model.load_trainable_state_dict(ckpt["trainable_state_dict"])
-    elif "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
+    # Step 1: load encoder + mixer weights (only the relevant keys, not the heads)
+    if enc_ckpt is not None and "trainable_state_dict" in enc_ckpt:
+        enc_state = enc_ckpt["trainable_state_dict"]
+        encoder_keys = {
+            k: v for k, v in enc_state.items()
+            if "vision_encoder.projection" in k
+            or "traj_encoder" in k
+            or "text_encoder" in k
+            or "cross_attention_mixer" in k
+        }
+        if encoder_keys:
+            missing, unexpected = model.load_state_dict(encoder_keys, strict=False)
+            unexpected = [u for u in unexpected
+                          if "decision_head" not in u
+                          and "assistant_head" not in u]
+            if unexpected:
+                print(f"  WARNING: Unexpected keys: {unexpected[:3]}...")
+            print(f"  Loaded {len(encoder_keys)} encoder/mixer params")
+
+    # Step 2: load head weights
+    if "trainable_state_dict" in heads_ckpt:
+        model.load_trainable_state_dict(heads_ckpt["trainable_state_dict"])
+        print(f"  Loaded heads (decision + assistant)")
+    elif "model_state_dict" in heads_ckpt:
+        model.load_state_dict(heads_ckpt["model_state_dict"], strict=False)
     else:
-        # Try loading directly as a state dict
-        model.load_state_dict(ckpt, strict=False)
+        model.load_state_dict(heads_ckpt, strict=False)
 
     model.eval()
-    print(f"  Phase from checkpoint: {ckpt.get('phase', 'N/A')}, Epoch: {ckpt.get('epoch', '?')}")
+    print(f"  Phase from heads checkpoint: {heads_ckpt.get('phase', 'N/A')}, Epoch: {heads_ckpt.get('epoch', '?')}")
 
     #  -- Dataset (use the last val_split as validation)
     ds = ALIGNDataset(data_path, mode="head", traj_window=traj_window)
@@ -145,7 +193,11 @@ def evaluate(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate ALIGN trained heads")
     parser.add_argument("--data", required=True, help="Path to ALIGN HDF5 dataset")
-    parser.add_argument("--checkpoint", required=True, help="Combined heads checkpoint (.pt)")
+    parser.add_argument("--checkpoint", required=True,
+                        help="Heads checkpoint (.pt) — contains decision_head + assistant_head")
+    parser.add_argument("--encoder-checkpoint", default=None,
+                        help="Encoder/mixer checkpoint from Phase 1b. "
+                             "Auto-detected if not provided.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--traj-window", type=int, default=20)
     parser.add_argument("--chunk-size", type=int, default=5)
@@ -155,7 +207,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     evaluate(
         data_path=args.data,
-        checkpoint_path=args.checkpoint,
+        heads_checkpoint=args.checkpoint,
+        encoder_checkpoint=args.encoder_checkpoint,
         batch_size=args.batch_size,
         traj_window=args.traj_window,
         chunk_size=args.chunk_size,
