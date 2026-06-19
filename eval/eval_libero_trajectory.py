@@ -254,11 +254,13 @@ def run_episode_in_sim(
         noisy_actions = expert_actions[:n_expert].copy()
 
     # ── Run "No ALIGN" trajectory first ──
-    # Uses the SAME noised actions as "With ALIGN" — fair comparison
+    # Uses the SAME noised actions as "With ALIGN" — fair comparison.
+    # Tracks per-step error for comparison.
     obs = env.reset()
     step = 0
     done = False
     frames_no_align = []
+    error_no_align_raw = []  # per-step errors for No ALIGN branch
 
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(env)
@@ -274,11 +276,18 @@ def run_episode_in_sim(
         obs, reward, done, info = env.step(action)
         step += 1
 
+        # Per-step error: sim's EEF vs expert EEF (post-step, same timing as With ALIGN)
+        sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
+        if isinstance(sim_eef, torch.Tensor):
+            sim_eef = sim_eef.cpu().numpy()
+        # After stepping with noisy_actions[step], sim should be AT expert_poses[step]
+        clean_pose = expert_poses[step]  # step has NOT been incremented yet here
+        err = float(np.linalg.norm(sim_eef - clean_pose[:3]))
+        error_no_align_raw.append(err)
+
         # Capture frame AFTER stepping (so it shows the result of this action)
         frame_post = _get_sim_frame(env)
         if record_video:
-            # Store raw frame (text drawn in the video assembly section
-            # AFTER flipping, so text isn't flipped)
             frames_no_align.append(frame_post.copy())
     # ── Run "With ALIGN" trajectory ──
     obs = env.reset()
@@ -293,20 +302,24 @@ def run_episode_in_sim(
     frames_with_align = []
 
     while not done and step < max_steps and step < n_expert:
+        # Get the ACTUAL sim pose BEFORE stepping (this is what the sim actually produced)
+        sim_pose_before = np.concatenate([
+            obs.get("robot0_eef_pos", np.zeros(3)),
+            obs.get("robot0_eef_quat", np.zeros(4))[:3] if "robot0_eef_quat" in obs else np.zeros(3),
+        ])
         frame = _get_sim_frame(env)
-        raw_pose = noisy_poses[step]  # the noised version for sim input
-        clean_pose = expert_poses[step]  # the ground truth for comparison
-        base_action = noisy_actions[step]  # the noised delta (same noise as "No ALIGN")
+        clean_pose = expert_poses[step]  # ground truth for comparison
+        base_action = noisy_actions[step]  # noised delta (same noise as "No ALIGN")
 
-        # Build pose buffer for trajectory encoder
+        # Build pose buffer from ACTUAL sim poses (not noisy_poses from the dataset)
         # Buffer size = model.decision_K so the future prediction head
         # receives exactly K past embeddings.
         traj_window = model.decision_K
-        pose_buffer.append(raw_pose.copy())
+        pose_buffer.append(sim_pose_before.copy())
         if len(pose_buffer) > traj_window:
             pose_buffer.pop(0)
         while len(pose_buffer) < traj_window:
-            pose_buffer.insert(0, raw_pose.copy())
+            pose_buffer.insert(0, sim_pose_before.copy())
 
         # ALIGN inference: future prediction (Decision head) + corrective delta (Assistant head)
         with torch.no_grad():
@@ -386,7 +399,11 @@ def run_episode_in_sim(
         sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
         if isinstance(sim_eef, torch.Tensor):
             sim_eef = sim_eef.cpu().numpy()
-        err_no_align = float(np.linalg.norm(raw_pose[:3] - clean_pose[:3]))
+        # Error metrics: compare sim's EEF to expert EEF
+        # "No ALIGN" error: use the pre-computed per-step error from the
+        # "No ALIGN" branch (same timing: post-step, after the noised action).
+        # "With ALIGN" error: post-step after the ALIGN-corrected action.
+        err_no_align = error_no_align_raw[step - 1] if step <= len(error_no_align_raw) else 0.0
         err_with_align = float(np.linalg.norm(sim_eef - clean_pose[:3]))
         error_no_align.append(err_no_align)
         error_with_align.append(err_with_align)
