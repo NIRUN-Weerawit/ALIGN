@@ -280,10 +280,12 @@ def run_episode_in_sim(
         sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
         if isinstance(sim_eef, torch.Tensor):
             sim_eef = sim_eef.cpu().numpy()
-        # After stepping with noisy_actions[step], sim should be AT expert_poses[step]
-        clean_pose = expert_poses[step]  # step has NOT been incremented yet here
-        err = float(np.linalg.norm(sim_eef - clean_pose[:3]))
-        error_no_align_raw.append(err)
+        # After stepping with noisy_actions[step-1] (since step was already incremented),
+        # sim should be AT expert_poses[step-1]
+        if step > 0 and step - 1 < len(expert_poses):
+            clean_pose = expert_poses[step - 1]
+            err = float(np.linalg.norm(sim_eef - clean_pose[:3]))
+            error_no_align_raw.append(err)
 
         # Capture frame AFTER stepping (so it shows the result of this action)
         frame_post = _get_sim_frame(env)
@@ -572,11 +574,31 @@ def evaluate_suite(
     if encoder_checkpoint:
         enc_ckpt = torch.load(encoder_checkpoint, map_location=device)
         if "trainable_state_dict" in enc_ckpt:
-            model.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
+            # Load only encoder/mixer keys, skip head keys
+            enc_state = enc_ckpt["trainable_state_dict"]
+            encoder_keys = {
+                k: v for k, v in enc_state.items()
+                if "decision_head" not in k and "assistant_head" not in k
+            }
+            if encoder_keys:
+                missing, unexpected = model.load_state_dict(encoder_keys, strict=False)
+                print(f"  Loaded {len(encoder_keys)} encoder/mixer params from {encoder_checkpoint}")
         print(f"  Loaded encoder: {encoder_checkpoint}")
 
     if "trainable_state_dict" in ckpt:
-        model.load_trainable_state_dict(ckpt["trainable_state_dict"])
+        # Load only the keys that exist in the current model (skip mismatched head weights)
+        head_state = ckpt["trainable_state_dict"]
+        current_state = model.state_dict()
+        compatible = {
+            k: v for k, v in head_state.items()
+            if k in current_state and v.shape == current_state[k].shape
+        }
+        skipped = len(head_state) - len(compatible)
+        if compatible:
+            missing, unexpected = model.load_state_dict(compatible, strict=False)
+            print(f"  Loaded {len(compatible)}/{len(head_state)} head params (skipped {skipped} mismatched)")
+        if skipped > 0:
+            print(f"  WARNING: {skipped} head keys had shape mismatch — likely old architecture. Heads are at random init.")
     elif "model_state_dict" in ckpt:
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
     else:
