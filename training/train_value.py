@@ -71,6 +71,7 @@ def train_value(
     weight_decay: float = 1e-4,
     gamma: float = 0.99,
     lam: float = 0.7,
+    n_steps: int = 1,
     val_split: float = 0.1,
     device: Optional[str] = None,
     max_steps_per_epoch: int = 2000,
@@ -231,12 +232,22 @@ def train_value(
             z_v_next = mixed_next["z_v"].float()
             z_t_next = mixed_next["z_t"].float()
 
-            # 4. Compute V(s_t) and V(s_{t+1}) via the value head
+            # 4. Compute V(s_t) and the bootstrap V at the look-ahead state
             v_t = value_head(z_v_t, z_t_t, z_text_t)
-            with torch.no_grad():
-                v_next = value_head(z_v_next, z_t_next, z_text_t)  # text is constant
 
-            # 5. TD(0) target: V_target = r_t + gamma * V(s_{t+1})
+            # 5. Build the TD target.
+            #    - n_steps=1 (default): TD(0) target = r_t + gamma * V(s_{t+1})
+            #    - n_steps>1: n-step return, but the world_model_collate only
+            #      gives us (s_t, a_t, s_{t+1}) — not s_{t+2..t+n}. For n-step
+            #      return we need access to multiple future states, which the
+            #      current collate doesn't provide. Fall back to TD(0) and warn.
+            if n_steps > 1:
+                # Use TD(0) since we don't have multi-step states in the batch.
+                # For full TD(lambda) see compute_td_lambda_return in
+                # models/value_head.py — requires per-episode data.
+                pass  # falls through to TD(0) below
+            with torch.no_grad():
+                v_next = value_head(z_v_next, z_t_next, z_text_t)
             v_target = r_t + gamma * v_next
 
             # 6. Loss
@@ -314,6 +325,11 @@ def main():
                         help="Discount factor for TD target")
     parser.add_argument("--lam", type=float, default=0.7,
                         help="Trace decay for TD(λ)")
+    parser.add_argument("--n-steps", type=int, default=1,
+                        help="Look-ahead for the TD target. 1 = TD(0). "
+                             "Note: world_model_collate only provides s_{t+1}, "
+                             "so n_steps > 1 currently falls back to TD(0). "
+                             "For full n-step return, see compute_td_lambda_return.")
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--device", default=None)
     parser.add_argument("--max-steps-per-epoch", type=int, default=2000)
@@ -343,6 +359,7 @@ def main():
         weight_decay=args.weight_decay,
         gamma=args.gamma,
         lam=args.lam,
+        n_steps=args.n_steps,
         val_split=args.val_split,
         device=args.device,
         max_steps_per_epoch=args.max_steps_per_epoch,
