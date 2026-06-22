@@ -400,6 +400,81 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
     }
 
 
+class MultiALIGNDataset(Dataset):
+    """Concatenates multiple ALIGNDataset instances for multi-dataset training.
+
+    Each underlying dataset can have a different file/suite. Samples are
+    dispatched to the right dataset based on a flat global index. The
+    ordering is: [dataset_0][dataset_1]...[dataset_{N-1}], so a single
+    random index selects a sample from the right source.
+
+    All datasets must be in the same mode ('pretrain' or 'head') and share
+    the same trajectory window, frames_per_ep, image_size, and camera —
+    these are passed to the constructor and applied to every underlying
+    dataset.
+    """
+
+    def __init__(
+        self,
+        h5_paths: List[str],
+        mode: str = "pretrain",
+        camera: str = DEFAULT_CAMERA,
+        image_size: Tuple[int, int] = DEFAULT_SIZE,
+        frames_per_ep: int = DEFAULT_FRAMES_PER_EP,
+        traj_window: int = TRAJ_WINDOW,
+        episodes_per_batch: int = 8,
+    ):
+        if not h5_paths:
+            raise ValueError("h5_paths must be a non-empty list")
+        self.datasets = [
+            ALIGNDataset(
+                p, mode=mode, camera=camera, image_size=image_size,
+                frames_per_ep=frames_per_ep, traj_window=traj_window,
+                episodes_per_batch=episodes_per_batch,
+            )
+            for p in h5_paths
+        ]
+        self._cumulative = [0]
+        for ds in self.datasets:
+            self._cumulative.append(self._cumulative[-1] + len(ds))
+        self.mode = mode
+        self.camera = camera
+        self.image_size = image_size
+        self.frames_per_ep = frames_per_ep
+        self.traj_window = traj_window
+        self.episodes_per_batch = episodes_per_batch
+        self.h5_paths = [str(p) for p in h5_paths]
+
+    def __len__(self) -> int:
+        return self._cumulative[-1]
+
+    def __getitem__(self, idx: int) -> dict:
+        if idx < 0:
+            idx += len(self)
+        if not (0 <= idx < len(self)):
+            raise IndexError(f"index {idx} out of range for dataset of size {len(self)}")
+        # Find which sub-dataset this index belongs to
+        import bisect
+        ds_idx = bisect.bisect_right(self._cumulative, idx) - 1
+        local_idx = idx - self._cumulative[ds_idx]
+        return self.datasets[ds_idx][local_idx]
+
+    def get_episode_count_per_source(self) -> List[int]:
+        """Return the number of episodes in each underlying dataset."""
+        return [len(ds._episode_keys) for ds in self.datasets]
+
+    def close(self):
+        if hasattr(self, "datasets"):
+            for ds in self.datasets:
+                ds.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
 def head_collate(batch: list, chunk_size: int = 5) -> dict:
     """Collate batch for head training with on-the-fly noise injection.
 

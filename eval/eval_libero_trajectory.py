@@ -122,13 +122,17 @@ def find_episode_for_task(h5_path: str, task_name: str,
     #     is lower but still high enough to match correctly.
     #   - libero_spatial: "pick_up_the_black_bowl_..."
     #     Text has all the same words, so overlap is 100%.
-    task_words = set(task_name.lower().replace("_", " ").split())
+    # Strip scene prefix (e.g. "LIVING_ROOM_SCENE2_put_both_..." → "put_both_...")
+    # so libero_10/90 task names match the HDF5 text which has no prefix.
+    import re as _re
+    task_stripped = _re.sub(r'^[A-Z_]+_SCENE\d+_', '', task_name)
+    task_words = set(task_stripped.lower().replace("_", " ").split())
 
     best_match = None
     best_score = -1
-    task_words = set(task_name.lower().replace("_", " ").split())
+    task_words = set(task_stripped.lower().replace("_", " ").split())
     # Normalize the task name for exact comparison
-    task_normalized = task_name.lower().replace("_", " ").strip()
+    task_normalized = task_stripped.lower().replace("_", " ").strip()
 
     with h5py.File(h5_path, "r") as h5:
         ep_keys = sorted([k for k in h5.keys() if k.startswith("ep_")])
@@ -300,6 +304,7 @@ def run_episode_in_sim(
     chunk_cache = None
     alpha_vals = []
     delta_norms = []
+    delta_vectors = []  # (dx, dy, dz) for quiver visualization
     error_no_align = []
     error_with_align = []
     frames_with_align = []
@@ -383,6 +388,7 @@ def run_episode_in_sim(
 
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(chunk_np[0])))
+        delta_vectors.append(corrective[:3].copy())  # 3D position delta
 
         # Apply the dataset action plus the ALIGN correction
         # base_action is already in delta format (OSC_POSE), so we just add
@@ -444,12 +450,23 @@ def run_episode_in_sim(
         "frames_buffer": None,
     }
 
-    # ── Create 3-panel video: [DATASET GT] | [NO ALIGN] | [WITH ALIGN] ──
+    # ── Create 4-panel video: [DATASET GT] | [NO ALIGN] | [WITH ALIGN] | [Δ VECTOR] ──
     if record_video and frames_no_align and frames_with_align:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from mpl_toolkits.mplot3d import Axes3D
+        import cv2
+
         n_frames = min(len(frames_no_align), len(frames_with_align))
         side_by_side = []
         # Use the sim's natural resolution for the panel
         h, w = frames_no_align[0].shape[:2]
+
+        # Pre-create figure for delta vector panel
+        fig = plt.figure(figsize=(2.5, 2.5 * h / w))
+        ax = fig.add_subplot(111, projection='3d')
+        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
 
         for i in range(n_frames):
             # Dataset ground truth frame (raw, no text — we'll add text after flip)
@@ -494,13 +511,57 @@ def run_episode_in_sim(
                 f_with = _overlay_text(f_with, f"WITH ALIGN  step={i+1}", color=(0, 255, 0))
             gt_display = _overlay_text(gt_raw, f"GT  step={gt_idx}", color=(255, 255, 255))
 
-            combined = np.concatenate([gt_display, f_no, f_with], axis=1)
+            # ── 4th panel: 3D delta vector quiver ──
+            ax.clear()
+            if i < len(delta_vectors):
+                dv = delta_vectors[i]
+                scale = 0.05
+                ax.quiver(0, 0, 0, dv[0], dv[1], dv[2],
+                          color='r', arrow_length_ratio=0.3, linewidth=2)
+                # Axes reference
+                ax.quiver(0, 0, 0, scale, 0, 0, color='gray', alpha=0.3, linewidth=1)
+                ax.quiver(0, 0, 0, 0, scale, 0, color='gray', alpha=0.3, linewidth=1)
+                ax.quiver(0, 0, 0, 0, 0, scale, color='gray', alpha=0.3, linewidth=1)
+                ax.text(scale, 0, 0, 'X', color='gray', fontsize=6)
+                ax.text(0, scale, 0, 'Y', color='gray', fontsize=6)
+                ax.text(0, 0, scale, 'Z', color='gray', fontsize=6)
+                # Set limits symmetric around origin
+                max_abs = max(abs(dv).max(), 0.02)
+                lim = max_abs * 1.5
+                ax.set_xlim(-lim, lim)
+                ax.set_ylim(-lim, lim)
+                ax.set_zlim(-lim, lim)
+            else:
+                ax.set_xlim(-0.02, 0.02)
+                ax.set_ylim(-0.02, 0.02)
+                ax.set_zlim(-0.02, 0.02)
+            ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
+            ax.xaxis.pane.fill = False; ax.yaxis.pane.fill = False; ax.zaxis.pane.fill = False
+            ax.xaxis.pane.set_edgecolor('none')
+            ax.yaxis.pane.set_edgecolor('none')
+            ax.zaxis.pane.set_edgecolor('none')
+            ax.set_facecolor('black')
+            fig.patch.set_facecolor('black')
+            # Title
+            ax.text2D(0.5, 0.95, f"Δ  α={alpha_vals[i]:.2f}" if i < len(alpha_vals) else "Δ",
+                      transform=ax.transAxes, ha='center', color='white', fontsize=8)
+
+            fig.canvas.draw()
+            buf = np.array(fig.canvas.buffer_rgba())
+            # Convert RGBA → RGB, resize to match panel height
+            delta_panel = cv2.cvtColor(buf, cv2.COLOR_RGBA2RGB)
+            delta_panel = cv2.resize(delta_panel, (int(w * 0.8), h))
+
+            combined = np.concatenate([gt_display, f_no, f_with, delta_panel], axis=1)
             side_by_side.append(combined)
+
+        plt.close(fig)
 
         # White divider lines between panels
         for i in range(n_frames):
             side_by_side[i][:, w-2:w+2] = [255, 255, 255]
             side_by_side[i][:, 2*w-2:2*w+2] = [255, 255, 255]
+            side_by_side[i][:, 3*w-2:3*w+2] = [255, 255, 255]
 
         result["frames_buffer"] = side_by_side
 

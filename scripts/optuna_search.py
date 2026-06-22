@@ -465,7 +465,8 @@ def main():
         description="Optuna search for the full ALIGN pipeline"
     )
     # ── Required ──
-    parser.add_argument("--data", required=True, help="Path to HDF5 dataset")
+    parser.add_argument("--data", required=True, nargs="+",
+                        help="Path(s) to HDF5 dataset(s) — pass multiple to train on the concatenation")
     parser.add_argument("--encoder-checkpoint", required=True,
                         help="Phase 1 backbone (used when --search-encoders is OFF)")
 

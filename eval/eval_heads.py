@@ -12,6 +12,7 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
@@ -24,7 +25,7 @@ from data.align_dataset import ALIGNDataset, head_collate
 
 
 def evaluate(
-    data_path: str,
+    data_paths: List[str],
     heads_checkpoint: str,
     encoder_checkpoint: str = None,
     batch_size: int = 64,
@@ -140,12 +141,18 @@ def evaluate(
     print(f"  Phase from heads checkpoint: {heads_ckpt.get('phase', 'N/A')}, Epoch: {heads_ckpt.get('epoch', '?')}")
 
     #  -- Dataset (use the last val_split as validation)
-    ds = ALIGNDataset(data_path, mode="head", traj_window=traj_window)
+    if len(data_paths) == 1:
+        ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window)
+    else:
+        from data.align_dataset import MultiALIGNDataset
+        ds = MultiALIGNDataset(
+            data_paths, mode="head", traj_window=traj_window
+        )
     n_total = len(ds)
     n_val = max(1, int(n_total * val_split))
     indices = list(range(n_total - n_val, n_total))
 
-    print(f"  Dataset: {data_path}")
+    print(f"  Dataset ({len(data_paths)}): {data_paths}")
     print(f"  Validation samples: {n_val}")
     print(f"  Device: {device}")
 
@@ -225,7 +232,8 @@ def evaluate(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate ALIGN trained heads")
-    parser.add_argument("--data", required=True, help="Path to ALIGN HDF5 dataset")
+    parser.add_argument("--data", required=True, nargs="+",
+                        help="Path(s) to HDF5 dataset(s). Pass multiple to evaluate on the union.")
     parser.add_argument("--checkpoint", required=True,
                         help="Heads checkpoint (.pt) — contains decision_head + assistant_head")
     parser.add_argument("--encoder-checkpoint", default=None,
@@ -253,7 +261,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     evaluate(
-        data_path=args.data,
+        data_paths=args.data,
         heads_checkpoint=args.checkpoint,
         encoder_checkpoint=args.encoder_checkpoint,
         batch_size=args.batch_size,

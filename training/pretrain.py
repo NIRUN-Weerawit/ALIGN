@@ -29,7 +29,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import torch
@@ -80,7 +80,7 @@ from data.align_dataset import ALIGNDataset, pretrain_collate
 # ================================================================
 
 def pretrain_hdf5(
-    data_path: str,
+    data_paths: List[str],
     output_dir: str,
     epochs_encoder: int = 40,
     epochs_mixer: int = 10,
@@ -115,7 +115,11 @@ def pretrain_hdf5(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     # Derive subdirectory: checkpoints/pretrain_local/libero_align/run_N/
-    ds_name = Path(data_path).stem
+    # For multi-dataset training, join the dataset names.
+    if len(data_paths) == 1:
+        ds_name = Path(data_paths[0]).stem
+    else:
+        ds_name = "+".join(Path(p).stem for p in data_paths)
     base_dir = Path(output_dir) / ds_name
 
     # Find next available run number
@@ -134,7 +138,7 @@ def pretrain_hdf5(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"=== ALIGN Contrastive Pretraining (HDF5) ===")
-    print(f"  Dataset:  {data_path}")
+    print(f"  Datasets ({len(data_paths)}): {data_paths}")
     print(f"  Device:   {device}")
     print(f"  Phase 1a (encoder): {epochs_encoder} epochs")
     print(f"  Phase 1b (mixer):   {epochs_mixer} epochs")
@@ -146,7 +150,7 @@ def pretrain_hdf5(
         name=wandb_run,
         config={
             "model": "align-pretrain-hdf5",
-            "dataset": str(data_path),
+            "datasets": [str(p) for p in data_paths],
             "epochs_encoder": epochs_encoder,
             "epochs_mixer": epochs_mixer,
             "batch_size": batch_size,
@@ -165,12 +169,22 @@ def pretrain_hdf5(
     print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Dataset ──
-    full_ds = ALIGNDataset(
-        data_path,
-        mode="pretrain",
-        frames_per_ep=frames_per_ep,
-        traj_window=traj_window,
-    )
+    # Use MultiALIGNDataset when multiple paths are provided, ALIGNDataset otherwise.
+    if len(data_paths) == 1:
+        full_ds = ALIGNDataset(
+            data_paths[0],
+            mode="pretrain",
+            frames_per_ep=frames_per_ep,
+            traj_window=traj_window,
+        )
+    else:
+        from data.align_dataset import MultiALIGNDataset
+        full_ds = MultiALIGNDataset(
+            data_paths,
+            mode="pretrain",
+            frames_per_ep=frames_per_ep,
+            traj_window=traj_window,
+        )
     n_total = len(full_ds)
     n_val = max(1, int(n_total * val_split))
     n_train = n_total - n_val
@@ -525,7 +539,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="ALIGN Contrastive Pretraining — HDF5 data, 2-phase: encoder → mixer"
     )
-    parser.add_argument("--data", required=True, help="Path to align.h5 dataset")
+    parser.add_argument("--data", required=True, nargs="+",
+                        help="Path(s) to align.h5 dataset(s). Pass multiple "
+                             "to train on the concatenation.")
     parser.add_argument("--output-dir", default="./checkpoints/pretrain")
     parser.add_argument("--epochs-encoder", type=int, default=40,
                         help="Phase 1a: encoder pretrain epochs")
@@ -569,7 +585,7 @@ def main():
     args = parser.parse_args()
 
     pretrain_hdf5(
-        data_path=args.data,
+        data_paths=args.data,
         output_dir=args.output_dir,
         epochs_encoder=args.epochs_encoder,
         epochs_mixer=args.epochs_mixer,

@@ -18,7 +18,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import torch
@@ -55,7 +55,7 @@ def _unfreeze_module(module):
 # ================================================================
 
 def train_heads_hdf5(
-    data_path: str,
+    data_paths: List[str],
     pretrained_checkpoint: str,
     output_dir: str,
     epochs_decision: int = 10,
@@ -106,7 +106,10 @@ def train_heads_hdf5(
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     # Derive subdirectory: checkpoints/heads_local/libero_align/run_N/
-    ds_name = Path(data_path).stem
+    if len(data_paths) == 1:
+        ds_name = Path(data_paths[0]).stem
+    else:
+        ds_name = "+".join(Path(p).stem for p in data_paths)
     base_dir = Path(output_dir) / ds_name
 
     # Find next available run number
@@ -126,7 +129,7 @@ def train_heads_hdf5(
 
     print(f"=== ALIGN Head Training (independent stages) ===")
     print(f"  Run:          {out_dir}")
-    print(f"  Data:         {data_path}")
+    print(f"  Data ({len(data_paths)}): {data_paths}")
     print(f"  Pretrained:   {pretrained_checkpoint}")
     print(f"  Device:       {device}")
     print(f"  Stage A (α):  {epochs_decision} epochs, lr={lr_decision}")
@@ -138,7 +141,7 @@ def train_heads_hdf5(
         name=wandb_run,
         config={
             "model": "align-heads-independent",
-            "data": str(data_path),
+            "data": [str(p) for p in data_paths],
             "pretrained_checkpoint": pretrained_checkpoint,
             "epochs_decision": epochs_decision,
             "epochs_assistant": epochs_assistant,
@@ -154,7 +157,13 @@ def train_heads_hdf5(
     print(f"  W&B:          {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Dataset ──
-    full_ds = ALIGNDataset(data_path, mode="head", traj_window=traj_window)
+    if len(data_paths) == 1:
+        full_ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window)
+    else:
+        from data.align_dataset import MultiALIGNDataset
+        full_ds = MultiALIGNDataset(
+            data_paths, mode="head", traj_window=traj_window
+        )
     n_total = len(full_ds)
     n_val = max(1, int(n_total * val_split))
     n_train = n_total - n_val
@@ -509,7 +518,9 @@ def train_heads_hdf5(
 def main():
     parser = argparse.ArgumentParser(
         description="ALIGN Head Training (independent stages: Decision → Assistant)")
-    parser.add_argument("--data", required=True, help="Path to align.h5 dataset")
+    parser.add_argument("--data", required=True, nargs="+",
+                        help="Path(s) to align.h5 dataset(s). Pass multiple "
+                             "to train on the concatenation.")
     parser.add_argument("--pretrained", required=True, help="Phase 1 pretrained checkpoint")
     parser.add_argument("--output-dir", default="./checkpoints/heads")
     parser.add_argument("--epochs-decision", type=int, default=10,
@@ -572,7 +583,7 @@ def main():
     args = parser.parse_args()
 
     train_heads_hdf5(
-        data_path=args.data,
+        data_paths=args.data,
         pretrained_checkpoint=args.pretrained,
         output_dir=args.output_dir,
         epochs_decision=args.epochs_decision,
