@@ -408,10 +408,13 @@ class MultiALIGNDataset(Dataset):
     ordering is: [dataset_0][dataset_1]...[dataset_{N-1}], so a single
     random index selects a sample from the right source.
 
-    All datasets must be in the same mode ('pretrain' or 'head') and share
-    the same trajectory window, frames_per_ep, image_size, and camera —
-    these are passed to the constructor and applied to every underlying
-    dataset.
+    All datasets must be in the same mode ('pretrain', 'head', or 'world_model')
+    and share the same trajectory window, frames_per_ep, image_size, and camera —
+    these are passed to the constructor and applied to every underlying dataset.
+
+    Note: 'mode' is just a label on the dataset; the collate function
+    (pretrain_collate, head_collate, world_model_collate) is what shapes
+    the data for a specific training stage.
     """
 
     def __init__(
@@ -473,6 +476,115 @@ class MultiALIGNDataset(Dataset):
             self.close()
         except Exception:
             pass
+
+
+def world_model_collate(batch: list, traj_window: int = 5) -> dict:
+    """Collate batch for world model training.
+
+    For each item in the batch (which contains a full episode's frames,
+    poses, actions), sample a random transition (s_t, a_t, s_{t+1}):
+
+        s_t      = (frame_t, traj_window ending at t, text)
+        a_t      = actions[t]                       (6D OSC_POSE)
+        s_{t+1}  = (frame_{t+1}, traj_window ending at t+1, text)
+
+    The transitions are batched. The trajectory window has the same
+    size as the world model's input (traj_window=k). The next-state
+    trajectory window is offset by 1.
+
+    Returns:
+        {
+            "frame_t":      (B, H, W, 3) uint8 — current frame
+            "traj_t":       (B, traj_window, 6) float32 — current traj window
+            "action":       (B, 6) float32 — the action at timestep t
+            "frame_next":   (B, H, W, 3) uint8 — next frame
+            "traj_next":    (B, traj_window, 6) float32 — next traj window
+            "text":         list of strings (B,) — task description
+            "ep_idx":       (B,) int64 — episode index (for diagnostics)
+        }
+
+    The encoder (frozen) is applied at training time to produce the
+    actual (z_v, z_t, z_text) embeddings. The collate function only
+    provides the raw inputs.
+    """
+    all_frame_t = []
+    all_traj_t = []
+    all_action = []
+    all_frame_next = []
+    all_traj_next = []
+    all_text = []
+    all_ep_idx = []
+
+    for item in batch:
+        frames = item["frames"]     # (N, H, W, 3)
+        poses = item["poses"]       # (N, 6) or (N, 7)
+        actions = item.get("actions")  # (N, 6) or (N, 7)
+        text = item["text"]
+        ep_idx = item["ep_idx"]
+
+        N = len(frames)
+        # Need at least traj_window past + 1 transition
+        if N < traj_window + 1:
+            # Episode too short; skip by padding with copies
+            t = 0
+        else:
+            # Sample t such that t+1 is valid AND t >= traj_window - 1
+            # so we have traj_window past poses
+            t_min = traj_window - 1
+            t_max = N - 2  # need t+1
+            if t_min > t_max:
+                t = t_max
+            else:
+                t = int(np.random.randint(t_min, t_max + 1))
+
+        # Current state: frame t + traj window [t-traj_window+1 .. t]
+        frame_t = frames[t]
+        # Trajectory window: (traj_window, 6) — last `traj_window` poses
+        traj_t = poses[t - traj_window + 1 : t + 1, :6]
+        if traj_t.shape[0] < traj_window:
+            # Pad with the first pose
+            pad = np.zeros((traj_window - traj_t.shape[0], 6), dtype=poses.dtype)
+            traj_t = np.concatenate([pad, traj_t], axis=0)
+
+        # Action at t
+        if actions is not None and t < len(actions):
+            action_t = actions[t, :6].astype(np.float32)
+        elif t > 0:
+            # Fallback: derive from pose difference
+            action_t = (poses[t, :6] - poses[t - 1, :6]).astype(np.float32)
+        else:
+            action_t = np.zeros(6, dtype=np.float32)
+
+        # Next state: frame t+1 + traj window [t-traj_window+2 .. t+1]
+        frame_next = frames[t + 1]
+        traj_next = poses[t - traj_window + 2 : t + 2, :6]
+        if traj_next.shape[0] < traj_window:
+            pad = np.zeros((traj_window - traj_next.shape[0], 6), dtype=poses.dtype)
+            traj_next = np.concatenate([pad, traj_next], axis=0)
+
+        # Text variant: pick a random variant from the list
+        if isinstance(text, list):
+            text_pick = text[np.random.randint(0, len(text))]
+        else:
+            text_pick = text
+
+        all_frame_t.append(frame_t)
+        all_traj_t.append(traj_t.astype(np.float32))
+        all_action.append(action_t)
+        all_frame_next.append(frame_next)
+        all_traj_next.append(traj_next.astype(np.float32))
+        all_text.append(text_pick)
+        all_ep_idx.append(ep_idx)
+
+    return {
+        "frame_t": np.stack(all_frame_t, axis=0),
+        "traj_t": np.stack(all_traj_t, axis=0),
+        "action": np.stack(all_action, axis=0),
+        "frame_next": np.stack(all_frame_next, axis=0),
+        "traj_next": np.stack(all_traj_next, axis=0),
+        "text": all_text,
+        "ep_idx": np.array(all_ep_idx, dtype=np.int64),
+    }
 
 
 def head_collate(batch: list, chunk_size: int = 5) -> dict:
