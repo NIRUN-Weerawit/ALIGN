@@ -12,6 +12,10 @@ eval/libero_results/
 eval/libero_traj_results/
 eval/*.mp4
 
+# Optuna trials
+optuna_trials/
+optuna_smoke/
+
 # Python
 __pycache__/
 *.pyc
