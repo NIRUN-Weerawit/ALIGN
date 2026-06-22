@@ -266,6 +266,7 @@ class FuturePredictionHeadTransformer(nn.Module):
         nhead: int = 4,
         num_layers: int = 2,
         dim_feedforward: int = 1024,
+        dropout: float = 0.0,
         max_timesteps: int = 64,
     ):
         super().__init__()
@@ -283,6 +284,7 @@ class FuturePredictionHeadTransformer(nn.Module):
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
+            dropout=dropout,
             batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
@@ -428,6 +430,15 @@ class ALIGNModel(nn.Module):
         max_traj_len: int = 64,
         decision_K: int = 10,
         decision_arch: str = "mlp",
+        # MLP head params
+        mlp_hidden_dim: int = 512,
+        mlp_num_layers: int = 3,
+        # Transformer head params
+        num_layers: int = 2,
+        d_model: int = 384,
+        nhead: int = 4,
+        dropout: float = 0.0,
+        dim_feedforward: int = 1024,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -462,11 +473,15 @@ class ALIGNModel(nn.Module):
         # error becomes the alpha signal at inference time.
         if decision_arch == "mlp":
             self.decision_head = FuturePredictionHeadMLP(
-                embed_dim=embed_dim, K=decision_K
+                embed_dim=embed_dim, K=decision_K,
+                hidden_dim=mlp_hidden_dim, num_layers=mlp_num_layers,
             )
         elif decision_arch == "transformer":
             self.decision_head = FuturePredictionHeadTransformer(
-                embed_dim=embed_dim, K=decision_K
+                embed_dim=embed_dim, K=decision_K,
+                d_model=d_model, nhead=nhead,
+                num_layers=num_layers, dropout=dropout,
+                dim_feedforward=dim_feedforward,
             )
         else:
             raise ValueError(
@@ -631,16 +646,33 @@ class ALIGNModel(nn.Module):
         predicted_z_t: torch.Tensor,  # (B, K, embed_dim)
         target_z_v: torch.Tensor,     # (B, K, embed_dim) — detached
         target_z_t: torch.Tensor,     # (B, K, embed_dim) — detached
+        decay: float = 1.0,           # exponential decay weight on older steps
     ) -> torch.Tensor:
         """Cosine-similarity loss for future prediction.
 
-        Bounded in [0, 2] per step. Returns the mean loss over the K window.
+        Bounded in [0, 2] per step. Returns the weighted mean loss over the
+        K window, where older steps are weighted by `decay^(K-1-i)`. With
+        decay=1.0, all steps are weighted equally (simple mean). With
+        decay=0.7, the most recent step is weighted 1.0 and the oldest step
+        is weighted 0.7^(K-1).
+
         Targets are detached (stop-gradient) so this loss doesn't try to
         reshape the encoder.
         """
         cos_v = F.cosine_similarity(predicted_z_v, target_z_v.detach(), dim=-1)  # (B, K)
         cos_t = F.cosine_similarity(predicted_z_t, target_z_t.detach(), dim=-1)  # (B, K)
-        loss = ((1 - cos_v) + (1 - cos_t)).mean() / 2
+        per_step = ((1 - cos_v) + (1 - cos_t)) / 2  # (B, K) in [0, 1]
+        if decay < 1.0:
+            K = per_step.shape[1]
+            # weight = decay^(K-1-i) — most recent step gets the highest weight
+            weights = torch.tensor(
+                [decay ** (K - 1 - i) for i in range(K)],
+                device=per_step.device, dtype=per_step.dtype,
+            )
+            weights = weights / weights.sum()  # normalize
+            loss = (per_step * weights).sum()
+        else:
+            loss = per_step.mean()
         return loss
 
     def forward(
