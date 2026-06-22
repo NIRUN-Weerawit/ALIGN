@@ -211,7 +211,7 @@ def run_trial(trial: optuna.Trial, args: argparse.Namespace) -> float:
     head_cmd = [
         sys.executable, "training/train_heads.py",
         "--data", args.data,
-        "--encoder-checkpoint", str(encoder_ckpt),
+        "--pretrained", str(encoder_ckpt),
         "--output-dir", str(heads_dir),
         "--epochs-decision", str(args.epochs_decision),
         "--epochs-assistant", str(args.epochs_assistant),
@@ -223,7 +223,7 @@ def run_trial(trial: optuna.Trial, args: argparse.Namespace) -> float:
     if args.search_decision:
         head_cmd += [
             "--decision-arch", config["decision_arch"],
-            "--decision-K", str(config["decision_K"]),
+            "--chunk-size", str(config["decision_K"]),  # decision_K = chunk_size
             "--decision-noise-std", str(config["decision_noise_std"]),
             "--lr-decision", str(config["lr_decision"]),
             "--loss-decay", str(config["loss_decay"]),
@@ -277,7 +277,25 @@ def run_trial(trial: optuna.Trial, args: argparse.Namespace) -> float:
         "--checkpoint", str(heads_ckpt),
         "--encoder-checkpoint", str(encoder_ckpt),
         "--batch-size", str(config["batch_size"]),
+        "--chunk-size", str(config["decision_K"] if args.search_decision else 5),
     ]
+    if args.search_decision:
+        eval_cmd += [
+            "--decision-arch", config["decision_arch"],
+            "--mlp-hidden", str(config["mlp_hidden_dim"]),
+            "--mlp-layers", str(config["mlp_num_layers"]),
+            "--transformer-layers", str(config["transformer_layers"]),
+            "--transformer-d-model", str(config["transformer_d_model"]),
+            "--transformer-nhead", str(config["transformer_nhead"]),
+            "--transformer-dropout", str(config["transformer_dropout"]),
+            "--transformer-dim-ff", str(config["transformer_dim_feedforward"]),
+        ]
+    if args.search_assistant:
+        eval_cmd += [
+            "--assistant-hidden", str(config["assistant_hidden_dim"]),
+            "--assistant-layers", str(config["assistant_layers"]),
+            "--assistant-dropout", str(config["assistant_dropout"]),
+        ]
     print(f"  [eval] Evaluating...")
     eval_log = trial_dir / "eval.log"
     eval_result = subprocess.run(

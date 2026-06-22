@@ -1,0 +1,77 @@
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /home/ucluser/.netrc.
+wandb: Currently logged in as: nirun-weerawit (nirun-weerawit-nagoya-university) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: setting up run 5c7gf2s5
+wandb: Tracking run with wandb version 0.24.2
+wandb: Run data is saved locally in /home/ucluser/ALIGN/wandb/run-20260622_122753-5c7gf2s5
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run hearty-lion-34
+wandb: ⭐️ View project at https://wandb.ai/nirun-weerawit-nagoya-university/align-heads
+wandb: 🚀 View run at https://wandb.ai/nirun-weerawit-nagoya-university/align-heads/runs/5c7gf2s5
+Using cache found in /home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main
+/home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:43: UserWarning: xFormers is available (SwiGLU)
+  warnings.warn("xFormers is available (SwiGLU)")
+/home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:27: UserWarning: xFormers is available (Attention)
+  warnings.warn("xFormers is available (Attention)")
+/home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:33: UserWarning: xFormers is available (Block)
+  warnings.warn("xFormers is available (Block)")
+/home/ucluser/ALIGN/training/train_heads.py:250: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  scheduler_a.step()
+=== ALIGN Head Training (independent stages) ===
+  Run:          optuna_smoke/trial_000/heads/libero_spatial/run_1
+  Data:         /media/ucluser/PortableSSD/lerobot/nvidia/LIBERO_LeRobot_v3/libero_spatial/libero_spatial.h5
+  Pretrained:   checkpoints/pretrain/run_3/best.pt
+  Device:       cuda
+  Stage A (α):  1 epochs, lr=0.001331121608073689
+  Stage B (Δ):  1 epochs, lr=0.00788671412999049
+  W&B:          enabled
+  NOTE: Detected 'actions' dataset — will load actions when available
+  4826 train, 536 val samples
+  Loaded pretrained backbone from checkpoints/pretrain/run_3/best.pt
+  All encoders + mixer frozen — only heads train
+
+=== Stage A: Training Decision Head (Future Prediction) ===
+  Trainable params: 3,845,120
+[Decision] Epoch 1/1:   0%|          | 0/2 [00:00<?, ?step/s][Decision] Epoch 1/1:   0%|          | 0/2 [00:01<?, ?step/s, err_t=0.965, err_v=0.995, loss=31.3676][Decision] Epoch 1/1:  50%|█████     | 1/2 [00:01<00:01,  1.13s/step, err_t=0.965, err_v=0.995, loss=31.3676][Decision] Epoch 1/1: 100%|██████████| 2/2 [00:02<00:00,  1.01step/s, err_t=0.965, err_v=0.995, loss=31.3676][Decision] Epoch 1/1: 100%|██████████| 2/2 [00:02<00:00,  1.31s/step, err_t=0.965, err_v=0.995, loss=31.3676]
+  [α-future] Epoch   1/1  loss: 28.1353  err_v: 0.878  err_t: 0.880
+  -> decision_best.pt (loss: 28.1353)
+
+  Stage A complete. Best loss: 28.1353
+
+=== Stage B: Training Assistant Head (Δpose) ===
+  Trainable params: 412,190
+[Assistant] Epoch 1/1:   0%|          | 0/2 [00:00<?, ?step/s][Assistant] Epoch 1/1:   0%|          | 0/2 [00:00<?, ?step/s, d_mean=0.3499, mse=0.18478][Assistant] Epoch 1/1:  50%|█████     | 1/2 [00:00<00:00,  1.44step/s, d_mean=0.3499, mse=0.18478][Assistant] Epoch 1/1: 100%|██████████| 2/2 [00:01<00:00,  1.36step/s, d_mean=0.3499, mse=0.18478][Assistant] Epoch 1/1: 100%|██████████| 2/2 [00:02<00:00,  1.01s/step, d_mean=0.3499, mse=0.18478]
+wandb: updating run metadata
+wandb: uploading output.log; uploading wandb-summary.json; uploading config.yaml
+wandb: uploading output.log; uploading config.yaml
+wandb: uploading history steps 0-1, summary, console lines 1-35
+wandb: 
+wandb: Run history:
+wandb: delta mean ▁
+wandb:      epoch ▁▁
+wandb:      err_t ▁
+wandb:      err_v ▁
+wandb:       loss █▁
+wandb: 
+wandb: Run summary:
+wandb: delta mean 1.91649
+wandb:      epoch 1
+wandb:      err_t 0.87972
+wandb:      err_v 0.87766
+wandb:       loss 7.89951
+wandb:      stage assistant
+wandb: 
+wandb: 🚀 View run hearty-lion-34 at: https://wandb.ai/nirun-weerawit-nagoya-university/align-heads/runs/5c7gf2s5
+wandb: ⭐️ View project at: https://wandb.ai/nirun-weerawit-nagoya-university/align-heads
+wandb: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+wandb: Find logs at: ./wandb/run-20260622_122753-5c7gf2s5/logs
+  [Δ] Epoch   1/1  MSE: 7.8995  Δ_mean: 1.9165
+  -> assistant_best.pt (loss: 7.8995)
+
+  Stage B complete. Best loss: 7.8995
+
+  Head training complete.
+    Decision:   optuna_smoke/trial_000/heads/libero_spatial/run_1/decision_best.pt
+    Assistant:  optuna_smoke/trial_000/heads/libero_spatial/run_1/assistant_best.pt
+    Combined:   optuna_smoke/trial_000/heads/libero_spatial/run_1/heads_best.pt
+    Logs:       optuna_smoke/trial_000/heads/libero_spatial/run_1/head_log.jsonl

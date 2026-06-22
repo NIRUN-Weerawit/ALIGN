@@ -33,6 +33,17 @@ def evaluate(
     val_split: float = 0.1,
     device: str = None,
     use_bf16: bool = True,
+    decision_arch: str = "transformer",
+    mlp_hidden_dim: int = 512,
+    mlp_num_layers: int = 3,
+    transformer_layers: int = 2,
+    transformer_d_model: int = 384,
+    transformer_nhead: int = 4,
+    transformer_dropout: float = 0.0,
+    transformer_dim_ff: int = 1024,
+    assistant_hidden: int = 256,
+    assistant_layers: int = 2,
+    assistant_dropout: float = 0.0,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -68,12 +79,31 @@ def evaluate(
             print("           Eval results will be meaningless. Pass --encoder-checkpoint to fix.")
 
     # -- Model
+    head_kwargs = {}
+    if decision_arch == "mlp":
+        head_kwargs = {
+            "mlp_hidden_dim": mlp_hidden_dim,
+            "mlp_num_layers": mlp_num_layers,
+        }
+    elif decision_arch == "transformer":
+        head_kwargs = {
+            "num_layers": transformer_layers,
+            "d_model": transformer_d_model,
+            "nhead": transformer_nhead,
+            "dropout": transformer_dropout,
+            "dim_feedforward": transformer_dim_ff,
+        }
     model = ALIGNModel(
         embed_dim=256,
         chunk_size=chunk_size,
         use_text=True,
         device=device,
         decision_K=decision_K,
+        decision_arch=decision_arch,
+        **head_kwargs,
+        assistant_hidden=assistant_hidden,
+        assistant_layers=assistant_layers,
+        assistant_dropout=assistant_dropout,
     ).to(device)
     model.freeze_backbone()
     model.freeze_all_encoders()
@@ -206,6 +236,20 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-size", type=int, default=5)
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--device", default=None)
+    # Decision head arch (must match training to load weights)
+    parser.add_argument("--decision-arch", default="transformer",
+                        choices=["mlp", "transformer"])
+    parser.add_argument("--mlp-hidden", type=int, default=512)
+    parser.add_argument("--mlp-layers", type=int, default=3)
+    parser.add_argument("--transformer-layers", type=int, default=2)
+    parser.add_argument("--transformer-d-model", type=int, default=384)
+    parser.add_argument("--transformer-nhead", type=int, default=4)
+    parser.add_argument("--transformer-dropout", type=float, default=0.0)
+    parser.add_argument("--transformer-dim-ff", type=int, default=1024)
+    # Assistant head arch
+    parser.add_argument("--assistant-hidden", type=int, default=256)
+    parser.add_argument("--assistant-layers", type=int, default=2)
+    parser.add_argument("--assistant-dropout", type=float, default=0.0)
 
     args = parser.parse_args()
     evaluate(
@@ -217,4 +261,15 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         val_split=args.val_split,
         device=args.device,
+        decision_arch=args.decision_arch,
+        mlp_hidden_dim=args.mlp_hidden,
+        mlp_num_layers=args.mlp_layers,
+        transformer_layers=args.transformer_layers,
+        transformer_d_model=args.transformer_d_model,
+        transformer_nhead=args.transformer_nhead,
+        transformer_dropout=args.transformer_dropout,
+        transformer_dim_ff=args.transformer_dim_ff,
+        assistant_hidden=args.assistant_hidden,
+        assistant_layers=args.assistant_layers,
+        assistant_dropout=args.assistant_dropout,
     )

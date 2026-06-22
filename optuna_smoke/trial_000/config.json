@@ -1,0 +1,22 @@
+{
+  "decision_arch": "transformer",
+  "decision_K": 5,
+  "decision_noise_std": 0.007160849144555759,
+  "noise_schedule": "random_uniform",
+  "lr_decision": 0.001331121608073689,
+  "loss_decay": 0.5092630224331111,
+  "warmup_epochs": 5,
+  "mlp_hidden_dim": 256,
+  "mlp_num_layers": 2,
+  "transformer_layers": 2,
+  "transformer_d_model": 512,
+  "transformer_nhead": 8,
+  "transformer_dropout": 0.13682099526511077,
+  "transformer_dim_feedforward": 512,
+  "assistant_hidden_dim": 512,
+  "assistant_layers": 1,
+  "assistant_dropout": 0.28466566117599995,
+  "lr_assistant": 0.00788671412999049,
+  "batch_size": 32,
+  "weight_decay": 3.0771802712506896e-06
+}
