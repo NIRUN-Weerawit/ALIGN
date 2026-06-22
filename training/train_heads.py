@@ -87,6 +87,9 @@ def train_heads_hdf5(
     transformer_dim_ff: int = 1024,
     loss_decay: float = 0.7,
     warmup_epochs: int = 0,
+    assistant_hidden: int = 256,
+    assistant_layers: int = 2,
+    assistant_dropout: float = 0.0,
 ) -> str:
     """Train Decision and Assistant heads independently.
 
@@ -205,6 +208,9 @@ def train_heads_hdf5(
         decision_K=chunk_size,
         decision_arch=decision_arch,
         **head_kwargs,
+        assistant_hidden=assistant_hidden,
+        assistant_layers=assistant_layers,
+        assistant_dropout=assistant_dropout,
     ).to(device)
 
     ckpt = torch.load(pretrained_checkpoint, map_location=device)
@@ -553,6 +559,12 @@ def main():
                         help="Decay for weighted mean of K-step prediction errors")
     parser.add_argument("--warmup-epochs", type=int, default=0,
                         help="Linear LR warmup over this many epochs")
+    parser.add_argument("--assistant-hidden", type=int, default=256,
+                        help="Assistant head hidden layer width")
+    parser.add_argument("--assistant-layers", type=int, default=2,
+                        help="Assistant head number of hidden layers (between input and output)")
+    parser.add_argument("--assistant-dropout", type=float, default=0.0,
+                        help="Assistant head dropout")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="align-heads")
     parser.add_argument("--wandb-run", default=None)
@@ -592,6 +604,9 @@ def main():
         transformer_dim_ff=args.transformer_dim_ff,
         loss_decay=args.loss_decay,
         warmup_epochs=args.warmup_epochs,
+        assistant_hidden=args.assistant_hidden,
+        assistant_layers=args.assistant_layers,
+        assistant_dropout=args.assistant_dropout,
     )
 
 

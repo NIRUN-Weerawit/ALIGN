@@ -105,6 +105,7 @@ def pretrain_hdf5(
     use_text: bool = True,
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
+    mixer_nhead: int = 8,
     use_bf16: bool = True,
     encoder_checkpoint: Optional[str] = None,
     resume: Optional[str] = None,
@@ -201,6 +202,7 @@ def pretrain_hdf5(
         device=str(device),
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
+        mixer_nhead=mixer_nhead,
         # Default decision_K=10 matches pretrain's traj_window default
         decision_K=10,
     ).to(device)
@@ -548,6 +550,7 @@ def main():
     parser.add_argument("--episodes-per-batch", type=int, default=8)
     parser.add_argument("--mixer-dim", type=int, default=512)
     parser.add_argument("--num-mixer-blocks", type=int, default=2)
+    parser.add_argument("--mixer-nhead", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=0,
                         help="DataLoader workers (0 for HDF5 works fine)")
     parser.add_argument("--bf16", action="store_true", default=True,
@@ -591,6 +594,7 @@ def main():
         use_text=not args.no_text,
         mixer_dim=args.mixer_dim,
         num_mixer_blocks=args.num_mixer_blocks,
+        mixer_nhead=args.mixer_nhead,
         use_bf16=args.bf16,
         encoder_checkpoint=args.encoder_checkpoint,
         resume=args.resume,

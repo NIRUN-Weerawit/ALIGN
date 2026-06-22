@@ -334,20 +334,30 @@ class AssistantHead(nn.Module):
         controller; the current EEF pose is already encoded in z_t.
 
     Output: (B, K, 6) — K corrective deltas to add to the human's actions.
+
+    Args:
+        latent_dim: per-modality embedding dim (default 256).
+        chunk_size: number of corrective deltas to predict.
+        action_dim: 6 (OSC_POSE).
+        hidden_dim: hidden layer width (default 256).
+        num_hidden_layers: number of hidden layers (default 2 → 256→128).
+        dropout: dropout rate applied between hidden layers (default 0).
     """
 
-    def __init__(self, latent_dim: int = 256, chunk_size: int = 5, action_dim: int = 6):
+    def __init__(self, latent_dim: int = 256, chunk_size: int = 5, action_dim: int = 6,
+                 hidden_dim: int = 256, num_hidden_layers: int = 2, dropout: float = 0.0):
         super().__init__()
         input_dim = latent_dim * 3 + action_dim
         self.chunk_size = chunk_size
         self.action_dim = action_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, chunk_size * action_dim),
-        )
+        # Build a configurable MLP: input → hidden → hidden → ... → output
+        layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden_layers - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+            if dropout > 0:
+                layers += [nn.Dropout(dropout)]
+        layers += [nn.Linear(hidden_dim, chunk_size * action_dim)]
+        self.mlp = nn.Sequential(*layers)
 
     def forward(
         self,
@@ -439,6 +449,10 @@ class ALIGNModel(nn.Module):
         nhead: int = 4,
         dropout: float = 0.0,
         dim_feedforward: int = 1024,
+        # Assistant head params
+        assistant_hidden: int = 256,
+        assistant_layers: int = 2,
+        assistant_dropout: float = 0.0,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -488,7 +502,10 @@ class ALIGNModel(nn.Module):
                 f"Unknown decision_arch: {decision_arch} (expected 'mlp' or 'transformer')"
             )
         self.assistant_head = AssistantHead(
-            latent_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim
+            latent_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim,
+            hidden_dim=assistant_hidden,
+            num_hidden_layers=assistant_layers,
+            dropout=assistant_dropout,
         )
 
         # Register which modules are trainable vs frozen
