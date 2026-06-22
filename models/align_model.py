@@ -350,13 +350,17 @@ class AssistantHead(nn.Module):
         input_dim = latent_dim * 3 + action_dim
         self.chunk_size = chunk_size
         self.action_dim = action_dim
-        # Build a configurable MLP: input → hidden → hidden → ... → output
+        # Build a configurable MLP with decreasing hidden dims:
+        # input → hidden_dim → hidden_dim//2 → ... → output
         layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+        current_dim = hidden_dim
         for _ in range(num_hidden_layers - 1):
-            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+            next_dim = max(current_dim // 2, 32)
+            layers += [nn.Linear(current_dim, next_dim), nn.ReLU()]
+            current_dim = next_dim
             if dropout > 0:
                 layers += [nn.Dropout(dropout)]
-        layers += [nn.Linear(hidden_dim, chunk_size * action_dim)]
+        layers += [nn.Linear(current_dim, chunk_size * action_dim)]
         self.mlp = nn.Sequential(*layers)
 
     def forward(
@@ -439,7 +443,7 @@ class ALIGNModel(nn.Module):
         mixer_nhead: int = 8,
         max_traj_len: int = 64,
         decision_K: int = 10,
-        decision_arch: str = "mlp",
+        decision_arch: str = "transformer",
         # MLP head params
         mlp_hidden_dim: int = 512,
         mlp_num_layers: int = 3,

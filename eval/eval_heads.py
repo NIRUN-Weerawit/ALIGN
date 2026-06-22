@@ -24,6 +24,80 @@ from models.align_model import ALIGNModel
 from data.align_dataset import ALIGNDataset, head_collate
 
 
+def _detect_arch_from_checkpoint(ckpt: dict) -> dict:
+    """Auto-detect model architecture from checkpoint state dict keys and shapes.
+
+    Returns a dict of kwargs to pass to ALIGNModel.__init__.
+    """
+    state = ckpt.get("trainable_state_dict", ckpt)
+    cfg = ckpt.get("config", {})
+    kwargs = {}
+
+    # chunk_size
+    kwargs["chunk_size"] = cfg.get("chunk_size", 5)
+
+    # decision_K
+    kwargs["decision_K"] = cfg.get("decision_K", kwargs["chunk_size"])
+
+    # Detect decision head architecture
+    has_transformer = any("transformer" in k for k in state)
+    has_mlp = any(k.startswith("decision_head.mlp.") for k in state)
+
+    if has_transformer:
+        kwargs["decision_arch"] = "transformer"
+        # Infer d_model from pos_encoding
+        pe = state.get("decision_head.pos_encoding", None)
+        if pe is not None:
+            kwargs["d_model"] = pe.shape[1]
+        # Infer num_layers from transformer.layers count
+        layer_keys = [k for k in state if "transformer.layers." in k]
+        layer_ids = set()
+        for k in layer_keys:
+            parts = k.split(".")
+            for p in parts:
+                if p.isdigit():
+                    layer_ids.add(int(p))
+        kwargs["num_layers"] = max(layer_ids) + 1 if layer_ids else 2
+        # Infer dim_feedforward from linear1 weight
+        l1 = state.get("decision_head.transformer.layers.0.linear1.weight", None)
+        if l1 is not None:
+            kwargs["dim_feedforward"] = l1.shape[0]
+        # Infer nhead: d_model must be divisible by nhead
+        d_model = kwargs.get("d_model", 384)
+        # Try common nhead values
+        for n in [8, 4, 2, 1]:
+            if d_model % n == 0:
+                kwargs["nhead"] = n
+                break
+        kwargs["dropout"] = 0.0
+    elif has_mlp:
+        kwargs["decision_arch"] = "mlp"
+        # Infer hidden_dim from mlp.0.weight
+        w0 = state.get("decision_head.mlp.0.weight", None)
+        if w0 is not None:
+            kwargs["mlp_hidden_dim"] = w0.shape[0]
+        # Infer num_layers from mlp.*.weight count (excluding output layer)
+        mlp_weights = sorted([k for k in state if k.startswith("decision_head.mlp.") and "weight" in k])
+        # mlp.0.weight, mlp.2.weight, ..., mlp.N.weight where N is output
+        # Number of hidden layers = (len(mlp_weights) - 1)  # exclude output
+        kwargs["mlp_num_layers"] = max(len(mlp_weights) - 1, 1)
+    else:
+        print("  WARNING: Could not detect decision head architecture from checkpoint keys.")
+        print(f"  Available keys: {[k for k in state if 'decision_head' in k][:5]}...")
+
+    # Detect assistant head architecture
+    ah_w0 = state.get("assistant_head.mlp.0.weight", None)
+    if ah_w0 is not None:
+        kwargs["assistant_hidden"] = ah_w0.shape[0]
+    # Count assistant head layers (mlp.0, mlp.2, ..., mlp.N where N is output)
+    ah_weights = sorted([k for k in state if k.startswith("assistant_head.mlp.") and "weight" in k])
+    # Number of hidden layers = len(ah_weights) - 1 (exclude output layer)
+    kwargs["assistant_layers"] = max(len(ah_weights) - 1, 1)
+    kwargs["assistant_dropout"] = 0.0
+
+    return kwargs
+
+
 def evaluate(
     data_paths: List[str],
     heads_checkpoint: str,
@@ -34,17 +108,17 @@ def evaluate(
     val_split: float = 0.1,
     device: str = None,
     use_bf16: bool = True,
-    decision_arch: str = "transformer",
-    mlp_hidden_dim: int = 512,
-    mlp_num_layers: int = 3,
-    transformer_layers: int = 2,
-    transformer_d_model: int = 384,
-    transformer_nhead: int = 4,
-    transformer_dropout: float = 0.0,
-    transformer_dim_ff: int = 1024,
-    assistant_hidden: int = 256,
-    assistant_layers: int = 2,
-    assistant_dropout: float = 0.0,
+    decision_arch: str = None,
+    mlp_hidden_dim: int = None,
+    mlp_num_layers: int = None,
+    transformer_layers: int = None,
+    transformer_d_model: int = None,
+    transformer_nhead: int = None,
+    transformer_dropout: float = None,
+    transformer_dim_ff: int = None,
+    assistant_hidden: int = None,
+    assistant_layers: int = None,
+    assistant_dropout: float = None,
 ):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -60,8 +134,40 @@ def evaluate(
     else:
         decision_K = chunk_size
 
+    # Auto-detect architecture from checkpoint
+    detected = _detect_arch_from_checkpoint(heads_ckpt)
+    print(f"  Auto-detected architecture: {detected}")
+
+    # CLI args override auto-detected values (if explicitly provided)
+    overrides = {}
+    if decision_arch is not None:
+        overrides["decision_arch"] = decision_arch
+    if mlp_hidden_dim is not None:
+        overrides["mlp_hidden_dim"] = mlp_hidden_dim
+    if mlp_num_layers is not None:
+        overrides["mlp_num_layers"] = mlp_num_layers
+    if transformer_layers is not None:
+        overrides["num_layers"] = transformer_layers
+    if transformer_d_model is not None:
+        overrides["d_model"] = transformer_d_model
+    if transformer_nhead is not None:
+        overrides["nhead"] = transformer_nhead
+    if transformer_dropout is not None:
+        overrides["dropout"] = transformer_dropout
+    if transformer_dim_ff is not None:
+        overrides["dim_feedforward"] = transformer_dim_ff
+    if assistant_hidden is not None:
+        overrides["assistant_hidden"] = assistant_hidden
+    if assistant_layers is not None:
+        overrides["assistant_layers"] = assistant_layers
+    if assistant_dropout is not None:
+        overrides["assistant_dropout"] = assistant_dropout
+
+    detected.update(overrides)
+    if overrides:
+        print(f"  CLI overrides: {overrides}")
+
     # Load the ENCODER checkpoint (vision_proj + traj_encoder + text_encoder + mixer).
-    # This is the Phase 1b best.pt.
     enc_ckpt = None
     if encoder_checkpoint is not None and Path(encoder_checkpoint).exists():
         enc_ckpt = torch.load(encoder_checkpoint, map_location=device)
@@ -79,32 +185,24 @@ def evaluate(
             print("           The encoders will be randomly initialized.")
             print("           Eval results will be meaningless. Pass --encoder-checkpoint to fix.")
 
-    # -- Model
-    head_kwargs = {}
-    if decision_arch == "mlp":
-        head_kwargs = {
-            "mlp_hidden_dim": mlp_hidden_dim,
-            "mlp_num_layers": mlp_num_layers,
-        }
-    elif decision_arch == "transformer":
-        head_kwargs = {
-            "num_layers": transformer_layers,
-            "d_model": transformer_d_model,
-            "nhead": transformer_nhead,
-            "dropout": transformer_dropout,
-            "dim_feedforward": transformer_dim_ff,
-        }
+    # Build model with detected architecture
     model = ALIGNModel(
         embed_dim=256,
-        chunk_size=chunk_size,
+        chunk_size=detected["chunk_size"],
         use_text=True,
         device=device,
-        decision_K=decision_K,
-        decision_arch=decision_arch,
-        **head_kwargs,
-        assistant_hidden=assistant_hidden,
-        assistant_layers=assistant_layers,
-        assistant_dropout=assistant_dropout,
+        decision_K=detected["decision_K"],
+        decision_arch=detected["decision_arch"],
+        mlp_hidden_dim=detected.get("mlp_hidden_dim", 512),
+        mlp_num_layers=detected.get("mlp_num_layers", 3),
+        num_layers=detected.get("num_layers", 2),
+        d_model=detected.get("d_model", 384),
+        nhead=detected.get("nhead", 4),
+        dropout=detected.get("dropout", 0.0),
+        dim_feedforward=detected.get("dim_feedforward", 1024),
+        assistant_hidden=detected["assistant_hidden"],
+        assistant_layers=detected["assistant_layers"],
+        assistant_dropout=detected.get("assistant_dropout", 0.0),
     ).to(device)
     model.freeze_backbone()
     model.freeze_all_encoders()

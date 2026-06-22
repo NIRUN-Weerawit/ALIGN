@@ -98,6 +98,71 @@ def axisangle_to_quat(axisangle: np.ndarray) -> np.ndarray:
 
 
 # ================================================================
+# Auto-detect architecture from checkpoint
+# ================================================================
+
+def _detect_arch_from_checkpoint(ckpt: dict) -> dict:
+    """Auto-detect model architecture from checkpoint state dict keys and shapes.
+
+    Returns a dict of kwargs to pass to ALIGNModel.__init__.
+    """
+    state = ckpt.get("trainable_state_dict", ckpt)
+    cfg = ckpt.get("config", {})
+    kwargs = {}
+
+    # chunk_size
+    kwargs["chunk_size"] = cfg.get("chunk_size", 5)
+
+    # decision_K
+    kwargs["decision_K"] = cfg.get("decision_K", kwargs["chunk_size"])
+
+    # Detect decision head architecture
+    has_transformer = any("transformer" in k for k in state)
+    has_mlp = any(k.startswith("decision_head.mlp.") for k in state)
+
+    if has_transformer:
+        kwargs["decision_arch"] = "transformer"
+        pe = state.get("decision_head.pos_encoding", None)
+        if pe is not None:
+            kwargs["d_model"] = pe.shape[1]
+        layer_keys = [k for k in state if "transformer.layers." in k]
+        layer_ids = set()
+        for k in layer_keys:
+            for p in k.split("."):
+                if p.isdigit():
+                    layer_ids.add(int(p))
+        kwargs["num_layers"] = max(layer_ids) + 1 if layer_ids else 2
+        l1 = state.get("decision_head.transformer.layers.0.linear1.weight", None)
+        if l1 is not None:
+            kwargs["dim_feedforward"] = l1.shape[0]
+        d_model = kwargs.get("d_model", 384)
+        for n in [8, 4, 2, 1]:
+            if d_model % n == 0:
+                kwargs["nhead"] = n
+                break
+        kwargs["dropout"] = 0.0
+    elif has_mlp:
+        kwargs["decision_arch"] = "mlp"
+        w0 = state.get("decision_head.mlp.0.weight", None)
+        if w0 is not None:
+            kwargs["mlp_hidden_dim"] = w0.shape[0]
+        mlp_weights = sorted([k for k in state if k.startswith("decision_head.mlp.") and "weight" in k])
+        kwargs["mlp_num_layers"] = max(len(mlp_weights) - 1, 1)
+    else:
+        print("  WARNING: Could not detect decision head architecture from checkpoint keys.")
+
+    # Detect assistant head architecture
+    ah_w0 = state.get("assistant_head.mlp.0.weight", None)
+    if ah_w0 is not None:
+        kwargs["assistant_hidden"] = ah_w0.shape[0]
+    ah_weights = sorted([k for k in state if k.startswith("assistant_head.mlp.") and "weight" in k])
+    kwargs["assistant_layers"] = max(len(ah_weights) - 1, 1)
+    kwargs["assistant_dropout"] = 0.0
+
+    return kwargs
+
+
+# ================================================================
 # Load expert trajectory from HDF5
 # ================================================================
 
@@ -633,8 +698,24 @@ def evaluate_suite(
     ckpt = torch.load(checkpoint_path, map_location=device)
     chunk_size = ckpt.get("config", {}).get("chunk_size", 10)
 
+    # Auto-detect architecture from checkpoint
+    detected = _detect_arch_from_checkpoint(ckpt)
+    print(f"  Auto-detected architecture: {detected}")
+
     model = ALIGNModel(
-        embed_dim=256, chunk_size=chunk_size, use_text=True, device=DEVICE,
+        embed_dim=256, chunk_size=detected["chunk_size"], use_text=True, device=DEVICE,
+        decision_K=detected["decision_K"],
+        decision_arch=detected["decision_arch"],
+        mlp_hidden_dim=detected.get("mlp_hidden_dim", 512),
+        mlp_num_layers=detected.get("mlp_num_layers", 3),
+        num_layers=detected.get("num_layers", 2),
+        d_model=detected.get("d_model", 384),
+        nhead=detected.get("nhead", 4),
+        dropout=detected.get("dropout", 0.0),
+        dim_feedforward=detected.get("dim_feedforward", 1024),
+        assistant_hidden=detected["assistant_hidden"],
+        assistant_layers=detected["assistant_layers"],
+        assistant_dropout=detected.get("assistant_dropout", 0.0),
     ).to(DEVICE)
 
     if encoder_checkpoint:
