@@ -500,10 +500,11 @@ def print_head_report(results: dict, texts: List[str]):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate ALIGN models")
     parser.add_argument("--checkpoint", required=True, help="Checkpoint (.pt)")
-    parser.add_argument("--data-dir", help="Local LIBERO data directory")
+    parser.add_argument("--data", required=True, help="HDF5 dataset path")
     parser.add_argument("--n-samples", type=int, default=10, help="Number of samples")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--traj-window", type=int, default=20, help="Trajectory window K")
+    parser.add_argument("--n-episodes", type=int, default=5, help="Number of episodes to load from HDF5")
     parser.add_argument("--compare-raw-vs-mixed", action="store_true",
                         help="Compare raw encoder vs mixer outputs")
     parser.add_argument("--compare-texts", action="store_true",
@@ -512,26 +513,23 @@ def main():
                         help="Comma-separated text list for comparison")
     parser.add_argument("--eval-heads", action="store_true",
                         help="Evaluate full model with Decision + Assistant heads")
+    parser.add_argument("--eval-misalignment", action="store_true",
+                        help="Evaluate aligned vs misaligned pairs")
     parser.add_argument("--frame", help="Single image file path")
     parser.add_argument("--pose", help="Single pose as space-separated numbers")
     parser.add_argument("--text", help="Single text query")
-    parser.add_argument("--data", help="HDF5 dataset path (for misalignment eval)")
-    parser.add_argument("--n-episodes", type=int, default=5, help="Number of episodes to load from HDF5")
-    parser.add_argument("--eval-misalignment", action="store_true",
-                        help="Evaluate aligned vs misaligned pairs")
     args = parser.parse_args()
 
     model = load_model(args.checkpoint, args.device)
 
-    if args.eval_misalignment:
-        if not args.data:
-            print("ERROR: --data required for misalignment eval")
-            sys.exit(1)
+    # ── Load episodes from HDF5 (used by all modes except single-sample) ──
+    if args.data and not (args.frame and args.pose and args.text):
         print(f"[load] Loading {args.n_episodes} episodes from {args.data}...")
         all_frames, all_poses, all_texts = load_episodes_from_hdf5(
             args.data, args.n_episodes, args.traj_window)
         print(f"  Loaded {len(all_frames)} episodes")
 
+    if args.eval_misalignment:
         pairs = build_misalignment_pairs(
             all_frames, all_poses, all_texts,
             n_pairs=args.n_samples, traj_window=args.traj_window)
@@ -561,19 +559,18 @@ def main():
         except Exception:
             pass
 
-    elif args.data_dir:
-        # ── Batch evaluation from LIBERO data (legacy) ──
-        frames, trajs, texts = load_libero_samples(
-            args.data_dir, args.n_samples, traj_window=args.traj_window)
+    elif args.data:
+        # ── Standard evaluation from HDF5 ──
+        frames, trajs, texts = sample_windows(
+            all_frames, all_poses, all_texts,
+            n_samples=args.n_samples, traj_window=args.traj_window)
         frames = frames.to(args.device)
         trajs = trajs.float().to(args.device)
 
         if args.eval_heads:
-            # Phase 2: full model with heads
             results = get_head_predictions(model, frames, trajs, texts)
             print_head_report(results, texts)
         elif args.compare_raw_vs_mixed:
-            # Compare raw vs mixed embeddings
             raw = get_raw_embeddings(model, frames, trajs, texts)
             mixed = get_mixed_embeddings(model, frames, trajs, texts)
             print_report(raw, texts, prefix="[RAW] ")
@@ -583,7 +580,6 @@ def main():
             print(f"    cos_vl: {mixed['cos_vl'].mean().item() - raw['cos_vl'].mean().item():+.4f}")
             print(f"    cos_tl: {mixed['cos_tl'].mean().item() - raw['cos_tl'].mean().item():+.4f}")
         else:
-            # Default: mixed embeddings (Phase 1b style)
             results = get_mixed_embeddings(model, frames, trajs, texts)
             print_report(results, texts)
 
@@ -624,7 +620,7 @@ def main():
             print_report(results, [args.text])
 
     else:
-        print("Provide --data-dir for batch eval, or --frame --pose --text for single eval.")
+        print("Provide --data for batch eval, or --frame --pose --text for single eval.")
         sys.exit(1)
 
 
