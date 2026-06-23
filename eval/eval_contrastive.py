@@ -559,7 +559,7 @@ def main():
         except Exception:
             pass
 
-    elif args.data:
+    if args.data and not (args.frame and args.pose and args.text):
         # ── Standard evaluation from HDF5 ──
         frames, trajs, texts = sample_windows(
             all_frames, all_poses, all_texts,
@@ -579,27 +579,38 @@ def main():
             print(f"    cos_vt: {mixed['cos_vt'].mean().item() - raw['cos_vt'].mean().item():+.4f}")
             print(f"    cos_vl: {mixed['cos_vl'].mean().item() - raw['cos_vl'].mean().item():+.4f}")
             print(f"    cos_tl: {mixed['cos_tl'].mean().item() - raw['cos_tl'].mean().item():+.4f}")
-        else:
+        elif not args.eval_misalignment:
+            # Default: mixed embeddings (skip if misalignment already ran)
             results = get_mixed_embeddings(model, frames, trajs, texts)
             print_report(results, texts)
 
-        # Multi-text comparison
-        if args.compare_texts:
-            alt_texts = [t.strip() for t in args.texts.split(",")]
-            print(f"\n{'='*70}")
-            print("MULTI-TEXT COMPARISON: first sample against all texts")
-            print(f"{'='*70}")
-            for t in tqdm(alt_texts, desc="Comparing texts", unit="text"):
-                if args.eval_heads:
-                    r = get_head_predictions(model, frames[:1], trajs[:1], [t])
-                else:
-                    r = get_mixed_embeddings(model, frames[:1], trajs[:1], [t])
-                al = min(r['cos_vt'].item(), r['cos_vl'].item(), r['cos_tl'].item())
-                print(f"  text='{t:>42s}'  "
-                      f"cos_vt={r['cos_vt'].item():.4f}  "
-                      f"cos_vl={r['cos_vl'].item():.4f}  "
-                      f"cos_tl={r['cos_tl'].item():.4f}  "
-                      f"alpha={al:.4f}")
+    # Multi-text comparison (runs independently of other modes)
+    if args.compare_texts:
+        alt_texts = [t.strip() for t in args.texts.split(",")]
+        # Use first aligned sample from misalignment pairs if available, else sample one
+        if args.eval_misalignment and len(pairs["aligned"][0]) > 0:
+            mt_frame = pairs["aligned"][0][:1].to(args.device)
+            mt_traj = pairs["aligned"][1][:1].float().to(args.device)
+        else:
+            mt_frame, mt_traj, _ = sample_windows(
+                all_frames, all_poses, all_texts,
+                n_samples=1, traj_window=args.traj_window)
+            mt_frame = mt_frame.to(args.device)
+            mt_traj = mt_traj.float().to(args.device)
+        print(f"\n{'='*70}")
+        print("MULTI-TEXT COMPARISON")
+        print(f"{'='*70}")
+        for t in tqdm(alt_texts, desc="Comparing texts", unit="text"):
+            if args.eval_heads:
+                r = get_head_predictions(model, mt_frame, mt_traj, [t])
+            else:
+                r = get_mixed_embeddings(model, mt_frame, mt_traj, [t])
+            al = min(r['cos_vt'].item(), r['cos_vl'].item(), r['cos_tl'].item())
+            print(f"  text='{t:>42s}'  "
+                  f"cos_vt={r['cos_vt'].item():.4f}  "
+                  f"cos_vl={r['cos_vl'].item():.4f}  "
+                  f"cos_tl={r['cos_tl'].item():.4f}  "
+                  f"alpha={al:.4f}")
 
     elif args.frame and args.pose and args.text:
         # ── Single sample evaluation ──
