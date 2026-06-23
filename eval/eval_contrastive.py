@@ -215,20 +215,177 @@ def get_head_predictions(
 # Data loading
 # ================================================================
 
+def load_episodes_from_hdf5(
+    h5_path: str,
+    n_episodes: int = 5,
+    traj_window: int = 20,
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[str]]:
+    """Load full episodes from HDF5 for temporal window sampling.
+
+    Returns:
+        (all_frames, all_poses, all_texts) where each is a list of arrays
+        per episode. all_frames[i].shape = (T, H, W, 3), all_poses[i].shape = (T, 6).
+    """
+    import h5py, json
+    all_frames, all_poses, all_texts = [], [], []
+    with h5py.File(h5_path, "r") as h5:
+        ep_keys = sorted([k for k in h5.keys() if k.startswith("ep_")])
+        selected = sorted(np.random.choice(len(ep_keys), min(n_episodes, len(ep_keys)), replace=False))
+        for idx in selected:
+            ep = h5[ep_keys[idx]]
+            text = json.loads(ep["texts"][()])[0]
+            # Frames
+            frames_group = ep["frames"]
+            cam = "wrist_image" if "wrist_image" in frames_group else list(frames_group.keys())[0]
+            frames = frames_group[cam][:]
+            # Poses
+            poses = ep["poses"][:, :6]
+            all_frames.append(frames)
+            all_poses.append(poses)
+            all_texts.append(text)
+    return all_frames, all_poses, all_texts
+
+
+def sample_windows(
+    all_frames: List[np.ndarray],
+    all_poses: List[np.ndarray],
+    all_texts: List[str],
+    n_samples: int = 20,
+    traj_window: int = 20,
+) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
+    """Sample (frame, trajectory_window, text) tuples from episodes.
+
+    Each sample picks a random episode, a random timestep t, and extracts:
+      - frame at t
+      - trajectory window [t, t+traj_window) of consecutive poses
+      - the episode's text
+
+    Returns:
+        frames: (B, H, W, 3) uint8
+        trajs:  (B, K, 6) float32
+        texts:  list of str
+    """
+    frames_list, trajs_list, texts_list = [], [], []
+    for _ in range(n_samples):
+        ep_idx = np.random.randint(len(all_frames))
+        ep_frames = all_frames[ep_idx]
+        ep_poses = all_poses[ep_idx]
+        T = len(ep_frames)
+        if T < traj_window + 1:
+            continue
+        t = np.random.randint(0, T - traj_window)
+        # Frame at t
+        frame = ep_frames[t]
+        # Trajectory window [t, t+traj_window)
+        traj = ep_poses[t:t + traj_window]
+        frames_list.append(frame)
+        trajs_list.append(traj)
+        texts_list.append(all_texts[ep_idx])
+    if not frames_list:
+        return torch.zeros(0, 224, 224, 3, dtype=torch.uint8), torch.zeros(0, traj_window, 6), []
+    return (
+        torch.from_numpy(np.stack(frames_list)),
+        torch.from_numpy(np.stack(trajs_list)).float(),
+        texts_list,
+    )
+
+
+def build_misalignment_pairs(
+    all_frames: List[np.ndarray],
+    all_poses: List[np.ndarray],
+    all_texts: List[str],
+    n_pairs: int = 20,
+    traj_window: int = 20,
+) -> dict:
+    """Build aligned and misaligned (frame, trajectory) pairs for contrastive eval.
+
+    Returns:
+        dict with keys:
+            "aligned": (frames, trajs, texts) — same episode, same timestep
+            "wrong_ep": (frames, trajs, texts) — frame from ep A, traj from ep B
+            "wrong_time": (frames, trajs, texts) — frame at t, traj at t+offset
+            "wrong_text": (frames, trajs, texts) — frame+traj from ep A, text from ep B
+    """
+    aligned_f, aligned_t, aligned_txt = sample_windows(all_frames, all_poses, all_texts, n_pairs, traj_window)
+
+    # Wrong episode: frame from ep A, trajectory from ep B
+    wep_f, wep_t, wep_txt = [], [], []
+    for _ in range(n_pairs):
+        a = np.random.randint(len(all_frames))
+        b = np.random.randint(len(all_frames))
+        while b == a:
+            b = np.random.randint(len(all_frames))
+        ep_a = all_frames[a]
+        ep_b = all_poses[b]
+        T_a, T_b = len(ep_a), len(ep_b)
+        if T_a < 1 or T_b < traj_window:
+            continue
+        t_a = np.random.randint(0, T_a)
+        t_b = np.random.randint(0, T_b - traj_window)
+        wep_f.append(ep_a[t_a])
+        wep_t.append(ep_b[t_b:t_b + traj_window])
+        wep_txt.append(all_texts[a])
+    wep_f = torch.from_numpy(np.stack(wep_f)) if wep_f else torch.zeros(0, 224, 224, 3, dtype=torch.uint8)
+    wep_t = torch.from_numpy(np.stack(wep_t)).float() if wep_t else torch.zeros(0, traj_window, 6)
+
+    # Wrong time: frame at t, trajectory at t+offset (same episode)
+    wt_f, wt_t, wt_txt = [], [], []
+    offset = traj_window  # shift by a full window
+    for _ in range(n_pairs):
+        ep_idx = np.random.randint(len(all_frames))
+        ep_frames = all_frames[ep_idx]
+        ep_poses = all_poses[ep_idx]
+        T = len(ep_frames)
+        if T < traj_window + offset + 1:
+            continue
+        t = np.random.randint(0, T - traj_window - offset)
+        wt_f.append(ep_frames[t])
+        wt_t.append(ep_poses[t + offset:t + offset + traj_window])
+        wt_txt.append(all_texts[ep_idx])
+    wt_f = torch.from_numpy(np.stack(wt_f)) if wt_f else torch.zeros(0, 224, 224, 3, dtype=torch.uint8)
+    wt_t = torch.from_numpy(np.stack(wt_t)).float() if wt_t else torch.zeros(0, traj_window, 6)
+
+    # Wrong text: frame+traj from ep A, text from ep B
+    wl_f, wl_t, wl_txt = [], [], []
+    for _ in range(n_pairs):
+        a = np.random.randint(len(all_frames))
+        b = np.random.randint(len(all_texts))
+        while b == a:
+            b = np.random.randint(len(all_texts))
+        ep_a = all_frames[a]
+        ep_poses = all_poses[a]
+        T = len(ep_a)
+        if T < traj_window + 1:
+            continue
+        t = np.random.randint(0, T - traj_window)
+        wl_f.append(ep_a[t])
+        wl_t.append(ep_poses[t:t + traj_window])
+        wl_txt.append(all_texts[b])
+    wl_f = torch.from_numpy(np.stack(wl_f)) if wl_f else torch.zeros(0, 224, 224, 3, dtype=torch.uint8)
+    wl_t = torch.from_numpy(np.stack(wl_t)).float() if wl_t else torch.zeros(0, traj_window, 6)
+
+    return {
+        "aligned": (aligned_f, aligned_t, aligned_txt),
+        "wrong_ep": (wep_f, wep_t, wep_txt),
+        "wrong_time": (wt_f, wt_t, wt_txt),
+        "wrong_text": (wl_f, wl_t, wl_txt),
+    }
+
+
 def load_libero_samples(
     data_dir: str,
     n_samples: int = 10,
     repo_id: str = "nvidia/LIBERO_LeRobot_v3",
     traj_window: int = 20,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
-    """Load samples from local LIBERO data directory.
+    """Load samples from local LIBERO data directory (legacy, single-timestep).
 
     Uses LeRobotDataset with pyav backend (no torchcodec dependency).
 
     Returns:
         (frames, trajs, texts) where:
             frames: (B, H, W, 3) uint8
-            trajs:  (B, K, 6) float32
+            trajs:  (B, K, 6) float32 — each row is the SAME pose repeated K times
             texts:  list of str
     """
     try:
@@ -358,12 +515,54 @@ def main():
     parser.add_argument("--frame", help="Single image file path")
     parser.add_argument("--pose", help="Single pose as space-separated numbers")
     parser.add_argument("--text", help="Single text query")
+    parser.add_argument("--data", help="HDF5 dataset path (for misalignment eval)")
+    parser.add_argument("--n-episodes", type=int, default=5, help="Number of episodes to load from HDF5")
+    parser.add_argument("--eval-misalignment", action="store_true",
+                        help="Evaluate aligned vs misaligned pairs")
     args = parser.parse_args()
 
     model = load_model(args.checkpoint, args.device)
 
-    if args.data_dir:
-        # ── Batch evaluation from LIBERO data ──
+    if args.eval_misalignment:
+        if not args.data:
+            print("ERROR: --data required for misalignment eval")
+            sys.exit(1)
+        print(f"[load] Loading {args.n_episodes} episodes from {args.data}...")
+        all_frames, all_poses, all_texts = load_episodes_from_hdf5(
+            args.data, args.n_episodes, args.traj_window)
+        print(f"  Loaded {len(all_frames)} episodes")
+
+        pairs = build_misalignment_pairs(
+            all_frames, all_poses, all_texts,
+            n_pairs=args.n_samples, traj_window=args.traj_window)
+
+        print(f"\n{'='*70}")
+        print("MISALIGNMENT EVALUATION")
+        print(f"{'='*70}")
+        for name, (f, t, txt) in pairs.items():
+            if len(f) == 0:
+                print(f"  {name:15s}: no samples")
+                continue
+            f = f.to(args.device)
+            t = t.float().to(args.device)
+            results = get_mixed_embeddings(model, f, t, txt)
+            cos_vt = results["cos_vt"].mean().item()
+            cos_vl = results["cos_vl"].mean().item()
+            cos_tl = results["cos_tl"].mean().item()
+            print(f"  {name:15s}:  cos_vt={cos_vt:.4f}  cos_vl={cos_vl:.4f}  cos_tl={cos_tl:.4f}  (N={len(f)})")
+
+        # Also run head eval if checkpoint has heads
+        try:
+            head_results = get_head_predictions(model, pairs["aligned"][0].to(args.device),
+                                                pairs["aligned"][1].float().to(args.device),
+                                                pairs["aligned"][2])
+            print(f"\n  Head predictions (aligned):")
+            print(f"    α={head_results['alpha'].mean().item():.4f}  |Δ|={head_results['delta'].norm(dim=-1).mean().item():.4f}")
+        except Exception:
+            pass
+
+    elif args.data_dir:
+        # ── Batch evaluation from LIBERO data (legacy) ──
         frames, trajs, texts = load_libero_samples(
             args.data_dir, args.n_samples, traj_window=args.traj_window)
         frames = frames.to(args.device)
