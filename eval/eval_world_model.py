@@ -34,7 +34,7 @@ from typing import List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler, SubsetRandomSampler
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -254,7 +254,7 @@ def evaluate(
     loader = DataLoader(
         ds,
         batch_size=batch_size,
-        sampler=RandomSampler(indices),
+        sampler=SubsetRandomSampler(indices),
         drop_last=False,
         collate_fn=collate_fn,
     )
@@ -368,44 +368,69 @@ def evaluate(
             # the first frame that matches.
             n_rollout = min(B, 16)
             for i in range(n_rollout):
-                global_idx = (
-                    step * batch_size + i if step * batch_size + i < len(indices)
-                    else None
-                )
-                if global_idx is None:
+                # Get the source ep_id from the collate
+                if "ep_idx" in batch:
+                    source_ep_id = int(batch["ep_idx"][i])
+                else:
                     continue
-                source = ds[global_idx]
-                frames_i = source["frames"]
-                poses_i = source["poses"][..., :6]
-                actions_i_full = source.get("actions", None)
-                if actions_i_full is None:
-                    actions_i_full = np.zeros_like(poses_i)
-                actions_i = actions_i_full[..., :6]
-
-                # Find anchor t in the source episode that matches the
-                # frame the collate picked. We compare frame hashes (sum
-                # of bytes) — fast and uniquely identifies the frame in
-                # practice, since episodes have <1000 frames.
-                target_frame = frames_t[i].cpu().numpy()
-                target_hash = int(target_frame.sum()) if target_frame.size else 0
+                # Read the FULL episode from the HDF5 file directly,
+                # not via the chunked __getitem__. This avoids the
+                # chunk size limit and gives us the actual anchor t
+                # to use for the rollout. Currently only supports
+                # single-dataset eval (MultiALIGNDataset skipped).
+                if not hasattr(ds, "_h5") or not hasattr(ds, "_episode_keys"):
+                    continue
+                if hasattr(ds, "datasets"):
+                    # MultiALIGNDataset: skip for now (would need
+                    # to track which sub-dataset the batch came from)
+                    continue
+                if source_ep_id >= len(ds._episode_keys):
+                    continue
+                ep_key = ds._episode_keys[source_ep_id]
+                try:
+                    # Read full frames from the camera group.
+                    # `ds.camera` is the camera used by the dataset
+                    # (e.g. "wrist_image"). The batch's frames were
+                    # encoded from this same camera, so the rollout
+                    # must use the same camera to compare.
+                    camera_name = ds.camera or "image"
+                    full_frames = ds._h5[f"{ep_key}/frames/{camera_name}"][:]
+                    # Poses — the per-episode `noisy_poses` group
+                    # contains the full episode's poses.
+                    pose_key = "noisy_poses"
+                    full_poses = ds._h5[f"{ep_key}/{pose_key}"][:, :6]
+                    # Actions
+                    full_actions = None
+                    if getattr(ds, "_has_actions", False):
+                        action_path = f"{ep_key}/actions"
+                        if action_path in ds._h5:
+                            full_actions = ds._h5[action_path][:, :6]
+                    if full_actions is None:
+                        full_actions = np.zeros((len(full_frames), 6), dtype=np.float32)
+                except Exception as e:
+                    print(f"  Error reading episode {source_ep_id} (key={ep_key}): {e}", flush=True)
+                    continue
+                # Now find the anchor t by hash-matching
+                target_hash = int(frames_t[i].cpu().numpy().sum())
                 chosen_t = None
-                # Bound the search: episodes are short (~few hundred frames)
-                search_n = min(len(frames_i), 1000)
-                for cand in range(search_n):
-                    if int(frames_i[cand].sum()) == target_hash:
-                        # verify shape match (cheap full check)
-                        if frames_i[cand].shape == target_frame.shape:
-                            chosen_t = cand
+                for t in range(len(full_frames)):
+                    if int(full_frames[t].sum()) == target_hash:
+                        if full_frames[t].shape == frames_t[i].cpu().numpy().shape:
+                            chosen_t = t
                             break
                 if chosen_t is None:
-                    # Episode too short or hash collision — fall back to
-                    # anchor at the largest valid t that allows a K-step rollout.
-                    chosen_t = max(0, len(frames_i) - 1 - rollout_steps_kept)
-                if chosen_t + rollout_steps_kept >= len(frames_i):
-                    # Episode too short for full rollout
-                    chosen_t = max(0, len(frames_i) - 1 - rollout_steps_kept)
-                if chosen_t < 0 or chosen_t + 1 >= len(frames_i):
                     continue
+                # Check if we have enough frames for K-step rollout
+                if chosen_t + rollout_steps_kept >= len(full_frames):
+                    # Not enough — use what we have
+                    K = min(rollout_steps_kept, len(full_frames) - chosen_t - 1)
+                else:
+                    K = rollout_steps_kept
+                if K < 1:
+                    continue
+                frames_i = full_frames
+                poses_i = full_poses
+                actions_i = full_actions
 
                 K = rollout_steps_kept
                 # Build input batch of 1 for the rollout, anchored at chosen_t
