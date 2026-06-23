@@ -395,18 +395,16 @@ def evaluate(
                     # must use the same camera to compare.
                     camera_name = ds.camera or "image"
                     full_frames = ds._h5[f"{ep_key}/frames/{camera_name}"][:]
-                    # Poses — the per-episode `noisy_poses` group
-                    # contains the full episode's poses.
-                    pose_key = "noisy_poses"
-                    full_poses = ds._h5[f"{ep_key}/{pose_key}"][:, :6]
-                    # Actions
-                    full_actions = None
+                    # Use the dataset's offset-aware _read_poses and
+                    # _read_actions methods to get the trajectory
+                    # window and actions. These handle the cumulative
+                    # pose layout correctly.
+                    N = len(full_frames)
+                    full_poses = ds._read_poses(source_ep_id, 0, N)
                     if getattr(ds, "_has_actions", False):
-                        action_path = f"{ep_key}/actions"
-                        if action_path in ds._h5:
-                            full_actions = ds._h5[action_path][:, :6]
-                    if full_actions is None:
-                        full_actions = np.zeros((len(full_frames), 6), dtype=np.float32)
+                        full_actions = ds._read_actions(source_ep_id, 0, N)[:, :6]
+                    else:
+                        full_actions = np.zeros((N, 6), dtype=np.float32)
                 except Exception as e:
                     print(f"  Error reading episode {source_ep_id} (key={ep_key}): {e}", flush=True)
                     continue
