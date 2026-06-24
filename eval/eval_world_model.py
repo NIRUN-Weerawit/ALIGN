@@ -460,15 +460,24 @@ def evaluate(
                 except Exception as e:
                     print(f"  Error reading episode {source_ep_id} (key={ep_key}): {e}", flush=True)
                     continue
-                # Now find the anchor t by hash-matching the LAST frame in the window
-                target_hash = int(frames_t[i, -1].cpu().numpy().sum())
+                # Now find the anchor t by hash-matching
+                # frames_t[i] is (K, H, W, 3) if window, or (H, W, 3) if single frame
+                if frames_t.dim() == 5:
+                    target_hash = int(frames_t[i, -1].cpu().numpy().sum())
+                else:
+                    target_hash = int(frames_t[i].cpu().numpy().sum())
                 chosen_t = None
                 for t in range(len(full_frames)):
                     if int(full_frames[t].sum()) == target_hash:
-                        if full_frames[t].shape == frames_t[i].cpu().numpy().shape:
+                        if full_frames[t].shape == (frames_t.shape[-3], frames_t.shape[-2], frames_t.shape[-1]):
                             chosen_t = t
                             break
                 if chosen_t is None:
+                    # Debug: print first few frame hashes to diagnose
+                    if i == 0 and step == 0:
+                        print(f"  [debug] target_hash={target_hash}, full_frames range=[0,{len(full_frames)-1}]")
+                        for t in range(min(5, len(full_frames))):
+                            print(f"  [debug]   full_frames[{t}].sum()={int(full_frames[t].sum())}")
                     continue
                 # Check if we have enough frames for K-step rollout
                 if chosen_t + rollout_steps_kept >= len(full_frames):
