@@ -208,7 +208,8 @@ def train_value(
                 break
 
             # 1. Encode current state s_t
-            frame_t = torch.from_numpy(batch["frame_t"]).to(device)
+            # world_model_collate returns frame_t as (B, K, H, W, 3) — use last frame
+            frame_t = torch.from_numpy(batch["frame_t"][:, -1]).to(device)
             traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)
             action = torch.from_numpy(batch["action"]).float().to(device)
             texts = batch["text"]
