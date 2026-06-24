@@ -412,23 +412,21 @@ def train_world_model(
                 # frames_t is (B, K, H, W, 3) — encode each frame separately
                 B, K, H, W, C = frames_t.shape
 
-                # Encode each frame through raw vision encoder
+                # Encode all frames at once through raw vision encoder
                 frames_flat = frames_t.reshape(B * K, H, W, C)
                 z_v_raw = align.encode_raw_vision(frames_flat)  # (B*K, D)
                 z_v_window = z_v_raw.reshape(B, K, -1)          # (B, K, D)
 
-                # Encode trajectory tokens (once, shared across all K vision timesteps)
+                # Encode trajectory and text
                 z_t_tokens = align.encode_raw_trajectory_tokens(traj_t)  # (B, K, D)
                 z_text = align.encode_raw_text(texts)                    # (B, D)
                 if z_text is None:
                     z_text = torch.zeros_like(z_v_window[:, 0])
 
-                # Mix trajectory and text once (vision is already per-timestep)
-                # The mixer expects (B, D) for z_v — use the last frame's vision
-                _, z_t_tokens, z_text = align.cross_attention_mixer(
-                    z_v_window[:, -1], z_t_tokens, z_text
+                # Through mixer — now accepts (B, K, D) for z_v
+                z_v_window, z_t_tokens, z_text = align.cross_attention_mixer(
+                    z_v_window, z_t_tokens, z_text
                 )
-                # z_v_window stays as raw vision embeddings (no mixer applied per-timestep)
 
                 # -- Encode state_t+1 (target) via frozen ALIGNModel --
                 mixed_next = align.encode_mixed(frames_next, traj_next, texts)

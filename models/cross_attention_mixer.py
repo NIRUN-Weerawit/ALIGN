@@ -242,15 +242,22 @@ class CrossAttentionMixer(nn.Module):
         """Apply cross-attention mixer.
 
         Args:
-            z_v: (B, 256) vision
-            z_t: (B, K, 256) trajectory
-            z_text: (B, 256) text
+            z_v: (B, D) or (B, K, D) — vision (single or batched frames)
+            z_t: (B, K, D) trajectory
+            z_text: (B, D) text
 
         Returns:
-            (z_v', z_t', z_text') — all 256d
+            (z_v', z_t', z_text') — same shapes as inputs
         """
-        # Project to mixer space
-        v_h = self.input_proj["vision"](z_v).unsqueeze(1)  # (B, 1, mixer_dim)
+        # Handle both single vision token (B, D) and batched (B, K, D)
+        v_is_batched = z_v.dim() == 3
+        if v_is_batched:
+            B, K_v, D = z_v.shape
+            v_h = self.input_proj["vision"](z_v)  # (B, K_v, mixer_dim)
+        else:
+            B, D = z_v.shape
+            v_h = self.input_proj["vision"](z_v).unsqueeze(1)  # (B, 1, mixer_dim)
+
         t_h = self.input_proj["trajectory"](z_t)             # (B, K, mixer_dim)
         x_h = self.input_proj["text"](z_text).unsqueeze(1)   # (B, 1, mixer_dim)
 
@@ -260,23 +267,26 @@ class CrossAttentionMixer(nn.Module):
         t_h = t_h + pos
 
         for block in self.blocks:
-            # 1. Trajectory attends to (Vision, Text) — K tokens query, 2 keys
-            kv = torch.cat([v_h, x_h], dim=1)  # (B, 2, mixer_dim)
+            # 1. Trajectory attends to (Vision, Text) — K tokens query, K_v+1 keys
+            kv = torch.cat([v_h, x_h], dim=1)  # (B, K_v+1, mixer_dim)
             t_out = block["gca_traj"](t_h, kv, kv)
             t_h = block["modln_traj"](t_out, "trajectory")
 
-            # 2. Vision attends to (Trajectory', Text) — 1 token query, K+1 keys
+            # 2. Vision attends to (Trajectory', Text) — K_v tokens query, K+1 keys
             kv = torch.cat([t_h, x_h], dim=1)  # (B, K+1, mixer_dim)
             v_out = block["gca_vis"](v_h, kv, kv)
             v_h = block["modln_vis"](v_out, "vision")
 
-            # 3. Text attends to (Vision', Trajectory') — 1 token query, K+1 keys
-            kv = torch.cat([v_h, t_h], dim=1)  # (B, K+1, mixer_dim)
+            # 3. Text attends to (Vision', Trajectory') — 1 token query, K_v+K keys
+            kv = torch.cat([v_h, t_h], dim=1)  # (B, K_v+K, mixer_dim)
             x_out = block["gca_text"](x_h, kv, kv)
             x_h = block["modln_text"](x_out, "text")
 
-        # Project back to enc_dim (squeeze the singleton dim added above)
-        z_v_out = z_v + self.output_proj["vision"](v_h).squeeze(1)
+        # Project back to enc_dim
+        if v_is_batched:
+            z_v_out = z_v + self.output_proj["vision"](v_h)  # (B, K_v, D)
+        else:
+            z_v_out = z_v + self.output_proj["vision"](v_h).squeeze(1)  # (B, D)
         z_t_out = z_t + self.output_proj["trajectory"](t_h)
         z_text_out = z_text + self.output_proj["text"](x_h).squeeze(1)
         return z_v_out, z_t_out, z_text_out
