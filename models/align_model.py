@@ -53,12 +53,17 @@ class VisionEncoder(nn.Module):
         """Encode camera frame(s).
 
         Args:
-            x: (B, H, W, 3) uint8 RGB images.
+            x: (B, H, W, 3) or (B, K, H, W, 3) uint8 RGB images.
 
         Returns:
-            (B, embed_dim) vision embeddings.
+            (B, embed_dim) or (B*K, embed_dim) vision embeddings.
         """
-        B, H, W, C = x.shape
+        # Handle both 4D (B, H, W, C) and 5D (B, K, H, W, C)
+        if x.dim() == 5:
+            B, K, H, W, C = x.shape
+            x = x.reshape(B * K, H, W, C)
+        else:
+            B, H, W, C = x.shape
         if C != 3:
             raise ValueError(f"Expected HWC RGB images, got shape {x.shape}")
         if H != 224 or W != 224:
