@@ -428,6 +428,10 @@ def train_world_model(
                     z_v_window, z_t_tokens, z_text
                 )
 
+                # Slice to world model's window size (use last `window_size` timesteps)
+                z_v_window = z_v_window[:, -window_size:]
+                z_t_tokens = z_t_tokens[:, -window_size:]
+
                 # -- Encode state_t+1 (target) via frozen ALIGNModel --
                 mixed_next = align.encode_mixed(frames_next, traj_next, texts)
                 z_v_target = mixed_next["z_v"].float()  # (B, D)
@@ -562,8 +566,8 @@ def main() -> None:
                         help="MLP world model hidden dim.")
     parser.add_argument("--mlp-layers", type=int, default=3,
                         help="MLP world model num layers.")
-    parser.add_argument("--window-size", type=int, default=20,
-                        help="Number of past timesteps in the window (default 20, matches traj_window).")
+    parser.add_argument("--window-size", type=int, default=5,
+                        help="Number of past timesteps for the world model (default 5). Sliced from traj_window.")
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-d-model", type=int, default=384)
     parser.add_argument("--transformer-nhead", type=int, default=4)
