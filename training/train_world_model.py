@@ -303,6 +303,8 @@ def train_world_model(
     wm_kwargs: dict = {}
     if arch == "mlp":
         wm_kwargs = {"hidden_dim": mlp_hidden, "num_layers": mlp_layers, "window_size": window_size}
+    elif arch == "rnn":
+        wm_kwargs = {"hidden_dim": mlp_hidden, "num_rnn_layers": 1}
     elif arch == "transformer":
         wm_kwargs = {
             "d_model": transformer_d_model,
@@ -312,7 +314,7 @@ def train_world_model(
             "dropout": transformer_dropout,
         }
     else:
-        raise ValueError(f"Unknown arch: {arch} (expected 'mlp' or 'transformer')")
+        raise ValueError(f"Unknown arch: {arch} (expected 'mlp', 'rnn', or 'transformer')")
 
     world_model = create_world_model(
         arch=arch,
@@ -553,7 +555,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
 
     # World model arch + kwargs
-    parser.add_argument("--arch", default="mlp", choices=["mlp", "transformer"],
+    parser.add_argument("--arch", default="mlp", choices=["mlp", "rnn", "transformer"],
                         help="WorldModel architecture.")
     parser.add_argument("--action-dim", type=int, default=6,
                         help="Action dim (default 6 for OSC_POSE delta).")
@@ -575,8 +577,57 @@ def main() -> None:
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="align-world-model")
     parser.add_argument("--wandb-run", default=None)
+    parser.add_argument("--compare-archs", action="store_true",
+                        help="Train both 'mlp' and 'rnn' architectures sequentially, "
+                             "saving best checkpoints for each.")
 
     args = parser.parse_args()
+
+    if args.compare_archs:
+        print(f"\n{'='*70}")
+        print("COMPARISON MODE: training MLP and RNN sequentially")
+        print(f"{'='*70}\n")
+        for comp_arch in ["mlp", "rnn"]:
+            print(f"\n>>> Training arch={comp_arch} <<<\n")
+            train_world_model(
+                data_paths=args.data,
+                pretrained_checkpoint=args.pretrained,
+                output_dir=args.output_dir,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                val_split=args.val_split,
+                device=args.device,
+                max_steps_per_epoch=args.max_steps_per_epoch,
+                wandb_project=args.wandb_project,
+                wandb_run=f"{args.wandb_run or ''}_{comp_arch}" if args.wandb_run else comp_arch,
+                enable_wandb=args.wandb,
+                num_workers=args.num_workers,
+                traj_window=args.traj_window,
+                chunk_size=args.chunk_size,
+                mixer_dim=args.mixer_dim,
+                num_mixer_blocks=args.num_mixer_blocks,
+                use_bf16=args.bf16,
+                arch=comp_arch,
+                action_dim=args.action_dim,
+                embed_dim=args.embed_dim,
+                mlp_hidden=args.mlp_hidden,
+                mlp_layers=args.mlp_layers,
+                window_size=args.window_size,
+                transformer_layers=args.transformer_layers,
+                transformer_d_model=args.transformer_d_model,
+                transformer_nhead=args.transformer_nhead,
+                transformer_dropout=args.transformer_dropout,
+                transformer_dim_ff=args.transformer_dim_ff,
+                seed=args.seed,
+            )
+        print(f"\n{'='*70}")
+        print("COMPARISON COMPLETE — checkpoints in:")
+        print(f"  {args.output_dir}/{{dataset}}/run_N/  (MLP)")
+        print(f"  {args.output_dir}/{{dataset}}/run_N+1/  (RNN)")
+        print(f"{'='*70}")
+        return
 
     train_world_model(
         data_paths=args.data,

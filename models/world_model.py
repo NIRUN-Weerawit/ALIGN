@@ -110,6 +110,95 @@ class WorldModelMLP(nn.Module):
         return z_v_prime, z_t_prime
 
 
+class WorldModelRNN(nn.Module):
+    """RNN-based action-conditioned transition model with temporal memory.
+
+    f(s_{t-K:t}, a_t) -> s_{t+1}
+
+    Processes the K past embeddings sequentially through a GRU, building
+    a recurrent hidden state that captures temporal context. Unlike the
+    MLP which flattens the window, the RNN can in principle remember
+    information beyond the window size.
+
+    Input layout (per sample):
+      - z_v_window: (B, K, embed_dim) K past vision embeddings
+      - z_t_window: (B, K, embed_dim) K past trajectory embeddings
+      - z_text:     (B, embed_dim) text embedding (constant for the task)
+      - action:     (B, action_dim) the action to apply (6D OSC_POSE delta)
+
+    Output:
+      - z_v_prime: (B, embed_dim) predicted next vision embedding
+      - z_t_prime: (B, embed_dim) predicted next trajectory embedding
+
+    Args:
+        embed_dim: per-modality embedding dim (default 256).
+        action_dim: 6 (OSC_POSE delta in meters / axis-angle).
+        hidden_dim: GRU hidden size (default 256).
+        num_rnn_layers: number of stacked GRU layers (default 1).
+        dropout: dropout between GRU layers (if num_rnn_layers > 1).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 256,
+        action_dim: int = 6,
+        hidden_dim: int = 256,
+        num_rnn_layers: int = 1,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.action_dim = action_dim
+        self.hidden_dim = hidden_dim
+
+        # Per-timestep input: cat(z_v, z_t) = 2*embed_dim
+        rnn_input_dim = 2 * embed_dim
+        self.gru = nn.GRU(
+            input_size=rnn_input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_rnn_layers,
+            batch_first=True,
+            dropout=dropout if num_rnn_layers > 1 else 0.0,
+        )
+
+        # Output MLP: hidden + text + action -> 2*embed_dim
+        output_dim = 2 * embed_dim
+        self.output_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + embed_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+        # Init final layer near zero
+        nn.init.normal_(self.output_mlp[-1].weight, std=0.02)
+        nn.init.zeros_(self.output_mlp[-1].bias)
+
+    def forward(
+        self,
+        z_v_window: torch.Tensor,  # (B, K, embed_dim)
+        z_t_window: torch.Tensor,  # (B, K, embed_dim)
+        z_text: torch.Tensor,      # (B, embed_dim)
+        action: torch.Tensor,      # (B, action_dim)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict next state embeddings from a sequence of past states + action.
+
+        Returns:
+            (z_v_prime, z_t_prime), each of shape (B, embed_dim)
+        """
+        # Concatenate vision and trajectory at each timestep: (B, K, 2*D)
+        rnn_input = torch.cat([z_v_window, z_t_window], dim=-1)
+        # GRU: (B, K, 2*D) -> (B, K, hidden_dim), final hidden (num_layers, B, hidden_dim)
+        _, h_n = self.gru(rnn_input)
+        # Take the last layer's final hidden state: (B, hidden_dim)
+        h_last = h_n[-1]  # (B, hidden_dim)
+
+        # Concatenate with text and action: (B, hidden_dim + D + A)
+        x = torch.cat([h_last, z_text, action], dim=-1)
+        out = self.output_mlp(x)
+        z_v_prime = out[:, :self.embed_dim]
+        z_t_prime = out[:, self.embed_dim:]
+        return z_v_prime, z_t_prime
+
+
 class WorldModelTransformer(nn.Module):
     """Transformer-based action-conditioned transition model.
 
@@ -196,6 +285,10 @@ def create_world_model(
     """
     if arch == "mlp":
         return WorldModelMLP(
+            embed_dim=embed_dim, action_dim=action_dim, **kwargs
+        )
+    elif arch == "rnn":
+        return WorldModelRNN(
             embed_dim=embed_dim, action_dim=action_dim, **kwargs
         )
     elif arch == "transformer":
