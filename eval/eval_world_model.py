@@ -194,6 +194,11 @@ def evaluate(
             "num_layers": cfg.get("mlp_layers", 3),
             "window_size": cfg.get("window_size", 5),
         }
+    elif arch == "rnn":
+        wm_kwargs = {
+            "hidden_dim": cfg.get("mlp_hidden", 256),
+            "num_rnn_layers": cfg.get("num_rnn_layers", 1),
+        }
     elif arch == "transformer":
         wm_kwargs = {
             "d_model": cfg.get("transformer_d_model", 384),
