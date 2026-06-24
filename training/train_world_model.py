@@ -152,6 +152,7 @@ def train_world_model(
     embed_dim: int = 256,
     mlp_hidden: int = 512,
     mlp_layers: int = 3,
+    window_size: int = 5,
     transformer_layers: int = 2,
     transformer_d_model: int = 384,
     transformer_nhead: int = 4,
@@ -294,7 +295,7 @@ def train_world_model(
     # -- World Model head ------------------------------------
     wm_kwargs: dict = {}
     if arch == "mlp":
-        wm_kwargs = {"hidden_dim": mlp_hidden, "num_layers": mlp_layers}
+        wm_kwargs = {"hidden_dim": mlp_hidden, "num_layers": mlp_layers, "window_size": window_size}
     elif arch == "transformer":
         wm_kwargs = {
             "d_model": transformer_d_model,
@@ -400,17 +401,21 @@ def train_world_model(
                 "cuda", dtype=torch.bfloat16, enabled=use_bf16
             ):
                 mixed_t = align.encode_mixed(frames_t, traj_t, texts)
-                z_v = mixed_t["z_v"].float()       # (B, D)
-                z_t = mixed_t["z_t"].float()       # (B, D)
-                z_text = mixed_t["z_text"].float() # (B, D)
+                z_v = mixed_t["z_v"].float()             # (B, D)
+                z_t_tokens = mixed_t["z_t_tokens"].float()  # (B, K, D)
+                z_text = mixed_t["z_text"].float()       # (B, D)
+
+                # Build window: z_v repeated K times, z_t_tokens as-is
+                K = z_t_tokens.shape[1]
+                z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
 
                 # -- Encode state_t+1 (target) via frozen ALIGNModel --
                 mixed_next = align.encode_mixed(frames_next, traj_next, texts)
                 z_v_target = mixed_next["z_v"].float()  # (B, D)
                 z_t_target = mixed_next["z_t"].float()  # (B, D)
 
-            # -- Predict next state from (z_v, z_t, z_text, action) --
-            z_v_pred, z_t_pred = world_model(z_v, z_t, z_text, action)
+            # -- Predict next state from window of past states + action --
+            z_v_pred, z_t_pred = world_model(z_v_window, z_t_tokens, z_text, action)
 
             # -- MSE loss (world_model_loss detaches targets internally
             #    via stop-gradient convention — encoder never trains) --
@@ -538,6 +543,8 @@ def main() -> None:
                         help="MLP world model hidden dim.")
     parser.add_argument("--mlp-layers", type=int, default=3,
                         help="MLP world model num layers.")
+    parser.add_argument("--window-size", type=int, default=5,
+                        help="Number of past timesteps in the window (default 5).")
     parser.add_argument("--transformer-layers", type=int, default=2)
     parser.add_argument("--transformer-d-model", type=int, default=384)
     parser.add_argument("--transformer-nhead", type=int, default=4)
@@ -576,6 +583,7 @@ def main() -> None:
         embed_dim=args.embed_dim,
         mlp_hidden=args.mlp_hidden,
         mlp_layers=args.mlp_layers,
+        window_size=args.window_size,
         transformer_layers=args.transformer_layers,
         transformer_d_model=args.transformer_d_model,
         transformer_nhead=args.transformer_nhead,

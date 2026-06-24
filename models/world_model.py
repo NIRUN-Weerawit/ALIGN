@@ -30,27 +30,27 @@ from typing import Tuple
 
 
 class WorldModelMLP(nn.Module):
-    """MLP-based action-conditioned transition model.
+    """MLP-based action-conditioned transition model with temporal window.
 
-    f(s, a) -> s'
+    f(s_{t-K:t}, a_t) -> s_{t+1}
+
+    Accepts a window of K past embeddings to provide temporal context,
+    similar to how the decision head sees K past timesteps.
 
     Input layout (per sample):
-      - z_v:    (B, embed_dim) current vision embedding
-      - z_t:    (B, embed_dim) current trajectory embedding
-      - z_text: (B, embed_dim) text embedding (constant for the task)
-      - action: (B, action_dim) the action to apply (6D OSC_POSE delta)
+      - z_v_window: (B, K, embed_dim) K past vision embeddings
+      - z_t_window: (B, K, embed_dim) K past trajectory embeddings
+      - z_text:     (B, embed_dim) text embedding (constant for the task)
+      - action:     (B, action_dim) the action to apply (6D OSC_POSE delta)
 
     Output:
       - z_v_prime: (B, embed_dim) predicted next vision embedding
       - z_t_prime: (B, embed_dim) predicted next trajectory embedding
 
-    The head is intentionally simple: a few-layer MLP that maps the
-    concatenated state+action to the next state. Identity-initialized
-    so initial predictions are close to the current state (delta ≈ 0).
-
     Args:
         embed_dim: per-modality embedding dim (default 256).
         action_dim: 6 (OSC_POSE delta in meters / axis-angle).
+        window_size: number of past timesteps to condition on (default 5).
         hidden_dim: MLP hidden layer width.
         num_layers: total number of linear layers (>=2).
         dropout: dropout between hidden layers.
@@ -60,6 +60,7 @@ class WorldModelMLP(nn.Module):
         self,
         embed_dim: int = 256,
         action_dim: int = 6,
+        window_size: int = 5,
         hidden_dim: int = 512,
         num_layers: int = 3,
         dropout: float = 0.0,
@@ -67,9 +68,9 @@ class WorldModelMLP(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.action_dim = action_dim
-        # Input: 3*embed_dim + action_dim
-        # Output: 2*embed_dim  (split into z_v', z_t')
-        input_dim = 3 * embed_dim + action_dim
+        self.window_size = window_size
+        # Input: K * (z_v + z_t) + z_text + action
+        input_dim = window_size * 2 * embed_dim + embed_dim + action_dim
         output_dim = 2 * embed_dim
 
         layers = []
@@ -80,10 +81,7 @@ class WorldModelMLP(nn.Module):
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             in_dim = hidden_dim
-        # Final layer: identity-init so initial prediction is close to
-        # the current state (we'll add the delta to a residual stream).
         final = nn.Linear(in_dim, output_dim)
-        # Initialize so initial output is ~zero (residual = input)
         nn.init.normal_(final.weight, std=0.02)
         nn.init.zeros_(final.bias)
         layers.append(final)
@@ -91,21 +89,22 @@ class WorldModelMLP(nn.Module):
 
     def forward(
         self,
-        z_v: torch.Tensor,    # (B, embed_dim)
-        z_t: torch.Tensor,    # (B, embed_dim)
-        z_text: torch.Tensor, # (B, embed_dim)
-        action: torch.Tensor, # (B, action_dim)
+        z_v_window: torch.Tensor,  # (B, K, embed_dim)
+        z_t_window: torch.Tensor,  # (B, K, embed_dim)
+        z_text: torch.Tensor,      # (B, embed_dim)
+        action: torch.Tensor,      # (B, action_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict next state embeddings.
+        """Predict next state embeddings from a window of past states + action.
 
         Returns:
             (z_v_prime, z_t_prime), each of shape (B, embed_dim)
         """
-        # Concatenate all inputs: (B, 3*embed_dim + action_dim)
-        x = torch.cat([z_v, z_t, z_text, action], dim=-1)
-        # MLP: (B, 2*embed_dim)
+        B, K, D = z_v_window.shape
+        # Flatten window: (B, K * 2 * D)
+        window_flat = torch.cat([z_v_window, z_t_window], dim=-1).reshape(B, -1)
+        # Concatenate with text and action: (B, K*2*D + D + A)
+        x = torch.cat([window_flat, z_text, action], dim=-1)
         out = self.mlp(x)
-        # Split into z_v' and z_t'
         z_v_prime = out[:, :self.embed_dim]
         z_t_prime = out[:, self.embed_dim:]
         return z_v_prime, z_t_prime
@@ -243,36 +242,36 @@ if __name__ == "__main__":
     """Quick smoke test of the WorldModel class."""
     import torch
 
-    print("Testing WorldModelMLP...")
-    B, D, A = 4, 256, 6
-    wm_mlp = WorldModelMLP(embed_dim=D, action_dim=A)
-    z_v = torch.randn(B, D)
-    z_t = torch.randn(B, D)
+    print("Testing WorldModelMLP with window...")
+    B, D, A, K = 4, 256, 6, 5
+    wm_mlp = WorldModelMLP(embed_dim=D, action_dim=A, window_size=K)
+    z_v_window = torch.randn(B, K, D)
+    z_t_window = torch.randn(B, K, D)
     z_text = torch.randn(B, D)
     action = torch.randn(B, A)
-    z_v_p, z_t_p = wm_mlp(z_v, z_t, z_text, action)
+    z_v_p, z_t_p = wm_mlp(z_v_window, z_t_window, z_text, action)
     assert z_v_p.shape == (B, D), f"z_v_p shape: {z_v_p.shape}"
     assert z_t_p.shape == (B, D), f"z_t_p shape: {z_t_p.shape}"
     print(f"  Output shapes OK: {z_v_p.shape}, {z_t_p.shape}")
-    loss = world_model_loss(z_v_p, z_v, z_t_p, z_t)
+    loss = world_model_loss(z_v_p, z_v_window[:, -1], z_t_p, z_t_window[:, -1])
     print(f"  Loss: {loss.item():.4f}")
     loss.backward()
     print(f"  Backward OK, params have gradients")
 
     print("\nTesting WorldModelTransformer...")
     wm_tx = WorldModelTransformer(embed_dim=D, action_dim=A)
-    z_v_p, z_t_p = wm_tx(z_v, z_t, z_text, action)
+    z_v_p, z_t_p = wm_tx(z_v_window[:, -1], z_t_window[:, -1], z_text, action)
     assert z_v_p.shape == (B, D)
     assert z_t_p.shape == (B, D)
     print(f"  Output shapes OK: {z_v_p.shape}, {z_t_p.shape}")
-    loss = world_model_loss(z_v_p, z_v, z_t_p, z_t)
+    loss = world_model_loss(z_v_p, z_v_window[:, -1], z_t_p, z_t_window[:, -1])
     print(f"  Loss: {loss.item():.4f}")
     loss.backward()
     print(f"  Backward OK")
 
     print("\nTesting create_world_model factory...")
-    wm_factory = create_world_model("mlp", embed_dim=D, action_dim=A)
-    z_v_p, z_t_p = wm_factory(z_v, z_t, z_text, action)
+    wm_factory = create_world_model("mlp", embed_dim=D, action_dim=A, window_size=K)
+    z_v_p, z_t_p = wm_factory(z_v_window, z_t_window, z_text, action)
     print(f"  Factory created: {type(wm_factory).__name__}")
 
     print("\nAll smoke tests passed.")
