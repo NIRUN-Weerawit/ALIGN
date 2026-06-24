@@ -411,24 +411,30 @@ def train_world_model(
             ):
                 # frames_t is (B, K, H, W, 3) — encode each frame separately
                 B, K, H, W, C = frames_t.shape
-                frames_flat = frames_t.reshape(B * K, H, W, C)  # (B*K, H, W, 3)
 
-                # Encode all frames at once, then reshape
-                z_v_all = align.encode_raw_vision(frames_flat)   # (B*K, D)
-                z_v_window = z_v_all.reshape(B, K, -1)           # (B, K, D)
-
-                # Encode trajectory tokens
+                # Encode each frame with the same traj_t, stack z_v
+                z_v_all = []
+                for k in range(K):
+                    frame_k = frames_t[:, k]       # (B, H, W, 3)
+                    mixed_k = align.encode_mixed(frame_k, traj_t, texts)
+                    z_v_all.append(mixed_k["z_v"].float())  # (B, D)
+                z_v_window = torch.stack(z_v_all, dim=1)     # (B, K, D)
                 z_t_tokens = align.encode_raw_trajectory_tokens(traj_t)  # (B, K, D)
-
-                # Text (same for all K timesteps)
-                z_text = align.encode_raw_text(texts)             # (B, D)
+                z_text = align.encode_raw_text(texts)        # (B, D)
                 if z_text is None:
                     z_text = torch.zeros_like(z_v_window[:, 0])
 
-                # Through mixer (handles (B, K, D) for z_v and z_t)
-                z_v_window, z_t_tokens, z_text = align.cross_attention_mixer(
-                    z_v_window, z_t_tokens, z_text
-                )
+                # Through mixer — expects (B, D) for z_v, not (B, K, D)
+                # Process each timestep separately
+                z_v_mixed, z_t_mixed = [], []
+                for k in range(K):
+                    z_v_k, z_t_k, _ = align.cross_attention_mixer(
+                        z_v_window[:, k], z_t_tokens, z_text
+                    )
+                    z_v_mixed.append(z_v_k)
+                    z_t_mixed.append(z_t_k)
+                z_v_window = torch.stack(z_v_mixed, dim=1)   # (B, K, D)
+                z_t_tokens = torch.stack(z_t_mixed, dim=1)   # (B, K, D)
 
                 # -- Encode state_t+1 (target) via frozen ALIGNModel --
                 mixed_next = align.encode_mixed(frames_next, traj_next, texts)
