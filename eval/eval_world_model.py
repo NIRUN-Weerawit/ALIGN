@@ -62,6 +62,7 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
     all_frames_t, all_traj_t = [], []
     all_frames_next, all_traj_next = [], []
     all_actions, all_texts = [], []
+    all_ep_idx = []
     rng = np.random.default_rng()
 
     for item in batch:
@@ -69,6 +70,7 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
         poses = item["poses"][..., :6]
         actions = item.get("actions", None)
         text = item["text"]
+        ep_idx = item.get("ep_idx", -1)
 
         N = len(frames)
         max_t = max(0, N - 2)
@@ -104,6 +106,7 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
             act = np.zeros(6, dtype=np.float32)
         all_actions.append(act)
         all_texts.append(text)
+        all_ep_idx.append(ep_idx)
 
     return {
         "frames_t": np.stack(all_frames_t, axis=0),       # (B, K, H, W, 3)
@@ -112,6 +115,7 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
         "trajectory_next": np.stack(all_traj_next, axis=0),
         "action": np.stack(all_actions, axis=0),
         "texts": all_texts,
+        "ep_idx": np.array(all_ep_idx, dtype=np.int64),
     }
 
 
@@ -338,7 +342,7 @@ def evaluate(
     def _batch_to_tensors(batch: dict) -> dict:
         """Normalize batch keys (frame_t vs frames_t) and to-device."""
         if "frame_t" in batch:
-            return {
+            result = {
                 "frames_t": torch.from_numpy(batch["frame_t"]).to(device),
                 "traj_t": torch.from_numpy(batch["traj_t"]).float().to(device),
                 "frames_next": torch.from_numpy(batch["frame_next"]).to(device),
@@ -346,14 +350,18 @@ def evaluate(
                 "action": torch.from_numpy(batch["action"]).float().to(device),
                 "texts": batch["text"],
             }
-        return {
-            "frames_t": torch.from_numpy(batch["frames_t"]).to(device),
-            "traj_t": torch.from_numpy(batch["trajectory_t"]).float().to(device),
-            "frames_next": torch.from_numpy(batch["frames_next"]).to(device),
-            "traj_next": torch.from_numpy(batch["trajectory_next"]).float().to(device),
-            "action": torch.from_numpy(batch["action"]).float().to(device),
-            "texts": batch["texts"],
-        }
+        else:
+            result = {
+                "frames_t": torch.from_numpy(batch["frames_t"]).to(device),
+                "traj_t": torch.from_numpy(batch["trajectory_t"]).float().to(device),
+                "frames_next": torch.from_numpy(batch["frames_next"]).to(device),
+                "traj_next": torch.from_numpy(batch["trajectory_next"]).float().to(device),
+                "action": torch.from_numpy(batch["action"]).float().to(device),
+                "texts": batch["texts"],
+            }
+        if "ep_idx" in batch:
+            result["ep_idx"] = batch["ep_idx"]
+        return result
 
     n_seen_batches = 0
     t0 = time.time()
@@ -452,8 +460,8 @@ def evaluate(
                 except Exception as e:
                     print(f"  Error reading episode {source_ep_id} (key={ep_key}): {e}", flush=True)
                     continue
-                # Now find the anchor t by hash-matching
-                target_hash = int(frames_t[i].cpu().numpy().sum())
+                # Now find the anchor t by hash-matching the LAST frame in the window
+                target_hash = int(frames_t[i, -1].cpu().numpy().sum())
                 chosen_t = None
                 for t in range(len(full_frames)):
                     if int(full_frames[t].sum()) == target_hash:
