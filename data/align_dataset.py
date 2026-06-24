@@ -537,8 +537,11 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
             else:
                 t = int(np.random.randint(t_min, t_max + 1))
 
-        # Current state: frame t + traj window [t-traj_window+1 .. t]
-        frame_t = frames[t]
+        # Current state: frame window [t-traj_window+1 .. t] + traj window
+        frame_window = frames[t - traj_window + 1 : t + 1]
+        if frame_window.shape[0] < traj_window:
+            pad = np.zeros((traj_window - frame_window.shape[0], *frames.shape[1:]), dtype=frames.dtype)
+            frame_window = np.concatenate([pad, frame_window], axis=0)
         # Trajectory window: (traj_window, 6) — last `traj_window` poses
         traj_t = poses[t - traj_window + 1 : t + 1, :6]
         if traj_t.shape[0] < traj_window:
@@ -568,7 +571,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         else:
             text_pick = text
 
-        all_frame_t.append(frame_t)
+        all_frame_t.append(frame_window)
         all_traj_t.append(traj_t.astype(np.float32))
         all_action.append(action_t)
         all_frame_next.append(frame_next)
@@ -577,7 +580,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         all_ep_idx.append(ep_idx)
 
     return {
-        "frame_t": np.stack(all_frame_t, axis=0),
+        "frame_t": np.stack(all_frame_t, axis=0),       # (B, K, H, W, 3)
         "traj_t": np.stack(all_traj_t, axis=0),
         "action": np.stack(all_action, axis=0),
         "frame_next": np.stack(all_frame_next, axis=0),

@@ -412,7 +412,6 @@ def train_world_model(
                 # frames_t is (B, K, H, W, 3) — encode each frame separately
                 B, K, H, W, C = frames_t.shape
                 frames_flat = frames_t.reshape(B * K, H, W, C)  # (B*K, H, W, 3)
-                traj_flat = traj_t.reshape(B * K, -1)            # (B*K, K, 6) — already K per sample
 
                 # Encode all frames at once, then reshape
                 z_v_all = align.encode_raw_vision(frames_flat)   # (B*K, D)
