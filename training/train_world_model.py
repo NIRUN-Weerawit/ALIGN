@@ -88,7 +88,14 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
         max_t = max(0, N - 2)
         t = int(rng.integers(0, max_t + 1)) if max_t > 0 else 0
 
-        all_frames_t.append(frames[t])
+        # Frame window ending at t (length chunk_size)
+        start_f = max(0, t - chunk_size + 1)
+        frame_window = frames[start_f:t + 1]
+        if len(frame_window) < chunk_size:
+            pad = _np.zeros((chunk_size - len(frame_window), *frames.shape[1:]), dtype=frames.dtype)
+            frame_window = _np.concatenate([pad, frame_window], axis=0)
+        all_frames_t.append(frame_window)
+
         # Trajectory window ending at t (length chunk_size)
         start_t = max(0, t - chunk_size + 1)
         traj_t = poses[start_t:t + 1]
@@ -113,7 +120,7 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
         all_texts.append(text)
 
     return {
-        "frames_t": _np.stack(all_frames_t, axis=0),
+        "frames_t": _np.stack(all_frames_t, axis=0),       # (B, K, H, W, 3)
         "trajectory_t": _np.stack(all_traj_t, axis=0),
         "frames_next": _np.stack(all_frames_next, axis=0),
         "trajectory_next": _np.stack(all_traj_next, axis=0),
@@ -400,14 +407,27 @@ def train_world_model(
             with torch.no_grad(), torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=use_bf16
             ):
-                mixed_t = align.encode_mixed(frames_t, traj_t, texts)
-                z_v = mixed_t["z_v"].float()             # (B, D)
-                z_t_tokens = mixed_t["z_t_tokens"].float()  # (B, K, D)
-                z_text = mixed_t["z_text"].float()       # (B, D)
+                # frames_t is (B, K, H, W, 3) — encode each frame separately
+                B, K, H, W, C = frames_t.shape
+                frames_flat = frames_t.reshape(B * K, H, W, C)  # (B*K, H, W, 3)
+                traj_flat = traj_t.reshape(B * K, -1)            # (B*K, K, 6) — already K per sample
 
-                # Build window: z_v repeated K times, z_t_tokens as-is
-                K = z_t_tokens.shape[1]
-                z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
+                # Encode all frames at once, then reshape
+                z_v_all = align.encode_raw_vision(frames_flat)   # (B*K, D)
+                z_v_window = z_v_all.reshape(B, K, -1)           # (B, K, D)
+
+                # Encode trajectory tokens
+                z_t_tokens = align.encode_raw_trajectory_tokens(traj_t)  # (B, K, D)
+
+                # Text (same for all K timesteps)
+                z_text = align.encode_raw_text(texts)             # (B, D)
+                if z_text is None:
+                    z_text = torch.zeros_like(z_v_window[:, 0])
+
+                # Through mixer (handles (B, K, D) for z_v and z_t)
+                z_v_window, z_t_tokens, z_text = align.cross_attention_mixer(
+                    z_v_window, z_t_tokens, z_text
+                )
 
                 # -- Encode state_t+1 (target) via frozen ALIGNModel --
                 mixed_next = align.encode_mixed(frames_next, traj_next, texts)
