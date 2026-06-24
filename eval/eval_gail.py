@@ -62,8 +62,9 @@ def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
 
     Returns dict with z_v (B, D), z_t (B, traj_window, D), z_text (B, D).
     """
-    frames = batch["frame_t"]  # (B, H, W, 3)
-    traj = batch["traj_t"]      # (B, K, 6)
+    # world_model_collate returns frame_t as (B, K, H, W, 3) — use last frame
+    frames = batch["frame_t"][:, -1]  # (B, H, W, 3)
+    traj = batch["traj_t"]            # (B, K, 6)
     texts = batch["text"]
 
     frames_t = torch.from_numpy(frames).to(device)

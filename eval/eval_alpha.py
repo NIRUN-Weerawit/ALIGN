@@ -50,8 +50,9 @@ from eval.compute_alpha import load_components, compute_alpha_batch
 
 def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
     """Encode a batch through the frozen encoder+mixer."""
-    frames = batch["frame_t"]
-    traj = batch["traj_t"]
+    # world_model_collate returns frame_t as (B, K, H, W, 3) — use last frame
+    frames = batch["frame_t"][:, -1]  # (B, H, W, 3)
+    traj = batch["traj_t"]            # (B, K, 6)
     texts = batch["text"]
 
     frames_t = torch.from_numpy(frames).to(device)
