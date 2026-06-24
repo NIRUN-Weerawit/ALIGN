@@ -278,26 +278,32 @@ def create_world_model(
     """Factory for world model.
 
     Args:
-        arch: 'mlp' or 'transformer'.
+        arch: 'mlp', 'rnn', or 'transformer'.
         embed_dim: per-modality embedding dim.
         action_dim: action dim (default 6 for OSC_POSE).
-        **kwargs: passed to the underlying class.
+        **kwargs: passed to the underlying class. Filtered per arch.
     """
     if arch == "mlp":
+        mlp_kw = {k: v for k, v in kwargs.items()
+                   if k in ("hidden_dim", "num_layers", "window_size", "dropout")}
         return WorldModelMLP(
-            embed_dim=embed_dim, action_dim=action_dim, **kwargs
+            embed_dim=embed_dim, action_dim=action_dim, **mlp_kw
         )
     elif arch == "rnn":
+        rnn_kw = {k: v for k, v in kwargs.items()
+                   if k in ("hidden_dim", "num_rnn_layers", "dropout")}
         return WorldModelRNN(
-            embed_dim=embed_dim, action_dim=action_dim, **kwargs
+            embed_dim=embed_dim, action_dim=action_dim, **rnn_kw
         )
     elif arch == "transformer":
+        tx_kw = {k: v for k, v in kwargs.items()
+                  if k in ("d_model", "nhead", "num_layers", "dim_feedforward", "dropout")}
         return WorldModelTransformer(
-            embed_dim=embed_dim, action_dim=action_dim, **kwargs
+            embed_dim=embed_dim, action_dim=action_dim, **tx_kw
         )
     else:
         raise ValueError(
-            f"Unknown arch: {arch} (expected 'mlp' or 'transformer')"
+            f"Unknown arch: {arch} (expected 'mlp', 'rnn', or 'transformer')"
         )
 
 
