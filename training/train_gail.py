@@ -428,11 +428,12 @@ def train_gail(
                 break
 
             # -- To device --
-            # world_model_collate schema: frame_t, traj_t, action, frame_next,
-            # traj_next, text, ep_idx. We only need (frame_t, traj_t, action,
-            # text) — the discriminator classifies (s, a) pairs.
-            frame_t = torch.from_numpy(batch["frame_t"]).to(device)
-            traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)
+            # world_model_collate schema: frame_t (B, K, H, W, 3), traj_t (B, K, 6),
+            # action, frame_next, traj_next, text, ep_idx.
+            # We only need (frame_t, traj_t, action, text) — use the LAST frame
+            # in the window (current timestep).
+            frame_t = torch.from_numpy(batch["frame_t"][:, -1]).to(device)  # (B, H, W, 3)
+            traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)   # (B, K, 6)
             action_exp = torch.from_numpy(batch["action"]).float().to(device)
             texts = batch["text"]
             B = frame_t.shape[0]
