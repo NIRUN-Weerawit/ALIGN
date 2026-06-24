@@ -55,7 +55,10 @@ except ImportError:
 # ================================================================
 
 def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
-    """Build (s_t, a_t, s_{t+1}) triples from each batch item."""
+    """Build (s_t, a_t, s_{t+1}) triples from each batch item.
+
+    Returns frame windows (B, K, H, W, 3) matching the training pipeline.
+    """
     all_frames_t, all_traj_t = [], []
     all_frames_next, all_traj_next = [], []
     all_actions, all_texts = [], []
@@ -71,7 +74,15 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
         max_t = max(0, N - 2)
         t = int(rng.integers(0, max_t + 1)) if max_t > 0 else 0
 
-        all_frames_t.append(frames[t])
+        # Frame window ending at t (length chunk_size)
+        start_f = max(0, t - chunk_size + 1)
+        frame_window = frames[start_f:t + 1]
+        if len(frame_window) < chunk_size:
+            pad = np.zeros((chunk_size - len(frame_window), *frames.shape[1:]), dtype=frames.dtype)
+            frame_window = np.concatenate([pad, frame_window], axis=0)
+        all_frames_t.append(frame_window)
+
+        # Trajectory window ending at t
         start_t = max(0, t - chunk_size + 1)
         traj_t = poses[start_t:t + 1]
         if len(traj_t) < chunk_size:
@@ -95,7 +106,7 @@ def _fallback_world_model_collate(batch: list, chunk_size: int = 1) -> dict:
         all_texts.append(text)
 
     return {
-        "frames_t": np.stack(all_frames_t, axis=0),
+        "frames_t": np.stack(all_frames_t, axis=0),       # (B, K, H, W, 3)
         "trajectory_t": np.stack(all_traj_t, axis=0),
         "frames_next": np.stack(all_frames_next, axis=0),
         "trajectory_next": np.stack(all_traj_next, axis=0),
@@ -177,6 +188,7 @@ def evaluate(
         wm_kwargs = {
             "hidden_dim": cfg.get("mlp_hidden", 512),
             "num_layers": cfg.get("mlp_layers", 3),
+            "window_size": cfg.get("window_size", 5),
         }
     elif arch == "transformer":
         wm_kwargs = {
@@ -280,14 +292,48 @@ def evaluate(
     # -- Get a representative sample of action vectors for Test 2 --
     real_action_samples: List[np.ndarray] = []
 
-    def _encode_state(frames: torch.Tensor,
-                      traj: torch.Tensor,
-                      texts) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _encode_state_window(frames: torch.Tensor,
+                             traj: torch.Tensor,
+                             texts,
+                             window_size: int = 5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode state with K-frame window for world model input.
+
+        Returns (z_v_window, z_t_window, z_text) all (B, W, D) except z_text (B, D).
+        """
+        with torch.no_grad(), torch.amp.autocast(
+            "cuda", dtype=torch.bfloat16, enabled=use_bf16
+        ):
+            if frames.dim() == 4:
+                frames = frames.unsqueeze(1)
+            B, K, H, W, C = frames.shape
+
+            frames_flat = frames.reshape(B * K, H, W, C)
+            z_v_raw = align.encode_raw_vision(frames_flat)
+            z_v = z_v_raw.reshape(B, K, -1)
+
+            z_t_tokens = align.encode_raw_trajectory_tokens(traj)
+            z_text = align.encode_raw_text(texts)
+            if z_text is None:
+                z_text = torch.zeros_like(z_v[:, 0])
+
+            z_v, z_t_tokens, z_text = align.cross_attention_mixer(
+                z_v, z_t_tokens, z_text
+            )
+
+            z_v = z_v[:, -window_size:]
+            z_t_tokens = z_t_tokens[:, -window_size:]
+
+        return z_v, z_t_tokens, z_text
+
+    def _encode_state_target(frames: torch.Tensor,
+                              traj: torch.Tensor,
+                              texts) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode target state (single embedding, mean-pooled)."""
         with torch.no_grad(), torch.amp.autocast(
             "cuda", dtype=torch.bfloat16, enabled=use_bf16
         ):
             mixed = align.encode_mixed(frames, traj, texts)
-        return mixed["z_v"].float(), mixed["z_t"].float(), mixed["z_text"].float()
+        return mixed["z_v"].float(), mixed["z_t"].float()
 
     def _batch_to_tensors(batch: dict) -> dict:
         """Normalize batch keys (frame_t vs frames_t) and to-device."""
@@ -328,10 +374,8 @@ def evaluate(
             real_action_samples.append(action.detach().cpu().numpy().copy())
 
             # -- Encode state_t and state_t+1 --
-            z_v, z_t, z_text = _encode_state(frames_t, traj_t, texts)
-            z_v_next, z_t_next, z_text_next = _encode_state(
-                frames_next, traj_next, texts
-            )
+            z_v, z_t, z_text = _encode_state_window(frames_t, traj_t, texts, window_size=cfg.get("window_size", 5))
+            z_v_next, z_t_next = _encode_state_target(frames_next, traj_next, texts)
 
             # ============== TEST 1: real (s, a) -> predicted s' ====
             z_v_pred, z_t_pred = world_model(z_v, z_t, z_text, action)
@@ -432,9 +476,10 @@ def evaluate(
 
                 K = rollout_steps_kept
                 # Build input batch of 1 for the rollout, anchored at chosen_t
-                z_v_cur = z_v[i:i + 1].clone()
-                z_t_cur = z_t[i:i + 1].clone()
-                z_text_cur = z_text[i:i + 1].clone()
+                # Maintain a window of K past embeddings
+                z_v_cur = z_v[i:i + 1].clone()       # (1, W, D)
+                z_t_cur = z_t[i:i + 1].clone()       # (1, W, D)
+                z_text_cur = z_text[i:i + 1].clone()  # (1, D)
                 text_i = [texts[i]] if isinstance(texts, list) else [texts]
                 for k in range(K):
                     if chosen_t + k + 1 >= len(frames_i):
@@ -443,9 +488,12 @@ def evaluate(
                     a_real = torch.from_numpy(
                         actions_i[chosen_t + k, :6].astype(np.float32)
                     ).to(device).unsqueeze(0)
-                    z_v_cur, z_t_cur = world_model(
+                    z_v_pred, z_t_pred = world_model(
                         z_v_cur, z_t_cur, z_text_cur, a_real
                     )
+                    # Slide window: drop oldest, append predicted
+                    z_v_cur = torch.cat([z_v_cur[:, 1:], z_v_pred.unsqueeze(1)], dim=1)
+                    z_t_cur = torch.cat([z_t_cur[:, 1:], z_t_pred.unsqueeze(1)], dim=1)
                     # Encode the real next state (k+1 steps ahead)
                     f_real = torch.from_numpy(
                         frames_i[chosen_t + k + 1]
@@ -462,11 +510,11 @@ def evaluate(
                             device=device,
                         )
                         p_real = torch.cat([pad, p_real], dim=1)
-                    z_v_real_next, z_t_real_next, _ = _encode_state(
+                    z_v_real_next, z_t_real_next = _encode_state_target(
                         f_real, p_real, text_i
                     )
                     real_joint_k = _joint_norm(z_v_real_next, z_t_real_next)
-                    pred_joint_k = _joint_norm(z_v_cur, z_t_cur)
+                    pred_joint_k = _joint_norm(z_v_pred, z_t_pred)
                     cos_k = F.cosine_similarity(
                         pred_joint_k, real_joint_k, dim=-1
                     ).item()
