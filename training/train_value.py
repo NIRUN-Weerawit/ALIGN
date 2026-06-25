@@ -14,12 +14,12 @@ cumulative future reward, and is used to compute alpha:
 where s'_m = world_model(s, a_m) and s'_h = world_model(s, a_h).
 
 Usage:
-    python training/train_value.py \\
-        --data /path/to/libero.h5 \\
-        --pretrained checkpoints/pretrain/.../best.pt \\
-        --gail-checkpoint checkpoints/gail/.../gail_best.pt \\
-        --output-dir ./checkpoints/value \\
-        --epochs 30 --batch-size 32 --lr 1e-3 \\
+    python training/train_value.py \
+        --data /path/to/libero.h5 \
+        --pretrained checkpoints/pretrain/.../best.pt \
+        --gail-checkpoint checkpoints/gail/.../gail_best.pt \
+        --output-dir ./checkpoints/value \
+        --epochs 30 --batch-size 32 --lr 1e-3 \
         --gamma 0.99 --lam 0.7
 
 Training loop:
