@@ -249,13 +249,20 @@ def evaluate(
     print(f"    phase={enc_phase}  epoch={enc_ckpt.get('epoch', '?')}")
 
     # -- ALIGNModel for the frozen encoder+mixer --
+    # IMPORTANT: read mixer_dim from the ENCODER checkpoint's config,
+    # not from the world model config. The world model was trained
+    # against a specific encoder with a specific mixer_dim. If the
+    # encoder checkpoint has been retrained with a different mixer_dim
+    # (e.g., 1280 instead of 512), using the world model's recorded
+    # mixer_dim causes a shape mismatch in the mixer.
+    enc_cfg = enc_ckpt.get("config", {}) if isinstance(enc_ckpt, dict) else {}
     align = ALIGNModel(
         embed_dim=embed_dim,
         chunk_size=chunk_size,
         use_text=True,
         device=str(device),
-        mixer_dim=cfg.get("mixer_dim", 512),
-        num_mixer_blocks=cfg.get("num_mixer_blocks", 2),
+        mixer_dim=enc_cfg.get("mixer_dim", cfg.get("mixer_dim", 512)),
+        num_mixer_blocks=enc_cfg.get("num_mixer_blocks", cfg.get("num_mixer_blocks", 2)),
     ).to(device)
     if "trainable_state_dict" in enc_ckpt:
         align.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
