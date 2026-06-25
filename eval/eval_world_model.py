@@ -206,9 +206,23 @@ def evaluate(
             # New architecture: window of K timesteps
             wm_kwargs["window_size"] = cfg.get("window_size", 5)
     elif arch == "rnn":
+        # Auto-detect num_rnn_layers from the saved state_dict.
+        # The saved config may have the wrong value (e.g., the
+        # training script hardcoded 1 layer), so we count the
+        # `_lN` suffixes in keys like "gru.weight_ih_lN" to find
+        # the actual number of layers.
+        max_l = 0
+        for k in wm_ckpt.get("world_model_state", {}).keys():
+            if k.startswith("gru.weight_ih_l"):
+                try:
+                    l = int(k.split("_l")[-1])
+                    max_l = max(max_l, l + 1)
+                except ValueError:
+                    pass
         wm_kwargs = {
-            "hidden_dim": cfg.get("mlp_hidden", 256),
-            "num_rnn_layers": cfg.get("num_rnn_layers", 1),
+            "hidden_dim": cfg.get("rnn_hidden_dim",
+                                   cfg.get("mlp_hidden", 256)),
+            "num_rnn_layers": max_l if max_l > 0 else cfg.get("num_rnn_layers", 1),
         }
     elif arch == "transformer":
         wm_kwargs = {
@@ -218,6 +232,11 @@ def evaluate(
             "dim_feedforward": cfg.get("transformer_dim_ff", 1024),
             "dropout": cfg.get("transformer_dropout", 0.0),
         }
+    # Auto-detect window_size for RNN/Transformer from state_dict
+    # if not in config (older training runs may not have saved it).
+    if arch in ("rnn", "transformer"):
+        if "window_size" not in wm_kwargs:
+            wm_kwargs["window_size"] = cfg.get("window_size", 5)
     world_model = create_world_model(
         arch=arch, embed_dim=embed_dim, action_dim=action_dim, **wm_kwargs,
     ).to(device)
