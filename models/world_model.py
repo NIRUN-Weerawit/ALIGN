@@ -69,8 +69,12 @@ class WorldModelMLP(nn.Module):
         self.embed_dim = embed_dim
         self.action_dim = action_dim
         self.window_size = window_size
-        # Input: K * (z_v + z_t) + z_text + action
-        input_dim = window_size * 2 * embed_dim + embed_dim + action_dim
+        # Input: K * (z_v + z_t) + z_text + action  (new arch)
+        # or: 3*embed_dim + action_dim (old arch, window_size=0)
+        if window_size > 0:
+            input_dim = window_size * 2 * embed_dim + embed_dim + action_dim
+        else:
+            input_dim = 3 * embed_dim + action_dim
         output_dim = 2 * embed_dim
 
         layers = []
@@ -89,8 +93,8 @@ class WorldModelMLP(nn.Module):
 
     def forward(
         self,
-        z_v_window: torch.Tensor,  # (B, K, embed_dim)
-        z_t_window: torch.Tensor,  # (B, K, embed_dim)
+        z_v_window: torch.Tensor,  # (B, K, embed_dim) or (B, embed_dim) for old arch
+        z_t_window: torch.Tensor,  # (B, K, embed_dim) or (B, embed_dim) for old arch
         z_text: torch.Tensor,      # (B, embed_dim)
         action: torch.Tensor,      # (B, action_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -99,11 +103,14 @@ class WorldModelMLP(nn.Module):
         Returns:
             (z_v_prime, z_t_prime), each of shape (B, embed_dim)
         """
-        B, K, D = z_v_window.shape
-        # Flatten window: (B, K * 2 * D)
-        window_flat = torch.cat([z_v_window, z_t_window], dim=-1).reshape(B, -1)
-        # Concatenate with text and action: (B, K*2*D + D + A)
-        x = torch.cat([window_flat, z_text, action], dim=-1)
+        if self.window_size > 0:
+            # New architecture: (B, K, D) window
+            B, K, D = z_v_window.shape
+            window_flat = torch.cat([z_v_window, z_t_window], dim=-1).reshape(B, -1)
+            x = torch.cat([window_flat, z_text, action], dim=-1)
+        else:
+            # Old architecture: (B, D) single embeddings
+            x = torch.cat([z_v_window, z_t_window, z_text, action], dim=-1)
         out = self.mlp(x)
         z_v_prime = out[:, :self.embed_dim]
         z_t_prime = out[:, self.embed_dim:]

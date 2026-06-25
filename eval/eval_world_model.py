@@ -200,6 +200,7 @@ def evaluate(
         if first_w is not None and first_w.shape[1] == 774:
             # Old architecture: single timestep (3*256+6 = 774)
             _is_old_arch = True
+            wm_kwargs["window_size"] = 0
             print(f"    Detected OLD architecture (single timestep, input_dim=774)")
         else:
             # New architecture: window of K timesteps
