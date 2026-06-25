@@ -208,7 +208,9 @@ def test_2_v_increases_along_trajectories(
                 v_first = value_head(m_first["z_v"].float(), m_first["z_t"].float(), m_first["z_text"].float())
 
             # Check V_last >= V_first (or close)
-            diff = (v_last - v_first).cpu().numpy()
+            # Cast to FP32 first — BF16 outputs from value_head
+            # can't be converted via .cpu().numpy() directly.
+            diff = (v_last.float() - v_first.float()).cpu().numpy()
             n_total += B
             n_increasing += int(np.sum(diff >= -0.05))  # tolerance
             diffs.extend(diff.tolist())
@@ -317,6 +319,13 @@ def test_4_v_counterfactual_discrimination(
     gail_disc.eval()
     world_model.eval()
 
+    # Detect world model architecture — old (window_size=0) takes
+    # (B, D) single embeddings, new (window_size>0) takes (B, K, D)
+    # windows. We need to add a K dimension if the world model was
+    # trained with a window.
+    wm_window_size = getattr(world_model, "window_size", 0)
+    use_window = wm_window_size > 0
+
     n_pairs = 0
     n_v_agrees = 0
     pair_diffs = []  # (v_good - v_bad) for each pair
@@ -328,6 +337,15 @@ def test_4_v_counterfactual_discrimination(
         emb = encode_batch(model, batch, device)
         B = emb["z_v"].shape[0]
         device_t = emb["z_v"].device
+
+        # For window-based models, expand (B, D) -> (B, K, D) by
+        # repeating the current embedding K times.
+        if use_window:
+            z_v_w = emb["z_v"].unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
+            z_t_w = emb["z_t"].unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
+        else:
+            z_v_w = emb["z_v"]
+            z_t_w = emb["z_t"]
 
         # 1. Compute GAIL reward for the real (expert) action
         with torch.no_grad():
@@ -353,18 +371,18 @@ def test_4_v_counterfactual_discrimination(
             with torch.no_grad():
                 # s'_good = f(s, expert_action)
                 z_v_g, z_t_g = world_model(
-                    emb["z_v"][i:i+1], emb["z_t"][i:i+1],
+                    z_v_w[i:i+1], z_t_w[i:i+1],
                     emb["z_text"][i:i+1], emb["action"][i:i+1]
                 )
                 # s'_bad = f(s, random_action)
                 z_v_b, z_t_b = world_model(
-                    emb["z_v"][i:i+1], emb["z_t"][i:i+1],
+                    z_v_w[i:i+1], z_t_w[i:i+1],
                     emb["z_text"][i:i+1], random_action[i:i+1]
                 )
 
-                # V(s'_good) vs V(s'_bad)
-                v_g = value_head(z_v_g, z_t_g, emb["z_text"][i:i+1]).item()
-                v_b = value_head(z_v_b, z_t_b, emb["z_text"][i:i+1]).item()
+                # V(s'_good) vs V(s'_bad) — value_head takes (B, D)
+                v_g = value_head(z_v_g, z_t_g, emb["z_text"][i:i+1]).float().item()
+                v_b = value_head(z_v_b, z_t_b, emb["z_text"][i:i+1]).float().item()
 
             n_pairs += 1
             if v_g > v_b:
