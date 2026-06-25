@@ -188,12 +188,22 @@ def evaluate(
 
     # -- Build world model head with the saved config --
     wm_kwargs: dict = {}
+    _is_old_arch = False  # global flag for old single-timestep checkpoints
     if arch == "mlp":
         wm_kwargs = {
             "hidden_dim": cfg.get("mlp_hidden", 512),
             "num_layers": cfg.get("mlp_layers", 3),
-            "window_size": cfg.get("window_size", 5),
         }
+        # Detect old vs new architecture from state dict shape
+        state = wm_ckpt.get("world_model_state", wm_ckpt)
+        first_w = state.get("mlp.0.weight", None)
+        if first_w is not None and first_w.shape[1] == 774:
+            # Old architecture: single timestep (3*256+6 = 774)
+            _is_old_arch = True
+            print(f"    Detected OLD architecture (single timestep, input_dim=774)")
+        else:
+            # New architecture: window of K timesteps
+            wm_kwargs["window_size"] = cfg.get("window_size", 5)
     elif arch == "rnn":
         wm_kwargs = {
             "hidden_dim": cfg.get("mlp_hidden", 256),
@@ -387,8 +397,13 @@ def evaluate(
             real_action_samples.append(action.detach().cpu().numpy().copy())
 
             # -- Encode state_t and state_t+1 --
-            z_v, z_t, z_text = _encode_state_window(frames_t, traj_t, texts, window_size=cfg.get("window_size", 5))
-            z_v_next, z_t_next = _encode_state_target(frames_next, traj_next, texts)
+            if _is_old_arch:
+                # Old architecture: single embeddings (B, D)
+                z_v, z_t, z_text = _encode_state_target(frames_t, traj_t, texts)
+                z_v_next, z_t_next = _encode_state_target(frames_next, traj_next, texts)
+            else:
+                z_v, z_t, z_text = _encode_state_window(frames_t, traj_t, texts, window_size=cfg.get("window_size", 5))
+                z_v_next, z_t_next = _encode_state_target(frames_next, traj_next, texts)
 
             # ============== TEST 1: real (s, a) -> predicted s' ====
             z_v_pred, z_t_pred = world_model(z_v, z_t, z_text, action)
@@ -498,9 +513,13 @@ def evaluate(
 
                 K = rollout_steps_kept
                 # Build input batch of 1 for the rollout, anchored at chosen_t
-                # Maintain a window of K past embeddings
-                z_v_cur = z_v[i:i + 1].clone()       # (1, W, D)
-                z_t_cur = z_t[i:i + 1].clone()       # (1, W, D)
+                if _is_old_arch:
+                    # Old: single embedding (1, D) — unsqueeze to (1, 1, D)
+                    z_v_cur = z_v[i:i + 1].unsqueeze(1).clone()
+                    z_t_cur = z_t[i:i + 1].unsqueeze(1).clone()
+                else:
+                    z_v_cur = z_v[i:i + 1].clone()       # (1, W, D)
+                    z_t_cur = z_t[i:i + 1].clone()       # (1, W, D)
                 z_text_cur = z_text[i:i + 1].clone()  # (1, D)
                 text_i = [texts[i]] if isinstance(texts, list) else [texts]
                 for k in range(K):
