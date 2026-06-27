@@ -58,6 +58,7 @@ from models.align_model import ALIGNModel
 from models.value_head import create_value_head, value_loss
 from models.gail_discriminator import create_gail_discriminator, compute_reward
 from data.align_dataset import ALIGNDataset, MultiALIGNDataset, world_model_collate
+from training.wandb_utils import init_wandb, log_metrics
 
 
 def train_value(
@@ -76,6 +77,8 @@ def train_value(
     device: Optional[str] = None,
     max_steps_per_epoch: int = 2000,
     enable_wandb: bool = False,
+    wandb_project: str = "align-value",
+    wandb_run: Optional[str] = None,
     num_workers: int = 0,
     traj_window: int = 5,
     chunk_size: int = 1,
@@ -121,6 +124,39 @@ def train_value(
     print(f"  Device: {device}")
     print(f"  Epochs: {epochs}, gamma={gamma}, lambda={lam}")
     print(f"  Value head: hidden={hidden_dim}, layers={num_layers}")
+
+    # -- W&B -------------------------------------------------
+    wandb_trainer = init_wandb(
+        project=wandb_project,
+        name=wandb_run or out_dir.name,
+        config={
+            "model": "align-value",
+            "data": [str(p) for p in data_paths],
+            "pretrained_checkpoint": pretrained_checkpoint,
+            "gail_checkpoint": gail_checkpoint,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "gamma": gamma,
+            "lam": lam,
+            "n_steps": n_steps,
+            "val_split": val_split,
+            "max_steps_per_epoch": max_steps_per_epoch,
+            "num_workers": num_workers,
+            "traj_window": traj_window,
+            "chunk_size": chunk_size,
+            "embed_dim": embed_dim,
+            "hidden_dim": hidden_dim,
+            "num_layers": num_layers,
+            "device": str(device),
+            "use_bf16": use_bf16,
+            "seed": seed,
+        },
+    ) if enable_wandb else init_wandb(
+        project=wandb_project, name=wandb_run or out_dir.name, config={},
+    )
+    print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Load encoder+mixer --
     model = ALIGNModel(
@@ -282,6 +318,13 @@ def train_value(
 
         print(f"  Epoch {epoch+1}/{epochs}  loss: {mean_loss:.4f}  V: {mean_v:.4f}  r: {mean_r:.4f}")
 
+        wandb_trainer.log({
+            "epoch": epoch + 1,
+            "train/loss": mean_loss,
+            "train/v_mean": mean_v,
+            "train/r_mean": mean_r,
+        }, step=epoch + 1)
+
         if mean_loss < best_loss:
             best_loss = mean_loss
             ckpt_path = out_dir / "value_best.pt"
@@ -298,8 +341,11 @@ def train_value(
                 "loss": mean_loss,
             }, ckpt_path)
             print(f"  -> value_best.pt (loss: {mean_loss:.4f})")
+            # Save the best checkpoint to wandb (uploads as artifact)
+            wandb_trainer.save(str(ckpt_path))
 
     log_fp.close()
+    wandb_trainer.finish()
     print(f"\n  Value head training complete.")
     print(f"    Best loss: {best_loss:.4f}")
     print(f"    Best ckpt: {out_dir / 'value_best.pt'}")
@@ -345,6 +391,10 @@ def main():
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--no-bf16", dest="bf16", action="store_false")
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="align-value",
+                        help="W&B project name")
+    parser.add_argument("--wandb-run", default=None,
+                        help="W&B run name (defaults to run_N)")
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
@@ -365,6 +415,8 @@ def main():
         device=args.device,
         max_steps_per_epoch=args.max_steps_per_epoch,
         enable_wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_run=args.wandb_run,
         num_workers=args.num_workers,
         traj_window=args.traj_window,
         chunk_size=args.chunk_size,
