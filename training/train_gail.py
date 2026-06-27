@@ -230,6 +230,8 @@ def train_gail(
             "output_dir": str(output_dir),
             "data": [str(p) for p in data_paths],
             "pretrained_checkpoint": pretrained_checkpoint,
+            "wandb_project": wandb_project,
+            "wandb_run": wandb_run,
             "epochs": epochs,
             "batch_size": batch_size,
             "lr": lr,
