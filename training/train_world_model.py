@@ -218,20 +218,29 @@ def train_world_model(
     # -- W&B -------------------------------------------------
     wandb_trainer = init_wandb(
         project=wandb_project,
-        name=wandb_run,
+        name=wandb_run or out_dir.name,
         config={
             "model": "align-world-model",
+            "output_dir": str(output_dir),
             "data": [str(p) for p in data_paths],
             "pretrained_checkpoint": pretrained_checkpoint,
             "epochs": epochs,
             "batch_size": batch_size,
             "lr": lr,
             "weight_decay": weight_decay,
+            "val_split": val_split,
+            "max_steps_per_epoch": max_steps_per_epoch,
+            "num_workers": num_workers,
             "arch": arch,
             "action_dim": action_dim,
             "embed_dim": embed_dim,
+            "mixer_dim": mixer_dim,
+            "num_mixer_blocks": num_mixer_blocks,
+            "traj_window": traj_window,
+            "chunk_size": chunk_size,
             "mlp_hidden": mlp_hidden,
             "mlp_layers": mlp_layers,
+            "window_size": window_size,
             "transformer_layers": transformer_layers,
             "transformer_d_model": transformer_d_model,
             "transformer_nhead": transformer_nhead,
@@ -239,10 +248,9 @@ def train_world_model(
             "transformer_dim_ff": transformer_dim_ff,
             "device": str(device),
             "use_bf16": use_bf16,
-            "traj_window": traj_window,
-            "chunk_size": chunk_size,
+            "seed": seed,
         },
-    ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
+    ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run or out_dir.name, config={})
     print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Dataset --------------------------------------------
@@ -507,6 +515,8 @@ def train_world_model(
             best_path = out_dir / "world_model_best.pt"
             save_checkpoint(best_path, epoch + 1, avg_loss)
             print(f"  -> world_model_best.pt (loss: {avg_loss:.4f})")
+            # Upload best checkpoint to wandb as an artifact
+            wandb_trainer.save(str(best_path))
 
     log_fp.close()
     wandb_trainer.finish()
