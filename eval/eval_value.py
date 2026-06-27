@@ -319,12 +319,30 @@ def test_4_v_counterfactual_discrimination(
     gail_disc.eval()
     world_model.eval()
 
-    # Detect world model architecture — old (window_size=0) takes
-    # (B, D) single embeddings, new (window_size>0) takes (B, K, D)
-    # windows. We need to add a K dimension if the world model was
-    # trained with a window.
-    wm_window_size = getattr(world_model, "window_size", 0)
-    use_window = wm_window_size > 0
+    # Detect world model architecture and required input shape.
+    # Old arch (window_size=0, MLP) takes (B, D) single embeddings.
+    # New archs (window_size>0 MLP, RNN, Transformer) take (B, K, D)
+    # windows. We need to add a K dimension if the world model needs
+    # a window.
+    #
+    # Detection logic:
+    #   - WorldModelMLP: hasattr window_size. If > 0, needs window.
+    #   - WorldModelRNN: ALWAYS needs (B, K, D) input (uses GRU over time).
+    #   - WorldModelTransformer: ALWAYS needs (B, K, D) input (uses attention).
+    cls_name = type(world_model).__name__
+    if cls_name == "WorldModelMLP":
+        wm_window_size = getattr(world_model, "window_size", 0)
+        use_window = wm_window_size > 0
+    elif cls_name in ("WorldModelRNN", "WorldModelTransformer"):
+        use_window = True
+        # Default K=5 if not specified. The actual K doesn't matter
+        # much because we're feeding the same embedding K times —
+        # the model has seen this during training.
+        wm_window_size = 5
+    else:
+        # Unknown arch — assume no window for safety
+        use_window = False
+        wm_window_size = 0
 
     n_pairs = 0
     n_v_agrees = 0
