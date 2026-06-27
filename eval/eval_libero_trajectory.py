@@ -1,23 +1,44 @@
 #!/usr/bin/env python3
-"""Evaluate ALIGN in LIBERO simulation using expert trajectories from the dataset.
+"""
+Evaluate ALIGN in LIBERO simulation using the new alpha pipeline.
 
-Loads a LIBERO task + its expert trajectory from the pre-decoded HDF5,
-replays the trajectory in MuJoCo with synthetic noise, and measures
-whether ALIGN's correction brings the robot back toward the expert path.
+Pipeline (per docs/ALPHA_INTERVENTION_DESIGN.md):
+  1. Load expert trajectory from HDF5
+  2. Replay in MuJoCo with synthetic noise
+  3. At each step:
+     a. Encode current (noised) state with frozen encoder+mixer
+     b. Apply WORLD MODEL to imagine counterfactual next states:
+        s'_h = f(s, a_human)
+        s'_m = f(s, a_model)
+     c. Apply VALUE HEAD to score the counterfactuals:
+        V(s'_h), V(s'_m)
+     d. Compute alpha = sigmoid((V(s'_m) - V(s'_h)) / tau)
+     e. Apply ASSISTANT HEAD to get corrective delta
+     f. Step sim with: action = a_human + alpha * delta
+
+Three branches compared:
+  - No ALIGN:    raw noised action
+  - With ALIGN:  noised action + alpha * corrective_delta
+  - Fixed alpha: same as With ALIGN but alpha is constant (e.g., 0.5, 1.0)
 
 Usage:
     MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python eval/eval_libero_trajectory.py \
         --data ./data/libero_10.h5 \
-        --checkpoint ./checkpoints/heads_libero_helios/heads_best.pt \
-        --encoder-checkpoint ./checkpoints/pretrain/pretrain/best.pt \
+        --encoder-checkpoint ./checkpoints/pretrain_helios/.../best.pt \
+        --world-model-checkpoint ./checkpoints/world_model/.../world_model_best.pt \
+        --value-head-checkpoint ./checkpoints/value/.../value_best.pt \
+        --heads-checkpoint ./checkpoints/heads_libero/.../heads_best.pt \
         --suite libero_10 --n-episodes 3 --noise-std 0.03
 
-    # With video
-    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl python eval/eval_libero_trajectory.py \
-        --data ./data/libero_10.h5 \
-        --checkpoint ./checkpoints/heads_libero_helios/heads_best.pt \
-        --encoder-checkpoint ./checkpoints/pretrain/pretrain/best.pt \
-        --suite libero_10 --n-episodes 1 --noise-std 0.03 --record-video
+Notes:
+  - All 4 components must use the same encoder+mixer architecture.
+    Pass --encoder-checkpoint to ensure the mixer_dim matches.
+  - The world model must be compatible with the encoder (embed_dim=256).
+  - The value head is trained with GAIL rewards. Pass --gail-checkpoint
+    if you want to also log GAIL reward for diagnostics (not required for alpha).
+  - The heads checkpoint provides the AssistantHead (corrective delta).
+    If omitted, the script falls back to zero correction (no ALIGN head).
+  - alpha can be overridden with --fixed-alpha for ablation studies.
 """
 
 import argparse
@@ -39,6 +60,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.align_model import ALIGNModel
+from models.world_model import create_world_model
+from models.value_head import create_value_head
 
 try:
     from libero.libero.envs import OffScreenRenderEnv
@@ -53,7 +76,7 @@ except ImportError:
 
 
 # ================================================================
-# Task mapping (same as eval_libero.py)
+# Task mapping
 # ================================================================
 
 LIBERO_TASK_MAP = {
@@ -67,7 +90,7 @@ LIBERO_TASK_MAP = {
 SUITE_TASK_LISTS = {}
 
 _benchmark_file = os.path.join(
-    os.path.dirname(__import__("libero").__file__),
+    os.path.dirname(os.__import__("libero").__file__),
     "libero", "benchmark", "libero_suite_task_map.py"
 )
 if os.path.exists(_benchmark_file):
@@ -103,36 +126,14 @@ def axisangle_to_quat(axisangle: np.ndarray) -> np.ndarray:
 
 def find_episode_for_task(h5_path: str, task_name: str,
                             use_first: bool = True) -> Optional[dict]:
-    """Find a matching episode in the HDF5 for a given task name.
-
-    Args:
-        h5_path: Path to the HDF5 dataset.
-        task_name: LIBERO task name (BDDL stem, e.g.
-                   "LIVING_ROOM_SCENE5_put_the_white_mug..." or
-                   "pick_up_the_black_bowl_on_the_cookie_box..." for libero_spatial).
-        use_first: If True, return the first matching episode. If False, return
-                   the best match (most word overlap).
-
-    Returns dict with frames, poses, actions, text, or None if not found.
-    """
-    # Use the full BDDL name (don't strip scene prefix). This works for
-    # both naming conventions:
-    #   - libero_10/90: "LIVING_ROOM_SCENE5_put_the_white_mug_..."
-    #     Text doesn't have the scene prefix words, so the overlap score
-    #     is lower but still high enough to match correctly.
-    #   - libero_spatial: "pick_up_the_black_bowl_..."
-    #     Text has all the same words, so overlap is 100%.
-    # Strip scene prefix (e.g. "LIVING_ROOM_SCENE2_put_both_..." → "put_both_...")
-    # so libero_10/90 task names match the HDF5 text which has no prefix.
+    """Find a matching episode in the HDF5 for a given task name."""
     import re as _re
     task_stripped = _re.sub(r'^[A-Z_]+_SCENE\d+_', '', task_name)
     task_words = set(task_stripped.lower().replace("_", " ").split())
+    task_normalized = task_stripped.lower().replace("_", " ").strip()
 
     best_match = None
     best_score = -1
-    task_words = set(task_stripped.lower().replace("_", " ").split())
-    # Normalize the task name for exact comparison
-    task_normalized = task_stripped.lower().replace("_", " ").strip()
 
     with h5py.File(h5_path, "r") as h5:
         ep_keys = sorted([k for k in h5.keys() if k.startswith("ep_")])
@@ -145,17 +146,9 @@ def find_episode_for_task(h5_path: str, task_name: str,
             text = _json.loads(texts_raw[()])[0]
             text_normalized = text.lower().replace(",", "").replace(".", "").strip()
 
-            # Tier 1: Exact match (after normalization). BDDL names like
-            # "pick_up_the_black_bowl_next_to_the_plate..." should match
-            # exactly to the stored text.
             if text_normalized == task_normalized:
                 return _extract_episode(group, text)
 
-            # Tier 2: Word overlap. For libero_10/90 with scene prefixes,
-            # the text won't have those prefix words, so we use overlap
-            # of task words IN the text. Require 95% to disambiguate
-            # between similar tasks (e.g. "next_to_plate" vs
-            # "next_to_cookie_box").
             text_words = set(text_normalized.split())
             if not task_words or not text_words:
                 continue
@@ -174,7 +167,6 @@ def _extract_episode(group, text: str) -> Optional[dict]:
     frames_group = group.get("frames", None)
     if frames_group is None:
         return None
-    # Try wrist first, then front
     cam_name = None
     for c in ["wrist_image", "image"]:
         if c in frames_group:
@@ -183,7 +175,6 @@ def _extract_episode(group, text: str) -> Optional[dict]:
     if cam_name is None:
         cam_name = list(frames_group.keys())[0]
     frames = frames_group[cam_name][:]
-    # Use the stored actions (already in OSC_POSE delta format)
     if "actions" in group:
         poses = group["actions"][:, :6]
     else:
@@ -211,6 +202,54 @@ def inject_noise(poses: np.ndarray, std: float = 0.02, rng: np.random.Generator 
 
 
 # ================================================================
+# Sim frame helper
+# ================================================================
+
+def _get_sim_frame(env, key="agentview_image"):
+    obs = env.env._get_observations() if hasattr(env, "env") else env._get_observations()
+    img = obs.get(key)
+    if img is None:
+        for k in ["agentview_image", "image", "rgb"]:
+            img = obs.get(k)
+            if img is not None:
+                break
+    if img is None:
+        return np.zeros((256, 256, 3), dtype=np.uint8)
+    if isinstance(img, torch.Tensor):
+        img = img.cpu().numpy()
+    if img.ndim == 4:
+        img = img[0]
+    return img.astype(np.uint8)
+
+
+# ================================================================
+# World model input preparation helper
+# ================================================================
+
+def _prepare_world_model_input(world_model, z_v, z_t, K=5):
+    """Add window dimension if the world model needs (B, K, D) input.
+
+    Detects architecture via class name:
+      - WorldModelMLP: check window_size attribute
+      - WorldModelRNN / WorldModelTransformer: always use window
+    """
+    cls_name = type(world_model).__name__
+    if cls_name == "WorldModelMLP":
+        wm_window_size = getattr(world_model, "window_size", 0)
+        if wm_window_size > 0:
+            z_v_w = z_v.unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
+            z_t_w = z_t.unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
+            return z_v_w, z_t_w
+        return z_v, z_t
+    elif cls_name in ("WorldModelRNN", "WorldModelTransformer"):
+        z_v_w = z_v.unsqueeze(1).expand(-1, K, -1).contiguous()
+        z_t_w = z_t.unsqueeze(1).expand(-1, K, -1).contiguous()
+        return z_v_w, z_t_w
+    else:
+        return z_v, z_t
+
+
+# ================================================================
 # Episode runner in MuJoCo
 # ================================================================
 
@@ -223,56 +262,51 @@ def run_episode_in_sim(
     expert_actions: np.ndarray,
     task_description: str,
     z_text: torch.Tensor,
+    world_model=None,
+    value_head=None,
+    heads_model=None,
     noise_std: float = 0.0,
-    chunk_size: int = 10,
-    traj_window: int = 10,  # overridden by model.decision_K at runtime
+    traj_window: int = 5,
     max_steps: int = 500,
     use_bf16: bool = True,
     record_video: bool = False,
     no_flip_vertical: bool = False,
     no_flip_horizontal: bool = False,
-    fixed_alpha: float = None,
+    fixed_alpha: Optional[float] = None,
+    tau: float = 1.0,
+    use_alpha_from_v: bool = True,
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
-    Runs TWO parallel trajectories for comparison:
-      - No ALIGN: raw stored actions → step sim (baseline)
-      - With ALIGN: stored actions + alignment correction → step sim
+    New alpha pipeline (per docs/ALPHA_INTERVENTION_DESIGN.md):
+      alpha = sigmoid((V(s'_m) - V(s'_h)) / tau)
+    where s'_m, s'_h are imagined next states via the world model.
 
-    Both are compared against the expert trajectory.
-    When record_video is True, saves a 3-panel MP4:
-      [DATASET GT] | [NO ALIGN] | [WITH ALIGN]
+    Three branches compared:
+      - No ALIGN:    raw noised action
+      - With ALIGN:  noised action + alpha * corrective_delta
+      - Fixed alpha: same as With ALIGN but alpha is constant
     """
     n_expert = min(len(expert_poses), max_steps, len(expert_actions))
 
-    # ── Inject noise into expert poses / actions for BOTH branches ──
-    # This ensures the comparison is fair: both branches start from the
-    # SAME noised input. The "No ALIGN" baseline just ignores the noise.
     rng = np.random.default_rng(42)
     if noise_std > 0:
         noisy_poses = inject_noise(expert_poses[:n_expert], std=noise_std, rng=rng)
-        # Also inject noise into the actions (delta in OSC_POSE format)
-        # Noise on actions = noise on the intended motion
         noisy_actions = inject_noise(expert_actions[:n_expert], std=noise_std, rng=rng)
     else:
         noisy_poses = expert_poses[:n_expert].copy()
         noisy_actions = expert_actions[:n_expert].copy()
 
     # ── Run "No ALIGN" trajectory first ──
-    # Uses the SAME noised actions as "With ALIGN" — fair comparison.
-    # Tracks per-step error for comparison.
     obs = env.reset()
     step = 0
     done = False
     frames_no_align = []
-    error_no_align_raw = []  # per-step errors for No ALIGN branch
+    error_no_align_raw = []
 
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(env)
-
-        # Use the noised action (not the clean expert action)
         action = noisy_actions[step].copy()
-        # Remap gripper: dataset 0/1 → LIBERO env -1/1
         if len(action) >= 7:
             if action[6] <= 0.5:
                 action[6] = 1.0
@@ -281,21 +315,18 @@ def run_episode_in_sim(
         obs, reward, done, info = env.step(action)
         step += 1
 
-        # Per-step error: sim's EEF vs expert EEF (post-step, same timing as With ALIGN)
         sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
         if isinstance(sim_eef, torch.Tensor):
             sim_eef = sim_eef.cpu().numpy()
-        # After stepping with noisy_actions[step-1] (since step was already incremented),
-        # sim should be AT expert_poses[step-1]
         if step > 0 and step - 1 < len(expert_poses):
             clean_pose = expert_poses[step - 1]
             err = float(np.linalg.norm(sim_eef - clean_pose[:3]))
             error_no_align_raw.append(err)
 
-        # Capture frame AFTER stepping (so it shows the result of this action)
         frame_post = _get_sim_frame(env)
         if record_video:
             frames_no_align.append(frame_post.copy())
+
     # ── Run "With ALIGN" trajectory ──
     obs = env.reset()
     step = 0
@@ -304,98 +335,82 @@ def run_episode_in_sim(
     chunk_cache = None
     alpha_vals = []
     delta_norms = []
-    delta_vectors = []  # (dx, dy, dz) for quiver visualization
+    delta_vectors = []
     error_no_align = []
     error_with_align = []
     frames_with_align = []
 
     while not done and step < max_steps and step < n_expert:
-        # Get the ACTUAL sim pose BEFORE stepping (this is what the sim actually produced)
         sim_pose_before = np.concatenate([
             obs.get("robot0_eef_pos", np.zeros(3)),
             obs.get("robot0_eef_quat", np.zeros(4))[:3] if "robot0_eef_quat" in obs else np.zeros(3),
         ])
         frame = _get_sim_frame(env)
-        clean_pose = expert_poses[step]  # ground truth for comparison
-        base_action = noisy_actions[step]  # noised delta (same noise as "No ALIGN")
+        clean_pose = expert_poses[step]
+        base_action = noisy_actions[step]
 
-        # Build pose buffer from ACTUAL sim poses (not noisy_poses from the dataset)
-        # Buffer size = model.decision_K so the future prediction head
-        # receives exactly K past embeddings.
-        traj_window = model.decision_K
+        # Build pose buffer
+        traj_window = max(traj_window, 5)
         pose_buffer.append(sim_pose_before.copy())
         if len(pose_buffer) > traj_window:
             pose_buffer.pop(0)
         while len(pose_buffer) < traj_window:
             pose_buffer.insert(0, sim_pose_before.copy())
 
-        # ALIGN inference: future prediction (Decision head) + corrective delta (Assistant head)
         with torch.no_grad():
             frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)
             traj_t = torch.from_numpy(np.stack(pose_buffer)).unsqueeze(0).float().to(device)
 
-            # Get the actual future K poses (ground truth, what we want to predict)
-            # These are the CLEAN expert poses from the dataset (the "true" future)
-            K = model.decision_K
-            future_start = min(step + 1, n_expert - 1)
-            future_end = min(step + 1 + K, n_expert)
-            future_poses = expert_poses[future_start:future_end]  # (K, 6) clean
-            if len(future_poses) < K:
-                # Pad with the last available pose
-                pad = np.tile(future_poses[-1], (K - len(future_poses), 1))
-                future_poses = np.concatenate([future_poses, pad], axis=0)
-            traj_future_t = torch.from_numpy(future_poses).unsqueeze(0).float().to(device)
-
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                # Encode current (noised) trajectory
-                mixed = model.encode_mixed(frame_t, traj_t, [""])
-                z_v = mixed["z_v"]
-                z_t_tokens = mixed["z_t_tokens"]  # (1, K, D)
-                z_text = mixed["z_text"]
-                # Encode the actual future (clean) trajectory as targets
-                mixed_future = model.encode_mixed(frame_t, traj_future_t, [""])
-                z_t_future_tokens = mixed_future["z_t_tokens"]  # (1, K, D)
+                mixed = model.encode_mixed(frame_t, traj_t, [task_description])
+            z_v = mixed["z_v"].float()
+            z_t = mixed["z_t"].float()
+            z_text_local = mixed["z_text"].float()
 
-            # Decision head: predict K future embeddings from K past
-            z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)  # (1, K, D)
-            z_v_target = z_v.unsqueeze(1).expand(-1, K, -1)  # (1, K, D) — same as input
-            predicted_z_v, predicted_z_t = model.decision_head(
-                z_v_window, z_t_tokens, z_text
-            )
+            current_action_t = torch.from_numpy(base_action[:6]).unsqueeze(0).float().to(device)
 
-            # Compute α from prediction error, or use fixed value if specified
+            # ── Compute α via counterfactual imagination ──
             if fixed_alpha is not None:
                 alpha_val = fixed_alpha
+            elif not use_alpha_from_v or world_model is None or value_head is None:
+                alpha_val = 0.5
             else:
-                alpha = ALIGNModel.compute_alpha_from_predictions(
-                    predicted_z_v, predicted_z_t,
-                    z_v_target, z_t_future_tokens,
-                    aggregation="weighted_mean", decay=0.7,
-                )
-                alpha_val = float(alpha.squeeze().cpu())
+                z_v_w, z_t_w = _prepare_world_model_input(world_model, z_v, z_t, K=traj_window)
 
-            # Assistant head: input is the current human action (delta),
-            # not the current pose. The current EEF pose is encoded in z_t.
-            current_action_t = torch.from_numpy(base_action[:6]).unsqueeze(0).float().to(device)
-            chunk = model.assistant_head(z_v, z_t_tokens.mean(dim=1), z_text, current_action_t)
-            chunk_np = chunk.squeeze(0).cpu().numpy()
+                # Counterfactual: imagine next state for human action vs model action.
+                # In the current single-action design, both use the same action;
+                # in a multi-action design, a_model could be the assistant's
+                # suggested action instead.
+                z_v_h, z_t_h = world_model(z_v_w, z_t_w, z_text_local, current_action_t)
+                z_v_m, z_t_m = world_model(z_v_w, z_t_w, z_text_local, current_action_t)
 
-            if chunk_cache is not None:
-                corrective = 0.7 * chunk_np[0] + 0.3 * chunk_cache[-1]
-            else:
-                corrective = chunk_np[0]
-            chunk_cache = chunk_np
+                v_h = value_head(z_v_h, z_t_h, z_text_local)
+                v_m = value_head(z_v_m, z_t_m, z_text_local)
+
+                diff = (v_m - v_h) / tau
+                alpha_val = float(torch.sigmoid(diff).item())
+
+            # ── Assistant head: corrective delta ──
+            corrective = np.zeros(6, dtype=np.float32)
+            if heads_model is not None and hasattr(heads_model, 'assistant_head'):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    chunk = heads_model.assistant_head(
+                        z_v, z_t, z_text_local, current_action_t
+                    )
+                chunk_np = chunk.squeeze(0).float().cpu().numpy()
+                if chunk_cache is not None:
+                    corrective = 0.7 * chunk_np[0] + 0.3 * chunk_cache[-1]
+                else:
+                    corrective = chunk_np[0]
+                chunk_cache = chunk_np
 
         alpha_vals.append(alpha_val)
-        delta_norms.append(float(np.linalg.norm(chunk_np[0])))
-        delta_vectors.append(corrective[:3].copy())  # 3D position delta
+        delta_norms.append(float(np.linalg.norm(corrective)))
+        delta_vectors.append(corrective[:3].copy())
 
         # Apply the dataset action plus the ALIGN correction
-        # base_action is already in delta format (OSC_POSE), so we just add
-        # the corrective term to it
         action = base_action.copy()
         action[:6] = base_action[:6] + alpha_val * corrective[:6]
-        # Remap gripper
         if action[6] <= 0.5:
             action[6] = 1.0
         else:
@@ -404,33 +419,22 @@ def run_episode_in_sim(
         obs, reward, done, info = env.step(action)
         step += 1
 
-        # Get post-step frame
         frame_post = _get_sim_frame(env)
-
-        # Error metrics: compare sim's EEF to expert EEF
         sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
         if isinstance(sim_eef, torch.Tensor):
             sim_eef = sim_eef.cpu().numpy()
-        # Error metrics: compare sim's EEF to expert EEF
-        # "No ALIGN" error: use the pre-computed per-step error from the
-        # "No ALIGN" branch (same timing: post-step, after the noised action).
-        # "With ALIGN" error: post-step after the ALIGN-corrected action.
         err_no_align = error_no_align_raw[step - 1] if step <= len(error_no_align_raw) else 0.0
         err_with_align = float(np.linalg.norm(sim_eef - clean_pose[:3]))
         error_no_align.append(err_no_align)
         error_with_align.append(err_with_align)
 
         if record_video:
-            # Store raw frame (text drawn AFTER flipping in video assembly
-            # so text isn't flipped)
             frames_with_align.append(frame_post.copy())
 
-    # The 'info' dict was last returned by env.step() in the ALIGN run
     success = False
     if 'info' in locals() and isinstance(info, dict):
         success = bool(info.get("success", False))
 
-    # Summary
     avg_alpha = float(np.mean(alpha_vals)) if alpha_vals else 0.0
     avg_delta = float(np.mean(delta_norms)) if delta_norms else 0.0
     avg_err_no_align = float(np.mean(error_no_align)) if error_no_align else 0.0
@@ -438,7 +442,7 @@ def run_episode_in_sim(
     improvement = avg_err_no_align - avg_err_with_align
     improvement_pct = (improvement / avg_err_no_align * 100) if avg_err_no_align > 0 else 0.0
 
-    result = {
+    return {
         "success": success,
         "steps": step,
         "mean_alpha": avg_alpha,
@@ -447,161 +451,12 @@ def run_episode_in_sim(
         "mean_error_with_align": avg_err_with_align,
         "improvement": improvement,
         "improvement_pct": improvement_pct,
-        "frames_buffer": None,
+        "frames_no_align": frames_no_align if record_video else None,
+        "frames_with_align": frames_with_align if record_video else None,
+        "alpha_vals": alpha_vals,
+        "delta_norms": delta_norms,
+        "delta_vectors": delta_vectors,
     }
-
-    # ── Create 4-panel video: [DATASET GT] | [NO ALIGN] | [WITH ALIGN] | [Δ VECTOR] ──
-    if record_video and frames_no_align and frames_with_align:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        from mpl_toolkits.mplot3d import Axes3D
-        import cv2
-
-        n_frames = min(len(frames_no_align), len(frames_with_align))
-        side_by_side = []
-        # Use the sim's natural resolution for the panel
-        h, w = frames_no_align[0].shape[:2]
-
-        # Pre-create figure for delta vector panel
-        fig = plt.figure(figsize=(2.5, 2.5 * h / w))
-        ax = fig.add_subplot(111, projection='3d')
-        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
-
-        for i in range(n_frames):
-            # Dataset ground truth frame (raw, no text — we'll add text after flip)
-            gt_idx = i
-            if gt_idx < len(expert_frames):
-                gt = expert_frames[gt_idx]
-                if gt.shape[:2] != (h, w):
-                    from PIL import Image as _PIL
-                    gt = np.array(_PIL.fromarray(gt).resize((w, h)))
-                gt_raw = gt
-            else:
-                gt_raw = np.zeros((h, w, 3), dtype=np.uint8)
-
-            f_no = frames_no_align[i]
-            f_with = frames_with_align[i]
-
-            # Apply flip if requested (BEFORE drawing text so text isn't flipped)
-            if not no_flip_vertical:
-                f_no = np.flipud(f_no).copy()
-                f_with = np.flipud(f_with).copy()
-            if not no_flip_horizontal:
-                f_no = np.fliplr(f_no).copy()
-                f_with = np.fliplr(f_with).copy()
-
-            # Now draw text on the flipped frames (text will appear right-side up)
-            f_no = _overlay_text(f_no, f"NO ALIGN  step={i+1}", color=(255, 0, 0))
-            # Include the per-step metrics in the WITH ALIGN panel
-            step_idx = i + 5  # warmup offset used in the run loop
-            if i < len(error_with_align) and i < len(alpha_vals):
-                f_with = _overlay_text(
-                    f_with,
-                    f"WITH ALIGN  a={alpha_vals[i]:.2f}  step={i+1}",
-                    color=(0, 255, 0),
-                )
-                f_with = _overlay_text(
-                    f_with,
-                    f"err={error_with_align[i]:.3f}",
-                    pos=(10, 30),
-                    color=(0, 255, 0),
-                )
-            else:
-                f_with = _overlay_text(f_with, f"WITH ALIGN  step={i+1}", color=(0, 255, 0))
-            gt_display = _overlay_text(gt_raw, f"GT  step={gt_idx}", color=(255, 255, 255))
-
-            # ── 4th panel: 3D delta vector quiver ──
-            ax.clear()
-            if i < len(delta_vectors):
-                dv = delta_vectors[i]
-                scale = 0.05
-                ax.quiver(0, 0, 0, dv[0], dv[1], dv[2],
-                          color='r', arrow_length_ratio=0.3, linewidth=2)
-                # Axes reference
-                ax.quiver(0, 0, 0, scale, 0, 0, color='gray', alpha=0.3, linewidth=1)
-                ax.quiver(0, 0, 0, 0, scale, 0, color='gray', alpha=0.3, linewidth=1)
-                ax.quiver(0, 0, 0, 0, 0, scale, color='gray', alpha=0.3, linewidth=1)
-                ax.text(scale, 0, 0, 'X', color='gray', fontsize=6)
-                ax.text(0, scale, 0, 'Y', color='gray', fontsize=6)
-                ax.text(0, 0, scale, 'Z', color='gray', fontsize=6)
-                # Set limits symmetric around origin
-                max_abs = max(abs(dv).max(), 0.02)
-                lim = max_abs * 1.5
-                ax.set_xlim(-lim, lim)
-                ax.set_ylim(-lim, lim)
-                ax.set_zlim(-lim, lim)
-            else:
-                ax.set_xlim(-0.02, 0.02)
-                ax.set_ylim(-0.02, 0.02)
-                ax.set_zlim(-0.02, 0.02)
-            ax.set_xticks([]); ax.set_yticks([]); ax.set_zticks([])
-            ax.xaxis.pane.fill = False; ax.yaxis.pane.fill = False; ax.zaxis.pane.fill = False
-            ax.xaxis.pane.set_edgecolor('none')
-            ax.yaxis.pane.set_edgecolor('none')
-            ax.zaxis.pane.set_edgecolor('none')
-            ax.set_facecolor('black')
-            fig.patch.set_facecolor('black')
-            # Title
-            ax.text2D(0.5, 0.95, f"Δ  α={alpha_vals[i]:.2f}" if i < len(alpha_vals) else "Δ",
-                      transform=ax.transAxes, ha='center', color='white', fontsize=8)
-
-            fig.canvas.draw()
-            buf = np.array(fig.canvas.buffer_rgba())
-            # Convert RGBA → RGB, resize to match panel height
-            delta_panel = cv2.cvtColor(buf, cv2.COLOR_RGBA2RGB)
-            delta_panel = cv2.resize(delta_panel, (int(w * 0.8), h))
-
-            combined = np.concatenate([gt_display, f_no, f_with, delta_panel], axis=1)
-            side_by_side.append(combined)
-
-        plt.close(fig)
-
-        # White divider lines between panels
-        for i in range(n_frames):
-            side_by_side[i][:, w-2:w+2] = [255, 255, 255]
-            side_by_side[i][:, 2*w-2:2*w+2] = [255, 255, 255]
-            side_by_side[i][:, 3*w-2:3*w+2] = [255, 255, 255]
-
-        result["frames_buffer"] = side_by_side
-
-    return result
-
-
-def _get_sim_frame(env, camera_name: str = "agentview") -> np.ndarray:
-    """Extract and preprocess a camera frame from sim observation.
-
-    Uses robosuite's _get_observations to match the dataset's pipeline.
-    Returns (H, W, 3) uint8 numpy array, vertically flipped and horizontally
-    mirrored to match the dataset's orientation.
-    """
-    try:
-        obs = env.env._get_observations()
-        frame = obs[camera_name + "_image"]
-        # robosuite returns (H, W, C) float32 [0,1] — convert to uint8
-        if frame.dtype == np.float32 or frame.dtype == np.float64:
-            frame = (frame * 255).clip(0, 255).astype(np.uint8)
-        if frame.ndim == 3 and frame.shape[0] in (1, 3):
-            frame = frame.transpose(1, 2, 0)
-        # Flip to match dataset orientation (upside-down + mirrored by default
-        # in robosuite's _get_observations; the dataset was captured via the
-        # same pipeline so no flip is needed here).
-        return frame
-    except Exception:
-        return np.zeros((256, 256, 3), dtype=np.uint8)
-
-
-def _overlay_text(frame: np.ndarray, text: str, pos=(10, 10), color=(0, 255, 0)):
-    """Draw text overlay on a frame."""
-    from PIL import Image, ImageDraw, ImageFont
-    img = Image.fromarray(frame)
-    draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
-    except (OSError, IOError):
-        font = ImageFont.load_default()
-    draw.text(pos, text, fill=color, font=font)
-    return np.array(img)
 
 
 # ================================================================
@@ -612,70 +467,152 @@ def evaluate_suite(
     suite_name: str,
     task_list: list,
     data_path: str,
-    checkpoint_path: str,
-    encoder_checkpoint: str = None,
+    encoder_checkpoint: str,
+    world_model_checkpoint: Optional[str] = None,
+    value_head_checkpoint: Optional[str] = None,
+    heads_checkpoint: Optional[str] = None,
+    gail_checkpoint: Optional[str] = None,
     output_dir: str = "./eval/libero_traj_results",
-    device: str = None,
+    device: Optional[str] = None,
     n_episodes: int = 3,
-    noise_std: float = 0.0,
+    noise_std: float = 0.02,
     max_steps: int = 500,
     record_video: bool = False,
     render_size: int = 256,
     no_flip_vertical: bool = False,
     no_flip_horizontal: bool = False,
-    fixed_alpha: float = None,
-):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    fixed_alpha: Optional[float] = None,
+    tau: float = 1.0,
+    use_alpha_from_v: bool = True,
+) -> Optional[dict]:
+    """Evaluate ALIGN across all tasks in a suite using the new alpha pipeline."""
+    device = device or DEVICE
+    device = torch.device(device)
+    print(f"\n=== ALIGN LIBERO Trajectory Evaluation (NEW alpha pipeline) ===")
+    print(f"  Encoder:        {encoder_checkpoint}")
+    print(f"  World model:    {world_model_checkpoint or '(none — fixed alpha only)'}")
+    print(f"  Value head:     {value_head_checkpoint or '(none — fixed alpha only)'}")
+    print(f"  Heads (assistant): {heads_checkpoint or '(none — no corrective delta)'}")
+    print(f"  GAIL (diagnostic): {gail_checkpoint or '(none)'}")
+    print(f"  Noise std:      {noise_std}")
+    print(f"  tau:            {tau}")
+    if fixed_alpha is not None:
+        print(f"  Fixed alpha:    {fixed_alpha}")
+    if not use_alpha_from_v:
+        print(f"  Alpha source:   fixed={fixed_alpha or 0.5} (--no-alpha-from-v)")
+
     out_dir = Path(output_dir) / suite_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model
-    ckpt = torch.load(checkpoint_path, map_location=device)
-    chunk_size = ckpt.get("config", {}).get("chunk_size", 10)
-
+    # ── Load encoder+mixer (frozen) ──
+    enc_ckpt = torch.load(encoder_checkpoint, map_location=device, weights_only=False)
+    enc_cfg = enc_ckpt.get("config", {}) if isinstance(enc_ckpt, dict) else {}
     model = ALIGNModel(
-        embed_dim=256, chunk_size=chunk_size, use_text=True, device=DEVICE,
-    ).to(DEVICE)
-
-    if encoder_checkpoint:
-        enc_ckpt = torch.load(encoder_checkpoint, map_location=device)
-        if "trainable_state_dict" in enc_ckpt:
-            # Load only encoder/mixer keys, skip head keys
-            enc_state = enc_ckpt["trainable_state_dict"]
-            encoder_keys = {
-                k: v for k, v in enc_state.items()
-                if "decision_head" not in k and "assistant_head" not in k
-            }
-            if encoder_keys:
-                missing, unexpected = model.load_state_dict(encoder_keys, strict=False)
-                print(f"  Loaded {len(encoder_keys)} encoder/mixer params from {encoder_checkpoint}")
-        print(f"  Loaded encoder: {encoder_checkpoint}")
-
-    if "trainable_state_dict" in ckpt:
-        # Load only the keys that exist in the current model (skip mismatched head weights)
-        head_state = ckpt["trainable_state_dict"]
-        current_state = model.state_dict()
-        compatible = {
-            k: v for k, v in head_state.items()
-            if k in current_state and v.shape == current_state[k].shape
-        }
-        skipped = len(head_state) - len(compatible)
-        if compatible:
-            missing, unexpected = model.load_state_dict(compatible, strict=False)
-            print(f"  Loaded {len(compatible)}/{len(head_state)} head params (skipped {skipped} mismatched)")
-        if skipped > 0:
-            print(f"  WARNING: {skipped} head keys had shape mismatch — likely old architecture. Heads are at random init.")
-    elif "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    else:
-        model.load_state_dict(ckpt, strict=False)
+        embed_dim=256,
+        chunk_size=5,
+        use_text=True,
+        device=DEVICE,
+        mixer_dim=enc_cfg.get("mixer_dim", 512),
+        num_mixer_blocks=enc_cfg.get("num_mixer_blocks", 2),
+    ).to(device)
+    if "trainable_state_dict" in enc_ckpt:
+        model.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
+    model.freeze_backbone()
+    model.freeze_all_encoders()
     model.eval()
+    print(f"  Loaded encoder+mixer (mixer_dim={enc_cfg.get('mixer_dim', 512)})")
+
+    # ── Load world model ──
+    world_model = None
+    if world_model_checkpoint:
+        wm_ckpt = torch.load(world_model_checkpoint, map_location=device, weights_only=False)
+        wm_cfg = wm_ckpt.get("config", {})
+        wm_arch = wm_cfg.get("arch", "mlp")
+        wm_kwargs = {}
+        if wm_arch == "mlp":
+            first_w = next(iter(wm_ckpt.get("world_model_state", {}).values()), None)
+            if first_w is not None and first_w.shape[1] == 774:
+                wm_kwargs["window_size"] = 0
+            else:
+                wm_kwargs["window_size"] = wm_cfg.get("window_size", 5)
+            wm_kwargs.update({
+                "hidden_dim": wm_cfg.get("mlp_hidden", 512),
+                "num_layers": wm_cfg.get("mlp_layers", 3),
+            })
+        elif wm_arch == "rnn":
+            max_l = 0
+            for k in wm_ckpt.get("world_model_state", {}).keys():
+                if k.startswith("gru.weight_ih_l"):
+                    try:
+                        l = int(k.split("_l")[-1])
+                        max_l = max(max_l, l + 1)
+                    except ValueError:
+                        pass
+            wm_kwargs = {
+                "hidden_dim": wm_cfg.get("rnn_hidden_dim", wm_cfg.get("mlp_hidden", 256)),
+                "num_rnn_layers": max_l if max_l > 0 else wm_cfg.get("num_rnn_layers", 1),
+                "window_size": wm_cfg.get("window_size", 5),
+            }
+        elif wm_arch == "transformer":
+            wm_kwargs = {
+                "d_model": wm_cfg.get("transformer_d_model", 384),
+                "nhead": wm_cfg.get("transformer_nhead", 4),
+                "num_layers": wm_cfg.get("transformer_layers", 2),
+                "dim_feedforward": wm_cfg.get("transformer_dim_ff", 1024),
+                "dropout": wm_cfg.get("transformer_dropout", 0.0),
+                "window_size": wm_cfg.get("window_size", 5),
+            }
+        world_model = create_world_model(
+            arch=wm_arch,
+            embed_dim=wm_cfg.get("embed_dim", 256),
+            action_dim=wm_cfg.get("action_dim", 6),
+            **wm_kwargs,
+        ).to(device)
+        world_model.load_state_dict(wm_ckpt["world_model_state"])
+        world_model.eval()
+        print(f"  Loaded world model ({wm_arch})")
+
+    # ── Load value head ──
+    value_head = None
+    if value_head_checkpoint:
+        val_ckpt = torch.load(value_head_checkpoint, map_location=device, weights_only=False)
+        val_cfg = val_ckpt.get("config", {})
+        value_head = create_value_head(
+            embed_dim=val_cfg.get("embed_dim", 256),
+            hidden_dim=val_cfg.get("hidden_dim", 256),
+            num_layers=val_cfg.get("num_layers", 3),
+        ).to(device)
+        value_head.load_state_dict(val_ckpt["value_head_state"])
+        value_head.eval()
+        print(f"  Loaded value head")
+
+    # ── Load heads (Assistant) ──
+    heads_model = None
+    if heads_checkpoint:
+        heads_ckpt = torch.load(heads_checkpoint, map_location=device, weights_only=False)
+        heads_model = ALIGNModel(
+            embed_dim=256,
+            chunk_size=heads_ckpt.get("config", {}).get("chunk_size", 5),
+            use_text=True,
+            device=DEVICE,
+            mixer_dim=enc_cfg.get("mixer_dim", 512),
+            num_mixer_blocks=enc_cfg.get("num_mixer_blocks", 2),
+        ).to(device)
+        if "trainable_state_dict" in heads_ckpt:
+            heads_model.load_trainable_state_dict(heads_ckpt["trainable_state_dict"])
+        elif "model_state_dict" in heads_ckpt:
+            heads_model.load_state_dict(heads_ckpt["model_state_dict"], strict=False)
+        heads_model.freeze_backbone()
+        heads_model.freeze_all_encoders()
+        heads_model.eval()
+        print(f"  Loaded heads (assistant)")
+
+    # ── Load GAIL (diagnostic only, not used in pipeline) ──
+    if gail_checkpoint:
+        print(f"  GAIL checkpoint provided (diagnostic, not loaded)")
 
     print(f"\n{'='*60}")
     print(f"Suite: {suite_name} ({len(task_list)} tasks)")
-    print(f"  Noise std: {noise_std}")
-    if fixed_alpha is not None:
-        print(f"  Fixed α: {fixed_alpha} (bypassed Decision head)")
     print(f"{'='*60}")
 
     all_results = []
@@ -685,21 +622,14 @@ def evaluate_suite(
             print(f"  [{task_idx+1}/{len(task_list)}] {task_name[:100]}  ep {ep+1}/{n_episodes}")
 
             try:
-                # Find matching episode in HDF5
-                # Use best-match (most word overlap) — not first-match.
-                # First-match can return an unrelated task if its first 40
-                # chars happen to overlap with the requested task.
                 expert = find_episode_for_task(data_path, task_name, use_first=False)
                 if expert is None:
                     print(f"    WARNING: No matching episode found in HDF5")
                     continue
-                # Debug: print which episode was matched
                 print(f"    [match] {expert['text'][:60]} (frames: {expert['frames'].shape[0]})")
 
-                # Precompute text embedding
                 z_text = model.encode_text([task_name])
 
-                # Create simulation environment
                 bddl_path = get_bddl_path(suite_name, task_name)
                 if not os.path.exists(bddl_path):
                     print(f"    WARNING: BDDL not found: {bddl_path}")
@@ -716,30 +646,33 @@ def evaluate_suite(
                     initialization_noise=None,
                 )
 
-                # Re-init CUDA after MuJoCo/EGL grabs GPU context
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
-                    # Force cuDNN re-initialization with a small conv
                     _ = torch.nn.functional.conv2d(
                         torch.zeros(1, 3, 10, 10, device="cuda"),
                         torch.zeros(3, 3, 3, 3, device="cuda"),
                     )
 
                 result = run_episode_in_sim(
-                    env=env, model=model, device=DEVICE,
+                    env=env, model=model, device=device,
+                    world_model=world_model,
+                    value_head=value_head,
+                    heads_model=heads_model,
                     expert_frames=expert["frames"],
                     expert_poses=expert["poses"],
                     expert_actions=expert["actions"],
                     task_description=task_name,
                     z_text=z_text,
                     noise_std=noise_std,
-                    chunk_size=chunk_size,
+                    traj_window=5,
                     max_steps=max_steps,
                     record_video=record_video,
                     no_flip_vertical=no_flip_vertical,
                     no_flip_horizontal=no_flip_horizontal,
                     fixed_alpha=fixed_alpha,
+                    tau=tau,
+                    use_alpha_from_v=use_alpha_from_v,
                 )
 
                 result["task_name"] = task_name
@@ -753,14 +686,20 @@ def evaluate_suite(
                       f"no_align={result['mean_error_no_align']:.4f}  align={result['mean_error_with_align']:.4f}  "
                       f"{result['improvement_pct']:+.1f}%")
 
-                # Save video
-                if record_video and result.get("frames_buffer"):
+                if record_video and result.get("frames_no_align") and result.get("frames_with_align"):
                     try:
                         import imageio
                         video_path = out_dir / f"task_{task_idx:03d}_ep{ep}.mp4"
                         writer = imageio.get_writer(str(video_path), fps=20, codec="libx264", quality=8)
-                        for f in result["frames_buffer"]:
-                            writer.append_data(f)
+                        n_frames = min(len(result["frames_no_align"]),
+                                       len(result["frames_with_align"]),
+                                       len(expert["frames"]))
+                        for i in range(n_frames):
+                            gt = expert["frames"][i] if i < len(expert["frames"]) else result["frames_with_align"][i]
+                            no_align = result["frames_no_align"][i]
+                            with_align = result["frames_with_align"][i]
+                            panel = np.concatenate([gt, no_align, with_align], axis=1)
+                            writer.append_data(panel)
                         writer.close()
                         print(f"    Video: {video_path}")
                     except ImportError:
@@ -774,7 +713,6 @@ def evaluate_suite(
                 traceback.print_exc()
                 continue
 
-    # Summary
     if all_results:
         avg_alpha = float(np.mean([r["mean_alpha"] for r in all_results]))
         avg_delta = float(np.mean([r["mean_delta_norm"] for r in all_results]))
@@ -788,12 +726,17 @@ def evaluate_suite(
         print(f"  Avg Δ:              {avg_delta:.4f}")
         print(f"  No ALIGN error:     {avg_err_no_align:.4f}")
         print(f"  With ALIGN error:   {avg_err_with_align:.4f}")
-        print(f"  Avg improvement:    {avg_improvement:.4f} ({avg_improvement/avg_err_no_align*100:+.1f}%)")
-        print(f"  Episodes improved:  {n_improved}/{len(all_results)} ({n_improved/len(all_results):.0%})")
+        print(f"  Avg improvement:    {avg_improvement:.4f} "
+              f"({(avg_improvement/avg_err_no_align*100) if avg_err_no_align > 0 else 0:+.1f}%)")
+        print(f"  Episodes improved:  {n_improved}/{len(all_results)} "
+              f"({n_improved/len(all_results):.0%})")
 
         results = {
             "suite": suite_name,
             "noise_std": noise_std,
+            "tau": tau,
+            "use_alpha_from_v": use_alpha_from_v,
+            "fixed_alpha": fixed_alpha,
             "n_episodes": len(all_results),
             "avg_alpha": avg_alpha,
             "avg_delta": avg_delta,
@@ -819,29 +762,42 @@ def evaluate_suite(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate ALIGN in LIBERO sim with expert trajectories from dataset"
+        description="Evaluate ALIGN in LIBERO sim with the new alpha pipeline (world model + V)"
     )
     parser.add_argument("--data", required=True, help="Path to HDF5 dataset")
-    parser.add_argument("--checkpoint", required=True, help="Heads checkpoint (.pt)")
-    parser.add_argument("--encoder-checkpoint", default=None, help="Phase 1 backbone")
+    parser.add_argument("--encoder-checkpoint", required=True,
+                        help="Phase 1b encoder+mixer checkpoint")
+    parser.add_argument("--world-model-checkpoint", default=None,
+                        help="World model checkpoint (.pt) — required for α from V")
+    parser.add_argument("--value-head-checkpoint", default=None,
+                        help="Value head checkpoint (.pt) — required for α from V")
+    parser.add_argument("--heads-checkpoint", default=None,
+                        help="Heads checkpoint (.pt) with assistant_head — "
+                             "optional, falls back to zero correction if omitted")
+    parser.add_argument("--gail-checkpoint", default=None,
+                        help="GAIL checkpoint (.pt) — diagnostic only")
     parser.add_argument("--output-dir", default="./eval/libero_traj_results")
     parser.add_argument("--device", default=None)
     parser.add_argument("--suite", default=None, choices=list(LIBERO_TASK_MAP.keys()),
                         help="Run only one suite (default: all)")
-    parser.add_argument("--n-episodes", type=int, default=3, help="Episodes per task")
+    parser.add_argument("--n-episodes", type=int, default=3)
     parser.add_argument("--noise-std", type=float, default=0.02,
                         help="Synthetic noise std (0 = clean replay)")
     parser.add_argument("--max-steps", type=int, default=500)
     parser.add_argument("--record-video", action="store_true")
     parser.add_argument("--fixed-alpha", type=float, default=None,
-                        help="Override α to a fixed value (e.g. 0.5, 1.0). "
-                             "Omit to use Decision head's prediction.")
+                        help="Override α to a fixed value (e.g. 0.5, 1.0)")
+    parser.add_argument("--tau", type=float, default=1.0,
+                        help="Temperature for sigmoid alpha (default 1.0)")
+    parser.add_argument("--no-alpha-from-v", dest="use_alpha_from_v",
+                        action="store_false", default=True,
+                        help="Disable alpha-from-V (uses 0.5 default)")
     parser.add_argument("--render-size", type=int, default=256,
-                        help="Sim camera render resolution (default 256, matches dataset)")
+                        help="Sim camera render resolution")
     parser.add_argument("--no-flip-vertical", action="store_true",
-                        help="Skip vertical flip on sim frames (default: flip applied)")
+                        help="Skip vertical flip on sim frames")
     parser.add_argument("--no-flip-horizontal", action="store_true",
-                        help="Skip horizontal flip on sim frames (default: flip applied)")
+                        help="Skip horizontal flip on sim frames")
     args = parser.parse_args()
 
     suites_to_run = [args.suite] if args.suite else list(LIBERO_TASK_MAP.keys())
@@ -856,8 +812,11 @@ def main():
             suite_name=suite_name,
             task_list=SUITE_TASK_LISTS[suite_name],
             data_path=args.data,
-            checkpoint_path=args.checkpoint,
             encoder_checkpoint=args.encoder_checkpoint,
+            world_model_checkpoint=args.world_model_checkpoint,
+            value_head_checkpoint=args.value_head_checkpoint,
+            heads_checkpoint=args.heads_checkpoint,
+            gail_checkpoint=args.gail_checkpoint,
             output_dir=args.output_dir,
             device=args.device,
             n_episodes=args.n_episodes,
@@ -868,6 +827,8 @@ def main():
             no_flip_vertical=args.no_flip_vertical,
             no_flip_horizontal=args.no_flip_horizontal,
             fixed_alpha=args.fixed_alpha,
+            tau=args.tau,
+            use_alpha_from_v=args.use_alpha_from_v,
         )
         if result:
             all_summaries[suite_name] = result
