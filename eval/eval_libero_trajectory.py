@@ -390,27 +390,28 @@ def run_episode_in_sim(
                 diff = (v_m - v_h) / tau
                 alpha_val = float(torch.sigmoid(diff).item())
 
-            # ── Assistant head: corrective delta ──
-            corrective = np.zeros(6, dtype=np.float32)
+            # ── Assistant head: K pose-relative goals ──
+            # Output is now (B, K, 6) where goal[k] = desired_pose[t+k+1] - noisy_current_pose.
+            # Use goal[0] as the model's proposed action (a_model).
+            a_model = np.zeros(6, dtype=np.float32)  # default fallback
             if heads_model is not None and hasattr(heads_model, 'assistant_head'):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                    chunk = heads_model.assistant_head(
+                    goal_5steps = heads_model.assistant_head(
                         z_v, z_t, z_text_local, current_action_t
                     )
-                chunk_np = chunk.squeeze(0).float().cpu().numpy()
-                if chunk_cache is not None:
-                    corrective = 0.7 * chunk_np[0] + 0.3 * chunk_cache[-1]
-                else:
-                    corrective = chunk_np[0]
-                chunk_cache = chunk_np
+                goal_np = goal_5steps.squeeze(0).float().cpu().numpy()
+                a_model = goal_np[0]
 
         alpha_vals.append(alpha_val)
-        delta_norms.append(float(np.linalg.norm(corrective)))
-        delta_vectors.append(corrective[:3].copy())
+        delta_norms.append(float(np.linalg.norm(a_model)))
+        delta_vectors.append(a_model[:3].copy())
 
-        # Apply the dataset action plus the ALIGN correction
-        action = base_action.copy()
-        action[:6] = base_action[:6] + alpha_val * corrective[:6]
+        # Apply α-weighted blend of human action and model's proposed action.
+        # new: action = (1 - α) * a_human + α * a_model
+        # (vs. the old formulation: action = a_human + α * corrective)
+        action = (1.0 - alpha_val) * base_action.copy() + alpha_val * np.concatenate(
+            [a_model, np.zeros(1, dtype=np.float32)]  # pad to 7-dim (with gripper)
+        )
         if action[6] <= 0.5:
             action[6] = 1.0
         else:

@@ -326,7 +326,7 @@ class FuturePredictionHeadTransformer(nn.Module):
 # ================================================================
 
 class AssistantHead(nn.Module):
-    """MLP predicting chunk of K corrective Δposes from shared embeddings.
+    """MLP predicting chunk of K pose-relative GOALS from shared embeddings.
 
     Input layout: cat([z_v, z_t, z_text, current_action], dim=-1)
       - z_v: vision embedding (256D)
@@ -336,11 +336,18 @@ class AssistantHead(nn.Module):
         (6D OSC_POSE). At inference, this comes directly from the VR
         controller; the current EEF pose is already encoded in z_t.
 
-    Output: (B, K, 6) — K corrective deltas to add to the human's actions.
+    Output: (B, K, 6) — K POSE-RELATIVE GOALS (delta from current noisy pose).
+      goal[k] = (where the EEF should be at step k+1) - (current noisy pose)
+
+    This is a planning-oriented quantity (vs. the older recovery-correction
+    formulation, which only existed when there was error). Combined with α at
+    inference time via:
+        a_model = goal[0]                                   # model's proposed action
+        final_action = (1 - α) * current_action + α * a_model  # α-weighted blend
 
     Args:
         latent_dim: per-modality embedding dim (default 256).
-        chunk_size: number of corrective deltas to predict.
+        chunk_size: number of goals to predict.
         action_dim: 6 (OSC_POSE).
         hidden_dim: hidden layer width (default 256).
         num_hidden_layers: number of hidden layers (default 2 → 256→128).

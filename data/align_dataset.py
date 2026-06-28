@@ -665,17 +665,22 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         pos_error = np.linalg.norm(current_clean_pose[:3] - noisy_pose[:3])
         need = min(pos_error / D_MAX, 1.0)
 
-        # --- Option B: Recovery + Incremental Expert Trajectory Targets ---
-        # Step 0: Immediate recovery from deviation toward expert path
-        # Steps 1..N-1: Smooth continuation along expert motion increments
+        # --- Option B: Pose-Relative Goal Targets ---
+        # The Assistant head now outputs K=chunk_size GOALS (relative to
+        # current noisy pose) rather than recovery corrections.
+        #
+        # delta[k] = poses_clean[t + k + 1] - noisy_pose   (relative goal at step k+1)
+        #
+        # This is "where should I be at t+k+1?" (relative to current).
+        # It exists even at zero error — the target is the goal itself.
+        # Combined with alpha via: action = (1-α)·a_human + α·goal[0]
+        # (α is the trust weight between human's and model's actions.)
         delta = np.zeros((chunk_size, 6), dtype=np.float32)
 
-        if t + 1 < N:
-            delta[0] = poses_clean[t + 1, :6] - noisy_pose[:6]  # Recovery correction
-
-        for i in range(2, chunk_size + 1):
-            if t + i < N:
-                delta[i - 1] = poses_clean[t + i, :6] - poses_clean[t + i - 1, :6]  # Expert increment
+        for k in range(chunk_size):
+            if t + k + 1 < N:
+                # Relative goal: clean_pose[t+k+1] relative to current noisy pose
+                delta[k] = poses_clean[t + k + 1, :6] - noisy_pose[:6]
 
         # --- Future trajectory window (K poses after current timestep) ---
         # Used as targets for the future-prediction (Decision) head.
