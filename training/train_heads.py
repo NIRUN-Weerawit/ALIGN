@@ -442,8 +442,8 @@ def train_heads_hdf5(
                 z_text = mixed["z_text"].float()
 
             # Assistant loss only (MSE against dynamic delta target)
-            current_action = torch.from_numpy(batch["current_action"]).float().to(device)
-            delta_pred = model.assistant_head(z_v, z_t, z_text, current_action)
+            # current_action = torch.from_numpy(batch["current_action"]).float().to(device)
+            delta_pred = model.assistant_head(z_v, z_t, z_text)
             loss_mse = F.mse_loss(delta_pred, delta_t)
 
             opt_b.zero_grad()

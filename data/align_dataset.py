@@ -680,7 +680,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         for k in range(chunk_size):
             if t + k + 1 < N:
                 # Relative goal: clean_pose[t+k+1] relative to current noisy pose
-                delta[k] = poses_clean[t + k + 1, :6] - noisy_pose[:6]
+                delta[k] = poses_clean[t + k + 1, :6] - poses_clean[t:6]
 
         # --- Future trajectory window (K poses after current timestep) ---
         # Used as targets for the future-prediction (Decision) head.

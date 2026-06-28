@@ -332,9 +332,6 @@ class AssistantHead(nn.Module):
       - z_v: vision embedding (256D)
       - z_t: pose trajectory embedding (256D) — past K poses
       - z_text: text embedding (256D)
-      - current_action: the human teleoperator's current delta-pose command
-        (6D OSC_POSE). At inference, this comes directly from the VR
-        controller; the current EEF pose is already encoded in z_t.
 
     Output: (B, K, 6) — K POSE-RELATIVE GOALS (delta from current noisy pose).
       goal[k] = (where the EEF should be at step k+1) - (current noisy pose)
@@ -357,7 +354,7 @@ class AssistantHead(nn.Module):
     def __init__(self, latent_dim: int = 256, chunk_size: int = 5, action_dim: int = 6,
                  hidden_dim: int = 256, num_hidden_layers: int = 2, dropout: float = 0.0):
         super().__init__()
-        input_dim = latent_dim * 3 + action_dim
+        input_dim = latent_dim * 3
         self.chunk_size = chunk_size
         self.action_dim = action_dim
         # Build a configurable MLP: input → hidden → hidden → ... → output
@@ -374,9 +371,8 @@ class AssistantHead(nn.Module):
         z_v: torch.Tensor,
         z_t: torch.Tensor,
         z_text: torch.Tensor,
-        current_action: torch.Tensor,
     ) -> torch.Tensor:
-        x = torch.cat([z_v, z_t, z_text, current_action], dim=-1)
+        x = torch.cat([z_v, z_t, z_text], dim=-1)
         out = self.mlp(x)
         return out.reshape(-1, self.chunk_size, self.action_dim)
 
