@@ -52,6 +52,10 @@ import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import os
 
 # MuJoCo EGL corrupts PyTorch's cuDNN state. Re-init CUDA after env creation.
 os.environ.setdefault("MUJOCO_GPU_RENDERING", "0")
@@ -120,6 +124,62 @@ def axisangle_to_quat(axisangle: np.ndarray) -> np.ndarray:
     return np.array([1, 0, 0, 0])
 
 
+def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions: np.ndarray, out_dir: Optional[str] = None, task_name: Optional[str] = None):
+    """Log and save plots comparing simulated EEF positions vs expert positions.
+
+    - sim_positions: (T,3) array of simulated end-effector positions (x,y,z)
+    - expert_positions: (N,>=3) array of expert poses (use first 3 dims for position)
+    """
+    if out_dir is None:
+        out_dir = os.getcwd()
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Ensure numpy arrays
+    sim_positions = np.asarray(sim_positions)
+    expert_positions = np.asarray(expert_positions)
+
+    T = len(sim_positions)
+    if T == 0:
+        print(f"No simulated positions to plot for episode {episode}")
+        return None
+
+    exp_pos = expert_positions[:T, :3] if expert_positions.shape[0] >= T else np.vstack([expert_positions[:, :3], np.zeros((T - expert_positions.shape[0], 3))])
+
+    times = np.arange(T)
+
+    fig, axes = plt.subplots(6, 1, figsize=(8, 10), sharex=True)
+    labels = ["x", "y", "z"]
+    for i in range(3):
+        axes[i].plot(times, sim_positions[:, i], label="sim", color="C0")
+        axes[i+3].plot(times, exp_pos[:, i], label="expert", color="C1", linestyle="--")
+        axes[i].set_ylabel(labels[i])
+        axes[i+3].set_ylabel(labels[i])
+        axes[i].legend()
+        axes[i+3].legend()
+
+    # Error norm
+    # err = np.linalg.norm(sim_positions - exp_pos, axis=1)
+    # axes[7].plot(times, err, label="error_norm", color="C3")
+    # axes[7].set_ylabel("error (m)")
+    # axes[7].set_xlabel("timestep")
+
+    title = f"Episode {episode}"
+    if task_name:
+        title += f" - {task_name}"
+    fig.suptitle(title)
+
+    fname = f"episode_{episode:03d}"
+    if task_name:
+        safe_task = task_name.replace(" ", "_")[:80]
+        fname += f"_{safe_task}"
+    fname += ".png"
+    out_path = os.path.join(out_dir, fname)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fig.savefig(out_path)
+    plt.close(fig)
+    print(f"Saved episode pose plot: {out_path}")
+
+
 # ================================================================
 # Load expert trajectory from HDF5
 # ================================================================
@@ -165,20 +225,27 @@ def find_episode_for_task(h5_path: str, task_name: str,
 def _extract_episode(group, text: str) -> Optional[dict]:
     """Extract frames, poses, actions from a HDF5 episode group."""
     frames_group = group.get("frames", None)
+    print(f"frames_group: {frames_group}")
     if frames_group is None:
         return None
     cam_name = None
-    for c in ["wrist_image", "image"]:
+    for c in ["agentview_image","agentview", "wrist_image", "image"]:
         if c in frames_group:
             cam_name = c
+            print("found camera:", cam_name)
             break
     if cam_name is None:
         cam_name = list(frames_group.keys())[0]
     frames = frames_group[cam_name][:]
-    if "actions" in group:
-        poses = group["actions"][:, :6]
-    else:
+    # CRITICAL: use 'poses' (or 'noisy_poses') for absolute EEF positions in world coords.
+    # Do NOT use 'actions' — those are OSC_POSE deltas normalized by LeRobot to [-0.9375, 0.9375],
+    # which is a different coordinate system from MuJoCo's world frame.
+    if "poses" in group:
+        poses = group["poses"][:]
+    elif "noisy_poses" in group:
         poses = group["noisy_poses"][:]
+    else:
+        raise KeyError(f"Episode {group.name} has neither 'poses' nor 'noisy_poses'")
     return {
         "frames": frames,
         "poses": poses,
@@ -275,6 +342,8 @@ def run_episode_in_sim(
     fixed_alpha: Optional[float] = None,
     tau: float = 1.0,
     use_alpha_from_v: bool = True,
+    episode: int = 0,
+    output_dir: Optional[str] = None,
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
@@ -307,6 +376,12 @@ def run_episode_in_sim(
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(env)
         action = noisy_actions[step].copy()
+        sim_pose_before = np.concatenate([
+            obs.get("robot0_eef_pos", np.zeros(3)),
+            obs.get("robot0_eef_quat", np.zeros(4)) if "robot0_eef_quat" in obs else np.zeros(4),
+        ])
+        sim_pose_before[3:6] = quat_to_axisangle(sim_pose_before[3:7])
+        # print(f"Step {step}: sim_pose={sim_pose_before[:6]}     clean_pose={expert_poses[step]}")
         if len(action) >= 7:
             if action[6] <= 0.5:
                 action[6] = 1.0
@@ -327,6 +402,9 @@ def run_episode_in_sim(
         if record_video:
             frames_no_align.append(frame_post.copy())
 
+    # Collect simulated positions during WITH-ALIGN run for plotting
+    sim_positions = []
+
     # ── Run "With ALIGN" trajectory ──
     obs = env.reset()
     step = 0
@@ -345,6 +423,8 @@ def run_episode_in_sim(
             obs.get("robot0_eef_pos", np.zeros(3)),
             obs.get("robot0_eef_quat", np.zeros(4))[:3] if "robot0_eef_quat" in obs else np.zeros(3),
         ])
+        # store position (x,y,z) for plotting later
+        sim_positions.append(sim_pose_before[:3].copy())
         frame = _get_sim_frame(env)
         clean_pose = expert_poses[step]
         base_action = noisy_actions[step]
@@ -360,7 +440,7 @@ def run_episode_in_sim(
         with torch.no_grad():
             frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)
             traj_t = torch.from_numpy(np.stack(pose_buffer)).unsqueeze(0).float().to(device)
-
+            print(f"Step {step}: sim_pose={sim_pose_before[:3]}     clean_pose={clean_pose[:3]}")
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frame_t, traj_t, [task_description])
             z_v = mixed["z_v"].float()
@@ -397,10 +477,9 @@ def run_episode_in_sim(
             if heads_model is not None and hasattr(heads_model, 'assistant_head'):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     goal_5steps = heads_model.assistant_head(
-                        z_v, z_t, z_text_local, current_action_t
-                    )
+                        z_v, z_t, z_text_local)
                 goal_np = goal_5steps.squeeze(0).float().cpu().numpy()
-                a_model = goal_np[0]
+                a_model = goal_np[0] * 100
 
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(a_model)))
@@ -416,7 +495,7 @@ def run_episode_in_sim(
             action[6] = 1.0
         else:
             action[6] = -1.0
-
+        print(f"base_action={base_action[:6]}, action={action[:6]}")
         obs, reward, done, info = env.step(action)
         step += 1
 
@@ -442,6 +521,13 @@ def run_episode_in_sim(
     avg_err_with_align = float(np.mean(error_with_align)) if error_with_align else 0.0
     improvement = avg_err_no_align - avg_err_with_align
     improvement_pct = (improvement / avg_err_no_align * 100) if avg_err_no_align > 0 else 0.0
+
+    # Save per-episode pose plot (simulated vs expert)
+    try:
+        sim_arr = np.vstack(sim_positions) if len(sim_positions) > 0 else np.zeros((0, 3), dtype=np.float32)
+        plot_episode_poses(episode, sim_arr, expert_poses[:n_expert], out_dir=output_dir, task_name=task_description)
+    except Exception as e:
+        print(f"Warning: failed to save episode plot: {e}")
 
     return {
         "success": success,
@@ -674,6 +760,8 @@ def evaluate_suite(
                     fixed_alpha=fixed_alpha,
                     tau=tau,
                     use_alpha_from_v=use_alpha_from_v,
+                    episode=ep,
+                    output_dir=str(out_dir),
                 )
 
                 result["task_name"] = task_name
