@@ -90,7 +90,7 @@ LIBERO_TASK_MAP = {
 SUITE_TASK_LISTS = {}
 
 _benchmark_file = os.path.join(
-    os.path.dirname(os.__import__("libero").__file__),
+    os.path.dirname(__import__("libero").__file__),
     "libero", "benchmark", "libero_suite_task_map.py"
 )
 if os.path.exists(_benchmark_file):
