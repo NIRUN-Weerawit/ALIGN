@@ -172,7 +172,7 @@ def main():
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
 
-                goal_pred = model.assistant_head(z_v, z_t, z_text, current_action)
+                goal_pred = model.assistant_head(z_v, z_t, z_text)
 
             # Compute metrics
             B = goal_pred.shape[0]
