@@ -119,38 +119,45 @@ def compute_displacement(p_before: dict, p_after: dict) -> dict:
     # Position: world frame
     pos_disp = p_after["pos"] - p_before["pos"]
 
-    # Position: local frame (rotate world displacement into EEF frame)
-    # The EEF frame is defined by the quaternion. We need the inverse
-    # rotation that maps world → EEF-local.
-    q = p_after["quat"]  # [w, x, y, z] or [x, y, z, w] depending on convention
-    # Use scipy which expects (x, y, z, w)
-    if q[0] > q[3] if abs(q[0]) < 0.5 else False:
-        # If first element is small, probably (x, y, z, w) order
-        q_xyzw = q
-    else:
-        # Assume (w, x, y, z) order, convert to (x, y, z, w)
-        q_xyzw = np.array([q[1], q[2], q[3], q[0]])
-    rot_world_to_local = Rotation.from_quat(q_xyzw).inv()
+    # Helper: robosuite returns quaternions in (w, x, y, z) order.
+    # scipy.spatial.transform.Rotation uses (x, y, z, w) order.
+    # Always convert (w, x, y, z) → (x, y, z, w) by rotating the elements.
+    def wxyz_to_xyzw(q):
+        q = np.asarray(q, dtype=np.float64)
+        if len(q) != 4:
+            raise ValueError(f"Expected 4-element quaternion, got {q}")
+        return np.array([q[1], q[2], q[3], q[0]])
+
+    # Convert quaternions to scipy (x, y, z, w) format
+    q_before_xyzw = wxyz_to_xyzw(p_before["quat"])
+    q_after_xyzw = wxyz_to_xyzw(p_after["quat"])
+
+    # Double-cover fix: pick the convention with positive w (closest to identity)
+    if q_before_xyzw[3] < 0:
+        q_before_xyzw = -q_before_xyzw
+    if q_after_xyzw[3] < 0:
+        q_after_xyzw = -q_after_xyzw
+
+    # Position: rotate world displacement into EEF-local frame
+    rot_world_to_local = Rotation.from_quat(q_after_xyzw).inv()
     pos_disp_local = rot_world_to_local.apply(pos_disp)
 
-    # Orientation: convert quaternions to axis-angle and compute difference
-    rot_before = Rotation.from_quat(q_xyzw)  # NOTE: this is the AFTER rotation
-    # Better: use both quaternions
-    # Actually let's use scipy's proper difference
-    q_before_xyzw = p_before["quat"]
-    if abs(q_before_xyzw[0]) < 0.5:
-        q_before_xyzw = np.array([q_before_xyzw[1], q_before_xyzw[2], q_before_xyzw[3], q_before_xyzw[0]])
+    # Orientation: relative rotation from before to after
     rot_before = Rotation.from_quat(q_before_xyzw)
-    rot_after = Rotation.from_quat(q_xyzw)
-
-    # Relative rotation: after * before^-1
+    rot_after = Rotation.from_quat(q_after_xyzw)
     rot_relative = rot_after * rot_before.inv()
-    ori_disp = rot_relative.as_rotvec()
+    # Handle double-cover on the relative rotation
+    q_rel = rot_relative.as_quat()
+    if q_rel[3] < 0:
+        q_rel = -q_rel
+    ori_disp = Rotation.from_quat(q_rel).as_rotvec()
 
     return {
         "pos_world": pos_disp,
         "pos_local": pos_disp_local,
         "ori": ori_disp,
+        "q_before_raw": p_before["quat"],
+        "q_after_raw": p_after["quat"],
     }
 
 
