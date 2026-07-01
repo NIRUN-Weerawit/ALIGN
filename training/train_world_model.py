@@ -153,6 +153,7 @@ def train_world_model(
     mixer_dim: int = 512,
     num_mixer_blocks: int = 2,
     use_bf16: bool = True,
+    resume: Optional[str] = None,
     # World model arch + kwargs
     arch: str = "mlp",
     action_dim: int = 6,
@@ -334,6 +335,33 @@ def train_world_model(
     trainable = list(world_model.parameters())
     print(f"  WorldModel ({arch}): {sum(p.numel() for p in trainable):,} trainable params")
 
+    # -- Resume from a previous world model checkpoint ----------
+    # When --resume is set, load the world model weights and continue
+    # training from the next epoch. The encoder+mixer stay frozen.
+    resume_start_epoch = 0
+    if resume:
+        resume_path = Path(resume)
+        if not resume_path.exists():
+            raise FileNotFoundError(f"--resume checkpoint not found: {resume_path}")
+        print(f"\n  Resuming from {resume_path} ...")
+        wm_ckpt = torch.load(str(resume_path), map_location=device, weights_only=False)
+        if "world_model_state" in wm_ckpt:
+            wm_sd = wm_ckpt["world_model_state"]
+        elif "model_state_dict" in wm_ckpt:
+            wm_sd = wm_ckpt["model_state_dict"]
+        else:
+            wm_sd = wm_ckpt  # raw state dict
+        missing, unexpected = world_model.load_state_dict(wm_sd, strict=False)
+        if unexpected:
+            print(f"  Resume: ignored {len(unexpected)} unexpected keys: {unexpected[:3]}...")
+        if missing:
+            print(f"  Resume: {len(missing)} keys not loaded (using init): {missing[:3]}...")
+        # Continue epoch numbering from the resumed checkpoint
+        prev_epoch = wm_ckpt.get("epoch", 0)
+        prev_loss = wm_ckpt.get("loss", float("inf"))
+        resume_start_epoch = prev_epoch
+        print(f"  Resumed at epoch {prev_epoch} (prev loss: {prev_loss:.4f})")
+
     opt = optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
 
     log_path = out_dir / "world_model_log.jsonl"
@@ -369,7 +397,7 @@ def train_world_model(
     best_loss = float("inf")
     t_start = time.time()
 
-    for epoch in range(epochs):
+    for epoch in range(resume_start_epoch, epochs):
         world_model.train()
         epoch_losses: List[float] = []
         epoch_cos_v: List[float] = []
@@ -544,6 +572,11 @@ def main() -> None:
                              "train on the concatenation.")
     parser.add_argument("--pretrained", required=True,
                         help="Phase 1b pretrained checkpoint (encoder + mixer).")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a world_model_best.pt (or world_model_epoch_NNNN.pt) "
+                             "to continue training from. Loads the world model weights only; "
+                             "encoder+mixer are still loaded from --pretrained. Epoch numbering "
+                             "continues from the resumed checkpoint.")
     parser.add_argument("--output-dir", default="./checkpoints/world_model",
                         help="Directory under which "
                              "{dataset_stem}/run_N/ will be created.")
@@ -620,6 +653,7 @@ def main() -> None:
                 mixer_dim=args.mixer_dim,
                 num_mixer_blocks=args.num_mixer_blocks,
                 use_bf16=args.bf16,
+                resume=args.resume,
                 arch=comp_arch,
                 action_dim=args.action_dim,
                 embed_dim=args.embed_dim,
@@ -660,6 +694,7 @@ def main() -> None:
         mixer_dim=args.mixer_dim,
         num_mixer_blocks=args.num_mixer_blocks,
         use_bf16=args.bf16,
+        resume=args.resume,
         arch=args.arch,
         action_dim=args.action_dim,
         embed_dim=args.embed_dim,
