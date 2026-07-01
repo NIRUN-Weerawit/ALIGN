@@ -124,7 +124,7 @@ def axisangle_to_quat(axisangle: np.ndarray) -> np.ndarray:
     return np.array([1, 0, 0, 0])
 
 
-def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions: np.ndarray, out_dir: Optional[str] = None, task_name: Optional[str] = None):
+def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions: np.ndarray, alpha_vals: np.ndarray, out_dir: Optional[str] = None, task_name: Optional[str] = None):
     """Log and save plots comparing simulated EEF positions vs expert positions.
 
     - sim_positions: (T,3) array of simulated end-effector positions (x,y,z)
@@ -137,31 +137,35 @@ def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions
     # Ensure numpy arrays
     sim_positions = np.asarray(sim_positions)
     expert_positions = np.asarray(expert_positions)
+    alpha_vals = np.asarray(alpha_vals)
 
     T = len(sim_positions)
     if T == 0:
         print(f"No simulated positions to plot for episode {episode}")
         return None
-
-    exp_pos = expert_positions[:T, :3] if expert_positions.shape[0] >= T else np.vstack([expert_positions[:, :3], np.zeros((T - expert_positions.shape[0], 3))])
+    assert sim_positions.shape[1] >= 3, f"sim_positions must have at least 3 dims, got {sim_positions.shape}"
+    assert expert_positions.shape[1] >= 6, f"expert_positions must have at least 6 dims, got {expert_positions.shape}"
+    exp_pos = expert_positions[:T, :6] if expert_positions.shape[0] >= T else np.vstack([expert_positions[:, :6], np.zeros((T - expert_positions.shape[0], 6))])
 
     times = np.arange(T)
 
-    fig, axes = plt.subplots(6, 1, figsize=(8, 10), sharex=True)
+    fig, axes = plt.subplots(7, 1, figsize=(8, 10), sharex=True)
     labels = ["x", "y", "z"]
     for i in range(3):
         axes[i].plot(times, sim_positions[:, i], label="sim", color="C0")
-        axes[i+3].plot(times, exp_pos[:, i], label="expert", color="C1", linestyle="--")
+        axes[i].plot(times, exp_pos[:, i], label="expert", color="C1", linestyle="--")
         axes[i].set_ylabel(labels[i])
-        axes[i+3].set_ylabel(labels[i])
         axes[i].legend()
+        axes[i+3].plot(times, sim_positions[:, i+3], label="sim", color="C0")
+        axes[i+3].plot(times, exp_pos[:, i+3], label="expert", color="C1", linestyle="--")
+        axes[i+3].set_ylabel(labels[i])
         axes[i+3].legend()
 
     # Error norm
     # err = np.linalg.norm(sim_positions - exp_pos, axis=1)
-    # axes[7].plot(times, err, label="error_norm", color="C3")
-    # axes[7].set_ylabel("error (m)")
-    # axes[7].set_xlabel("timestep")
+    axes[6].plot(times, alpha_vals, label="alpha_vals", color="C3")
+    axes[6].set_ylabel("alpha")
+    axes[6].set_xlabel("timestep")
 
     title = f"Episode {episode}"
     if task_name:
@@ -372,16 +376,12 @@ def run_episode_in_sim(
     done = False
     frames_no_align = []
     error_no_align_raw = []
+    sim_positions = []
 
     while not done and step < max_steps and step < n_expert:
         frame = _get_sim_frame(env)
         action = noisy_actions[step].copy()
-        sim_pose_before = np.concatenate([
-            obs.get("robot0_eef_pos", np.zeros(3)),
-            obs.get("robot0_eef_quat", np.zeros(4)) if "robot0_eef_quat" in obs else np.zeros(4),
-        ])
-        sim_pose_before[3:6] = quat_to_axisangle(sim_pose_before[3:7])
-        # print(f"Step {step}: sim_pose={sim_pose_before[:6]}     clean_pose={expert_poses[step]}")
+        
         if len(action) >= 7:
             if action[6] <= 0.5:
                 action[6] = 1.0
@@ -401,7 +401,24 @@ def run_episode_in_sim(
         frame_post = _get_sim_frame(env)
         if record_video:
             frames_no_align.append(frame_post.copy())
+            
+        sim_pose_before = np.concatenate([
+            obs.get("robot0_eef_pos", np.zeros(3)),
+            obs.get("robot0_eef_quat", np.zeros(4)) if "robot0_eef_quat" in obs else np.zeros(4),
+        ])
+        sim_pose_before[3:6] = quat_to_axisangle(sim_pose_before[3:7])
+        sim_positions.append(sim_pose_before[:6].copy())
+        delta_eef = sim_positions[0][:3] - sim_positions[-1][:3] if len(sim_positions) > 1 else np.zeros(3)
+        # print(f"Step {step}: action = {action[:6]}     delta_EEF={delta_eef},   ratio={action[:3] / delta_eef if np.linalg.norm(delta_eef) > 1e-6 else np.zeros(3)}")
+        
 
+    # # Save per-episode pose plot (simulated vs expert)
+    # try:
+    #     sim_arr = np.vstack(sim_positions) if len(sim_positions) > 0 else np.zeros((0, 3), dtype=np.float32)
+    #     plot_episode_poses(episode, sim_arr, expert_poses[:n_expert], out_dir=output_dir, task_name=task_description)
+    # except Exception as e:
+    #     print(f"Warning: failed to save episode plot: {e}")
+    
     # Collect simulated positions during WITH-ALIGN run for plotting
     sim_positions = []
 
@@ -417,16 +434,21 @@ def run_episode_in_sim(
     error_no_align = []
     error_with_align = []
     frames_with_align = []
+    stored_actions = []
 
     while not done and step < max_steps and step < n_expert:
+        
         sim_pose_before = np.concatenate([
             obs.get("robot0_eef_pos", np.zeros(3)),
-            obs.get("robot0_eef_quat", np.zeros(4))[:3] if "robot0_eef_quat" in obs else np.zeros(3),
+            obs.get("robot0_eef_quat", np.zeros(4)) if "robot0_eef_quat" in obs else np.zeros(4),
         ])
-        # store position (x,y,z) for plotting later
-        sim_positions.append(sim_pose_before[:3].copy())
+        sim_pose_before[3:6] = quat_to_axisangle(sim_pose_before[3:7])
+        sim_pose_before = np.delete(sim_pose_before, 6)  # remove last quaternion component to get 6-dim pose
+        # sim_positions.append(sim_pose_before[:6].copy())
+        # print(f"Step {step}: sim_pose={sim_pose_before[:6]}     clean_pose={expert_poses[step]}")
+        
         frame = _get_sim_frame(env)
-        clean_pose = expert_poses[step]
+        # clean_pose = expert_poses[step]
         base_action = noisy_actions[step]
 
         # Build pose buffer
@@ -440,7 +462,8 @@ def run_episode_in_sim(
         with torch.no_grad():
             frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)
             traj_t = torch.from_numpy(np.stack(pose_buffer)).unsqueeze(0).float().to(device)
-            print(f"Step {step}: sim_pose={sim_pose_before[:3]}     clean_pose={clean_pose[:3]}")
+            # print(f"shape of frame_t: {frame_t.shape}, shape of traj_t: {traj_t.shape}")
+            # print(f"Step {step}: sim_pose={sim_pose_before[:3]}     clean_pose={clean_pose[:3]}")
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frame_t, traj_t, [task_description])
             z_v = mixed["z_v"].float()
@@ -449,6 +472,19 @@ def run_episode_in_sim(
 
             current_action_t = torch.from_numpy(base_action[:6]).unsqueeze(0).float().to(device)
 
+            # ── Assistant head: K pose-relative goals ──
+            # Output is now (B, K, 6) where goal[k] = desired_pose[t+k+1] - noisy_current_pose.
+            # Use goal[0] as the model's proposed action (a_model).
+            a_model = np.zeros(6, dtype=np.float32)  # default fallback
+            if heads_model is not None and hasattr(heads_model, 'assistant_head'):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    goal_5steps = heads_model.assistant_head(
+                        z_v, z_t, z_text_local)
+                goal_np = goal_5steps.squeeze(0).float().cpu().numpy()
+                a_model = goal_np[0]
+                SCALE = np.array([1/0.0048, 1/0.0058, 1/0.0059, 1/0.048, 1/0.025, 1/0.026])
+                a_model = a_model * SCALE  # scale to match action range
+                
             # ── Compute α via counterfactual imagination ──
             if fixed_alpha is not None:
                 alpha_val = fixed_alpha
@@ -462,28 +498,20 @@ def run_episode_in_sim(
                 # in a multi-action design, a_model could be the assistant's
                 # suggested action instead.
                 z_v_h, z_t_h = world_model(z_v_w, z_t_w, z_text_local, current_action_t)
-                z_v_m, z_t_m = world_model(z_v_w, z_t_w, z_text_local, current_action_t)
+                z_v_m, z_t_m = world_model(z_v_w, z_t_w, z_text_local, torch.from_numpy(a_model).unsqueeze(0).float().to(device))
 
                 v_h = value_head(z_v_h, z_t_h, z_text_local)
                 v_m = value_head(z_v_m, z_t_m, z_text_local)
 
                 diff = (v_m - v_h) / tau
                 alpha_val = float(torch.sigmoid(diff).item())
+                print(f"alpha_eval = {alpha_val}")
 
-            # ── Assistant head: K pose-relative goals ──
-            # Output is now (B, K, 6) where goal[k] = desired_pose[t+k+1] - noisy_current_pose.
-            # Use goal[0] as the model's proposed action (a_model).
-            a_model = np.zeros(6, dtype=np.float32)  # default fallback
-            if heads_model is not None and hasattr(heads_model, 'assistant_head'):
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                    goal_5steps = heads_model.assistant_head(
-                        z_v, z_t, z_text_local)
-                goal_np = goal_5steps.squeeze(0).float().cpu().numpy()
-                a_model = goal_np[0] * 100
 
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(a_model)))
         delta_vectors.append(a_model[:3].copy())
+        stored_actions.append(a_model.copy())
 
         # Apply α-weighted blend of human action and model's proposed action.
         # new: action = (1 - α) * a_human + α * a_model
@@ -491,11 +519,16 @@ def run_episode_in_sim(
         action = (1.0 - alpha_val) * base_action.copy() + alpha_val * np.concatenate(
             [a_model, np.zeros(1, dtype=np.float32)]  # pad to 7-dim (with gripper)
         )
+        action[6] = base_action[6]  # keep gripper action unchanged
+        # action = alpha_val * np.concatenate([a_model, np.zeros(1, dtype=np.float32)])
+        # action[6] = -1.0
+        '''
         if action[6] <= 0.5:
             action[6] = 1.0
         else:
             action[6] = -1.0
-        print(f"base_action={base_action[:6]}, action={action[:6]}")
+        '''   
+        # print(f"base_action={base_action[:6]}, action={action[:6]}")
         obs, reward, done, info = env.step(action)
         step += 1
 
@@ -511,6 +544,13 @@ def run_episode_in_sim(
         if record_video:
             frames_with_align.append(frame_post.copy())
 
+    # Save per-episode pose plot (simulated vs expert)
+    try:
+        action_arr = np.vstack(stored_actions) if len(stored_actions) > 0 else np.zeros((0, 6), dtype=np.float32)
+        plot_episode_poses(episode, action_arr, noisy_actions[:n_expert], np.vstack(alpha_vals), out_dir=output_dir, task_name=task_description)
+    except Exception as e:
+        print(f"Warning: failed to save episode plot: {e}")
+
     success = False
     if 'info' in locals() and isinstance(info, dict):
         success = bool(info.get("success", False))
@@ -522,12 +562,22 @@ def run_episode_in_sim(
     improvement = avg_err_no_align - avg_err_with_align
     improvement_pct = (improvement / avg_err_no_align * 100) if avg_err_no_align > 0 else 0.0
 
-    # Save per-episode pose plot (simulated vs expert)
-    try:
-        sim_arr = np.vstack(sim_positions) if len(sim_positions) > 0 else np.zeros((0, 3), dtype=np.float32)
-        plot_episode_poses(episode, sim_arr, expert_poses[:n_expert], out_dir=output_dir, task_name=task_description)
-    except Exception as e:
-        print(f"Warning: failed to save episode plot: {e}")
+    # Linear-motion action stats (XYZ components of the controller action)
+    action_arr = np.vstack(stored_actions) if len(stored_actions) > 0 else np.zeros((0, 6), dtype=np.float32)
+    if action_arr.size > 0:
+        action_xyz = action_arr[:, :3]
+        avg_action_xyz = action_xyz.mean(axis=0)
+        mean_action_norm = np.linalg.norm(action_xyz, axis=1).mean()
+        max_action_norm = np.linalg.norm(action_xyz, axis=1).max() if len(action_xyz) > 0 else 0.0
+    else:
+        avg_action_xyz = np.zeros(3, dtype=np.float32)
+        mean_action_norm = 0.0
+        max_action_norm = 0.0
+
+    print(
+        f"    action_stats: avg_xyz={avg_action_xyz.tolist()} "
+        f"mean_norm={mean_action_norm:.4f} max_norm={max_action_norm:.4f}"
+    )
 
     return {
         "success": success,
@@ -543,6 +593,9 @@ def run_episode_in_sim(
         "alpha_vals": alpha_vals,
         "delta_norms": delta_norms,
         "delta_vectors": delta_vectors,
+        "avg_action_xyz": avg_action_xyz.tolist(),
+        "mean_action_norm": mean_action_norm,
+        "max_action_norm": max_action_norm,
     }
 
 
@@ -773,7 +826,8 @@ def evaluate_suite(
                 print(f"    {status}  α={result['mean_alpha']:.3f}  "
                       f"Δ={result['mean_delta_norm']:.4f}  "
                       f"no_align={result['mean_error_no_align']:.4f}  align={result['mean_error_with_align']:.4f}  "
-                      f"{result['improvement_pct']:+.1f}%")
+                      f"{result['improvement_pct']:+.1f}%  "
+                      f"avg_xyz={result['avg_action_xyz']}  mean_norm={result['mean_action_norm']:.4f}")
 
                 if record_video and result.get("frames_no_align") and result.get("frames_with_align"):
                     try:
@@ -818,8 +872,11 @@ def evaluate_suite(
         print(f"  Avg improvement:    {avg_improvement:.4f} "
               f"({(avg_improvement/avg_err_no_align*100) if avg_err_no_align > 0 else 0:+.1f}%)")
         print(f"  Episodes improved:  {n_improved}/{len(all_results)} "
-              f"({n_improved/len(all_results):.0%})")
-
+              f"({n_improved/len(all_results):.0%})")        
+        avg_action_xyz_all = np.mean([np.asarray(r["avg_action_xyz"], dtype=np.float32) for r in all_results], axis=0) if all_results else np.zeros(3)
+        avg_mean_norm_all = float(np.mean([r["mean_action_norm"] for r in all_results])) if all_results else 0.0
+        print(f"  Avg action xyz:     {avg_action_xyz_all.tolist()}")
+        print(f"  Avg action norm:    {avg_mean_norm_all:.4f}")
         results = {
             "suite": suite_name,
             "noise_std": noise_std,
@@ -834,6 +891,8 @@ def evaluate_suite(
             "avg_improvement": avg_improvement,
             "avg_improvement_pct": avg_improvement / avg_err_no_align * 100 if avg_err_no_align > 0 else 0.0,
             "n_improved": n_improved,
+            "avg_action_xyz": avg_action_xyz_all.tolist(),
+            "avg_action_norm": avg_mean_norm_all,
             "details": all_results,
         }
 
