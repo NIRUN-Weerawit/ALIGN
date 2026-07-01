@@ -68,7 +68,7 @@ def train_value(
     output_dir: str,
     epochs: int = 30,
     batch_size: int = 32,
-    lr: float = 1e-3,
+    lr: float = 3e-4,  # Phase 9: lower from 1e-3 for stability
     weight_decay: float = 1e-4,
     gamma: float = 0.99,
     lam: float = 0.7,
@@ -88,6 +88,12 @@ def train_value(
     num_layers: int = 3,
     use_bf16: bool = True,
     seed: int = 42,
+    # Phase 9: stability techniques from PPO/DQN/DDPG
+    reward_clip: float = 1.0,         # DQN: clip GAIL reward to [-R, R]
+    soft_update_tau: float = 0.005,  # DDPG: Polyak averaging for target net
+    use_target_net: bool = True,     # DQN/DDPG: target network for V(s_{t+1})
+    use_huber_loss: bool = True,     # DQN: Huber loss for outlier robustness
+    huber_delta: float = 1.0,        # DQN: Huber loss threshold
 ) -> str:
     """Train value head on top of frozen encoder+mixer with GAIL rewards.
 
@@ -152,6 +158,12 @@ def train_value(
             "device": str(device),
             "use_bf16": use_bf16,
             "seed": seed,
+            # === Phase 9: stability techniques (PPO/DQN/DDPG) ===
+            "phase9/reward_clip": reward_clip,           # DQN
+            "phase9/soft_update_tau": soft_update_tau,   # DDPG/Polyak
+            "phase9/use_target_net": use_target_net,     # DQN/DDPG
+            "phase9/use_huber_loss": use_huber_loss,     # DQN
+            "phase9/huber_delta": huber_delta,           # DQN
         },
     ) if enable_wandb else init_wandb(
         project=wandb_project, name=wandb_run or out_dir.name, config={},
@@ -213,7 +225,30 @@ def train_value(
     trainable = [p for p in value_head.parameters() if p.requires_grad]
     print(f"  Value head: {sum(p.numel() for p in trainable):,} trainable params")
 
+    # Phase 9: target network (DDPG/DQN trick for stable bootstrapping)
+    if use_target_net:
+        v_target = create_value_head(
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+        ).to(device)
+        v_target.load_state_dict(value_head.state_dict())
+        for p in v_target.parameters():
+            p.requires_grad = False
+        v_target.eval()
+        print(f"  V target net: {sum(p.numel() for p in v_target.parameters()):,} params (frozen, soft-updated)")
+    else:
+        v_target = None
+
     opt = optim.AdamW(trainable, lr=lr, weight_decay=weight_decay)
+
+    def _soft_update_target():
+        """Polyak averaging (DDPG): v_target ← τ·v + (1-τ)·v_target."""
+        if not use_target_net:
+            return
+        with torch.no_grad():
+            for tp, p in zip(v_target.parameters(), value_head.parameters()):
+                tp.data.lerp_(p.data, soft_update_tau)
 
     # -- Build dataloader --
     loader = DataLoader(
@@ -278,22 +313,35 @@ def train_value(
             #      gives us (s_t, a_t, s_{t+1}) — not s_{t+2..t+n}. For n-step
             #      return we need access to multiple future states, which the
             #      current collate doesn't provide. Fall back to TD(0) and warn.
+            # Phase 9: DQN-style reward clipping to bound V
+            r_t = torch.clamp(r_t, min=-reward_clip, max=reward_clip)
+
             if n_steps > 1:
                 # Use TD(0) since we don't have multi-step states in the batch.
                 # For full TD(lambda) see compute_td_lambda_return in
                 # models/value_head.py — requires per-episode data.
                 pass  # falls through to TD(0) below
+            # Phase 9: use target network for bootstrap (DDPG/DQN trick)
             with torch.no_grad():
-                v_next = value_head(z_v_next, z_t_next, z_text_t)
-            v_target = r_t + gamma * v_next
+                if use_target_net:
+                    v_next = v_target(z_v_next, z_t_next, z_text_t)
+                else:
+                    v_next = value_head(z_v_next, z_t_next, z_text_t)
+            v_target_td = r_t + gamma * v_next
 
-            # 6. Loss
-            loss = value_loss(v_t, v_target.detach())
+            # 6. Loss — Phase 9: Huber loss (DQN trick) for outlier robustness
+            if use_huber_loss:
+                loss = F.smooth_l1_loss(v_t, v_target_td.detach(), beta=huber_delta)
+            else:
+                loss = value_loss(v_t, v_target_td.detach())
 
             opt.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable, 1.0)
             opt.step()
+
+            # Phase 9: soft update of target network (Polyak averaging, DDPG trick)
+            _soft_update_target()
 
             losses.append(loss.item())
             val_v_means.append(v_t.mean().item())
@@ -366,7 +414,8 @@ def main():
     parser.add_argument("--output-dir", default="./checkpoints/value")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4,
+                        help="Phase 9: lowered from 1e-3 for stability")
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99,
                         help="Discount factor for TD target")
@@ -395,6 +444,19 @@ def main():
                         help="W&B project name")
     parser.add_argument("--wandb-run", default=None,
                         help="W&B run name (defaults to run_N)")
+    # Phase 9: stability techniques (PPO/DQN/DDPG)
+    parser.add_argument("--reward-clip", type=float, default=1.0,
+                        help="DQN: clip GAIL reward to [-R, R] (default 1.0)")
+    parser.add_argument("--soft-update-tau", type=float, default=0.005,
+                        help="DDPG: Polyak averaging rate for target net (default 0.005)")
+    parser.add_argument("--no-target-net", dest="use_target_net",
+                        action="store_false", default=True,
+                        help="Disable target network (DDPG/DQN trick)")
+    parser.add_argument("--no-huber-loss", dest="use_huber_loss",
+                        action="store_false", default=True,
+                        help="Disable Huber loss (DQN trick)")
+    parser.add_argument("--huber-delta", type=float, default=1.0,
+                        help="Huber loss threshold (default 1.0)")
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
@@ -425,6 +487,12 @@ def main():
         num_layers=args.num_layers,
         use_bf16=args.bf16,
         seed=args.seed,
+        # Phase 9: stability techniques
+        reward_clip=args.reward_clip,
+        soft_update_tau=args.soft_update_tau,
+        use_target_net=args.use_target_net,
+        use_huber_loss=args.use_huber_loss,
+        huber_delta=args.huber_delta,
     )
 
 
