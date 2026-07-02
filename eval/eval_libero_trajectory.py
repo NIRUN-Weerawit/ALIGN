@@ -229,17 +229,17 @@ def find_episode_for_task(h5_path: str, task_name: str,
 def _extract_episode(group, text: str) -> Optional[dict]:
     """Extract frames, poses, actions from a HDF5 episode group."""
     frames_group = group.get("frames", None)
-    print(f"frames_group: {frames_group}")
     if frames_group is None:
         return None
     cam_name = None
-    for c in ["agentview_image","agentview", "wrist_image", "image"]:
+    for c in ["wrist_image","agentview_image","agentview", "image"]:
         if c in frames_group:
             cam_name = c
             print("found camera:", cam_name)
             break
     if cam_name is None:
         cam_name = list(frames_group.keys())[0]
+    print(f"cam_name: {cam_name}")
     frames = frames_group[cam_name][:]
     # CRITICAL: use 'poses' (or 'noisy_poses') for absolute EEF positions in world coords.
     # Do NOT use 'actions' — those are OSC_POSE deltas normalized by LeRobot to [-0.9375, 0.9375],
@@ -276,11 +276,24 @@ def inject_noise(poses: np.ndarray, std: float = 0.02, rng: np.random.Generator 
 # Sim frame helper
 # ================================================================
 
-def _get_sim_frame(env, key="agentview_image"):
+def _get_sim_frame(env, key="robot0_eye_in_hand_image",
+                    flip_vertical: bool = True, flip_horizontal: bool = False):
+    """Get a frame from the sim and apply orientation flip.
+
+    The sim's coordinate convention is flipped relative to the training
+    data, so by default we flip vertically (upside-down → right-side up).
+    Set flip_vertical=False to disable.
+
+    Args:
+        env: MuJoCo env wrapper.
+        key: obs key to fetch (defaults to wrist camera).
+        flip_vertical: if True, np.flipud the image before returning.
+        flip_horizontal: if True, np.fliplr the image before returning.
+    """
     obs = env.env._get_observations() if hasattr(env, "env") else env._get_observations()
     img = obs.get(key)
     if img is None:
-        for k in ["agentview_image", "image", "rgb"]:
+        for k in ["robot0_eye_in_hand_image", "agentview_image"]:
             img = obs.get(k)
             if img is not None:
                 break
@@ -290,7 +303,13 @@ def _get_sim_frame(env, key="agentview_image"):
         img = img.cpu().numpy()
     if img.ndim == 4:
         img = img[0]
-    return img.astype(np.uint8)
+    img = img.astype(np.uint8)
+    # Apply orientation correction to match training data convention
+    if flip_vertical:
+        img = np.flipud(img)
+    if flip_horizontal:
+        img = np.fliplr(img)
+    return img
 
 
 # ================================================================
@@ -379,7 +398,9 @@ def run_episode_in_sim(
     sim_positions = []
 
     while not done and step < max_steps and step < n_expert:
-        frame = _get_sim_frame(env)
+        frame = _get_sim_frame(env,
+                               flip_vertical=not no_flip_vertical,
+                               flip_horizontal=no_flip_horizontal)
         action = noisy_actions[step].copy()
         
         if len(action) >= 7:
@@ -398,10 +419,12 @@ def run_episode_in_sim(
             err = float(np.linalg.norm(sim_eef - clean_pose[:3]))
             error_no_align_raw.append(err)
 
-        frame_post = _get_sim_frame(env)
+        frame_post = _get_sim_frame(env, key="agentview_image",
+                                    flip_vertical=not no_flip_vertical,
+                                    flip_horizontal=no_flip_horizontal)
         if record_video:
             frames_no_align.append(frame_post.copy())
-            
+
         sim_pose_before = np.concatenate([
             obs.get("robot0_eef_pos", np.zeros(3)),
             obs.get("robot0_eef_quat", np.zeros(4)) if "robot0_eef_quat" in obs else np.zeros(4),
@@ -410,7 +433,7 @@ def run_episode_in_sim(
         sim_positions.append(sim_pose_before[:6].copy())
         delta_eef = sim_positions[0][:3] - sim_positions[-1][:3] if len(sim_positions) > 1 else np.zeros(3)
         # print(f"Step {step}: action = {action[:6]}     delta_EEF={delta_eef},   ratio={action[:3] / delta_eef if np.linalg.norm(delta_eef) > 1e-6 else np.zeros(3)}")
-        
+
 
     # # Save per-episode pose plot (simulated vs expert)
     # try:
@@ -418,7 +441,7 @@ def run_episode_in_sim(
     #     plot_episode_poses(episode, sim_arr, expert_poses[:n_expert], out_dir=output_dir, task_name=task_description)
     # except Exception as e:
     #     print(f"Warning: failed to save episode plot: {e}")
-    
+
     # Collect simulated positions during WITH-ALIGN run for plotting
     sim_positions = []
 
@@ -447,7 +470,9 @@ def run_episode_in_sim(
         # sim_positions.append(sim_pose_before[:6].copy())
         # print(f"Step {step}: sim_pose={sim_pose_before[:6]}     clean_pose={expert_poses[step]}")
         
-        frame = _get_sim_frame(env)
+        frame = _get_sim_frame(env,
+                               flip_vertical=not no_flip_vertical,
+                               flip_horizontal=no_flip_horizontal)
         # clean_pose = expert_poses[step]
         base_action = noisy_actions[step]
 
@@ -519,20 +544,22 @@ def run_episode_in_sim(
         action = (1.0 - alpha_val) * base_action.copy() + alpha_val * np.concatenate(
             [a_model, np.zeros(1, dtype=np.float32)]  # pad to 7-dim (with gripper)
         )
-        action[6] = base_action[6]  # keep gripper action unchanged
+        # action[6] = base_action[6]  # keep gripper action unchanged
         # action = alpha_val * np.concatenate([a_model, np.zeros(1, dtype=np.float32)])
-        # action[6] = -1.0
+        action[6] = -1.0
         '''
         if action[6] <= 0.5:
             action[6] = 1.0
         else:
             action[6] = -1.0
-        '''   
+        '''
         # print(f"base_action={base_action[:6]}, action={action[:6]}")
         obs, reward, done, info = env.step(action)
         step += 1
 
-        frame_post = _get_sim_frame(env)
+        frame_post = _get_sim_frame(env, key="agentview_image",
+                                    flip_vertical=not no_flip_vertical,
+                                    flip_horizontal=no_flip_horizontal)
         sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
         if isinstance(sim_eef, torch.Tensor):
             sim_eef = sim_eef.cpu().numpy()
@@ -737,6 +764,8 @@ def evaluate_suite(
             device=DEVICE,
             mixer_dim=enc_cfg.get("mixer_dim", 512),
             num_mixer_blocks=enc_cfg.get("num_mixer_blocks", 2),
+            assistant_hidden=256,
+            assistant_layers=2,
         ).to(device)
         if "trainable_state_dict" in heads_ckpt:
             heads_model.load_trainable_state_dict(heads_ckpt["trainable_state_dict"])
