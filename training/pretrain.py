@@ -174,6 +174,7 @@ def pretrain_hdf5(
         full_ds = ALIGNDataset(
             data_paths[0],
             mode="pretrain",
+            cameras=args.cameras,
             frames_per_ep=frames_per_ep,
             traj_window=traj_window,
         )
@@ -210,6 +211,8 @@ def pretrain_hdf5(
     )
 
     # -- Model ──
+    # Determine num_cameras from args.cameras (default: 1)
+    num_cameras = len(args.cameras) if args.cameras else 1
     model = ALIGNModel(
         embed_dim=embed_dim,
         use_text=use_text,
@@ -219,6 +222,7 @@ def pretrain_hdf5(
         mixer_nhead=mixer_nhead,
         # Default decision_K=10 matches pretrain's traj_window default
         decision_K=10,
+        num_cameras=num_cameras,
     ).to(device)
     model.freeze_backbone()
 
@@ -542,6 +546,10 @@ def main():
     parser.add_argument("--data", required=True, nargs="+",
                         help="Path(s) to align.h5 dataset(s). Pass multiple "
                              "to train on the concatenation.")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Default: auto-detect a single camera from the dataset. "
+                             "Use both 'wrist_image image' for multi-camera fusion.")
     parser.add_argument("--output-dir", default="./checkpoints/pretrain")
     parser.add_argument("--epochs-encoder", type=int, default=40,
                         help="Phase 1a: encoder pretrain epochs")

@@ -34,9 +34,16 @@ import torch.nn.functional as F  # noqa: N812
 # ================================================================
 
 class VisionEncoder(nn.Module):
-    """Frozen DINOv2 ViT-B + trainable projection head."""
+    """Frozen DINOv2 ViT-B + trainable projection head.
 
-    def __init__(self, backbone: str = "dinov2_vitb14", embed_dim: int = 256):
+    Supports single-camera (4D: (B, H, W, 3)) and multi-camera (5D:
+    (B, V, H, W, 3)) inputs. For multi-camera, each view is processed
+    through DINOv2 separately and the resulting V * embed_dim features
+    are fused via a learnable linear layer back to embed_dim.
+    """
+
+    def __init__(self, backbone: str = "dinov2_vitb14", embed_dim: int = 256,
+                 num_cameras: int = 1):
         super().__init__()
         try:
             self.backbone = torch.hub.load("facebookresearch/dinov2", backbone, pretrained=True)
@@ -44,24 +51,43 @@ class VisionEncoder(nn.Module):
             raise ImportError(
                 "DINOv2 not installed. Run: pip install dinov2"
             )
+        self.num_cameras = num_cameras
+        self.embed_dim = embed_dim
+        # Per-camera projection: DINOv2 feature (768) → embed_dim (256)
         self.projection = nn.Sequential(
             nn.Linear(768, embed_dim),
             nn.LayerNorm(embed_dim),
         )
+        # Multi-camera fusion: concatenate V * embed_dim → embed_dim
+        if num_cameras > 1:
+            self.fusion = nn.Sequential(
+                nn.Linear(num_cameras * embed_dim, embed_dim),
+                nn.LayerNorm(embed_dim),
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode camera frame(s).
 
         Args:
-            x: (..., H, W, 3) uint8 RGB images with any leading dims.
+            x: Single-camera: (B, H, W, 3) uint8 RGB.
+               Multi-camera: (B, V, H, W, 3) uint8 RGB, V = num_cameras.
 
         Returns:
-            (N, embed_dim) where N is the product of all leading dims.
+            (B, embed_dim) fused vision embedding.
         """
-        # Flatten all leading dimensions, keep last 3 (H, W, C)
-        *leading, H, W, C = x.shape
-        if leading:
-            x = x.reshape(-1, H, W, C)
+        # Detect multi-camera input
+        if x.ndim == 5:
+            B, V, H, W, C = x.shape
+            assert V == self.num_cameras, (
+                f"VisionEncoder expects {self.num_cameras} cameras, got {V}"
+            )
+            # Reshape to (B*V, H, W, 3) for batched DINOv2
+            x = x.reshape(B * V, H, W, C)
+        else:
+            B, H, W, C = x.shape
+            V = 1
+
+        # Standard DINOv2 preprocessing
         if C != 3:
             raise ValueError(f"Expected HWC RGB images, got shape {x.shape}")
         if H != 224 or W != 224:
@@ -74,9 +100,17 @@ class VisionEncoder(nn.Module):
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x - mean) / std
+
         with torch.no_grad():
-            features = self.backbone(x)  # (B, 768)
-        return self.projection(features)  # (B, 256)
+            features = self.backbone(x)  # (B*V, 768)
+        features = self.projection(features)  # (B*V, embed_dim)
+
+        if V > 1:
+            # Fuse multi-camera features
+            features = features.reshape(B, V * self.embed_dim)
+            features = self.fusion(features)  # (B, embed_dim)
+
+        return features
 
 
 # ================================================================
@@ -446,6 +480,8 @@ class ALIGNModel(nn.Module):
         max_traj_len: int = 64,
         decision_K: int = 10,
         decision_arch: str = "mlp",
+        # Multi-camera vision encoder
+        num_cameras: int = 1,
         # MLP head params
         mlp_hidden_dim: int = 512,
         mlp_num_layers: int = 3,
@@ -468,7 +504,8 @@ class ALIGNModel(nn.Module):
         self.decision_arch = decision_arch
 
         # Encoders
-        self.vision_encoder = VisionEncoder(embed_dim=embed_dim)
+        self.num_cameras = num_cameras
+        self.vision_encoder = VisionEncoder(embed_dim=embed_dim, num_cameras=num_cameras)
         self.traj_encoder = TrajectoryEncoder(
             input_dim=traj_input_dim,
             d_model=traj_d_model,

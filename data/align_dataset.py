@@ -67,6 +67,7 @@ class ALIGNDataset(Dataset):
         h5_path: str,
         mode: str = "pretrain",
         camera: str = DEFAULT_CAMERA,
+        cameras: Optional[List[str]] = None,
         image_size: Tuple[int, int] = DEFAULT_SIZE,
         frames_per_ep: int = DEFAULT_FRAMES_PER_EP,
         traj_window: int = TRAJ_WINDOW,
@@ -74,7 +75,12 @@ class ALIGNDataset(Dataset):
     ):
         self.h5_path = Path(h5_path)
         self.mode = mode
-        self.camera = camera
+        # Multi-camera support: prefer `cameras` (list) over `camera` (string).
+        # If `cameras` is given, use it; otherwise fall back to single `camera` (legacy).
+        if cameras is not None:
+            self.cameras: List[str] = list(cameras)
+        else:
+            self.cameras = [camera]
         self.image_size = image_size
         self.frames_per_ep = frames_per_ep
         self.traj_window = traj_window
@@ -100,18 +106,29 @@ class ALIGNDataset(Dataset):
         frames_obj = self._h5[f"{first_ep}/frames"]
         if isinstance(frames_obj, h5py.Dataset):
             # Frames is a single (N, H, W, 3) array — no camera subgroups
-            self.camera = None
+            self.cameras = []  # sentinel: no camera sub-dataset
         else:
             # Frames is a group with camera sub-datasets (e.g., frames/wrist_image)
             available_cameras = list(frames_obj.keys())
-            if self.camera in available_cameras:
+            if self.cameras and all(c in available_cameras for c in self.cameras):
+                # User-specified multi-camera list — all present, keep as is.
                 pass
-            elif "wrist_image" in available_cameras and self.camera in ("wrist", ""):
-                self.camera = "wrist_image"
+            elif len(self.cameras) == 1 and self.cameras[0] in ("wrist", ""):
+                # Legacy "wrist" alias
+                self.cameras = ["wrist_image"] if "wrist_image" in available_cameras else [available_cameras[0]]
             elif len(available_cameras) == 1:
-                self.camera = available_cameras[0]
+                # Only one camera available; use it
+                self.cameras = [available_cameras[0]]
             else:
-                raise ValueError(f"Camera {self.camera} not found. Available: {available_cameras}")
+                # Multi-camera dataset, but user didn't specify — try common defaults
+                if "wrist_image" in available_cameras:
+                    self.cameras = ["wrist_image"]
+                elif len(self.cameras) > 0 and self.cameras[0] in available_cameras:
+                    pass  # already correct
+                else:
+                    raise ValueError(
+                        f"Multiple cameras available ({available_cameras}); please specify --cameras"
+                    )
 
         # Detect if noisy_poses are cumulative across episodes (LIBERO v3 quirk)
         # and pre-compute per-episode frame lengths + pose offsets
@@ -149,14 +166,24 @@ class ALIGNDataset(Dataset):
             pose_key = self._pose_keys[ep_idx]
 
             # Frame length (handle both framedataset structures)
-            if self.camera is None:
-                # frames = Dataset — single array
+            if not self.cameras:
+                # frames = Dataset — single array (legacy single-frame dataset)
                 n_frames = len(self._h5[f"{key}/frames"])
             else:
-                try:
-                    n_frames = len(self._h5[f"{key}/frames/{self.camera}"])
-                except KeyError:
-                    n_frames = len(self._h5[f"{key}/{pose_key}"])
+                # Multi-camera: verify all cameras have the same length
+                n_frames = None
+                for cam in self.cameras:
+                    try:
+                        cam_len = len(self._h5[f"{key}/frames/{cam}"])
+                    except KeyError:
+                        cam_len = len(self._h5[f"{key}/{pose_key}"])
+                    if n_frames is None:
+                        n_frames = cam_len
+                    elif cam_len != n_frames:
+                        raise ValueError(
+                            f"Camera length mismatch in {key}: "
+                            f"{self.cameras[0]}={n_frames}, {cam}={cam_len}"
+                        )
             self._ep_frame_lengths.append(n_frames)
 
             # Pose offset: in cumulative HDF5, ep_N starts AFTER all previous episodes
@@ -192,15 +219,28 @@ class ALIGNDataset(Dataset):
         return self._ep_frame_lengths[ep_idx]
 
     def _read_frames(self, ep_idx: int, start: int, count: int) -> np.ndarray:
+        """Read frames for a given episode.
+
+        Returns:
+            - If multi-camera: (count, V, H, W, 3) where V = len(self.cameras)
+            - If single camera:  (count, H, W, 3)  (legacy format)
+        """
         key = self._episode_keys[ep_idx]
         if self._single_episode:
-            frames = self._h5["frames"][start:start + count]
-        elif self.camera is None:
-            # Frames is a single Dataset (N, H, W, 3)
-            frames = self._h5[f"{key}/frames"][start:start + count]
-        else:
-            frames = self._h5[f"{key}/frames/{self.camera}"][start:start + count]
-        return frames
+            # Legacy single-frame dataset
+            return self._h5["frames"][start:start + count]
+        if not self.cameras:
+            # frames = Dataset — single array (legacy)
+            return self._h5[f"{key}/frames"][start:start + count]
+        if len(self.cameras) == 1:
+            # Single camera — keep the legacy 4D shape for back-compat
+            return self._h5[f"{key}/frames/{self.cameras[0]}"][start:start + count]
+        # Multi-camera: stack along a new axis (axis=1) → (count, V, H, W, 3)
+        per_cam = [
+            self._h5[f"{key}/frames/{cam}"][start:start + count]
+            for cam in self.cameras
+        ]
+        return np.stack(per_cam, axis=1)
 
     def _read_poses(self, ep_idx: int, start: int, count: int) -> np.ndarray:
         key = self._episode_keys[ep_idx]
@@ -354,7 +394,7 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
 
     Returns:
         {
-            "frames": (B, H, W, 3) uint8,
+            "frames": (B, H, W, 3) or (B, V, H, W, 3) uint8,
             "trajectories": (B, K, 6) float32,
             "texts": list of strings,
             "ep_ids": (B,) int — for verifying positives/negatives,
@@ -384,7 +424,8 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
             t1 = 0
             t2 = 0
 
-        frame_sample = frames[t1]  # (H, W, 3)
+        # frames shape: (H, W, 3) for single camera, (V, H, W, 3) for multi
+        frame_sample = frames[t1]
         traj_sample = poses[t2:t2 + traj_window]  # (K, 6) or (K, 7)
 
         all_frames.append(frame_sample)
