@@ -304,11 +304,13 @@ def _get_sim_frame(env, key="robot0_eye_in_hand_image",
     if img.ndim == 4:
         img = img[0]
     img = img.astype(np.uint8)
-    # Apply orientation correction to match training data convention
+    # Apply orientation correction to match training data convention.
+    # np.flipud/np.fliplr return views with negative strides, which
+    # torch.from_numpy() rejects — so we copy() to get a contiguous array.
     if flip_vertical:
-        img = np.flipud(img)
+        img = np.flipud(img).copy()
     if flip_horizontal:
-        img = np.fliplr(img)
+        img = np.fliplr(img).copy()
     return img
 
 
