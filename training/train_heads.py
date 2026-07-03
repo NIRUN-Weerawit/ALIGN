@@ -87,10 +87,18 @@ def train_heads_hdf5(
     transformer_dropout: float = 0.0,
     transformer_dim_ff: int = 1024,
     loss_decay: float = 0.7,
-    warmup_epochs: int = 0,
+    # Assistant head params
     assistant_hidden: int = 256,
     assistant_layers: int = 2,
     assistant_dropout: float = 0.0,
+    # Assistant architecture: "mlp" (default, original) or "transformer"
+    assistant_arch: str = "mlp",
+    # Transformer assistant params
+    assistant_d_model: int = 384,
+    assistant_nhead: int = 4,
+    assistant_num_layers: int = 2,
+    assistant_dim_ff: int = 1024,
+    cameras: Optional[List[str]] = None,
 ) -> str:
     """Train Decision and Assistant heads independently.
 
@@ -224,6 +232,11 @@ def train_heads_hdf5(
         assistant_hidden=assistant_hidden,
         assistant_layers=assistant_layers,
         assistant_dropout=assistant_dropout,
+        assistant_arch=assistant_arch,
+        assistant_d_model=assistant_d_model,
+        assistant_nhead=assistant_nhead,
+        assistant_num_layers=assistant_num_layers,
+        assistant_dim_ff=assistant_dim_ff,
     ).to(device)
 
     ckpt = torch.load(pretrained_checkpoint, map_location=device)
@@ -442,12 +455,27 @@ def train_heads_hdf5(
                 mixed = model.encode_mixed(frames, traj_view, texts)
                 z_v = mixed["z_v"].float()
                 z_t = mixed["z_t"].float()
+                z_t_tokens = mixed["z_t_tokens"].float()  # (B, K, 256) for transformer
                 z_text = mixed["z_text"].float()
 
-            # Assistant loss only (MSE against dynamic delta target)
-            # current_action = torch.from_numpy(batch["current_action"]).float().to(device)
-            delta_pred = model.assistant_head(z_v, z_t, z_text)
-            loss_mse = F.mse_loss(delta_pred, delta_t)
+            # Assistant head: branch by architecture
+            # - "mlp": single forward with 2D embeddings
+            # - "transformer": forward with (B, K, D) windows
+            if model.assistant_arch == "transformer":
+                delta_pred = model.assistant_head(z_t_tokens[:, -5:], z_t_tokens[:, -5:], z_text)
+            else:
+                delta_pred = model.assistant_head(z_v, z_t, z_text)
+
+            # Per-step loss weighting (focuses the model on step 0 = the action
+            # actually used at inference). decay=0.7 means: w0=1.0, w1=0.7, w2=0.49, ...
+            K = delta_pred.shape[1]
+            step_weights = torch.tensor(
+                [loss_decay ** k for k in range(K)], device=device, dtype=delta_pred.dtype
+            )  # (K,)
+            # Per-step, per-dim MSE, then weighted mean
+            per_step_mse = (delta_pred - delta_t) ** 2  # (B, K, 6)
+            per_step_loss = per_step_mse.mean(dim=-1)     # (B, K)
+            loss_mse = (per_step_loss * step_weights.unsqueeze(0)).mean()
 
             opt_b.zero_grad()
             loss_mse.backward()
@@ -582,6 +610,17 @@ def main():
                         help="Assistant head number of hidden layers (between input and output)")
     parser.add_argument("--assistant-dropout", type=float, default=0.0,
                         help="Assistant head dropout")
+    parser.add_argument("--assistant-arch", type=str, default="mlp",
+                        choices=["mlp", "transformer"],
+                        help="Assistant head architecture: 'mlp' (default) or 'transformer'")
+    parser.add_argument("--assistant-d-model", type=int, default=384,
+                        help="Transformer assistant: hidden dim")
+    parser.add_argument("--assistant-nhead", type=int, default=4,
+                        help="Transformer assistant: number of attention heads")
+    parser.add_argument("--assistant-num-layers", type=int, default=2,
+                        help="Transformer assistant: number of transformer layers")
+    parser.add_argument("--assistant-dim-ff", type=int, default=1024,
+                        help="Transformer assistant: FFN hidden dim")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="align-heads")
     parser.add_argument("--wandb-run", default=None)
@@ -624,6 +663,11 @@ def main():
         assistant_hidden=args.assistant_hidden,
         assistant_layers=args.assistant_layers,
         assistant_dropout=args.assistant_dropout,
+        assistant_arch=args.assistant_arch,
+        assistant_d_model=args.assistant_d_model,
+        assistant_nhead=args.assistant_nhead,
+        assistant_num_layers=args.assistant_num_layers,
+        assistant_dim_ff=args.assistant_dim_ff,
         cameras=args.cameras,
     )
 

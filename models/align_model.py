@@ -411,6 +411,79 @@ class AssistantHead(nn.Module):
         return out.reshape(-1, self.chunk_size, self.action_dim)
 
 
+class AssistantHeadTransformer(nn.Module):
+    """Transformer predicting chunk of K future actions from a window of K past embeddings.
+
+    Input layout (per timestep): cat([z_v_k, z_t_k, z_text_broadcast], dim=-1)
+      - z_v_window:    (B, K, embed_dim)  — vision embeddings for K past timesteps
+      - z_t_window:    (B, K, embed_dim)  — pose trajectory embeddings for K past timesteps
+      - z_text:        (B, embed_dim)     — text embedding (broadcast over K)
+
+    Output: (B, K, action_dim) — K future ACTION deltas (or pose-relative goals,
+            depending on training target). The first timestep is used at inference:
+
+        a_model = goal[0]                                    # model's proposed action
+        final_action = (1 - α) * current_action + α * a_model  # α-weighted blend
+
+    Unlike AssistantHead (which sees a flat 3*embed_dim input), this variant
+    sees K past timesteps and uses self-attention to model temporal patterns
+    in the trajectory. Each output timestep is a function of the entire input
+    window, not just the current state.
+
+    Args:
+        embed_dim: per-modality embedding dim (default 256).
+        chunk_size: K — number of future steps to predict.
+        action_dim: 6 (OSC_POSE).
+        d_model: transformer hidden dim (default 384).
+        nhead: number of attention heads (default 4).
+        num_layers: number of transformer encoder layers (default 2).
+        dim_feedforward: FFN hidden dim (default 1024).
+        dropout: dropout rate (default 0.1).
+    """
+
+    def __init__(self, embed_dim: int = 256, chunk_size: int = 5, action_dim: int = 6,
+                 d_model: int = 384, nhead: int = 4, num_layers: int = 2,
+                 dim_feedforward: int = 1024, dropout: float = 0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.chunk_size = chunk_size
+        self.action_dim = action_dim
+        # Project per-timestep features (3*embed_dim) to d_model
+        self.input_proj = nn.Linear(3 * embed_dim, d_model)
+        # Learned positional encoding for the K input timesteps
+        self.pos_encoding = nn.Parameter(torch.randn(chunk_size, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Per-timestep output head: (B, K, d_model) -> (B, K, action_dim)
+        self.output_proj = nn.Linear(d_model, action_dim)
+
+    def forward(
+        self,
+        z_v_window: torch.Tensor,  # (B, K, embed_dim)
+        z_t_window: torch.Tensor,  # (B, K, embed_dim)
+        z_text: torch.Tensor,       # (B, embed_dim)
+    ) -> torch.Tensor:
+        B, K = z_v_window.shape[:2]
+        # Broadcast text over the K window
+        z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)  # (B, K, embed_dim)
+        # Concatenate per-timestep features
+        features = torch.cat([z_v_window, z_t_window, z_text_expanded], dim=-1)  # (B, K, 3D)
+        # Project to d_model + add positional encoding
+        x = self.input_proj(features) + self.pos_encoding[:K].unsqueeze(0)  # (B, K, d_model)
+        # Self-attention over the K timesteps
+        x = self.transformer(x)  # (B, K, d_model)
+        # Per-timestep output head
+        out = self.output_proj(x)  # (B, K, action_dim)
+        return out
+
+
 # ================================================================
 # Factory for cross-attention mixer
 # ================================================================
@@ -495,6 +568,13 @@ class ALIGNModel(nn.Module):
         assistant_hidden: int = 256,
         assistant_layers: int = 2,
         assistant_dropout: float = 0.0,
+        # Assistant architecture: "mlp" (default, original) or "transformer"
+        assistant_arch: str = "mlp",
+        # Transformer assistant params
+        assistant_d_model: int = 384,
+        assistant_nhead: int = 4,
+        assistant_num_layers: int = 2,
+        assistant_dim_ff: int = 1024,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -544,12 +624,28 @@ class ALIGNModel(nn.Module):
             raise ValueError(
                 f"Unknown decision_arch: {decision_arch} (expected 'mlp' or 'transformer')"
             )
-        self.assistant_head = AssistantHead(
-            latent_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim,
-            hidden_dim=assistant_hidden,
-            num_hidden_layers=assistant_layers,
-            dropout=assistant_dropout,
-        )
+        # Assistant head: "mlp" (default, original) or "transformer"
+        self.assistant_arch = assistant_arch
+        if assistant_arch == "mlp":
+            self.assistant_head = AssistantHead(
+                latent_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim,
+                hidden_dim=assistant_hidden,
+                num_hidden_layers=assistant_layers,
+                dropout=assistant_dropout,
+            )
+        elif assistant_arch == "transformer":
+            self.assistant_head = AssistantHeadTransformer(
+                embed_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim,
+                d_model=assistant_d_model,
+                nhead=assistant_nhead,
+                num_layers=assistant_num_layers,
+                dim_feedforward=assistant_dim_ff,
+                dropout=assistant_dropout,
+            )
+        else:
+            raise ValueError(
+                f"Unknown assistant_arch: {assistant_arch} (expected 'mlp' or 'transformer')"
+            )
 
         # Register which modules are trainable vs frozen
         self._trainable_prefixes = {"vision_encoder.projection", "traj_encoder",
@@ -782,13 +878,19 @@ class ALIGNModel(nn.Module):
             # with the actual future embeddings.
             result["alpha"] = torch.ones(B, 1, device=z_v.device)
         if compute_assistant:
-            # Backward-compat: when no current_action is supplied, use the
-            # last pose in the trajectory window. NOTE: this is no longer
-            # semantically correct — the Assistant head should see the
-            # current ACTION (delta), not the current pose. The pose is
-            # already encoded in z_t. Callers should pass `current_action`
-            # explicitly for the new design.
-            result["delta"] = self.assistant_head(z_v, z_t, z_text, traj[:, -1])
+            # Call the appropriate assistant head based on architecture.
+            # Both MLP and transformer heads take (z_v, z_t, z_text).
+            if self.assistant_arch == "transformer":
+                # Transformer needs (B, K, D) windows. Replicate the current
+                # embeddings K times to form a fake "window" of K identical
+                # timesteps. In practice, callers should pass a real window
+                # (see encode_mixed_windowed for the proper API).
+                K = self.assistant_head.chunk_size
+                z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)
+                z_t_window = z_t.unsqueeze(1).expand(-1, K, -1)
+                result["delta"] = self.assistant_head(z_v_window, z_t_window, z_text)
+            else:
+                result["delta"] = self.assistant_head(z_v, z_t, z_text)
         return result
 
     # ── Freeze helpers ─────────────────────────────────────────
