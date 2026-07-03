@@ -98,7 +98,6 @@ def train_heads_hdf5(
     assistant_nhead: int = 4,
     assistant_num_layers: int = 2,
     assistant_dim_ff: int = 1024,
-    cameras: Optional[List[str]] = None,
 ) -> str:
     """Train Decision and Assistant heads independently.
 
