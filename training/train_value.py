@@ -74,6 +74,7 @@ def train_value(
     lam: float = 0.7,
     n_steps: int = 1,
     val_split: float = 0.1,
+    cameras: Optional[List[str]] = None,
     device: Optional[str] = None,
     max_steps_per_epoch: int = 2000,
     enable_wandb: bool = False,
@@ -106,10 +107,12 @@ def train_value(
 
     # -- Build dataset --
     if len(data_paths) == 1:
-        ds = ALIGNDataset(data_paths[0], mode="pretrain", traj_window=traj_window)
+        ds = ALIGNDataset(data_paths[0], mode="pretrain", traj_window=traj_window,
+                          cameras=cameras)
         ds_name = Path(data_paths[0]).stem
     else:
-        ds = MultiALIGNDataset(data_paths, mode="pretrain", traj_window=traj_window)
+        ds = MultiALIGNDataset(data_paths, mode="pretrain", traj_window=traj_window,
+                               cameras=cameras)
         ds_name = "+".join(Path(p).stem for p in data_paths)
 
     # -- Derive output dir --
@@ -171,12 +174,14 @@ def train_value(
     print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Load encoder+mixer --
+    num_cameras = len(cameras) if cameras else 1
     model = ALIGNModel(
         embed_dim=embed_dim,
         chunk_size=chunk_size,
         use_text=True,
         device=str(device),
         traj_d_model=128,
+        num_cameras=num_cameras,
     ).to(device)
     enc_ckpt = torch.load(pretrained_checkpoint, map_location=device, weights_only=False)
     if "trainable_state_dict" in enc_ckpt:
@@ -408,6 +413,9 @@ def main():
                         help="Path(s) to HDF5 dataset(s)")
     parser.add_argument("--pretrained", required=True,
                         help="Phase 1b encoder+mixer checkpoint (FROZEN)")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during pretrain.")
     parser.add_argument("--gail-checkpoint", default=None,
                         help="Trained GAIL discriminator (for reward). "
                              "Optional — uses random init if not provided.")
@@ -487,6 +495,7 @@ def main():
         num_layers=args.num_layers,
         use_bf16=args.bf16,
         seed=args.seed,
+        cameras=args.cameras,
         # Phase 9: stability techniques
         reward_clip=args.reward_clip,
         soft_update_tau=args.soft_update_tau,

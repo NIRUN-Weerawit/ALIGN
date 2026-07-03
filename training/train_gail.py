@@ -144,6 +144,7 @@ def train_gail(
     wandb_run: Optional[str] = None,
     enable_wandb: bool = False,
     num_workers: int = 0,
+    cameras: Optional[List[str]] = None,
     traj_window: int = 5,
     chunk_size: int = 1,
     mixer_dim: int = 512,
@@ -273,10 +274,11 @@ def train_gail(
 
     # -- Dataset --------------------------------------------
     if len(data_paths) == 1:
-        full_ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window)
+        full_ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window,
+                               cameras=cameras)
     else:
         full_ds = MultiALIGNDataset(
-            data_paths, mode="head", traj_window=traj_window
+            data_paths, mode="head", traj_window=traj_window, cameras=cameras
         )
     n_total = len(full_ds)
     n_val = max(1, int(n_total * val_split))
@@ -296,6 +298,7 @@ def train_gail(
 
     # -- Frozen ALIGNModel (encoder + mixer only) ------------
     print(f"\n  Loading ALIGNModel from {pretrained_checkpoint} ...")
+    num_cameras = len(cameras) if cameras else 1
     align = ALIGNModel(
         embed_dim=embed_dim,
         chunk_size=chunk_size,
@@ -303,6 +306,7 @@ def train_gail(
         device=str(device),
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
+        num_cameras=num_cameras,
     ).to(device)
 
     # Load encoder + mixer weights from the pretrained checkpoint
@@ -568,6 +572,9 @@ def main() -> None:
                              "train on the concatenation.")
     parser.add_argument("--pretrained", required=True,
                         help="Phase 1b pretrained checkpoint (encoder + mixer).")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during pretrain.")
     parser.add_argument("--output-dir", default="./checkpoints/gail",
                         help="Directory under which "
                              "{dataset_stem}/run_N/ will be created.")
@@ -657,6 +664,7 @@ def main() -> None:
         transformer_dim_ff=args.transformer_dim_ff,
         rollout_mode=args.rollout_mode,
         rollout_noise_scale=args.rollout_noise_scale,
+        cameras=args.cameras,
         seed=args.seed,
     )
 

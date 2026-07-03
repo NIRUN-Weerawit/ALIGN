@@ -69,6 +69,7 @@ def train_heads_hdf5(
     device: Optional[str] = None,
     max_steps_per_epoch: int = 2000,
     wandb_project: str = "align-heads",
+    cameras: Optional[List[str]] = None,
     wandb_run: Optional[str] = None,
     enable_wandb: bool = True,
     num_workers: int = 0,
@@ -158,11 +159,12 @@ def train_heads_hdf5(
 
     # -- Dataset ──
     if len(data_paths) == 1:
-        full_ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window)
+        full_ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window,
+                               cameras=cameras)
     else:
         from data.align_dataset import MultiALIGNDataset
         full_ds = MultiALIGNDataset(
-            data_paths, mode="head", traj_window=traj_window
+            data_paths, mode="head", traj_window=traj_window, cameras=cameras
         )
     n_total = len(full_ds)
     n_val = max(1, int(n_total * val_split))
@@ -207,6 +209,7 @@ def train_heads_hdf5(
             "dim_feedforward": transformer_dim_ff,
         }
 
+    num_cameras = len(cameras) if cameras else 1
     model = ALIGNModel(
         embed_dim=256,
         chunk_size=chunk_size,
@@ -216,6 +219,7 @@ def train_heads_hdf5(
         num_mixer_blocks=num_mixer_blocks,
         decision_K=chunk_size,
         decision_arch=decision_arch,
+        num_cameras=num_cameras,
         **head_kwargs,
         assistant_hidden=assistant_hidden,
         assistant_layers=assistant_layers,
@@ -429,7 +433,6 @@ def train_heads_hdf5(
                 break
 
             frames = torch.from_numpy(batch["frames"]).to(device)
-            noisy_pose = torch.from_numpy(batch["noisy_pose"]).float().to(device)
             texts = batch["texts"]
             delta_t = torch.from_numpy(batch["delta_target"]).float().to(device)
             traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
@@ -522,6 +525,9 @@ def main():
                         help="Path(s) to align.h5 dataset(s). Pass multiple "
                              "to train on the concatenation.")
     parser.add_argument("--pretrained", required=True, help="Phase 1 pretrained checkpoint")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during pretrain.")
     parser.add_argument("--output-dir", default="./checkpoints/heads")
     parser.add_argument("--epochs-decision", type=int, default=10,
                         help="Decision (alpha) training epochs")
@@ -618,6 +624,7 @@ def main():
         assistant_hidden=args.assistant_hidden,
         assistant_layers=args.assistant_layers,
         assistant_dropout=args.assistant_dropout,
+        cameras=args.cameras,
     )
 
 

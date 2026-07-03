@@ -145,6 +145,7 @@ def train_world_model(
     device: Optional[str] = None,
     max_steps_per_epoch: int = 2000,
     wandb_project: str = "align-world-model",
+    cameras: Optional[List[str]] = None,
     wandb_run: Optional[str] = None,
     enable_wandb: bool = False,
     num_workers: int = 0,
@@ -256,10 +257,11 @@ def train_world_model(
 
     # -- Dataset --------------------------------------------
     if len(data_paths) == 1:
-        full_ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window)
+        full_ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window,
+                               cameras=cameras)
     else:
         full_ds = MultiALIGNDataset(
-            data_paths, mode="head", traj_window=traj_window
+            data_paths, mode="head", traj_window=traj_window, cameras=cameras
         )
     n_total = len(full_ds)
     n_val = max(1, int(n_total * val_split))
@@ -287,6 +289,8 @@ def train_world_model(
 
     # -- Frozen ALIGNModel (encoder + mixer only) ------------
     print(f"\n  Loading ALIGNModel from {pretrained_checkpoint} ...")
+    # Determine num_cameras: must match pretrain's --cameras
+    num_cameras = len(cameras) if cameras else 1
     align = ALIGNModel(
         embed_dim=embed_dim,
         chunk_size=chunk_size,
@@ -294,6 +298,7 @@ def train_world_model(
         device=str(device),
         mixer_dim=mixer_dim,
         num_mixer_blocks=num_mixer_blocks,
+        num_cameras=num_cameras,
     ).to(device)
 
     # Load encoder + mixer weights from the pretrained checkpoint
@@ -313,7 +318,7 @@ def train_world_model(
     if arch == "mlp":
         wm_kwargs = {"hidden_dim": mlp_hidden, "num_layers": mlp_layers, "window_size": window_size}
     elif arch == "rnn":
-        wm_kwargs = {"hidden_dim": mlp_hidden, "num_rnn_layers": 1}
+        wm_kwargs = {"hidden_dim": mlp_hidden, "num_rnn_layers": mlp_layers}
     elif arch == "transformer":
         wm_kwargs = {
             "d_model": transformer_d_model,
@@ -572,6 +577,10 @@ def main() -> None:
                              "train on the concatenation.")
     parser.add_argument("--pretrained", required=True,
                         help="Phase 1b pretrained checkpoint (encoder + mixer).")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during pretrain. "
+                             "Default: auto-detect a single camera from the dataset.")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a world_model_best.pt (or world_model_epoch_NNNN.pt) "
                              "to continue training from. Loads the world model weights only; "
@@ -665,6 +674,7 @@ def main() -> None:
                 transformer_nhead=args.transformer_nhead,
                 transformer_dropout=args.transformer_dropout,
                 transformer_dim_ff=args.transformer_dim_ff,
+                cameras=args.cameras,
                 seed=args.seed,
             )
         print(f"\n{'='*70}")
@@ -706,6 +716,7 @@ def main() -> None:
         transformer_nhead=args.transformer_nhead,
         transformer_dropout=args.transformer_dropout,
         transformer_dim_ff=args.transformer_dim_ff,
+        cameras=args.cameras,
         seed=args.seed,
     )
 
