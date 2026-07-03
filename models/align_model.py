@@ -658,8 +658,47 @@ class ALIGNModel(nn.Module):
     # ── Phase 1a helpers: raw encoder outputs (no mixer) ─────────
 
     def encode_raw_vision(self, frames: torch.Tensor) -> torch.Tensor:
-        """Encode frames, return raw vision embedding (no mixer)."""
+        """Encode frames, return raw vision embedding (no mixer).
+
+        Supports:
+          - (B, H, W, 3) — single camera, single timestep → (B, D)
+          - (B, V, H, W, 3) — multi-camera, single timestep → (B, D)
+          - (B, K, H, W, 3) — single camera, K timesteps → (B, K, D)
+          - (B, K, V, H, W, 3) — multi-camera, K timesteps → (B, K, D)
+        """
         return self.vision_encoder(frames)
+
+    def encode_raw_vision_window(
+        self, frames_window: torch.Tensor
+    ) -> torch.Tensor:
+        """Encode a window of K frames, return per-timestep embeddings.
+
+        Args:
+            frames_window: (B, K, H, W, 3) for single-camera or
+                           (B, K, V, H, W, 3) for multi-camera.
+
+        Returns:
+            (B, K, embed_dim) -- per-timestep vision embeddings.
+            (Multi-camera views are fused by VisionEncoder before this step.)
+        """
+        if frames_window.ndim == 5:
+            B, K, H, W, C = frames_window.shape
+            frames_flat = frames_window.reshape(B * K, H, W, C)
+            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, D)
+            return z_v_flat.reshape(B, K, -1)
+        elif frames_window.ndim == 6:
+            # Multi-camera window: (B, K, V, H, W, 3)
+            # VisionEncoder fuses V internally, so we feed it (B*K*V, H, W, 3)
+            # and reshape the result back to (B, K, D)
+            B, K, V, H, W, C = frames_window.shape
+            frames_flat = frames_window.reshape(B * K * V, H, W, C)
+            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, D) -- V was fused
+            return z_v_flat.reshape(B, K, -1)
+        else:
+            raise ValueError(
+                f"frames_window must be 5D (B,K,H,W,3) or 6D (B,K,V,H,W,3), "
+                f"got {frames_window.ndim}D"
+            )
 
     def encode_raw_trajectory(self, poses: torch.Tensor) -> torch.Tensor:
         """Encode trajectory, return raw mean-pooled trajectory embedding (no mixer)."""

@@ -458,10 +458,28 @@ def train_heads_hdf5(
                 z_text = mixed["z_text"].float()
 
             # Assistant head: branch by architecture
-            # - "mlp": single forward with 2D embeddings
-            # - "transformer": forward with (B, K, D) windows
+            # - "mlp": single forward with 2D embeddings (uses pooled z_v)
+            # - "transformer": forward with (B, K, D) windows (uses K past frames
+            #   encoded SEPARATELY, not the same z_v replicated)
+            #
+            # For the transformer, we encode K past frames individually and run them
+            # through the vision encoder + mixer to get per-timestep embeddings.
             if model.assistant_arch == "transformer":
-                delta_pred = model.assistant_head(z_t_tokens[:, -5:], z_t_tokens[:, -5:], z_text)
+                K = model.assistant_head.chunk_size
+                # frames_window is (B, K, H, W, 3) or (B, K, V, H, W, 3) for multi-cam
+                frames_window = torch.from_numpy(batch["frames_window"]).to(device)
+                # Encode K frames separately: (B, K, D)
+                z_v_window_raw = model.encode_raw_vision_window(frames_window)
+                # Run through the cross-attention mixer (per-timestep) to fuse with z_t
+                # We use z_t_tokens (B, K, D) as the trajectory context
+                # Run mixer: z_v_window_raw (B,K,D) + z_t_tokens (B,K,D) + z_text (B,D) -> (B,K,D)
+                z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
+                z_v_window_mixed, _, _ = model.cross_attention_mixer(
+                    z_v_window_raw, z_t_tokens, z_text_expanded
+                )
+                # Take the last K tokens of z_t_tokens (or just use z_t_tokens[:, -K:])
+                z_t_window = z_t_tokens[:, -K:]  # (B, K, D)
+                delta_pred = model.assistant_head(z_v_window_mixed, z_t_window, z_text)
             else:
                 delta_pred = model.assistant_head(z_v, z_t, z_text)
 

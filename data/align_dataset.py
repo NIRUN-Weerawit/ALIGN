@@ -38,7 +38,7 @@ DEFAULT_CAMERA = "wrist"
 DEFAULT_SIZE = (224, 224)
 DEFAULT_FRAMES_PER_EP = 8
 TRAJ_WINDOW = 10  # K frames per trajectory window
-POSITIVE_WINDOW = 5  # W_pos — frames within this window are positive pairs
+POSITIVE_WINDOW = 5  # W_pos -- frames within this window are positive pairs
 
 
 # ================================================================
@@ -49,12 +49,12 @@ class ALIGNDataset(Dataset):
     """HDF5 dataset for ALIGN training.
 
     Stores episodes as HDF5 groups:
-        /meta/              — json strings with episode metadata
-        /ep_XXX/frames/     — (N, H, W, 3) uint8 frames
-        /ep_XXX/noisy_poses — (N, 6) or (N, 7) float32
-        /ep_XXX/actions     — (N, 6) float32 (optional)
-        /ep_XXX/gripper     — (N,) float32
-        /ep_XXX/texts       — list of text variant strings
+        /meta/              -- json strings with episode metadata
+        /ep_XXX/frames/     -- (N, H, W, 3) uint8 frames
+        /ep_XXX/noisy_poses -- (N, 6) or (N, 7) float32
+        /ep_XXX/actions     -- (N, 6) float32 (optional)
+        /ep_XXX/gripper     -- (N,) float32
+        /ep_XXX/texts       -- list of text variant strings
 
     Supports two modes:
     - 'pretrain': sample (frame, trajectory_window) pairs within episodes.
@@ -105,13 +105,13 @@ class ALIGNDataset(Dataset):
         first_ep = self._episode_keys[0]
         frames_obj = self._h5[f"{first_ep}/frames"]
         if isinstance(frames_obj, h5py.Dataset):
-            # Frames is a single (N, H, W, 3) array — no camera subgroups
+            # Frames is a single (N, H, W, 3) array -- no camera subgroups
             self.cameras = []  # sentinel: no camera sub-dataset
         else:
             # Frames is a group with camera sub-datasets (e.g., frames/wrist_image)
             available_cameras = list(frames_obj.keys())
             if self.cameras and all(c in available_cameras for c in self.cameras):
-                # User-specified multi-camera list — all present, keep as is.
+                # User-specified multi-camera list -- all present, keep as is.
                 pass
             elif len(self.cameras) == 1 and self.cameras[0] in ("wrist", ""):
                 # Legacy "wrist" alias
@@ -120,7 +120,7 @@ class ALIGNDataset(Dataset):
                 # Only one camera available; use it
                 self.cameras = [available_cameras[0]]
             else:
-                # Multi-camera dataset, but user didn't specify — try common defaults
+                # Multi-camera dataset, but user didn't specify -- try common defaults
                 if "wrist_image" in available_cameras:
                     self.cameras = ["wrist_image"]
                 elif len(self.cameras) > 0 and self.cameras[0] in available_cameras:
@@ -146,7 +146,7 @@ class ALIGNDataset(Dataset):
             self._has_actions = False
 
         # Determine the pose field name per episode. Older HDF5 files use
-        # "noisy_poses" (misnomer — actually contains clean poses).
+        # "noisy_poses" (misnomer -- actually contains clean poses).
         # Newer files use "poses". Store the resolved name per episode.
         self._pose_keys: List[str] = []
         for ep_idx in range(len(self._episode_keys)):
@@ -167,7 +167,7 @@ class ALIGNDataset(Dataset):
 
             # Frame length (handle both framedataset structures)
             if not self.cameras:
-                # frames = Dataset — single array (legacy single-frame dataset)
+                # frames = Dataset -- single array (legacy single-frame dataset)
                 n_frames = len(self._h5[f"{key}/frames"])
             else:
                 # Multi-camera: verify all cameras have the same length
@@ -189,20 +189,20 @@ class ALIGNDataset(Dataset):
             # Pose offset: in cumulative HDF5, ep_N starts AFTER all previous episodes
             n_poses = len(self._h5[f"{key}/{pose_key}"])
             if n_poses == n_frames:
-                # Non-cumulative — pose aligns with frames directly
+                # Non-cumulative -- pose aligns with frames directly
                 self._ep_pose_offsets.append(0)
             elif ep_idx > 0:
-                # Cumulative — offset = sum of all previous frame lengths
+                # Cumulative -- offset = sum of all previous frame lengths
                 self._ep_pose_offsets.append(sum(self._ep_frame_lengths[:-1]))
             else:
                 self._ep_pose_offsets.append(0)
 
         # Warn if cumulative detected
         if any(o > 0 for o in self._ep_pose_offsets):
-            print("  NOTE: Detected cumulative noisy_poses — using per-episode offsets")
+            print("  NOTE: Detected cumulative noisy_poses -- using per-episode offsets")
 
         if self._has_actions:
-            print("  NOTE: Detected 'actions' dataset — will load actions when available")
+            print("  NOTE: Detected 'actions' dataset -- will load actions when available")
         # Build index: list of (ep_idx, start_frame, n_frames) for each valid window
         self._index: List[Tuple[int, int, int]] = []
         for ep_idx in range(len(self._episode_keys)):
@@ -230,10 +230,10 @@ class ALIGNDataset(Dataset):
             # Legacy single-frame dataset
             return self._h5["frames"][start:start + count]
         if not self.cameras:
-            # frames = Dataset — single array (legacy)
+            # frames = Dataset -- single array (legacy)
             return self._h5[f"{key}/frames"][start:start + count]
         if len(self.cameras) == 1:
-            # Single camera — keep the legacy 4D shape for back-compat
+            # Single camera -- keep the legacy 4D shape for back-compat
             return self._h5[f"{key}/frames/{self.cameras[0]}"][start:start + count]
         # Multi-camera: stack along a new axis (axis=1) → (count, V, H, W, 3)
         per_cam = [
@@ -397,7 +397,7 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
             "frames": (B, H, W, 3) or (B, V, H, W, 3) uint8,
             "trajectories": (B, K, 6) float32,
             "texts": list of strings,
-            "ep_ids": (B,) int — for verifying positives/negatives,
+            "ep_ids": (B,) int -- for verifying positives/negatives,
         }
     """
     all_frames = []
@@ -413,13 +413,13 @@ def pretrain_collate(batch: list, traj_window: int = TRAJ_WINDOW) -> dict:
         N = len(frames)
         # Sample a random anchor timestep within this episode
         # The vision frame and trajectory window are both anchored at the
-        # same time t — vision and trajectory are temporally aligned for
+        # same time t -- vision and trajectory are temporally aligned for
         # the positive pair. (Previously t1 and t2 were independent
-        # randoms — that breaks the contrastive signal.)
+        # randoms -- that breaks the contrastive signal.)
         max_offset = N - traj_window
         if max_offset > 0:
             t1 = np.random.randint(0, max_offset)  # vision anchor
-            t2 = t1                                # trajectory anchor — SAME time
+            t2 = t1                                # trajectory anchor -- SAME time
         else:
             t1 = 0
             t2 = 0
@@ -450,7 +450,7 @@ class MultiALIGNDataset(Dataset):
     random index selects a sample from the right source.
 
     All datasets must be in the same mode ('pretrain', 'head', or 'world_model')
-    and share the same trajectory window, frames_per_ep, image_size, and camera —
+    and share the same trajectory window, frames_per_ep, image_size, and camera --
     these are passed to the constructor and applied to every underlying dataset.
 
     Note: 'mode' is just a label on the dataset; the collate function
@@ -537,13 +537,13 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
 
     Returns:
         {
-            "frame_t":      (B, H, W, 3) uint8 — current frame
-            "traj_t":       (B, traj_window, 6) float32 — current traj window
-            "action":       (B, 6) float32 — the action at timestep t
-            "frame_next":   (B, H, W, 3) uint8 — next frame
-            "traj_next":    (B, traj_window, 6) float32 — next traj window
-            "text":         list of strings (B,) — task description
-            "ep_idx":       (B,) int64 — episode index (for diagnostics)
+            "frame_t":      (B, H, W, 3) uint8 -- current frame
+            "traj_t":       (B, traj_window, 6) float32 - current traj window
+            "action":       (B, 6) float32 - the action at timestep t
+            "frame_next":   (B, H, W, 3) uint8 -- next frame
+            "traj_next":    (B, traj_window, 6) float32 - next traj window
+            "text":         list of strings (B,) -- task description
+            "ep_idx":       (B,) int64 -- episode index (for diagnostics)
         }
 
     The encoder (frozen) is applied at training time to produce the
@@ -585,7 +585,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         if frame_window.shape[0] < traj_window:
             pad = np.zeros((traj_window - frame_window.shape[0], *frames.shape[1:]), dtype=frames.dtype)
             frame_window = np.concatenate([pad, frame_window], axis=0)
-        # Trajectory window: (traj_window, 6) — last `traj_window` poses
+        # Trajectory window: (traj_window, 6) -- last `traj_window` poses
         traj_t = poses[t - traj_window + 1 : t + 1, :6]
         if traj_t.shape[0] < traj_window:
             # Pad with the first pose
@@ -633,10 +633,27 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
     }
 
 
-def head_collate(batch: list, chunk_size: int = 5) -> dict:
-    """Collate batch for head training with on-the-fly noise injection.
+def head_collate(batch: list, chunk_size: int = 5,
+                 vision_window_size: int = 5) -> dict:
+    """Collate batch for head training (Decision + Assistant).
 
-    Returns sequential chunks for Decision (α = need × consistency) + Assistant supervision.
+    Samples one timestep per item, builds past/future trajectory windows,
+    and returns both:
+      - "frames":           (B, H, W, 3) -- single current frame (legacy)
+      - "frames_window":    (B, K, H, W, 3) -- K past frames for the transformer
+                            assistant head, where K = vision_window_size.
+                            Anchored at the current timestep t; padded at the
+                            episode boundary by replicating the earliest frame.
+
+    Args:
+        batch: list of items from ALIGNDataset (mode="head").
+        chunk_size: K for the assistant head's K-step chunk.
+        vision_window_size: number of past frames in the vision window.
+            Defaults to chunk_size so the transformer sees K past + predicts
+            K future. Set to 0 to disable the window (saves memory).
+    Collate batch for head training with on-the-fly noise injection.
+
+    Returns sequential chunks for Decision (alpha = need * consistency) + Assistant supervision.
 
     Note: The 'consistency' part (cosine similarity of embeddings) is calculated
     during the forward pass in train_heads.py using frozen encoders. This collate
@@ -645,15 +662,15 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
     Returns:
         {
             "frames": (B, H, W, 3) uint8,
-            "noisy_pose": (B, 6) float32 — corrupted pose (for alpha target),
-            "clean_pose": (B, 6) float32 — ground truth pose (for alpha target),
-            "current_action": (B, 6) float32 — the human's delta-pose command at
+            "noisy_pose": (B, 6) float32 - corrupted pose (for alpha target),
+            "clean_pose": (B, 6) float32 - ground truth pose (for alpha target),
+            "current_action": (B, 6) float32 - the human's delta-pose command at
                               this timestep (input to Assistant head). Sourced
                               from the dataset's `actions` field.
-            "trajectory": (B, K, 6) float32 — past window of clean poses,
-            "trajectory_future": (B, K, 6) float32 — NEXT K poses after the
+            "trajectory": (B, K, 6) float32 - past window of clean poses,
+            "trajectory_future": (B, K, 6) float32 - NEXT K poses after the
                               current timestep (targets for future prediction).
-            "alpha_need": (B,) float32 — kinematic error part of alpha_target,
+            "alpha_need": (B,) float32 - kinematic error part of alpha_target,
             "delta_target":(B, chunk_size, 6) float32,
             "texts": list of strings,
         }
@@ -667,6 +684,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
     all_needs = []
     all_deltas = []
     all_texts = []
+    all_frames_window = []  # K past frames for the transformer assistant head
 
     # Use a fixed seed for noise injection in the batch so it's reproducible
     rng = np.random.default_rng()
@@ -683,7 +701,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         max_t = N - chunk_size
         t = rng.integers(0, min(max(max_t + 1, 1), N)) if max_t >= 0 else min(rng.integers(0, 2), N - 1)
 
-        # --- Past Trajectory Window (Clean for encoding) — fixed to always be chunk_size ---
+        # --- Past Trajectory Window (Clean for encoding) -- fixed to always be chunk_size ---
         start = max(0, t - chunk_size + 1)
         traj_window = poses_clean[start:t + 1]
         if len(traj_window) < chunk_size:
@@ -715,7 +733,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         # delta[k] = poses_clean[t + k + 1] - noisy_pose   (relative goal at step k+1)
         #
         # This is "where should I be at t+k+1?" (relative to current).
-        # It exists even at zero error — the target is the goal itself.
+        # It exists even at zero error -- the target is the goal itself.
         # Combined with alpha via: action = (1-α)·a_human + α·goal[0]
         # (α is the trust weight between human's and model's actions.)
         delta = np.zeros((chunk_size, 6), dtype=np.float32)
@@ -741,6 +759,27 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         else:
             text = texts_raw
 
+        # Vision window: K past frames for the transformer assistant head.
+        # Anchored at t; the K-1 frames before t, then frame t.
+        # Padded at the episode boundary by replicating the earliest frame.
+        if vision_window_size > 0:
+            # Note: frames may be (N, H, W, 3) or (N, V, H, W, 3) for multi-cam
+            window_start = max(0, t - vision_window_size + 1)
+            window_end = t + 1  # inclusive
+            window_frames = frames[window_start:window_end]  # (K_actual, ...) or (K_actual, V, H, W, 3)
+            if len(window_frames) < vision_window_size:
+                # Pad at the start (replicate earliest)
+                if frames.ndim == 4:
+                    pad = np.tile(
+                        frames[0:1], (vision_window_size - len(window_frames), 1, 1, 1)
+                    )
+                else:  # 5D: (N, V, H, W, 3)
+                    pad = np.tile(
+                        frames[0:1], (vision_window_size - len(window_frames), 1, 1, 1, 1)
+                    )
+                window_frames = np.concatenate([pad, window_frames], axis=0)
+            all_frames_window.append(window_frames)
+
         all_frames.append(frames[t])
         all_noisy.append(noisy_pose[:6])
         all_clean.append(current_clean_pose[:6])
@@ -751,7 +790,7 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         all_deltas.append(delta)
         all_texts.append(text)
 
-    return {
+    return_dict = {
         "frames": np.stack(all_frames, axis=0),
         "noisy_pose": np.stack(all_noisy, axis=0).astype(np.float32),
         "clean_pose": np.stack(all_clean, axis=0).astype(np.float32),
@@ -762,6 +801,14 @@ def head_collate(batch: list, chunk_size: int = 5) -> dict:
         "delta_target": np.stack(all_deltas, axis=0).astype(np.float32),
         "texts": all_texts,
     }
+
+    # Add the vision window for the transformer assistant head.
+    # Only included if vision_window_size > 0. Shape:
+    #   (B, K, H, W, 3) for single-camera
+    #   (B, K, V, H, W, 3) for multi-camera
+    if vision_window_size > 0 and all_frames_window:
+        return_dict["frames_window"] = np.stack(all_frames_window, axis=0).astype(np.uint8)
+    return return_dict
 
 
 # ================================================================
