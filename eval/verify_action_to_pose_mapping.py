@@ -353,16 +353,14 @@ def main():
         print(f"=== SUMMARY: action → EEF displacement per unit action ===")
         print(f"{'='*60}")
         for r in results:
-            if r["axis"].endswith("+") or r["axis"].endswith("-"):
-                axis_idx = {"x": 0, "y": 1, "z": 2, "ax": 0, "ay": 1, "az": 2}[r["axis"][:-1]]
-                if r["axis"][-1] == "-":
-                    pass
-                if "x" in r["axis"] or "y" in r["axis"] or "z" in r["axis"]:
-                    pos = r["pos_local_avg"][axis_idx]
-                    print(f"  {r['axis']}: pos_local[{axis_idx}] = {pos:+.6f} m per unit action")
-                else:
-                    ori = r["ori_avg"][axis_idx]
-                    print(f"  {r['axis']}: ori[{axis_idx}] = {ori:+.6f} rad per unit action")
+            axis_name = r["axis"][:-1]  # strip +/-
+            axis_idx = {"x": 0, "y": 1, "z": 2, "ax": 0, "ay": 1, "az": 2}[axis_name]
+            if axis_name in ("x", "y", "z"):
+                pos = r["pos_local_avg"][axis_idx]
+                print(f"  {r['axis']}: pos_local[{axis_idx}] = {pos:+.6f} m per unit action")
+            else:
+                ori = r["ori_avg"][axis_idx]
+                print(f"  {r['axis']}: ori[{axis_idx}] = {ori:+.6f} rad per unit action")
     else:
         # Custom action
         action = np.array(json.loads(args.action), dtype=np.float64)
