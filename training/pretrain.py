@@ -110,6 +110,7 @@ def pretrain_hdf5(
     encoder_checkpoint: Optional[str] = None,
     resume: Optional[str] = None,
     stages: str = "all",
+    cameras: Optional[List[str]] = None,
 ):
     """Contrastive pretraining from HDF5 data with two sub-phases."""
     device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -174,7 +175,7 @@ def pretrain_hdf5(
         full_ds = ALIGNDataset(
             data_paths[0],
             mode="pretrain",
-            cameras=args.cameras,
+            cameras=cameras,
             frames_per_ep=frames_per_ep,
             traj_window=traj_window,
         )
@@ -183,6 +184,7 @@ def pretrain_hdf5(
         full_ds = MultiALIGNDataset(
             data_paths,
             mode="pretrain",
+            cameras=cameras,
             frames_per_ep=frames_per_ep,
             traj_window=traj_window,
         )
@@ -211,8 +213,8 @@ def pretrain_hdf5(
     )
 
     # -- Model ──
-    # Determine num_cameras from args.cameras (default: 1)
-    num_cameras = len(args.cameras) if args.cameras else 1
+    # Determine num_cameras from cameras param (default: 1)
+    num_cameras = len(cameras) if cameras else 1
     model = ALIGNModel(
         embed_dim=embed_dim,
         use_text=use_text,
@@ -623,6 +625,7 @@ def main():
         encoder_checkpoint=args.encoder_checkpoint,
         resume=args.resume,
         stages=args.stages,
+        cameras=args.cameras,
     )
 
 

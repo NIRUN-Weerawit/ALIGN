@@ -463,6 +463,7 @@ class MultiALIGNDataset(Dataset):
         h5_paths: List[str],
         mode: str = "pretrain",
         camera: str = DEFAULT_CAMERA,
+        cameras: Optional[List[str]] = None,
         image_size: Tuple[int, int] = DEFAULT_SIZE,
         frames_per_ep: int = DEFAULT_FRAMES_PER_EP,
         traj_window: int = TRAJ_WINDOW,
@@ -472,7 +473,8 @@ class MultiALIGNDataset(Dataset):
             raise ValueError("h5_paths must be a non-empty list")
         self.datasets = [
             ALIGNDataset(
-                p, mode=mode, camera=camera, image_size=image_size,
+                p, mode=mode, camera=camera, cameras=cameras,
+                image_size=image_size,
                 frames_per_ep=frames_per_ep, traj_window=traj_window,
                 episodes_per_batch=episodes_per_batch,
             )
