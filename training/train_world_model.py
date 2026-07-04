@@ -450,13 +450,9 @@ def train_world_model(
             with torch.no_grad(), torch.amp.autocast(
                 "cuda", dtype=torch.bfloat16, enabled=use_bf16
             ):
-                # frames_t is (B, K, H, W, 3) — encode each frame separately
-                B, K, H, W, C = frames_t.shape
-
-                # Encode all frames at once through raw vision encoder
-                frames_flat = frames_t.reshape(B * K, H, W, C)
-                z_v_raw = align.encode_raw_vision(frames_flat)  # (B*K, D)
-                z_v_window = z_v_raw.reshape(B, K, -1)          # (B, K, D)
+                # frames_t is (B, K, H, W, 3) for single-cam or (B, K, V, H, W, 3) for multi-cam
+                # Use encode_raw_vision_window which handles both cases
+                z_v_window = align.encode_raw_vision_window(frames_t)  # (B, K, D)
 
                 # Encode trajectory and text
                 z_t_tokens = align.encode_raw_trajectory_tokens(traj_t)  # (B, K, D)
@@ -464,7 +460,7 @@ def train_world_model(
                 if z_text is None:
                     z_text = torch.zeros_like(z_v_window[:, 0])
 
-                # Through mixer — now accepts (B, K, D) for z_v
+                # Through mixer — accepts (B, K, D) for z_v
                 z_v_window, z_t_tokens, z_text = align.cross_attention_mixer(
                     z_v_window, z_t_tokens, z_text
                 )
