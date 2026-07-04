@@ -98,6 +98,7 @@ def train_heads_hdf5(
     assistant_nhead: int = 4,
     assistant_num_layers: int = 2,
     assistant_dim_ff: int = 1024,
+    warmup_epochs: int = 0,
 ) -> str:
     """Train Decision and Assistant heads independently.
 
