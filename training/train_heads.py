@@ -470,14 +470,12 @@ def train_heads_hdf5(
                 frames_window = torch.from_numpy(batch["frames_window"]).to(device)
                 # Encode K frames separately: (B, K, D)
                 z_v_window_raw = model.encode_raw_vision_window(frames_window)
-                # Run through the cross-attention mixer (per-timestep) to fuse with z_t
-                # We use z_t_tokens (B, K, D) as the trajectory context
-                # Run mixer: z_v_window_raw (B,K,D) + z_t_tokens (B,K,D) + z_text (B,D) -> (B,K,D)
-                z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
+                # Run through the cross-attention mixer to fuse vision + trajectory
+                # Mixer expects z_text as (B, D) — it handles broadcasting internally
                 z_v_window_mixed, _, _ = model.cross_attention_mixer(
-                    z_v_window_raw, z_t_tokens, z_text_expanded
+                    z_v_window_raw, z_t_tokens, z_text
                 )
-                # Take the last K tokens of z_t_tokens (or just use z_t_tokens[:, -K:])
+                # Take the last K tokens for the assistant head
                 z_t_window = z_t_tokens[:, -K:]  # (B, K, D)
                 delta_pred = model.assistant_head(z_v_window_mixed, z_t_window, z_text)
             else:

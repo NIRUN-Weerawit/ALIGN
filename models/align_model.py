@@ -688,11 +688,10 @@ class ALIGNModel(nn.Module):
             return z_v_flat.reshape(B, K, -1)
         elif frames_window.ndim == 6:
             # Multi-camera window: (B, K, V, H, W, 3)
-            # VisionEncoder fuses V internally, so we feed it (B*K*V, H, W, 3)
-            # and reshape the result back to (B, K, D)
+            # Reshape to (B*K, V, H, W, C) so VisionEncoder fuses V cameras per timestep
             B, K, V, H, W, C = frames_window.shape
-            frames_flat = frames_window.reshape(B * K * V, H, W, C)
-            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, D) -- V was fused
+            frames_flat = frames_window.reshape(B * K, V, H, W, C)
+            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, D) — V fused per timestep
             return z_v_flat.reshape(B, K, -1)
         else:
             raise ValueError(
