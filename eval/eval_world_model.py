@@ -492,11 +492,8 @@ def evaluate(
                 ep_key = ds._episode_keys[source_ep_id]
                 try:
                     # Read full frames from the camera group.
-                    # `ds.camera` is the camera used by the dataset
-                    # (e.g. "wrist_image"). The batch's frames were
-                    # encoded from this same camera, so the rollout
-                    # must use the same camera to compare.
-                    camera_name = ds.camera or "image"
+                    # Use the first camera from the dataset's cameras list.
+                    camera_name = ds.cameras[0] if ds.cameras else "image"
                     full_frames = ds._h5[f"{ep_key}/frames/{camera_name}"][:]
                     # Use the dataset's offset-aware _read_poses and
                     # _read_actions methods to get the trajectory
