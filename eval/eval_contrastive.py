@@ -59,6 +59,7 @@ def load_model(
     checkpoint_path: str,
     device: str = "cuda",
     use_text: bool = True,
+    num_cameras: int = 1,
 ) -> ALIGNModel:
     """Load model from checkpoint. Handles both pretrain and head checkpoints.
 
@@ -71,6 +72,7 @@ def load_model(
         chunk_size=5,
         use_text=use_text,
         device=device,
+        num_cameras=num_cameras,
     ).to(device)
     model.eval()
 
@@ -219,12 +221,14 @@ def load_episodes_from_hdf5(
     h5_path: str,
     n_episodes: int = 5,
     traj_window: int = 20,
+    cameras: Optional[List[str]] = None,
 ) -> Tuple[List[np.ndarray], List[np.ndarray], List[str]]:
     """Load full episodes from HDF5 for temporal window sampling.
 
     Returns:
         (all_frames, all_poses, all_texts) where each is a list of arrays
-        per episode. all_frames[i].shape = (T, H, W, 3), all_poses[i].shape = (T, 6).
+        per episode. all_frames[i].shape = (T, H, W, 3) for single-cam or
+        (T, V, H, W, 3) for multi-cam. all_poses[i].shape = (T, 6).
     """
     import h5py, json
     all_frames, all_poses, all_texts = [], [], []
@@ -234,10 +238,23 @@ def load_episodes_from_hdf5(
         for idx in selected:
             ep = h5[ep_keys[idx]]
             text = json.loads(ep["texts"][()])[0]
-            # Frames
+            # Frames — support multi-camera
             frames_group = ep["frames"]
-            cam = "wrist_image" if "wrist_image" in frames_group else list(frames_group.keys())[0]
-            frames = frames_group[cam][:]
+            if isinstance(frames_group, h5py.Dataset):
+                # Single array (N, H, W, 3)
+                frames = frames_group[:]
+            else:
+                # Group with camera sub-datasets
+                available = list(frames_group.keys())
+                if cameras:
+                    cam_list = [c for c in cameras if c in available]
+                else:
+                    cam_list = ["wrist_image"] if "wrist_image" in available else [available[0]]
+                if len(cam_list) == 1:
+                    frames = frames_group[cam_list[0]][:]  # (N, H, W, 3)
+                else:
+                    per_cam = [frames_group[c][:] for c in cam_list]
+                    frames = np.stack(per_cam, axis=1)  # (N, V, H, W, 3)
             # Poses
             poses = ep["poses"][:, :6]
             all_frames.append(frames)
@@ -261,7 +278,7 @@ def sample_windows(
       - the episode's text
 
     Returns:
-        frames: (B, H, W, 3) uint8
+        frames: (B, H, W, 3) or (B, V, H, W, 3) uint8
         trajs:  (B, K, 6) float32
         texts:  list of str
     """
@@ -274,7 +291,7 @@ def sample_windows(
         if T < traj_window + 1:
             continue
         t = np.random.randint(0, T - traj_window)
-        # Frame at t
+        # Frame at t — (H, W, 3) or (V, H, W, 3) for multi-cam
         frame = ep_frames[t]
         # Trajectory window [t, t+traj_window)
         traj = ep_poses[t:t + traj_window]
@@ -518,15 +535,19 @@ def main():
     parser.add_argument("--frame", help="Single image file path")
     parser.add_argument("--pose", help="Single pose as space-separated numbers")
     parser.add_argument("--text", help="Single text query")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during pretrain.")
     args = parser.parse_args()
 
-    model = load_model(args.checkpoint, args.device)
+    num_cameras = len(args.cameras) if args.cameras else 1
+    model = load_model(args.checkpoint, args.device, num_cameras=num_cameras)
 
     # ── Load episodes from HDF5 (used by all modes except single-sample) ──
     if args.data and not (args.frame and args.pose and args.text):
         print(f"[load] Loading {args.n_episodes} episodes from {args.data}...")
         all_frames, all_poses, all_texts = load_episodes_from_hdf5(
-            args.data, args.n_episodes, args.traj_window)
+            args.data, args.n_episodes, args.traj_window, cameras=args.cameras)
         print(f"  Loaded {len(all_frames)} episodes")
 
     if args.eval_misalignment:
