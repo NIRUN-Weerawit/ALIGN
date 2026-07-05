@@ -332,6 +332,12 @@ def evaluate(
     test1_pred_norm: List[float] = []   # ||predicted s'||
     test1_real_norm: List[float] = []   # ||real s'||
 
+    # Test 1b: copy baseline diagnostic
+    test1b_cos_v_copy: List[float] = []
+    test1b_cos_t_copy: List[float] = []
+    test1b_cos_v_target_vs_input: List[float] = []
+    test1b_cos_t_target_vs_input: List[float] = []
+
     # Test 2: random-action predictions — norm only
     test2_random_norm: List[float] = []
 
@@ -448,6 +454,28 @@ def evaluate(
             test1_cos_t.extend(cos_t.cpu().tolist())
             test1_pred_norm.extend(pred_joint.norm(dim=-1).cpu().tolist())
             test1_real_norm.extend(real_joint.norm(dim=-1).cpu().tolist())
+
+            # ============== TEST 1b: copy baseline (pred vs last input) ====
+            # If the model is just copying the last input embedding, then
+            # cos(pred, last_input) ≈ cos(pred, target) ≈ high.
+            # A genuine dynamics model should have cos(pred, last_input) LOW
+            # and cos(pred, target) HIGH.
+            if _is_old_arch:
+                z_v_last_input = z_v  # (B, D)
+                z_t_last_input = z_t
+            else:
+                z_v_last_input = z_v[:, -1]  # (B, D) — last frame in window
+                z_t_last_input = z_t[:, -1]  # (B, D) — last traj token
+            cos_v_copy = F.cosine_similarity(z_v_pred, z_v_last_input, dim=-1)
+            cos_t_copy = F.cosine_similarity(z_t_pred, z_t_last_input, dim=-1)
+            # Also measure: how similar is the target to the last input?
+            # If target ≈ last_input, the task is trivially easy (copying works)
+            cos_v_target_vs_input = F.cosine_similarity(z_v_next, z_v_last_input, dim=-1)
+            cos_t_target_vs_input = F.cosine_similarity(z_t_next, z_t_last_input, dim=-1)
+            test1b_cos_v_copy.extend(cos_v_copy.cpu().tolist())
+            test1b_cos_t_copy.extend(cos_t_copy.cpu().tolist())
+            test1b_cos_v_target_vs_input.extend(cos_v_target_vs_input.cpu().tolist())
+            test1b_cos_t_target_vs_input.extend(cos_t_target_vs_input.cpu().tolist())
 
             # ============== TEST 2: random-action norm =============
             # Build a random action from the empirical distribution in this batch.
@@ -631,6 +659,32 @@ def evaluate(
         "passed": t1_pass,
     }
 
+    # --- Test 1b: copy baseline diagnostic ---
+    cos_v_copy = _to_np(test1b_cos_v_copy)
+    cos_t_copy = _to_np(test1b_cos_t_copy)
+    cos_v_tvi = _to_np(test1b_cos_v_target_vs_input)
+    cos_t_tvi = _to_np(test1b_cos_t_target_vs_input)
+
+    # Copy gap: how much better is prediction vs copying?
+    # copy_gap_v = cos(pred, target) - cos(pred, last_input)
+    # If positive: model predicts better than copying (good)
+    # If near zero: model is copying (bad)
+    copy_gap_v = float((cos_v.mean() - cos_v_copy.mean())) if cos_v.size and cos_v_copy.size else float("nan")
+    copy_gap_t = float((cos_t.mean() - cos_t_copy.mean())) if cos_t.size and cos_t_copy.size else float("nan")
+
+    report["test1b_copy_baseline"] = {
+        "cos_v_pred_vs_target": float(cos_v.mean()) if cos_v.size else None,
+        "cos_v_pred_vs_last_input": float(cos_v_copy.mean()) if cos_v_copy.size else None,
+        "cos_v_target_vs_last_input": float(cos_v_tvi.mean()) if cos_v_tvi.size else None,
+        "copy_gap_v": copy_gap_v,
+        "cos_t_pred_vs_target": float(cos_t.mean()) if cos_t.size else None,
+        "cos_t_pred_vs_last_input": float(cos_t_copy.mean()) if cos_t_copy.size else None,
+        "cos_t_target_vs_last_input": float(cos_t_tvi.mean()) if cos_t_tvi.size else None,
+        "copy_gap_t": copy_gap_t,
+        "interpretation": "copy_gap > 0 means model predicts better than copying. "
+                          "target_vs_last_input near 1.0 means task is trivially easy.",
+    }
+
     # --- Test 2 ---
     rand_norm = _to_np(test2_random_norm)
     real_norm_mean = float(real_norm.mean()) if real_norm.size else 1.0
@@ -725,6 +779,16 @@ def _print_report(report: dict) -> None:
     print(f"  Target:                     {t1['target']}")
     status = "PASS ✓" if t1["passed"] else "FAIL ✗"
     print(f"  Result:                     {status}")
+
+    t1b = report.get("test1b_copy_baseline", {})
+    if t1b:
+        print("\n[Test 1b] Copy baseline diagnostic")
+        print(f"  cos(pred, target)      v: {t1b.get('cos_v_pred_vs_target', float('nan')):.4f}  t: {t1b.get('cos_t_pred_vs_target', float('nan')):.4f}")
+        print(f"  cos(pred, last_input)  v: {t1b.get('cos_v_pred_vs_last_input', float('nan')):.4f}  t: {t1b.get('cos_t_pred_vs_last_input', float('nan')):.4f}")
+        print(f"  cos(target, last_in)   v: {t1b.get('cos_v_target_vs_last_input', float('nan')):.4f}  t: {t1b.get('cos_t_target_vs_last_input', float('nan')):.4f}")
+        print(f"  Copy gap (pred-target - pred-copy):")
+        print(f"    v: {t1b.get('copy_gap_v', float('nan')):+.4f}  t: {t1b.get('copy_gap_t', float('nan')):+.4f}")
+        print(f"  Interpretation: {t1b.get('interpretation', '')}")
 
     t2 = report["test2_ood_sanity"]
     print("\n[Test 2] OOD sanity (random actions)")
