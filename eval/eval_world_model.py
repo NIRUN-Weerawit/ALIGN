@@ -29,7 +29,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -149,6 +149,7 @@ def evaluate(
     n_batches: int = 50,
     rollout_steps: int = 10,
     seed: int = 42,
+    cameras: Optional[List[str]] = None,
 ) -> dict:
     """Run the three diagnostic tests on the world model.
 
@@ -282,6 +283,7 @@ def evaluate(
         device=str(device),
         mixer_dim=enc_cfg.get("mixer_dim", cfg.get("mixer_dim", 512)),
         num_mixer_blocks=enc_cfg.get("num_mixer_blocks", cfg.get("num_mixer_blocks", 2)),
+        num_cameras=len(cameras) if cameras else 1,
     ).to(device)
     if "trainable_state_dict" in enc_ckpt:
         align.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
@@ -300,9 +302,11 @@ def evaluate(
 
     # -- Dataset (validation tail) --
     if len(data_paths) == 1:
-        ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window)
+        ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window,
+                          cameras=cameras)
     else:
-        ds = MultiALIGNDataset(data_paths, mode="head", traj_window=traj_window)
+        ds = MultiALIGNDataset(data_paths, mode="head", traj_window=traj_window,
+                               cameras=cameras)
     n_total = len(ds)
     n_val = max(1, int(n_total * val_split))
     indices = list(range(n_total - n_val, n_total))
@@ -345,17 +349,17 @@ def evaluate(
         """Encode state with K-frame window for world model input.
 
         Returns (z_v_window, z_t_window, z_text) all (B, W, D) except z_text (B, D).
+        Handles both single-cam (B, K, H, W, 3) and multi-cam (B, K, V, H, W, 3).
         """
         with torch.no_grad(), torch.amp.autocast(
             "cuda", dtype=torch.bfloat16, enabled=use_bf16
         ):
+            # Handle single frame (4D) by wrapping
             if frames.dim() == 4:
                 frames = frames.unsqueeze(1)
-            B, K, H, W, C = frames.shape
 
-            frames_flat = frames.reshape(B * K, H, W, C)
-            z_v_raw = align.encode_raw_vision(frames_flat)
-            z_v = z_v_raw.reshape(B, K, -1)
+            # Use encode_raw_vision_window which handles both 5D and 6D
+            z_v = align.encode_raw_vision_window(frames)  # (B, K, D)
 
             z_t_tokens = align.encode_raw_trajectory_tokens(traj)
             z_text = align.encode_raw_text(texts)
@@ -790,6 +794,9 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-json", default=None,
                         help="Optional path to write the full report as JSON.")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during pretrain.")
     args = parser.parse_args()
 
     report = evaluate(
@@ -805,6 +812,7 @@ def main() -> None:
         n_batches=args.n_batches,
         rollout_steps=args.rollout_steps,
         seed=args.seed,
+        cameras=args.cameras,
     )
 
     if args.output_json:
