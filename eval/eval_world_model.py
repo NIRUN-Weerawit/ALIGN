@@ -509,9 +509,11 @@ def evaluate(
                     print(f"  Error reading episode {source_ep_id} (key={ep_key}): {e}", flush=True)
                     continue
                 # Now find the anchor t by comparing the last frame in the window
-                # against full episode frames. Use a robust approach: compare
-                # frame shape and approximate pixel sum (cast both to same dtype).
+                # against full episode frames. For multi-camera, compare only
+                # the first camera view against the single-camera HDF5 frames.
                 target_frame = frames_t[i, -1].cpu().numpy().astype(np.float64)
+                if target_frame.ndim == 4:  # (V, H, W, 3) — multi-camera
+                    target_frame = target_frame[0]  # use first camera view
                 target_sum = int(target_frame.sum())
                 target_shape = target_frame.shape
                 chosen_t = None
