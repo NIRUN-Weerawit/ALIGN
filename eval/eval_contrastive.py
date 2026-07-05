@@ -247,7 +247,14 @@ def load_episodes_from_hdf5(
                 # Group with camera sub-datasets
                 available = list(frames_group.keys())
                 if cameras:
-                    cam_list = [c for c in cameras if c in available]
+                    # Validate all requested cameras exist
+                    missing = [c for c in cameras if c not in available]
+                    if missing:
+                        raise ValueError(
+                            f"Camera(s) {missing} not found in HDF5. "
+                            f"Available: {available}"
+                        )
+                    cam_list = list(cameras)
                 else:
                     cam_list = ["wrist_image"] if "wrist_image" in available else [available[0]]
                 if len(cam_list) == 1:
