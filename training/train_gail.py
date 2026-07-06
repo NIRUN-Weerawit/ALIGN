@@ -459,7 +459,7 @@ def train_gail(
             # action, frame_next, traj_next, text, ep_idx.
             # We only need (frame_t, traj_t, action, text) — use the LAST frame
             # in the window (current timestep).
-            frame_t = torch.from_numpy(batch["frame_t"][:, -1]).to(device)  # (B, H, W, 3)
+            frame_t = torch.from_numpy(batch["frame_t"][:, -1]).to(device)  # (B, H, W, 3) or (B, V, H, W, 3) for multi-cam
             traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)   # (B, K, 6)
             action_exp = torch.from_numpy(batch["action"]).float().to(device)
             texts = batch["text"]
