@@ -70,11 +70,24 @@ USE_BF16 = True
 
 
 def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
-    """Encode a batch through the frozen encoder+mixer."""
-    # world_model_collate returns frame_t as (B, K, H, W, 3) — use last frame
-    frames = batch["frame_t"][:, -1] if batch["frame_t"].ndim == 5 else batch["frame_t"]
-    if frames.ndim == 5:
-        frames = frames[:, -1]
+    """Encode a batch through the frozen encoder+mixer.
+
+    The `frame_t` field has different shapes depending on the camera setup:
+      - Single camera: (B, K, H, W, 3) — K past frames
+      - Multi camera:  (B, K, V, H, W, 3) — K past frames × V cameras
+    We use only the LAST frame (current timestep) to avoid stale info,
+    then pass the appropriate 4D/5D shape to the encoder.
+    """
+    frame_t = batch["frame_t"]
+    if frame_t.ndim == 6:
+        # (B, K, V, H, W, 3) -> (B, V, H, W, 3): use last K, keep all V
+        frames = frame_t[:, -1]
+    elif frame_t.ndim == 5:
+        # (B, K, H, W, 3) -> (B, H, W, 3): use last K
+        frames = frame_t[:, -1]
+    else:
+        # Already (B, H, W, 3) or (B, V, H, W, 3)
+        frames = frame_t
     traj = batch["traj_t"]
     texts = batch["text"]
 
