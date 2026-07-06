@@ -135,45 +135,56 @@ def train_value(
     print(f"  Value head: hidden={hidden_dim}, layers={num_layers}")
 
     # -- W&B -------------------------------------------------
+    # Build the config dict once. We pass it to init_wandb (which is a
+    # no-op if --wandb is disabled) AND always save it to a local JSON
+    # file in the output dir, so config is preserved either way.
+    config = {
+        "model": "align-value",
+        "output_dir": str(out_dir),
+        "data": [str(p) for p in data_paths],
+        "pretrained_checkpoint": pretrained_checkpoint,
+        "gail_checkpoint": gail_checkpoint,
+        "wandb_project": wandb_project,
+        "wandb_run": wandb_run,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "gamma": gamma,
+        "lam": lam,
+        "n_steps": n_steps,
+        "val_split": val_split,
+        "max_steps_per_epoch": max_steps_per_epoch,
+        "num_workers": num_workers,
+        "traj_window": traj_window,
+        "chunk_size": chunk_size,
+        "embed_dim": embed_dim,
+        "hidden_dim": hidden_dim,
+        "num_layers": num_layers,
+        "device": str(device),
+        "use_bf16": use_bf16,
+        "seed": seed,
+        "cameras": cameras if cameras else ["wrist_image"],
+        # === Phase 9: stability techniques (PPO/DQN/DDPG) ===
+        "phase9/reward_clip": reward_clip,           # DQN
+        "phase9/soft_update_tau": soft_update_tau,   # DDPG/Polyak
+        "phase9/use_target_net": use_target_net,     # DQN/DDPG
+        "phase9/use_huber_loss": use_huber_loss,     # DQN
+        "phase9/huber_delta": huber_delta,           # DQN
+    }
+    # Always save config locally for traceability
+    try:
+        import json
+        config_path = out_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2, default=str)
+        print(f"  Config:     saved to {config_path}")
+    except Exception as e:
+        print(f"  Warning: could not save config to disk: {e}")
     wandb_trainer = init_wandb(
         project=wandb_project,
         name=wandb_run or out_dir.name,
-        config={
-            "model": "align-value",
-            "output_dir": str(out_dir),
-            "data": [str(p) for p in data_paths],
-            "pretrained_checkpoint": pretrained_checkpoint,
-            "gail_checkpoint": gail_checkpoint,
-            "wandb_project": wandb_project,
-            "wandb_run": wandb_run,
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "gamma": gamma,
-            "lam": lam,
-            "n_steps": n_steps,
-            "val_split": val_split,
-            "max_steps_per_epoch": max_steps_per_epoch,
-            "num_workers": num_workers,
-            "traj_window": traj_window,
-            "chunk_size": chunk_size,
-            "embed_dim": embed_dim,
-            "hidden_dim": hidden_dim,
-            "num_layers": num_layers,
-            "device": str(device),
-            "use_bf16": use_bf16,
-            "seed": seed,
-            "cameras": cameras if cameras else ["wrist_image"],
-            # === Phase 9: stability techniques (PPO/DQN/DDPG) ===
-            "phase9/reward_clip": reward_clip,           # DQN
-            "phase9/soft_update_tau": soft_update_tau,   # DDPG/Polyak
-            "phase9/use_target_net": use_target_net,     # DQN/DDPG
-            "phase9/use_huber_loss": use_huber_loss,     # DQN
-            "phase9/huber_delta": huber_delta,           # DQN
-        },
-    ) if enable_wandb else init_wandb(
-        project=wandb_project, name=wandb_run or out_dir.name, config={},
+        config=config,
     )
     print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
 

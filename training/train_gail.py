@@ -223,46 +223,59 @@ def train_gail(
     print(f"  Rollout:    mode={rollout_mode}  noise_scale={rollout_noise_scale}")
 
     # -- W&B -------------------------------------------------
+    # Build the config dict once. We pass it to init_wandb (which is a
+    # no-op if --wandb is disabled) AND always save it to a local JSON
+    # file in the output dir, so config is preserved either way.
+    config = {
+        "model": "align-gail",
+        "output_dir": str(output_dir),
+        "data": [str(p) for p in data_paths],
+        "pretrained_checkpoint": pretrained_checkpoint,
+        "wandb_project": wandb_project,
+        "wandb_run": wandb_run,
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "val_split": val_split,
+        "max_steps_per_epoch": max_steps_per_epoch,
+        "num_workers": num_workers,
+        "arch": arch,
+        "action_dim": action_dim,
+        "embed_dim": embed_dim,
+        "mixer_dim": mixer_dim,
+        "num_mixer_blocks": num_mixer_blocks,
+        "traj_window": traj_window,
+        "chunk_size": chunk_size,
+        "mlp_hidden": mlp_hidden,
+        "mlp_layers": mlp_layers,
+        "mlp_dropout": mlp_dropout,
+        "transformer_layers": transformer_layers,
+        "transformer_d_model": transformer_d_model,
+        "transformer_nhead": transformer_nhead,
+        "transformer_dropout": transformer_dropout,
+        "transformer_dim_ff": transformer_dim_ff,
+        "rollout_mode": rollout_mode,
+        "rollout_noise_scale": rollout_noise_scale,
+        "device": str(device),
+        "use_bf16": use_bf16,
+        "seed": seed,
+        "cameras": cameras if cameras else ["wrist_image"],
+    }
+    # Always save config locally for traceability
+    try:
+        import json
+        config_path = out_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2, default=str)
+        print(f"  Config:     saved to {config_path}")
+    except Exception as e:
+        print(f"  Warning: could not save config to disk: {e}")
     wandb_trainer = init_wandb(
         project=wandb_project,
         name=wandb_run or out_dir.name,
-        config={
-            "model": "align-gail",
-            "output_dir": str(output_dir),
-            "data": [str(p) for p in data_paths],
-            "pretrained_checkpoint": pretrained_checkpoint,
-            "wandb_project": wandb_project,
-            "wandb_run": wandb_run,
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "val_split": val_split,
-            "max_steps_per_epoch": max_steps_per_epoch,
-            "num_workers": num_workers,
-            "arch": arch,
-            "action_dim": action_dim,
-            "embed_dim": embed_dim,
-            "mixer_dim": mixer_dim,
-            "num_mixer_blocks": num_mixer_blocks,
-            "traj_window": traj_window,
-            "chunk_size": chunk_size,
-            "mlp_hidden": mlp_hidden,
-            "mlp_layers": mlp_layers,
-            "mlp_dropout": mlp_dropout,
-            "transformer_layers": transformer_layers,
-            "transformer_d_model": transformer_d_model,
-            "transformer_nhead": transformer_nhead,
-            "transformer_dropout": transformer_dropout,
-            "transformer_dim_ff": transformer_dim_ff,
-            "rollout_mode": rollout_mode,
-            "rollout_noise_scale": rollout_noise_scale,
-            "device": str(device),
-            "use_bf16": use_bf16,
-            "seed": seed,
-            "cameras": cameras if cameras else ["wrist_image"],
-        },
-    ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run or out_dir.name, config={})
+        config=config,
+    )
     print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Empirical action distribution ------------------------
