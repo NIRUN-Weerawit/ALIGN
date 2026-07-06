@@ -614,6 +614,7 @@ def evaluate(
         device=str(device),
         mixer_dim=vh_cfg.get("mixer_dim", 512),
         num_mixer_blocks=vh_cfg.get("num_mixer_blocks", 2),
+        num_cameras=len(args.cameras) if args.cameras else 1,
     ).to(device)
     enc_ckpt = torch.load(encoder_checkpoint, map_location=device, weights_only=False)
     if "trainable_state_dict" in enc_ckpt:
@@ -625,10 +626,12 @@ def evaluate(
 
     # Build validation loader
     if len(data_paths) == 1:
-        ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window)
+        ds = ALIGNDataset(data_paths[0], mode="head", traj_window=traj_window,
+                          cameras=args.cameras)
     else:
         from data.align_dataset import MultiALIGNDataset
-        ds = MultiALIGNDataset(data_paths, mode="head", traj_window=traj_window)
+        ds = MultiALIGNDataset(data_paths, mode="head", traj_window=traj_window,
+                               cameras=args.cameras)
 
     n_total = len(ds)
     n_val = max(1, int(n_total * val_split))
@@ -687,6 +690,9 @@ def main():
     parser = argparse.ArgumentParser(description="Value head sanity checks")
     parser.add_argument("--data", required=True, nargs="+",
                         help="Path(s) to HDF5 dataset(s)")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during training.")
     parser.add_argument("--value-head-checkpoint", required=True,
                         help="Path to value head checkpoint")
     parser.add_argument("--gail-checkpoint", required=True,

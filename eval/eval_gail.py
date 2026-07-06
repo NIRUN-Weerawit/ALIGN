@@ -420,6 +420,9 @@ def main():
     parser = argparse.ArgumentParser(description="Strict sanity checks for trained GAIL")
     parser.add_argument("--data", required=True, nargs="+",
                         help="Path(s) to HDF5 dataset(s)")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'wrist_image image'). "
+                             "Must match the cameras used during training.")
     parser.add_argument("--gail-checkpoint", required=True,
                         help="Path to gail_best.pt")
     parser.add_argument("--encoder-checkpoint", required=True,
@@ -476,6 +479,8 @@ def main():
     print(f"Loading encoder: {args.encoder_checkpoint}")
     enc_ckpt = torch.load(args.encoder_checkpoint, map_location=device, weights_only=False)
     enc_cfg = enc_ckpt.get("config", {}) if isinstance(enc_ckpt, dict) else {}
+    # num_cameras must match the cameras used during training
+    num_cameras = len(args.cameras) if args.cameras else 1
     align = ALIGNModel(
         embed_dim=256,
         chunk_size=5,
@@ -483,6 +488,7 @@ def main():
         device=str(device),
         mixer_dim=enc_cfg.get("mixer_dim", 512),
         num_mixer_blocks=enc_cfg.get("num_mixer_blocks", 2),
+        num_cameras=num_cameras,
     ).to(device)
     if "trainable_state_dict" in enc_ckpt:
         align.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
@@ -490,14 +496,15 @@ def main():
     align.freeze_all_encoders()
     align.eval()
     print(f"  Encoder: mixer_dim={align.cross_attention_mixer.mixer_dim}, "
-          f"num_blocks={align.cross_attention_mixer.num_blocks}")
+          f"num_blocks={align.cross_attention_mixer.num_blocks}, "
+          f"num_cameras={align.num_cameras}")
 
     # Build val dataset
     if len(args.data) == 1:
-        ds = ALIGNDataset(args.data[0], mode="head", traj_window=5)
+        ds = ALIGNDataset(args.data[0], mode="head", traj_window=5, cameras=args.cameras)
     else:
         from data.align_dataset import MultiALIGNDataset
-        ds = MultiALIGNDataset(args.data, mode="head", traj_window=5)
+        ds = MultiALIGNDataset(args.data, mode="head", traj_window=5, cameras=args.cameras)
 
     val_split = max(1, int(len(ds) * 0.1))
     val_indices = list(range(len(ds) - val_split, len(ds)))
