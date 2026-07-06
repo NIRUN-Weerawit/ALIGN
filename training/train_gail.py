@@ -260,6 +260,7 @@ def train_gail(
             "device": str(device),
             "use_bf16": use_bf16,
             "seed": seed,
+            "cameras": cameras if cameras else ["wrist_image"],
         },
     ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run or out_dir.name, config={})
     print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")

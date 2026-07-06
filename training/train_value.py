@@ -140,9 +140,12 @@ def train_value(
         name=wandb_run or out_dir.name,
         config={
             "model": "align-value",
+            "output_dir": str(out_dir),
             "data": [str(p) for p in data_paths],
             "pretrained_checkpoint": pretrained_checkpoint,
             "gail_checkpoint": gail_checkpoint,
+            "wandb_project": wandb_project,
+            "wandb_run": wandb_run,
             "epochs": epochs,
             "batch_size": batch_size,
             "lr": lr,
@@ -161,6 +164,7 @@ def train_value(
             "device": str(device),
             "use_bf16": use_bf16,
             "seed": seed,
+            "cameras": cameras if cameras else ["wrist_image"],
             # === Phase 9: stability techniques (PPO/DQN/DDPG) ===
             "phase9/reward_clip": reward_clip,           # DQN
             "phase9/soft_update_tau": soft_update_tau,   # DDPG/Polyak
