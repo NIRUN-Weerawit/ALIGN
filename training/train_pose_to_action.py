@@ -120,8 +120,21 @@ def train_pose_to_action(
     wandb_project: str = "align-pose-to-action",
     wandb_run: Optional[str] = None,
     device: Optional[str] = None,
+    # Bounded output: per-dim action range. If None, auto-compute from data.
+    action_min: Optional[List[float]] = None,
+    action_max: Optional[List[float]] = None,
+    # Margin: how much extra padding around the per-dim training-data range
+    # to allow for outliers. Default 1.05 = 5% padding on each side.
+    bound_margin: float = 1.05,
 ) -> str:
-    """Train PoseDeltaToAction from HDF5 demo data.
+    """Train PoseDeltaToAction from HDF5 demo data (bounded output).
+
+    The model's output is hard-bounded to [action_min[d], action_max[d]] per
+    dim via tanh × range + mid. If action_min/max are not provided, they
+    are auto-computed from the per-dim min/max of the training actions,
+    with `bound_margin` padding on each side (1.05 = 5% extra on each
+    end of the data range, so the model can slightly exceed the data
+    range during training but not blow up).
 
     Returns:
         Path to the best checkpoint.
@@ -139,7 +152,35 @@ def train_pose_to_action(
     out_dir = base_dir / f"run_{next_run}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== PoseDeltaToAction Training ===")
+    # ---- Auto-compute per-dim action range from data if not provided ----
+    if action_min is None or action_max is None:
+        print("  Auto-computing per-dim action range from data...")
+        all_actions = []
+        for h5_path in data_paths:
+            with h5py.File(h5_path, "r") as f:
+                for ep_key in sorted(k for k in f.keys() if k.startswith("ep_")):
+                    ep = f[ep_key]
+                    if "actions" not in ep:
+                        continue
+                    acts = ep["actions"][:, :6]
+                    all_actions.append(acts)
+        all_actions = np.concatenate(all_actions, axis=0).astype(np.float32)
+        d_min = all_actions.min(axis=0)
+        d_max = all_actions.max(axis=0)
+        if action_min is None:
+            # Margin extends the bound outward — for positive data_min,
+            # margin means: min = data_min * margin (further from 0).
+            # For negative data_min, margin means: min = data_min * margin
+            # (further from 0, more negative).
+            action_min = [float(x) for x in (d_min * bound_margin)]
+        if action_max is None:
+            action_max = [float(x) for x in (d_max * bound_margin)]
+        print(f"  data action min: {d_min.tolist()}")
+        print(f"  data action max: {d_max.tolist()}")
+        print(f"  bounded action_min: {action_min}")
+        print(f"  bounded action_max: {action_max}")
+
+    print(f"=== PoseDeltaToAction Training (bounded) ===")
     print(f"  Run:           {out_dir}")
     print(f"  Data:          {data_paths}")
     print(f"  Device:        {device}")
@@ -149,7 +190,7 @@ def train_pose_to_action(
 
     # ---- Config ----
     config = {
-        "model": "pose-delta-to-action",
+        "model": "pose-delta-to-action-bounded",
         "data": [str(p) for p in data_paths],
         "epochs": epochs,
         "batch_size": batch_size,
@@ -162,6 +203,9 @@ def train_pose_to_action(
         "use_bf16": use_bf16,
         "device": str(device),
         "cameras": cameras if cameras else ["wrist_image"],
+        "action_min": action_min,
+        "action_max": action_max,
+        "bound_margin": bound_margin,
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
 
@@ -191,10 +235,16 @@ def train_pose_to_action(
         sampler=val_indices, num_workers=0,
     )
 
-    # ---- Model ----
-    model = PoseDeltaToAction(pose_dim=6, action_dim=6, hidden_dim=hidden_dim).to(device)
+    # ---- Model (bounded) ----
+    model = PoseDeltaToAction(
+        pose_dim=6, action_dim=6,
+        hidden_dim=hidden_dim,
+        action_min=action_min,
+        action_max=action_max,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Params:        {n_params:,}")
+    print(f"  Bounded range: {list(zip(action_min, action_max))}")
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -224,7 +274,13 @@ def train_pose_to_action(
 
             with autocast_ctx:
                 pred = model(pose_delta)
-                loss = F.mse_loss(pred, action)
+                # Inverse-range weighted MSE: penalize per-dim squared errors
+                # by 1/range_d so a 10% error on any dim is treated equally
+                # (rotation dims have ~5x smaller range, so they get ~5x
+                # more weight than position dims).
+                # loss = mean over batch of [ sum_d (err_d^2 / range_d) ]
+                err = pred - action
+                loss = (err * err / model.action_range).sum(dim=-1).mean()
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -239,10 +295,14 @@ def train_pose_to_action(
 
         # Validate
         model.eval()
-        val_loss = 0.0
+        val_loss = 0.0            # action-space MSE per element (comparable to old)
+        val_wloss = 0.0           # inverse-range weighted MSE (matches training loss)
         val_n = 0
         val_abs_errors = []
         val_rel_errors = []
+        # Per-dim MSE accumulator — shows which dims are best/worst predicted
+        per_dim_se_sum = torch.zeros(model.action_dim, device=device)
+        per_dim_n = 0
         with torch.no_grad():
             for batch in val_loader:
                 pose_delta = batch["pose_delta"].to(device)
@@ -250,8 +310,13 @@ def train_pose_to_action(
 
                 with autocast_ctx:
                     pred = model(pose_delta)
+                # Action-space MSE (unweighted, comparable to old runs)
                 loss = F.mse_loss(pred, action)
                 val_loss += float(loss) * len(action)
+                # Inverse-range weighted MSE (matches training loss)
+                err = pred.float() - action.float()
+                wloss = (err * err / model.action_range).sum(dim=-1).mean()
+                val_wloss += float(wloss) * len(action)
                 val_n += len(action)
 
                 abs_err = (pred.float() - action.float()).abs()
@@ -260,18 +325,25 @@ def train_pose_to_action(
                 rel_err = abs_err.mean(dim=-1) / (action.float().abs().mean(dim=-1) + 1e-6)
                 val_rel_errors.extend(rel_err.cpu().numpy().tolist())
 
+                per_dim_se_sum += ((pred.float() - action.float()) ** 2).sum(dim=0)
+                per_dim_n += pred.shape[0]
+
         val_mse = val_loss / max(val_n, 1)
+        val_wmse = val_wloss / max(val_n, 1)
         val_mae = float(np.mean(val_abs_errors)) if val_abs_errors else 0.0
         val_rel = float(np.mean(val_rel_errors)) if val_rel_errors else 0.0
         val_acc = float(np.mean([1.0 if e < 0.1 else 0.0 for e in val_rel_errors])) if val_rel_errors else 0.0
+        per_dim_mse = (per_dim_se_sum / max(per_dim_n, 1)).cpu().tolist()
 
         # Log
         log_entry = {
             "epoch": epoch,
-            "train_mse": train_mse,
-            "val_mse": val_mse,
+            "train_wmse": train_mse,    # inverse-range weighted MSE (training loss)
+            "val_mse": val_mse,         # action-space MSE per element (unweighted)
+            "val_wmse": val_wmse,       # inverse-range weighted MSE (matches training)
             "val_mae": val_mae,
             "val_rel_error": val_rel,
+            "val_per_dim_mse": per_dim_mse,
             "val_accuracy_10pct": val_acc,
             "epoch_time_sec": time.time() - t_epoch,
         }
@@ -280,9 +352,10 @@ def train_pose_to_action(
         log_metrics(wandb_trainer, log_entry, step=epoch)
 
         print(
-            f"  ep {epoch:3d}  train_mse={train_mse:.6f}  "
-            f"val_mse={val_mse:.6f}  val_mae={val_mae:.4f}  "
-            f"val_rel={val_rel:.3f}  val_acc(10%)={val_acc:.3f}  "
+            f"  ep {epoch:3d}  train_wmse={train_mse:.6f}  "
+            f"val_mse={val_mse:.6f}  val_wmse={val_wmse:.6f}  "
+            f"val_mae={val_mae:.4f}  val_rel={val_rel:.3f}  "
+            f"val_acc(10%)={val_acc:.3f}  "
             f"({time.time() - t_epoch:.1f}s)"
         )
 
@@ -335,6 +408,15 @@ def main():
     p.add_argument("--wandb-project", default="align-pose-to-action")
     p.add_argument("--wandb-run", default=None)
     p.add_argument("--device", default=None)
+    p.add_argument("--action-min", type=float, nargs=6, default=None,
+                   metavar=("X", "Y", "Z", "AX", "AY", "AZ"),
+                   help="Per-dim lower bound for bounded output. Default: auto from data × bound_margin.")
+    p.add_argument("--action-max", type=float, nargs=6, default=None,
+                   metavar=("X", "Y", "Z", "AX", "AY", "AZ"),
+                   help="Per-dim upper bound for bounded output. Default: auto from data × bound_margin.")
+    p.add_argument("--bound-margin", type=float, default=1.05,
+                   help="Padding around the auto-computed per-dim data range. "
+                        "1.05 = 5%% extra on each side. Ignored if --action-min/max are set.")
     args = p.parse_args()
 
     train_pose_to_action(
@@ -354,6 +436,9 @@ def main():
         wandb_project=args.wandb_project,
         wandb_run=args.wandb_run,
         device=args.device,
+        action_min=args.action_min,
+        action_max=args.action_max,
+        bound_margin=args.bound_margin,
     )
 
 
