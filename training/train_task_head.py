@@ -234,8 +234,8 @@ def evaluate(
     )
 
     for batch in loader:
-        frames = batch["frames"].to(device, non_blocking=True)
-        traj = batch["trajectory"].to(device, non_blocking=True)
+        frames = batch["frames"]
+        traj = batch["trajectory"]
         task_ids = batch["task_id"].to(device)
         ood_labels = batch["ood_label"].to(device)
 
