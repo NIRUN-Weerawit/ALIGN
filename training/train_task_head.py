@@ -445,6 +445,7 @@ def train_task_head(
         "K": K,
         "vocab_known": known_tasks,
         "vocab_ood": ood_tasks,
+        "cameras": cameras if cameras else ["wrist_image"],
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
 

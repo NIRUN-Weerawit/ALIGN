@@ -161,8 +161,9 @@ def train_heads_hdf5(
             "chunk_size": chunk_size,
             "device": str(device),
             "use_bf16": use_bf16,
+            "cameras": cameras if cameras else ["wrist_image"],
         },
-    ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
+    )
     print(f"  W&B:          {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
     # -- Dataset ──

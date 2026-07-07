@@ -145,29 +145,42 @@ def pretrain_hdf5(
     print(f"  Phase 1b (mixer):   {epochs_mixer} epochs")
     print(f"  Output:   {output_dir}")
 
-    # -- W&B ──
+    # -- W&B -------------------------------------------------
+    # Build the config dict once. We pass it to init_wandb (which is a
+    # no-op if --wandb is disabled) AND always save it to a local JSON
+    # file in the output dir, so config is preserved either way.
+    config = {
+        "model": "align-pretrain-hdf5",
+        "datasets": [str(p) for p in data_paths],
+        "epochs_encoder": epochs_encoder,
+        "epochs_mixer": epochs_mixer,
+        "batch_size": batch_size,
+        "lr": lr,
+        "weight_decay": weight_decay,
+        "embed_dim": embed_dim,
+        "temperature": temperature,
+        "max_grad_norm": max_grad_norm,
+        "device": str(device),
+        "traj_window": traj_window,
+        "mixer_dim": mixer_dim,
+        "num_mixer_blocks": num_mixer_blocks,
+        "use_bf16": use_bf16,
+        "cameras": cameras if cameras else ["wrist_image"],
+    }
+    # Always save config locally for traceability
+    try:
+        import json
+        config_path = out_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(config, f, indent=2, default=str)
+        print(f"  Config:   saved to {config_path}")
+    except Exception as e:
+        print(f"  Warning: could not save config to disk: {e}")
     wandb_trainer = init_wandb(
         project=wandb_project,
         name=wandb_run,
-        config={
-            "model": "align-pretrain-hdf5",
-            "datasets": [str(p) for p in data_paths],
-            "epochs_encoder": epochs_encoder,
-            "epochs_mixer": epochs_mixer,
-            "batch_size": batch_size,
-            "lr": lr,
-            "weight_decay": weight_decay,
-            "embed_dim": embed_dim,
-            "temperature": temperature,
-            "max_grad_norm": max_grad_norm,
-            "device": str(device),
-            "traj_window": traj_window,
-            "mixer_dim": mixer_dim,
-            "num_mixer_blocks": num_mixer_blocks,
-            "use_bf16": use_bf16,
-        },
-    ) if enable_wandb else init_wandb(project=wandb_project, name=wandb_run, config={})
-    print(f"  W&B:      {'enabled' if wandb_trainer.enabled else 'disabled'}")
+        config=config,
+    )
 
     # -- Dataset ──
     # Use MultiALIGNDataset when multiple paths are provided, ALIGNDataset otherwise.

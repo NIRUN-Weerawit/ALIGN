@@ -106,6 +106,7 @@ class PoseActionDataset(Dataset):
 def train_pose_to_action(
     data_paths: List[str],
     output_dir: str,
+    cameras: Optional[List[str]] = None,
     epochs: int = 50,
     batch_size: int = 256,
     lr: float = 1e-3,
@@ -160,6 +161,7 @@ def train_pose_to_action(
         "seed": seed,
         "use_bf16": use_bf16,
         "device": str(device),
+        "cameras": cameras if cameras else ["wrist_image"],
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2))
 
@@ -316,6 +318,8 @@ def main():
     )
     p.add_argument("--data", required=True, nargs="+",
                    help="Path(s) to HDF5 file(s)")
+    p.add_argument("--cameras", nargs="+", default=None,
+                   help="Camera views used in the source data (logged for traceability)")
     p.add_argument("--output-dir", default="./checkpoints/pose_to_action")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=256)
@@ -336,6 +340,7 @@ def main():
     train_pose_to_action(
         data_paths=args.data,
         output_dir=args.output_dir,
+        cameras=args.cameras,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
