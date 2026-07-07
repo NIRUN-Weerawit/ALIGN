@@ -46,7 +46,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import h5py
 import numpy as np
@@ -124,7 +124,7 @@ def axisangle_to_quat(axisangle: np.ndarray) -> np.ndarray:
     return np.array([1, 0, 0, 0])
 
 
-def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions: np.ndarray, alpha_vals: np.ndarray, out_dir: Optional[str] = None, task_name: Optional[str] = None):
+def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions: np.ndarray, alpha_vals: np.ndarray, out_dir: Optional[str] = None,task_idx: Optional[str] = None, task_name: Optional[str] = None):
     """Log and save plots comparing simulated EEF positions vs expert positions.
 
     - sim_positions: (T,3) array of simulated end-effector positions (x,y,z)
@@ -172,7 +172,7 @@ def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions
         title += f" - {task_name}"
     fig.suptitle(title)
 
-    fname = f"episode_{episode:03d}"
+    fname = f"episode_{task_idx}_{episode:03d}"
     if task_name:
         safe_task = task_name.replace(" ", "_")[:80]
         fname += f"_{safe_task}"
@@ -189,7 +189,8 @@ def plot_episode_poses(episode: int, sim_positions: np.ndarray, expert_positions
 # ================================================================
 
 def find_episode_for_task(h5_path: str, task_name: str,
-                            use_first: bool = True) -> Optional[dict]:
+                            use_first: bool = True,
+                            cameras: Optional[List[str]] = None) -> Optional[dict]:
     """Find a matching episode in the HDF5 for a given task name."""
     import re as _re
     task_stripped = _re.sub(r'^[A-Z_]+_SCENE\d+_', '', task_name)
@@ -211,7 +212,7 @@ def find_episode_for_task(h5_path: str, task_name: str,
             text_normalized = text.lower().replace(",", "").replace(".", "").strip()
 
             if text_normalized == task_normalized:
-                return _extract_episode(group, text)
+                return _extract_episode(group, text, cameras=cameras)
 
             text_words = set(text_normalized.split())
             if not task_words or not text_words:
@@ -219,28 +220,52 @@ def find_episode_for_task(h5_path: str, task_name: str,
             overlap = len(task_words & text_words)
             score = overlap / len(task_words)
             if use_first and score >= 0.95:
-                return _extract_episode(group, text)
+                return _extract_episode(group, text, cameras=cameras)
             elif score > best_score and score >= 0.95:
                 best_score = score
-                best_match = _extract_episode(group, text)
+                best_match = _extract_episode(group, text, cameras=cameras)
     return best_match
 
 
-def _extract_episode(group, text: str) -> Optional[dict]:
-    """Extract frames, poses, actions from a HDF5 episode group."""
+def _extract_episode(group, text: str, cameras: Optional[List[str]] = None) -> Optional[dict]:
+    """Extract frames, poses, actions from a HDF5 episode group.
+
+    If cameras is given, reads those camera views and stacks as (N, V, H, W, 3).
+    Otherwise, picks the first available camera (single-cam (N, H, W, 3)).
+    """
     frames_group = group.get("frames", None)
     if frames_group is None:
         return None
-    cam_name = None
-    for c in ["wrist_image","agentview_image","agentview", "image"]:
-        if c in frames_group:
-            cam_name = c
-            print("found camera:", cam_name)
-            break
-    if cam_name is None:
-        cam_name = list(frames_group.keys())[0]
-    print(f"cam_name: {cam_name}")
-    frames = frames_group[cam_name][:]
+
+    if cameras:
+        # Multi-camera: stack V views
+        available = list(frames_group.keys()) if hasattr(frames_group, "keys") else []
+        cam_list = []
+        for c in cameras:
+            if c in available:
+                cam_list.append(c)
+            else:
+                print(f"  WARNING: camera '{c}' not found in episode, available: {available}")
+        if not cam_list:
+            cam_list = [available[0]] if available else None
+            if cam_list is None:
+                return None
+        if len(cam_list) == 1:
+            frames = frames_group[cam_list[0]][:]
+        else:
+            per_cam = [frames_group[c][:] for c in cam_list]
+            frames = np.stack(per_cam, axis=1)  # (N, V, H, W, 3)
+        cam_name = cam_list[0]
+    else:
+        # Single-camera fallback (original logic)
+        cam_name = None
+        for c in ["wrist_image","agentview_image","agentview", "image"]:
+            if c in frames_group:
+                cam_name = c
+                break
+        if cam_name is None:
+            cam_name = list(frames_group.keys())[0]
+        frames = frames_group[cam_name][:]
     # CRITICAL: use 'poses' (or 'noisy_poses') for absolute EEF positions in world coords.
     # Do NOT use 'actions' — those are OSC_POSE deltas normalized by LeRobot to [-0.9375, 0.9375],
     # which is a different coordinate system from MuJoCo's world frame.
@@ -277,41 +302,72 @@ def inject_noise(poses: np.ndarray, std: float = 0.02, rng: np.random.Generator 
 # ================================================================
 
 def _get_sim_frame(env, key="robot0_eye_in_hand_image",
-                    flip_vertical: bool = True, flip_horizontal: bool = False):
+                    flip_vertical: bool = True, flip_horizontal: bool = False,
+                    cameras: Optional[List[str]] = None):
     """Get a frame from the sim and apply orientation flip.
 
-    The sim's coordinate convention is flipped relative to the training
-    data, so by default we flip vertically (upside-down → right-side up).
-    Set flip_vertical=False to disable.
+    If cameras is given, returns (V, H, W, 3) with V views stacked.
+    Otherwise, returns (H, W, 3) from a single camera (original behavior).
 
-    Args:
-        env: MuJoCo env wrapper.
-        key: obs key to fetch (defaults to wrist camera).
-        flip_vertical: if True, np.flipud the image before returning.
-        flip_horizontal: if True, np.fliplr the image before returning.
+    Sim camera key mapping:
+      - 'image' / 'agentview_image' → 'agentview_image'
+      - 'wrist_image' → 'robot0_eye_in_hand_image'
     """
+    _sim_key_map = {
+        "image": "agentview_image",
+        "agentview_image": "agentview_image",
+        "wrist_image": "robot0_eye_in_hand_image",
+        "robot0_eye_in_hand_image": "robot0_eye_in_hand_image",
+    }
+
     obs = env.env._get_observations() if hasattr(env, "env") else env._get_observations()
-    img = obs.get(key)
-    if img is None:
-        for k in ["robot0_eye_in_hand_image", "agentview_image"]:
-            img = obs.get(k)
-            if img is not None:
-                break
-    if img is None:
-        return np.zeros((256, 256, 3), dtype=np.uint8)
-    if isinstance(img, torch.Tensor):
-        img = img.cpu().numpy()
-    if img.ndim == 4:
-        img = img[0]
-    img = img.astype(np.uint8)
-    # Apply orientation correction to match training data convention.
-    # np.flipud/np.fliplr return views with negative strides, which
-    # torch.from_numpy() rejects — so we copy() to get a contiguous array.
-    if flip_vertical:
-        img = np.flipud(img).copy()
-    if flip_horizontal:
-        img = np.fliplr(img).copy()
-    return img
+
+    if cameras and len(cameras) > 1:
+        # Multi-camera: collect V views
+        views = []
+        for cam in cameras:
+            sim_key = _sim_key_map.get(cam, cam)
+            img = obs.get(sim_key)
+            if img is None:
+                # Fallback
+                for k in ["robot0_eye_in_hand_image", "agentview_image"]:
+                    img = obs.get(k)
+                    if img is not None:
+                        break
+            if img is None:
+                img = np.zeros((256, 256, 3), dtype=np.uint8)
+            if isinstance(img, torch.Tensor):
+                img = img.cpu().numpy()
+            if img.ndim == 4:
+                img = img[0]
+            img = img.astype(np.uint8)
+            if flip_vertical:
+                img = np.flipud(img).copy()
+            if flip_horizontal:
+                img = np.fliplr(img).copy()
+            views.append(img)
+        return np.stack(views, axis=0)  # (V, H, W, 3)
+    else:
+        # Single camera (original logic)
+        sim_key = _sim_key_map.get(key, key) if cameras else key
+        img = obs.get(sim_key)
+        if img is None:
+            for k in ["robot0_eye_in_hand_image", "agentview_image"]:
+                img = obs.get(k)
+                if img is not None:
+                    break
+        if img is None:
+            return np.zeros((256, 256, 3), dtype=np.uint8)
+        if isinstance(img, torch.Tensor):
+            img = img.cpu().numpy()
+        if img.ndim == 4:
+            img = img[0]
+        img = img.astype(np.uint8)
+        if flip_vertical:
+            img = np.flipud(img).copy()
+        if flip_horizontal:
+            img = np.fliplr(img).copy()
+        return img
 
 
 # ================================================================
@@ -353,6 +409,7 @@ def run_episode_in_sim(
     expert_poses: np.ndarray,
     expert_actions: np.ndarray,
     task_description: str,
+    task_idx: str,
     z_text: torch.Tensor,
     world_model=None,
     value_head=None,
@@ -369,6 +426,7 @@ def run_episode_in_sim(
     use_alpha_from_v: bool = True,
     episode: int = 0,
     output_dir: Optional[str] = None,
+    cameras: Optional[List[str]] = None,
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
@@ -400,9 +458,6 @@ def run_episode_in_sim(
     sim_positions = []
 
     while not done and step < max_steps and step < n_expert:
-        frame = _get_sim_frame(env,
-                               flip_vertical=not no_flip_vertical,
-                               flip_horizontal=no_flip_horizontal)
         action = noisy_actions[step].copy()
         
         if len(action) >= 7:
@@ -423,9 +478,12 @@ def run_episode_in_sim(
 
         frame_post = _get_sim_frame(env, key="agentview_image",
                                     flip_vertical=not no_flip_vertical,
-                                    flip_horizontal=no_flip_horizontal)
+                                    flip_horizontal=no_flip_horizontal,
+                                    cameras=cameras)
         if record_video:
-            frames_no_align.append(frame_post.copy())
+            # For video, use first camera view only
+            frame_for_video = frame_post[0] if frame_post.ndim == 4 else frame_post
+            frames_no_align.append(frame_for_video.copy())
 
         sim_pose_before = np.concatenate([
             obs.get("robot0_eef_pos", np.zeros(3)),
@@ -472,9 +530,10 @@ def run_episode_in_sim(
         # sim_positions.append(sim_pose_before[:6].copy())
         # print(f"Step {step}: sim_pose={sim_pose_before[:6]}     clean_pose={expert_poses[step]}")
         
-        frame = _get_sim_frame(env,
+        frame = _get_sim_frame(env, key="robot0_eye_in_hand_image",
                                flip_vertical=not no_flip_vertical,
-                               flip_horizontal=no_flip_horizontal)
+                               flip_horizontal=no_flip_horizontal,
+                               cameras=cameras)
         # clean_pose = expert_poses[step]
         base_action = noisy_actions[step]
 
@@ -487,7 +546,7 @@ def run_episode_in_sim(
             pose_buffer.insert(0, sim_pose_before.copy())
 
         with torch.no_grad():
-            frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)
+            frame_t = torch.from_numpy(frame).unsqueeze(0).to(device)  # (1, H, W, 3) or (1, V, H, W, 3)
             traj_t = torch.from_numpy(np.stack(pose_buffer)).unsqueeze(0).float().to(device)
             # print(f"shape of frame_t: {frame_t.shape}, shape of traj_t: {traj_t.shape}")
             # print(f"Step {step}: sim_pose={sim_pose_before[:3]}     clean_pose={clean_pose[:3]}")
@@ -509,8 +568,12 @@ def run_episode_in_sim(
                         z_v, z_t, z_text_local)
                 goal_np = goal_5steps.squeeze(0).float().cpu().numpy()
                 a_model = goal_np[0]
-                SCALE = np.array([1/0.0048, 1/0.0058, 1/0.0059, 1/0.048, 1/0.025, 1/0.026])
+                SCALE = np.array([1/0.2, 1/0.2, 1/0.2, 1/2, 1/2, 1/3]) # libero_spatial
+                # SCALE = np.array([1/0.012, 1/0.012, 1/0.012, 1/0.1, 1/0.1, 1/0.1]) # libero_spatial
+                # SCALE = np.array([1/0.0048, 1/0.0058, 1/0.0059, 1/0.048, 1/0.025, 1/0.026])
                 a_model = a_model * SCALE  # scale to match action range
+                # a_model = np.clip(a_model, -1.0, 1.0)
+                
                 
             # ── Compute α via counterfactual imagination ──
             if fixed_alpha is not None:
@@ -561,7 +624,8 @@ def run_episode_in_sim(
 
         frame_post = _get_sim_frame(env, key="agentview_image",
                                     flip_vertical=not no_flip_vertical,
-                                    flip_horizontal=no_flip_horizontal)
+                                    flip_horizontal=no_flip_horizontal,
+                                    cameras=cameras)
         sim_eef = obs.get("robot0_eef_pos", np.zeros(3))
         if isinstance(sim_eef, torch.Tensor):
             sim_eef = sim_eef.cpu().numpy()
@@ -571,12 +635,13 @@ def run_episode_in_sim(
         error_with_align.append(err_with_align)
 
         if record_video:
-            frames_with_align.append(frame_post.copy())
+            frame_for_video = frame_post[0] if frame_post.ndim == 4 else frame_post
+            frames_with_align.append(frame_for_video.copy())
 
     # Save per-episode pose plot (simulated vs expert)
     try:
         action_arr = np.vstack(stored_actions) if len(stored_actions) > 0 else np.zeros((0, 6), dtype=np.float32)
-        plot_episode_poses(episode, action_arr, noisy_actions[:n_expert], np.vstack(alpha_vals), out_dir=output_dir, task_name=task_description)
+        plot_episode_poses(episode, action_arr, noisy_actions[:n_expert], np.vstack(alpha_vals), out_dir=output_dir,task_idx=task_idx, task_name=task_description)
     except Exception as e:
         print(f"Warning: failed to save episode plot: {e}")
 
@@ -653,6 +718,7 @@ def evaluate_suite(
     fixed_alpha: Optional[float] = None,
     tau: float = 1.0,
     use_alpha_from_v: bool = True,
+    cameras: Optional[List[str]] = None,
 ) -> Optional[dict]:
     """Evaluate ALIGN across all tasks in a suite using the new alpha pipeline."""
     device = device or DEVICE
@@ -683,6 +749,7 @@ def evaluate_suite(
         device=DEVICE,
         mixer_dim=enc_cfg.get("mixer_dim", 512),
         num_mixer_blocks=enc_cfg.get("num_mixer_blocks", 2),
+        num_cameras=len(cameras) if cameras else 1,
     ).to(device)
     if "trainable_state_dict" in enc_ckpt:
         model.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
@@ -766,6 +833,7 @@ def evaluate_suite(
             device=DEVICE,
             mixer_dim=enc_cfg.get("mixer_dim", 512),
             num_mixer_blocks=enc_cfg.get("num_mixer_blocks", 2),
+            num_cameras=len(cameras) if cameras else 1,
             assistant_hidden=256,
             assistant_layers=2,
         ).to(device)
@@ -793,7 +861,7 @@ def evaluate_suite(
             print(f"  [{task_idx+1}/{len(task_list)}] {task_name[:100]}  ep {ep+1}/{n_episodes}")
 
             try:
-                expert = find_episode_for_task(data_path, task_name, use_first=False)
+                expert = find_episode_for_task(data_path, task_name, use_first=False, cameras=cameras)
                 if expert is None:
                     print(f"    WARNING: No matching episode found in HDF5")
                     continue
@@ -834,6 +902,7 @@ def evaluate_suite(
                     expert_poses=expert["poses"],
                     expert_actions=expert["actions"],
                     task_description=task_name,
+                    task_idx=task_idx,
                     z_text=z_text,
                     noise_std=noise_std,
                     traj_window=5,
@@ -846,6 +915,7 @@ def evaluate_suite(
                     use_alpha_from_v=use_alpha_from_v,
                     episode=ep,
                     output_dir=str(out_dir),
+                    cameras=cameras,
                 )
 
                 result["task_name"] = task_name
@@ -870,6 +940,9 @@ def evaluate_suite(
                                        len(expert["frames"]))
                         for i in range(n_frames):
                             gt = expert["frames"][i] if i < len(expert["frames"]) else result["frames_with_align"][i]
+                            # Handle multi-cam expert frames: use first view
+                            if gt.ndim == 4:
+                                gt = gt[0]
                             no_align = result["frames_no_align"][i]
                             with_align = result["frames_with_align"][i]
                             panel = np.concatenate([gt, no_align, with_align], axis=1)
@@ -959,7 +1032,7 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--suite", default=None, choices=list(LIBERO_TASK_MAP.keys()),
                         help="Run only one suite (default: all)")
-    parser.add_argument("--n-episodes", type=int, default=3)
+    parser.add_argument("--n-episodes", type=int, default=1)
     parser.add_argument("--noise-std", type=float, default=0.02,
                         help="Synthetic noise std (0 = clean replay)")
     parser.add_argument("--max-steps", type=int, default=500)
@@ -977,6 +1050,10 @@ def main():
                         help="Skip vertical flip on sim frames")
     parser.add_argument("--no-flip-horizontal", action="store_true",
                         help="Skip horizontal flip on sim frames")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera views to use (e.g. 'image wrist_image'). "
+                             "Must match the cameras used during pretrain. "
+                             "Order matters: image first, then wrist_image.")
     args = parser.parse_args()
 
     suites_to_run = [args.suite] if args.suite else list(LIBERO_TASK_MAP.keys())
@@ -1008,6 +1085,7 @@ def main():
             fixed_alpha=args.fixed_alpha,
             tau=args.tau,
             use_alpha_from_v=args.use_alpha_from_v,
+            cameras=args.cameras,
         )
         if result:
             all_summaries[suite_name] = result
