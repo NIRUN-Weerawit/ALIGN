@@ -642,6 +642,7 @@ def train_task_head(
     )
 
     log_fp.close()
+    wandb_trainer.finish()
     print(f"\nDone. Best val_acc={best_val_acc:.3f}. Best checkpoint: {best_ckpt}")
     return str(best_ckpt)
 
