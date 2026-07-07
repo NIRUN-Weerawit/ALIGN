@@ -715,7 +715,7 @@ def main():
     p.add_argument("--embed-dim", type=int, default=256)
     p.add_argument("--hidden-dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--enable-wandb", action="store_true")
+    p.add_argument("--wandb", action="store_true")
     p.add_argument("--wandb-project", default="align-task-head")
     p.add_argument("--wandb-run", default=None)
     p.add_argument("--device", default=None)
@@ -742,7 +742,7 @@ def main():
         embed_dim=args.embed_dim,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
-        enable_wandb=args.enable_wandb,
+        enable_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run=args.wandb_run,
         device=args.device,
