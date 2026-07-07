@@ -427,6 +427,7 @@ def run_episode_in_sim(
     episode: int = 0,
     output_dir: Optional[str] = None,
     cameras: Optional[List[str]] = None,
+    pose_to_action_model=None,
 ) -> dict:
     """Run one episode in MuJoCo with expert trajectory + synthetic noise.
 
@@ -567,12 +568,18 @@ def run_episode_in_sim(
                     goal_5steps = heads_model.assistant_head(
                         z_v, z_t, z_text_local)
                 goal_np = goal_5steps.squeeze(0).float().cpu().numpy()
-                a_model = goal_np[0]
-                SCALE = np.array([1/0.2, 1/0.2, 1/0.2, 1/2, 1/2, 1/3]) # libero_spatial
-                # SCALE = np.array([1/0.012, 1/0.012, 1/0.012, 1/0.1, 1/0.1, 1/0.1]) # libero_spatial
-                # SCALE = np.array([1/0.0048, 1/0.0058, 1/0.0059, 1/0.048, 1/0.025, 1/0.026])
-                a_model = a_model * SCALE  # scale to match action range
-                # a_model = np.clip(a_model, -1.0, 1.0)
+                a_model = goal_np[0]  # pose delta in (m, rad)
+
+                # Convert pose delta → OSC action via learned connector
+                if pose_to_action_model is not None:
+                    with torch.no_grad():
+                        pose_delta_t = torch.from_numpy(a_model).unsqueeze(0).float().to(device)
+                        action_t = pose_to_action_model(pose_delta_t)
+                    a_model = action_t.squeeze(0).cpu().numpy()
+                else:
+                    # Fallback: fixed scale (libero_spatial)
+                    SCALE = np.array([1/0.2, 1/0.2, 1/0.2, 1/2, 1/2, 1/3])
+                    a_model = a_model * SCALE
                 
                 
             # ── Compute α via counterfactual imagination ──
@@ -719,6 +726,7 @@ def evaluate_suite(
     tau: float = 1.0,
     use_alpha_from_v: bool = True,
     cameras: Optional[List[str]] = None,
+    pose_to_action_checkpoint: Optional[str] = None,
 ) -> Optional[dict]:
     """Evaluate ALIGN across all tasks in a suite using the new alpha pipeline."""
     device = device or DEVICE
@@ -846,6 +854,20 @@ def evaluate_suite(
         heads_model.eval()
         print(f"  Loaded heads (assistant)")
 
+    # ── Load PoseDeltaToAction connector (adaptive scale) ──
+    pose_to_action_model = None
+    if pose_to_action_checkpoint:
+        from models.pose_to_action import PoseDeltaToAction
+        pta_ckpt = torch.load(pose_to_action_checkpoint, map_location=device, weights_only=False)
+        pta_cfg = pta_ckpt.get("config", {})
+        pose_to_action_model = PoseDeltaToAction(
+            pose_dim=6, action_dim=6,
+            hidden_dim=pta_cfg.get("hidden_dim", 128),
+        ).to(device)
+        pose_to_action_model.load_state_dict(pta_ckpt["model_state_dict"])
+        pose_to_action_model.eval()
+        print(f"  Loaded pose_to_action connector (val_mse={pta_cfg.get('val_mse', '?')})")
+
     # ── Load GAIL (diagnostic only, not used in pipeline) ──
     if gail_checkpoint:
         print(f"  GAIL checkpoint provided (diagnostic, not loaded)")
@@ -916,6 +938,7 @@ def evaluate_suite(
                     episode=ep,
                     output_dir=str(out_dir),
                     cameras=cameras,
+                    pose_to_action_model=pose_to_action_model,
                 )
 
                 result["task_name"] = task_name
@@ -1054,6 +1077,9 @@ def main():
                         help="Camera views to use (e.g. 'image wrist_image'). "
                              "Must match the cameras used during pretrain. "
                              "Order matters: image first, then wrist_image.")
+    parser.add_argument("--pose-to-action-checkpoint", default=None,
+                        help="PoseDeltaToAction checkpoint (.pt) — learned connector "
+                             "from pose delta to OSC action. Replaces fixed SCALE.")
     args = parser.parse_args()
 
     suites_to_run = [args.suite] if args.suite else list(LIBERO_TASK_MAP.keys())
@@ -1086,6 +1112,7 @@ def main():
             tau=args.tau,
             use_alpha_from_v=args.use_alpha_from_v,
             cameras=args.cameras,
+            pose_to_action_checkpoint=args.pose_to_action_checkpoint,
         )
         if result:
             all_summaries[suite_name] = result
