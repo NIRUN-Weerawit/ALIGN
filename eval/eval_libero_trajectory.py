@@ -864,7 +864,8 @@ def evaluate_suite(
         # Bounded model requires action_min and action_max from the saved
         # config (the training script auto-computes these from data).
         pta_kwargs = dict(
-            pose_dim=6, action_dim=6,
+            pose_dim=pta_cfg.get("pose_dim", 12),
+            action_dim=6,
             hidden_dim=pta_cfg.get("hidden_dim", 128),
         )
         if "action_min" not in pta_cfg or "action_max" not in pta_cfg:

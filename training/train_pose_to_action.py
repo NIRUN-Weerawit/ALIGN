@@ -200,6 +200,7 @@ def train_pose_to_action(
         "weight_decay": weight_decay,
         "val_split": val_split,
         "hidden_dim": hidden_dim,
+        "pose_dim": 12,
         "max_samples": max_samples,
         "seed": seed,
         "use_bf16": use_bf16,
