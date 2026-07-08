@@ -2,15 +2,61 @@
 # -*- coding: utf-8 -*-
 """ALIGN head training — independent stages so neither head interferes.
 
-Phase 2a (Decision): Train alpha prediction with BCE only.
-Phase 2b (Assistant): Train delta-pose correction with MSE only.
+Inputs / Outputs / Metrics
+==========================
+
+Phase 2a — Decision head (future prediction)
+  Input:
+    - z_v: (B, D) vision embedding from frozen encoder+mixer
+    - z_t_tokens: (B, K, D) per-timestep trajectory embeddings (noised past)
+    - z_text: (B, D) text embedding from CLIP
+  Output:
+    - predicted_z_v: (B, K, D) predicted future vision embeddings
+    - predicted_z_t: (B, K, D) predicted future trajectory embeddings
+  Target:
+    - z_v_target: (B, K, D) current vision broadcast (copy target)
+    - z_t_future_tokens: (B, K, D) actual future trajectory embeddings
+  Loss:
+    - Cosine loss: 1 - cos(pred, target), per-step decay weighting
+    - decay=0.7: w0=1.0, w1=0.7, w2=0.49, ... (step 0 weighted highest)
+  Metrics:
+    - loss: weighted cosine loss (lower = better)
+    - err_v: 1 - cos(pred_v, target_v) mean (vision prediction error)
+    - err_t: 1 - cos(pred_t, target_t) mean (trajectory prediction error)
+
+Phase 2b — Assistant head (delta pose correction)
+  Input:
+    - MLP arch: z_v (B, D), z_t (B, D), z_text (B, D) pooled embeddings
+    - Transformer arch: z_v_window (B, K, D), z_t_window (B, K, D), z_text (B, D)
+      K past per-timestep embeddings encoded via encode_raw_vision_window
+  Output:
+    - delta_pred: (B, K, 6) K predicted corrective pose deltas in (m, rad)
+  Target:
+    - delta_target: (B, K, 6) clean_pose[t+k+1] - noisy_pose[t] for k=0..K-1
+  Loss:
+    - Per-step weighted MSE: mean over batch of sum_k w_k * mean_d(err_d^2)
+    - decay=0.7: step 0 (used at inference) weighted highest
+  Metrics:
+    - mse: weighted per-step MSE (lower = better)
+    - delta_norm: mean |delta_pred| tracks if model produces reasonable deltas
+
+Encoders + mixer are frozen in both stages. Only the head being trained
+is unfrozen. The two stages run sequentially: decision first, then assistant.
 
 Usage:
     # Both stages in sequence (default)
-    python training/train_heads.py \\\n        --data ./align.h5 \\\n        --pretrained ./checkpoints/pretrain/best.pt \\\n        --output-dir ./checkpoints/heads \\\n        --epochs-decision 10 \\\n        --epochs-assistant 10
+    python training/train_heads.py \\
+        --data ./align.h5 \\
+        --pretrained ./checkpoints/pretrain/best.pt \\
+        --output-dir ./checkpoints/heads \\
+        --epochs-decision 10 \\
+        --epochs-assistant 10
 
     # Decision head only
-    python training/train_heads.py --data ./align.h5 \\\n        --pretrained ./checkpoints/pretrain/best.pt \\\n        --stage decision \\\n        --epochs-decision 10
+    python training/train_heads.py --data ./align.h5 \\
+        --pretrained ./checkpoints/pretrain/best.pt \\
+        --stage decision \\
+        --epochs-decision 10
 """
 
 import argparse
