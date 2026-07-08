@@ -11,15 +11,14 @@ Assistant head (delta pose correction)
     - Transformer arch: z_v_window (B, K, D), z_t_window (B, K, D), z_text (B, D)
       K past per-timestep embeddings encoded via encode_raw_vision_window
   Output:
-    - delta_pred: (B, K, 6) K predicted corrective pose deltas in (m, rad)
+    - action_pred: (B, 6) single predicted action in OSC units
   Target:
-    - delta_target: (B, K, 6) clean_pose[t+k+1] - noisy_pose[t] for k=0..K-1
+    - current_action: (B, 6) the human's current OSC action
   Loss:
-    - Per-step weighted MSE: mean over batch of sum_k w_k * mean_d(err_d^2)
-    - decay=0.7: step 0 (used at inference) weighted highest
+    - F.mse_loss(action_pred, current_action) -- single-step regression
   Metrics:
-    - mse: weighted per-step MSE (lower = better)
-    - delta_norm: mean |delta_pred| tracks if model produces reasonable deltas
+    - mse: MSE between predicted and ground-truth action (lower = better)
+    - action_mean: mean |action_pred| tracks if model produces reasonable actions
 
 Encoders + mixer are frozen. Only the assistant head trains.
 
