@@ -29,36 +29,30 @@ import torch.nn as nn
 
 
 class PoseDeltaToAction(nn.Module):
-    """Maps EEF pose delta (m, rad) → OSC action (normalized), bounded.
+    """Maps EEF pose delta + current pose → OSC action (bounded).
 
-    Input:  (B, 6) — [dx, dy, dz, dax, day, daz] in meters and radians
-    Output: (B, 6) — [ax, ay, az, arx, ary, arz] in OSC action space
+    Input:  (B, pose_dim) — cat(pose_delta, current_pose)
+            pose_delta: [dx, dy, dz, dax, day, daz] in meters and radians
+            current_pose: [x, y, z, ax, ay, az] current EEF pose
+    Output: (B, action_dim) — [ax, ay, az, arx, ary, arz] in OSC action space
             Hard-bounded to [action_min[d], action_max[d]] per dim.
 
-    The mapping is the inverse dynamics of the OSC controller. For a
-    simple controller with a fixed Jacobian, this reduces to per-axis
-    scaling. For real controllers with configuration-dependent Jacobians,
-    the learned model captures the non-linear coupling.
+    The current pose is included because the OSC Jacobian is
+    configuration-dependent — the same pose delta requires different
+    actions depending on the arm's current position. The EEF pose is
+    a proxy for the arm configuration.
 
     Args:
-        pose_dim: input dim (default 6)
+        pose_dim: total input dim (default 12 = 6 delta + 6 current)
         action_dim: output dim (default 6)
         hidden_dim: MLP hidden width (default 128)
         action_min: (action_dim,) sequence of per-dim min output.
         action_max: (action_dim,) sequence of per-dim max output.
-
-    Output for sample i and dim d is guaranteed to be in
-    [action_min[d], action_max[d]].
-
-    Note: `tanh` saturation near ±1 is a real issue with MSE loss. If
-    the model's pre-tanh output is consistently large, gradients vanish
-    in the saturated region. See training/train_pose_to_action.py for
-    the loss choice.
     """
 
     def __init__(
         self,
-        pose_dim: int = 6,
+        pose_dim: int = 12,  # 6 delta + 6 current pose
         action_dim: int = 6,
         hidden_dim: int = 128,
         action_min: Sequence[float] = (-1.0,) * 6,
@@ -97,8 +91,28 @@ class PoseDeltaToAction(nn.Module):
         self.register_buffer("action_range", (ax - am) / 2.0)
         self.register_buffer("action_mid",   (ax + am) / 2.0)
 
-    def forward(self, pose_delta: torch.Tensor) -> torch.Tensor:
-        h = self.net(pose_delta)
+    def forward(self, pose_delta: torch.Tensor, current_pose: torch.Tensor = None) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            pose_delta: (B, 6) — EEF pose delta in (m, rad)
+            current_pose: (B, 6) — current EEF pose in (m, rad).
+                          If None, zeros are used (backward compat).
+        Returns:
+            (B, action_dim) bounded OSC action
+        """
+        if current_pose is not None:
+            x = torch.cat([pose_delta, current_pose], dim=-1)
+        else:
+            # Backward compat: pad with zeros for current pose
+            B = pose_delta.shape[0]
+            if pose_delta.shape[-1] == self.pose_dim:
+                x = pose_delta  # already concatenated
+            else:
+                zeros = torch.zeros(B, self.pose_dim - pose_delta.shape[-1],
+                                    device=pose_delta.device, dtype=pose_delta.dtype)
+                x = torch.cat([pose_delta, zeros], dim=-1)
+        h = self.net(x)
         return torch.tanh(h) * self.action_range + self.action_mid
 
     @property
@@ -122,22 +136,25 @@ if __name__ == "__main__":
 
     print("Testing PoseDeltaToAction (bounded) — symmetric bounds...")
     model = PoseDeltaToAction(
+        pose_dim=12,
         action_min=[-1, -1, -1, -0.2, -0.4, -0.4],
         action_max=[ 1,  1,  1,  0.2,  0.4,  0.4],
     )
-    x = torch.randn(4, 6) * 0.01
-    out = model(x)
-    print(f"  in shape:  {tuple(x.shape)}  out shape: {tuple(out.shape)}")
+    x_delta = torch.randn(4, 6) * 0.01
+    x_pose = torch.randn(4, 6) * 0.1
+    out = model(x_delta, x_pose)
+    print(f"  in shape:  delta={tuple(x_delta.shape)} pose={tuple(x_pose.shape)}  out shape: {tuple(out.shape)}")
     print(f"  out range: [{out.min().item():.4f}, {out.max().item():.4f}]")
     assert (out >= model.action_min).all() and (out <= model.action_max).all()
     print(f"  output_bounds: min={model.action_min.tolist()}  max={model.action_max.tolist()}")
 
     print("\nTesting — asymmetric bounds (real LIBERO ranges)...")
     model_a = PoseDeltaToAction(
+        pose_dim=12,
         action_min=[-0.9375, -0.9375, -0.9375, -0.1875, -0.3675, -0.36],
         action_max=[ 0.9375,  0.9375,  0.9375,  0.1971,  0.3364,  0.375],
     )
-    out_a = model_a(x)
+    out_a = model_a(x_delta, x_pose)
     for d in range(6):
         lo = model_a.action_min[d].item()
         hi = model_a.action_max[d].item()
@@ -148,9 +165,10 @@ if __name__ == "__main__":
     print(f"  all 6 dims in their asymmetric range ✓")
 
     print("\nTesting — extreme extrapolation (10x training input)...")
-    x_extreme = torch.randn(100, 6) * 0.1
-    out_extreme = model_a(x_extreme)
-    print(f"  in range:  [{x_extreme.min():.4f}, {x_extreme.max():.4f}]")
+    x_extreme_delta = torch.randn(100, 6) * 0.1
+    x_extreme_pose = torch.randn(100, 6) * 0.5
+    out_extreme = model_a(x_extreme_delta, x_extreme_pose)
+    print(f"  in range:  delta=[{x_extreme_delta.min():.4f}, {x_extreme_delta.max():.4f}]  pose=[{x_extreme_pose.min():.4f}, {x_extreme_pose.max():.4f}]")
     print(f"  out range: [{out_extreme.min():.4f}, {out_extreme.max():.4f}]")
     for d in range(6):
         lo, hi = model_a.action_min[d].item(), model_a.action_max[d].item()
@@ -160,9 +178,9 @@ if __name__ == "__main__":
 
     print("\nTesting — default symmetric ±1...")
     model_d = PoseDeltaToAction()
-    x_default = torch.randn(8, 6) * 5.0
-    out_default = model_d(x_default)
-    print(f"  in range:  [{x_default.min():.4f}, {x_default.max():.4f}]")
+    x_def_delta = torch.randn(8, 6) * 5.0
+    x_def_pose = torch.randn(8, 6) * 0.5
+    out_default = model_d(x_def_delta, x_def_pose)
     print(f"  out range: [{out_default.min():.4f}, {out_default.max():.4f}]")
     assert (out_default >= -1.0).all() and (out_default <= 1.0).all()
     print(f"  default ±1 bounds hold ✓")

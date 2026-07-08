@@ -48,15 +48,16 @@ from training.wandb_utils import init_wandb, log_metrics
 # ================================================================
 
 class PoseActionDataset(Dataset):
-    """Mine (pose_delta, expert_action) pairs from HDF5.
+    """Mine (pose_delta, current_pose, expert_action) triples from HDF5.
 
     For each episode, for each timestep t:
       pose_delta = poses[t+1] - poses[t]   (the actual EEF movement)
+      current_pose = poses[t]               (the EEF pose before the action)
       action = actions[t]                   (the OSC command that caused it)
 
-    The model learns the mapping: "given I want to move by this delta,
-    what OSC action do I send?" — i.e. the inverse dynamics of the
-    OSC controller.
+    The current pose is included because the OSC Jacobian is
+    configuration-dependent — the same pose delta requires different
+    actions depending on the arm's current position.
     """
 
     def __init__(self, h5_paths: List[str], max_samples: int = 0):
@@ -88,15 +89,16 @@ class PoseActionDataset(Dataset):
 
                 for t in range(N - 1):
                     pose_delta = (poses[t + 1, :6] - poses[t, :6]).astype(np.float32)
+                    current_pose = poses[t, :6].astype(np.float32)
                     action = actions[t, :6].astype(np.float32)
-                    self.samples.append((pose_delta, action))
+                    self.samples.append((pose_delta, current_pose, action))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        pd, a = self.samples[idx]
-        return {"pose_delta": pd, "action": a}
+        pd, cp, a = self.samples[idx]
+        return {"pose_delta": pd, "current_pose": cp, "action": a}
 
 
 # ================================================================
@@ -235,9 +237,10 @@ def train_pose_to_action(
         sampler=val_indices, num_workers=0,
     )
 
-    # ---- Model (bounded) ----
+    # ---- Model (bounded, with current pose input) ----
     model = PoseDeltaToAction(
-        pose_dim=6, action_dim=6,
+        pose_dim=12,  # 6 pose_delta + 6 current_pose
+        action_dim=6,
         hidden_dim=hidden_dim,
         action_min=action_min,
         action_max=action_max,
@@ -270,10 +273,11 @@ def train_pose_to_action(
         pbar = tqdm(train_loader, desc=f"ep {epoch}/{epochs}")
         for batch in pbar:
             pose_delta = batch["pose_delta"].to(device)
+            current_pose = batch["current_pose"].to(device)
             action = batch["action"].to(device)
 
             with autocast_ctx:
-                pred = model(pose_delta)
+                pred = model(pose_delta, current_pose)
                 # Inverse-range weighted MSE: penalize per-dim squared errors
                 # by 1/range_d so a 10% error on any dim is treated equally
                 # (rotation dims have ~5x smaller range, so they get ~5x
@@ -306,10 +310,11 @@ def train_pose_to_action(
         with torch.no_grad():
             for batch in val_loader:
                 pose_delta = batch["pose_delta"].to(device)
+                current_pose = batch["current_pose"].to(device)
                 action = batch["action"].to(device)
 
                 with autocast_ctx:
-                    pred = model(pose_delta)
+                    pred = model(pose_delta, current_pose)
                 # Action-space MSE (unweighted, comparable to old runs)
                 loss = F.mse_loss(pred, action)
                 val_loss += float(loss) * len(action)

@@ -574,7 +574,8 @@ def run_episode_in_sim(
                 if pose_to_action_model is not None:
                     with torch.no_grad():
                         pose_delta_t = torch.from_numpy(a_model).unsqueeze(0).float().to(device)
-                        action_t = pose_to_action_model(pose_delta_t)
+                        current_pose_t = torch.from_numpy(sim_pose_before).unsqueeze(0).float().to(device)
+                        action_t = pose_to_action_model(pose_delta_t, current_pose_t)
                     a_model = action_t.squeeze(0).cpu().numpy()
                 else:
                     # Fallback: fixed scale (libero_spatial)
@@ -604,7 +605,7 @@ def run_episode_in_sim(
                 alpha_val = float(torch.sigmoid(diff).item())
                 print(f"alpha_eval = {alpha_val}")
 
-
+        print(f"Step {step}:    goal_np[0]={goal_np[0]} \n          a_model={a_model}")
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(a_model)))
         delta_vectors.append(a_model[:3].copy())
@@ -854,19 +855,33 @@ def evaluate_suite(
         heads_model.eval()
         print(f"  Loaded heads (assistant)")
 
-    # ── Load PoseDeltaToAction connector (adaptive scale) ──
+    # ── Load PoseDeltaToAction connector (bounded, per-dim) ──
     pose_to_action_model = None
     if pose_to_action_checkpoint:
         from models.pose_to_action import PoseDeltaToAction
         pta_ckpt = torch.load(pose_to_action_checkpoint, map_location=device, weights_only=False)
         pta_cfg = pta_ckpt.get("config", {})
-        pose_to_action_model = PoseDeltaToAction(
+        # Bounded model requires action_min and action_max from the saved
+        # config (the training script auto-computes these from data).
+        pta_kwargs = dict(
             pose_dim=6, action_dim=6,
             hidden_dim=pta_cfg.get("hidden_dim", 128),
-        ).to(device)
+        )
+        if "action_min" not in pta_cfg or "action_max" not in pta_cfg:
+            raise ValueError(
+                f"PoseDeltaToAction checkpoint {pose_to_action_checkpoint} is missing "
+                f"action_min/action_max in its config. This script requires the bounded "
+                f"model variant. Re-train with training/train_pose_to_action.py."
+            )
+        pta_kwargs["action_min"] = pta_cfg["action_min"]
+        pta_kwargs["action_max"] = pta_cfg["action_max"]
+        pose_to_action_model = PoseDeltaToAction(**pta_kwargs).to(device)
         pose_to_action_model.load_state_dict(pta_ckpt["model_state_dict"])
         pose_to_action_model.eval()
-        print(f"  Loaded pose_to_action connector (val_mse={pta_cfg.get('val_mse', '?')})")
+        print(f"  Loaded pose_to_action connector (bounded) "
+              f"(val_mse={pta_cfg.get('val_mse', '?')})")
+        print(f"    action_min: {pta_cfg['action_min']}")
+        print(f"    action_max: {pta_cfg['action_max']}")
 
     # ── Load GAIL (diagnostic only, not used in pipeline) ──
     if gail_checkpoint:
