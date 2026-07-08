@@ -168,7 +168,7 @@ def train_heads_hdf5(
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size),
+        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size, vision_window_size=chunk_size),
         num_workers=num_workers,
         pin_memory=True,
     )

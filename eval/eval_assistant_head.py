@@ -139,7 +139,7 @@ def main():
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size),
+        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size, vision_window_size=chunk_size),
     )
 
     # Evaluation

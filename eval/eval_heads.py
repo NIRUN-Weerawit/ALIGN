@@ -161,7 +161,7 @@ def evaluate(
         batch_size=batch_size,
         sampler=RandomSampler(indices),
         drop_last=False,
-        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size),
+        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size, vision_window_size=chunk_size),
     )
 
     # -- Evaluation loop
