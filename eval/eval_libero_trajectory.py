@@ -559,30 +559,16 @@ def run_episode_in_sim(
 
             current_action_t = torch.from_numpy(base_action[:6]).unsqueeze(0).float().to(device)
 
-            # ── Assistant head: K pose-relative goals ──
-            # Output is now (B, K, 6) where goal[k] = desired_pose[t+k+1] - noisy_current_pose.
-            # Use goal[0] as the model's proposed action (a_model).
+            # ── Assistant head: single-step action prediction ──
+            # Output is (B, 6) — current OSC action in OSC units.
+            # No pose-delta conversion needed; the model directly predicts
+            # the action the human would take.
             a_model = np.zeros(6, dtype=np.float32)  # default fallback
             if heads_model is not None and hasattr(heads_model, 'assistant_head'):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                    goal_5steps = heads_model.assistant_head(
-                        z_v, z_t, z_text_local)
-                goal_np = goal_5steps.squeeze(0).float().cpu().numpy()
-                a_model = goal_np[0]  # pose delta in (m, rad)
-
-                # Convert pose delta → OSC action via learned connector
-                if pose_to_action_model is not None:
-                    with torch.no_grad():
-                        pose_delta_t = torch.from_numpy(a_model).unsqueeze(0).float().to(device)
-                        current_pose_t = torch.from_numpy(sim_pose_before).unsqueeze(0).float().to(device)
-                        action_t = pose_to_action_model(pose_delta_t, current_pose_t)
-                    a_model = action_t.squeeze(0).cpu().numpy()
-                else:
-                    # Fallback: fixed scale (libero_spatial)
-                    SCALE = np.array([1/0.2, 1/0.2, 1/0.2, 1/2, 1/2, 1/3])
-                    a_model = a_model * SCALE
-                
-                
+                    action_pred = heads_model.assistant_head(z_v, z_t, z_text_local)
+                a_model = action_pred.squeeze(0).float().cpu().numpy()
+                # No scale conversion — model output is already in OSC units.
             # ── Compute α via counterfactual imagination ──
             if fixed_alpha is not None:
                 alpha_val = fixed_alpha
@@ -605,7 +591,7 @@ def run_episode_in_sim(
                 alpha_val = float(torch.sigmoid(diff).item())
                 print(f"alpha_eval = {alpha_val}")
 
-        print(f"Step {step}:    goal_np[0]={goal_np[0]} \n          a_model={a_model}")
+        print(f"Step {step}:    a_model={a_model}")
         alpha_vals.append(alpha_val)
         delta_norms.append(float(np.linalg.norm(a_model)))
         delta_vectors.append(a_model[:3].copy())

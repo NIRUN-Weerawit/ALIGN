@@ -220,24 +220,22 @@ def record_episode_video(
             # available from the dataset).
             alpha_val = 1.0
 
-            # Assistant head: input is the current action, not the pose.
-            # The current pose is encoded in z_t.
-            action_t = torch.from_numpy(current_action).unsqueeze(0).float().to(device)
-            chunk = model.assistant_head(z_v, z_t, z_text, action_t)
-            chunk_np = chunk.squeeze(0).cpu().numpy()
+            # Assistant head: predicts current action from K past frames.
+            action_pred = model.assistant_head(z_v, z_t, z_text)
+            action_pred_np = action_pred.squeeze(0).cpu().numpy()
 
             if chunk_cache is not None:
-                corrective = 0.7 * chunk_np[0] + 0.3 * chunk_cache[-1]
+                corrective = 0.7 * action_pred_np + 0.3 * chunk_cache
             else:
-                corrective = chunk_np[0]
+                corrective = action_pred_np
             commanded_pose = raw_pose + alpha_val * corrective
-            chunk_cache = chunk_np
+            chunk_cache = action_pred_np
 
         alpha_vals.append(alpha_val)
-        delta_norms.append(float(np.linalg.norm(chunk_np[0])))
+        delta_norms.append(float(np.linalg.norm(action_pred_np)))
 
         # Overlay info on frame
-        display = _overlay_text(frame, f"α={alpha_val:.2f}  Δ={np.linalg.norm(chunk_np[0]):.3f}  step={step}")
+        display = _overlay_text(frame, f"α={alpha_val:.2f}  Δ={np.linalg.norm(action_pred_np):.3f}  step={step}")
         display = _overlay_text(display, f"task: {task_description[:50]}", pos=(10, 30), color=(255, 255, 0))
         frames_buffer.append(display)
 
@@ -361,21 +359,19 @@ def run_episode(
             # eval (eval_libero_trajectory.py).
             alpha_val = 1.0
 
-            # Assistant head: input is the current action, not the pose.
-            # The current pose is encoded in z_t.
-            action_t = torch.from_numpy(current_action).unsqueeze(0).float().to(device)
-            chunk = model.assistant_head(z_v, z_t, z_text, action_t)
-            chunk_np = chunk.squeeze(0).cpu().numpy()
+            # Assistant head: predicts current action from K past frames.
+            action_pred = model.assistant_head(z_v, z_t, z_text)
+            action_pred_np = action_pred.squeeze(0).cpu().numpy()
 
             if chunk_cache is not None:
-                corrective = 0.7 * chunk_np[0] + 0.3 * chunk_cache[-1]
+                corrective = 0.7 * action_pred_np + 0.3 * chunk_cache
             else:
-                corrective = chunk_np[0]
+                corrective = action_pred_np
             commanded_pose = raw_pose + alpha_val * corrective
-            chunk_cache = chunk_np
+            chunk_cache = action_pred_np
 
         alpha_vals.append(alpha_val)
-        delta_norms.append(float(np.linalg.norm(chunk_np[0])))
+        delta_norms.append(float(np.linalg.norm(action_pred_np)))
 
         action = np.zeros(7, dtype=np.float32)
         action[:6] = commanded_pose

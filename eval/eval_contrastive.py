@@ -202,7 +202,8 @@ def get_head_predictions(
     if actions is None:
         # Backward-compat fallback: use last pose in the trajectory window
         actions = trajs[:, -1]
-    delta = model.assistant_head(z_v, z_t, z_text, actions)
+    # Single-step action prediction (no longer passes actions as input)
+    delta = model.assistant_head(z_v, z_t, z_text)
 
     return {
         "alpha": alpha.detach(),

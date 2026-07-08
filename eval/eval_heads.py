@@ -214,8 +214,9 @@ def evaluate(
             if not isinstance(_ca, torch.Tensor):
                 _ca = torch.tensor(_ca, dtype=torch.float32)
             current_action = _ca.to(device)
-            delta_pred = model.assistant_head(z_v, z_t, z_text, current_action)  # (B, K, 6)
-            rmse_per_batch = (delta_pred - delta_t).pow(2).mean(dim=[1, 2]).sqrt()
+            # Single-step action prediction: (B, 6)
+            action_pred = model.assistant_head(z_v, z_t, z_text)
+            rmse_per_batch = (action_pred - current_action).pow(2).mean(dim=1).sqrt()
             delta_rmses.extend(rmse_per_batch.cpu().tolist())
 
     avg_decision_loss = float(np.mean(decision_losses)) if decision_losses else 0.0

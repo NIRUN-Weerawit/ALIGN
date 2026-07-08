@@ -219,7 +219,7 @@ def train_heads_hdf5(
     # ================================================================
     for epoch in range(epochs_assistant):
         model.train()
-        losses_b, deltas_pred = [], []
+        losses_b, actions_pred = [], []
 
         progress = train_loader
         if max_steps_per_epoch and max_steps_per_epoch < len(train_loader):
@@ -237,10 +237,11 @@ def train_heads_hdf5(
             if step >= max_steps_per_epoch:
                 break
 
-            frames = torch.from_numpy(batch["frames"]).to(device)
-            texts = batch["texts"]
-            delta_t = torch.from_numpy(batch["delta_target"]).float().to(device)
-            traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
+            texts           = batch["texts"]
+            frames          = torch.from_numpy(batch["frames"]).to(device)
+            delta_t         = torch.from_numpy(batch["delta_target"]).float().to(device)
+            current_action  = torch.from_numpy(batch["current_action"]).float().to(device)
+            traj_view       = torch.from_numpy(batch["trajectory"]).float().to(device)
 
             # Frozen encodings via mixer
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
@@ -259,18 +260,15 @@ def train_heads_hdf5(
                     z_v_window_raw, z_t_tokens, z_text
                 )
                 z_t_window = z_t_tokens[:, -K:]  # (B, K, D)
-                delta_pred = model.assistant_head(z_v_window_mixed, z_t_window, z_text)
+                action_pred = model.assistant_head(z_v_window_mixed, z_t_window, z_text)
             else:
-                delta_pred = model.assistant_head(z_v, z_t, z_text)
+                action_pred = model.assistant_head(z_v, z_t, z_text)
 
-            # Per-step loss weighting (step 0 = action used at inference)
-            K = delta_pred.shape[1]
-            step_weights = torch.tensor(
-                [loss_decay ** k for k in range(K)], device=device, dtype=delta_pred.dtype
-            )
-            per_step_mse = (delta_pred - delta_t) ** 2  # (B, K, 6)
-            per_step_loss = per_step_mse.mean(dim=-1)     # (B, K)
-            loss_mse = (per_step_loss * step_weights.unsqueeze(0)).mean()
+            # Single-step action loss (B, 6) vs (B, 6)
+            # action_pred and current_action are both (B, 6) — current OSC action
+            # at this timestep. We don't do K-step prediction anymore; the
+            # model just predicts the current action from K past frames.
+            loss_mse = F.mse_loss(action_pred, current_action)
 
             optimizer.zero_grad()
             loss_mse.backward()
@@ -278,29 +276,29 @@ def train_heads_hdf5(
             optimizer.step()
 
             losses_b.append(loss_mse.item())
-            deltas_pred.append(delta_pred.detach().abs().mean().item())
+            actions_pred.append(action_pred.detach().abs().mean().item())
 
             if step % 10 == 0:
                 progress_bar.set_postfix(
                     mse=f"{loss_mse.item():.5f}",
-                    d_mean=f"{delta_pred.detach().abs().mean().item():.4f}",
+                    a_mean=f"{action_pred.detach().abs().mean().item():.4f}",
                 )
 
         avg_loss = float(np.mean(losses_b))
-        av_delta = float(np.mean(deltas_pred))
+        av_action = float(np.mean(actions_pred))
 
         print(f"  [Δ] Epoch {epoch+1:3d}/{epochs_assistant}  MSE: {avg_loss:.4f}  Δ_mean: {av_delta:.4f}")
 
         wandb_trainer.log({
             "stage": "assistant",
             "loss": avg_loss,
-            "delta_mean": av_delta,
+            "action_mean": av_action,
             "epoch": epoch + 1,
         }, step=epoch + 1)
 
         log_fp.write(json.dumps({
             "stage": "assistant", "epoch": epoch + 1,
-            "loss": avg_loss, "delta_mean": av_delta,
+            "loss": avg_loss, "action_mean": av_action,
             "timestamp": datetime.now().isoformat(),
         }) + "\n")
         log_fp.flush()
@@ -333,7 +331,7 @@ def train_heads_hdf5(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="ALIGN Assistant Head Training (delta pose correction)")
+        description="ALIGN Assistant Head Training (OSC action prediction)")
     parser.add_argument("--data", required=True, nargs="+",
                         help="Path(s) to align.h5 dataset(s).")
     parser.add_argument("--pretrained", required=True, help="Phase 1 pretrained checkpoint")

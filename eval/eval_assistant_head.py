@@ -162,7 +162,6 @@ def main():
             frames = torch.from_numpy(batch["frames"]).to(device)
             texts = batch["texts"]
             noisy_pose = torch.from_numpy(batch["noisy_pose"]).float().to(device)
-            delta_target = torch.from_numpy(batch["delta_target"]).float().to(device)
             current_action = torch.from_numpy(batch["current_action"]).float().to(device)
             traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
 
@@ -172,33 +171,30 @@ def main():
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
 
-                goal_pred = model.assistant_head(z_v, z_t, z_text)
+                action_pred = model.assistant_head(z_v, z_t, z_text)
 
-            # Compute metrics
-            B = goal_pred.shape[0]
+            # Compute metrics — single-step action prediction
+            # action_pred and current_action are both (B, 6)
+            B = action_pred.shape[0]
             n_samples += B
-            sum_se += ((goal_pred - delta_target) ** 2).sum().item()
-            sum_ae += (goal_pred - delta_target).abs().sum().item()
+            sum_se += ((action_pred - current_action) ** 2).sum().item()
+            sum_ae += (action_pred - current_action).abs().sum().item()
 
-            # Per-step cosine similarity
-            for k in range(chunk_size):
-                pred_k = goal_pred[:, k, :]
-                target_k = delta_target[:, k, :]
-                cos = F.cosine_similarity(pred_k, target_k, dim=-1)
-                per_step_cos[k].extend(cos.cpu().tolist())
-                per_step_mag_pred[k].extend(pred_k.norm(dim=-1).cpu().tolist())
-                per_step_mag_target[k].extend(target_k.norm(dim=-1).cpu().tolist())
+            # Per-dim cosine similarity (since we only have 1 output now)
+            cos = F.cosine_similarity(action_pred, current_action, dim=-1)
+            per_step_cos[0].extend(cos.cpu().tolist())
+            per_step_mag_pred[0].extend(action_pred.norm(dim=-1).cpu().tolist())
+            per_step_mag_target[0].extend(current_action.norm(dim=-1).cpu().tolist())
 
             # Check mode collapse: std of predictions across batch
-            all_pred_stds.append(goal_pred.std(dim=0).mean().item())
+            all_pred_stds.append(action_pred.std(dim=0).mean().item())
 
             # Collect first few predictions
             if i == 0:
                 pred_collected.append({
-                    "noisy_pose": noisy_pose[:3].cpu().tolist(),
+                    "current_pose": traj_view[-1,:3].cpu().tolist(),
                     "current_action": current_action[:3].cpu().tolist(),
-                    "pred_goal": goal_pred[:3].cpu().tolist(),
-                    "target_goal": delta_target[:3].cpu().tolist(),
+                    "pred_action": action_pred[:3].cpu().tolist(),
                     "text": texts[:3],
                 })
 
@@ -256,12 +252,9 @@ def main():
         sample = pred_collected[0]
         for i in range(min(3, len(sample["text"]))):
             print(f"\n  Sample {i}: task='{sample['text'][i][:50]}...'")
-            print(f"    noisy_pose[0:3]:     {sample['noisy_pose'][i]}")
+            print(f"    current_pose[0:3]:  {sample['current_pose'][i]}")
             print(f"    current_action[0:3]: {sample['current_action'][i]}")
-            print(f"    pred_goal[0][0:3]:   {sample['pred_goal'][i][0]}")
-            print(f"    target_goal[0][0:3]: {sample['target_goal'][i][0]}")
-            print(f"    pred_goal[4][0:3]:   {sample['pred_goal'][i][4]}")
-            print(f"    target_goal[4][0:3]: {sample['target_goal'][i][4]}")
+            print(f"    pred_action[0:3]:   {sample['pred_action'][i]}")
 
 
 if __name__ == "__main__":

@@ -412,42 +412,44 @@ class AssistantHead(nn.Module):
 
 
 class AssistantHeadTransformer(nn.Module):
-    """Transformer predicting chunk of K future actions from a window of K past embeddings.
+    """Transformer predicting a single next action from a window of K past embeddings.
 
     Input layout (per timestep): cat([z_v_k, z_t_k, z_text_broadcast], dim=-1)
       - z_v_window:    (B, K, embed_dim)  — vision embeddings for K past timesteps
       - z_t_window:    (B, K, embed_dim)  — pose trajectory embeddings for K past timesteps
       - z_text:        (B, embed_dim)     — text embedding (broadcast over K)
 
-    Output: (B, K, action_dim) — K future ACTION deltas (or pose-relative goals,
-            depending on training target). The first timestep is used at inference:
-
-        a_model = goal[0]                                    # model's proposed action
-        final_action = (1 - α) * current_action + α * a_model  # α-weighted blend
+    Output: (B, action_dim) — single next ACTION in OSC units (m, rad → OSC scale).
+            The transformer attends over the K past timesteps and emits one
+            action prediction per query.
 
     Unlike AssistantHead (which sees a flat 3*embed_dim input), this variant
     sees K past timesteps and uses self-attention to model temporal patterns
-    in the trajectory. Each output timestep is a function of the entire input
-    window, not just the current state.
+    in the trajectory. The K input slots provide context, but only ONE
+    action is produced.
 
     Args:
         embed_dim: per-modality embedding dim (default 256).
-        chunk_size: K — number of future steps to predict.
         action_dim: 6 (OSC_POSE).
         d_model: transformer hidden dim (default 384).
         nhead: number of attention heads (default 4).
         num_layers: number of transformer encoder layers (default 2).
         dim_feedforward: FFN hidden dim (default 1024).
         dropout: dropout rate (default 0.1).
+        pool: "last" | "mean" — how to aggregate the K output tokens into
+            a single action prediction. "last" uses the final timestep
+            (default); "mean" averages all K positions.
     """
 
     def __init__(self, embed_dim: int = 256, chunk_size: int = 5, action_dim: int = 6,
                  d_model: int = 384, nhead: int = 4, num_layers: int = 2,
-                 dim_feedforward: int = 1024, dropout: float = 0.1):
+                 dim_feedforward: int = 1024, dropout: float = 0.1,
+                 pool: str = "last"):
         super().__init__()
         self.embed_dim = embed_dim
         self.chunk_size = chunk_size
         self.action_dim = action_dim
+        self.pool = pool
         # Project per-timestep features (3*embed_dim) to d_model
         self.input_proj = nn.Linear(3 * embed_dim, d_model)
         # Learned positional encoding for the K input timesteps
@@ -461,7 +463,7 @@ class AssistantHeadTransformer(nn.Module):
             activation="gelu",
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        # Per-timestep output head: (B, K, d_model) -> (B, K, action_dim)
+        # Output head: (B, d_model) -> (B, action_dim)
         self.output_proj = nn.Linear(d_model, action_dim)
 
     def forward(
@@ -479,8 +481,15 @@ class AssistantHeadTransformer(nn.Module):
         x = self.input_proj(features) + self.pos_encoding[:K].unsqueeze(0)  # (B, K, d_model)
         # Self-attention over the K timesteps
         x = self.transformer(x)  # (B, K, d_model)
-        # Per-timestep output head
-        out = self.output_proj(x)  # (B, K, action_dim)
+        # Pool the K output tokens into a single vector
+        if self.pool == "last":
+            pooled = x[:, -1]  # (B, d_model)
+        elif self.pool == "mean":
+            pooled = x.mean(dim=1)  # (B, d_model)
+        else:
+            raise ValueError(f"Unknown pool: {self.pool}")
+        # Output head
+        out = self.output_proj(pooled)  # (B, action_dim)
         return out
 
 
