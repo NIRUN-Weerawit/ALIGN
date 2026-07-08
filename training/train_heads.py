@@ -287,7 +287,7 @@ def train_heads_hdf5(
         avg_loss = float(np.mean(losses_b))
         av_action = float(np.mean(actions_pred))
 
-        print(f"  [Δ] Epoch {epoch+1:3d}/{epochs_assistant}  MSE: {avg_loss:.4f}  Δ_mean: {av_delta:.4f}")
+        print(f"  [Δ] Epoch {epoch+1:3d}/{epochs_assistant}  MSE: {avg_loss:.4f}  Δ_mean: {av_action:.4f}")
 
         wandb_trainer.log({
             "stage": "assistant",
