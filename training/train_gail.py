@@ -352,6 +352,15 @@ def train_gail(
         num_workers=num_workers,
         pin_memory=True,
     )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
     # -- Frozen ALIGNModel (encoder + mixer only) ------------
     print(f"\n  Loading ALIGNModel from {pretrained_checkpoint} ...")
@@ -562,10 +571,50 @@ def train_gail(
         avg_r_rol = float(np.mean(epoch_reward_rol)) if epoch_reward_rol else 0.0
         elapsed = time.time() - t_start
 
+        # -- Validation loop -----------------------------------
+        val_losses, val_exp_accs, val_rol_accs, val_r_exp, val_r_rol = [], [], [], [], []
+        with torch.no_grad():
+            for vbatch in val_loader:
+                vframes = torch.from_numpy(vbatch["frames"]).to(device)
+                vtrajs = torch.from_numpy(vbatch["trajectories"]).float().to(device)
+                vtexts = vbatch["texts"]
+                vactions = torch.from_numpy(vbatch["actions"]).float().to(device)
+                B = vframes.shape[0]
+
+                # Pad trajectories if needed
+                if vtrajs.shape[-1] < 6:
+                    pad = torch.zeros(*vtrajs.shape[:-1], 6 - vtrajs.shape[-1], device=vtrajs.device)
+                    vtrajs = torch.cat([vtrajs, pad], dim=-1)
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    vmixed = align.encode_mixed(vframes, vtrajs, vtexts)
+                    vz_v = vmixed["z_v"].float()
+                    vz_t = vmixed["z_t"].float()
+                    vz_text = vmixed["z_text"].float()
+
+                v_action_exp = vactions[:, -1, :6] if vactions.ndim == 3 else vactions[:, :6]
+                v_action_rol = sample_rollout_actions(B)
+
+                vexpert_logits = discriminator(vz_v, vz_t, vz_text, v_action_exp)
+                vrollout_logits = discriminator(vz_v, vz_t, vz_text, v_action_rol)
+                vloss, vexp_acc, vrol_acc = gail_loss(vexpert_logits, vrollout_logits)
+                val_losses.append(vloss.item())
+                val_exp_accs.append(vexp_acc.item())
+                val_rol_accs.append(vrol_acc.item())
+                val_r_exp.append(compute_reward(vexpert_logits).mean().item())
+                val_r_rol.append(compute_reward(vrollout_logits).mean().item())
+
+        avg_val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+        avg_val_exp_acc = float(np.mean(val_exp_accs)) if val_exp_accs else 0.0
+        avg_val_rol_acc = float(np.mean(val_rol_accs)) if val_rol_accs else 0.0
+        avg_val_r_exp = float(np.mean(val_r_exp)) if val_r_exp else 0.0
+        avg_val_r_rol = float(np.mean(val_r_rol)) if val_r_rol else 0.0
+
         print(
             f"  Epoch {epoch+1:3d}/{epochs}  "
-            f"loss: {avg_loss:.4f}  exp_acc: {avg_exp_acc:.3f}  rol_acc: {avg_rol_acc:.3f}  "
-            f"r_exp: {avg_r_exp:.3f}  r_rol: {avg_r_rol:.3f}  "
+            f"train: loss={avg_loss:.4f} exp={avg_exp_acc:.3f} rol={avg_rol_acc:.3f}  "
+            f"r_exp={avg_r_exp:.3f} r_rol={avg_r_rol:.3f}  |  "
+            f"val: loss={avg_val_loss:.4f} exp={avg_val_exp_acc:.3f} rol={avg_val_rol_acc:.3f}  "
             f"elapsed: {elapsed:.0f}s"
         )
 
@@ -576,6 +625,11 @@ def train_gail(
             "train/rollout_acc": avg_rol_acc,
             "train/reward_expert": avg_r_exp,
             "train/reward_rollout": avg_r_rol,
+            "val/loss": avg_val_loss,
+            "val/expert_acc": avg_val_exp_acc,
+            "val/rollout_acc": avg_val_rol_acc,
+            "val/reward_expert": avg_val_r_exp,
+            "val/reward_rollout": avg_val_r_rol,
         }, step=epoch + 1)
 
         log_fp.write(json.dumps({

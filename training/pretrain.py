@@ -552,8 +552,44 @@ def pretrain_hdf5(
             avg_vl = float(np.mean(epoch_cos_vl))
             avg_tl = float(np.mean(epoch_cos_tl))
 
+            # Validation (only every val_every epochs)
+            val_msg = ""
+            if (epoch + 1) % val_every == 0:
+                model.eval()
+                val_losses_1b, val_vt_1b, val_vl_1b, val_tl_1b = [], [], [], []
+                with torch.no_grad():
+                    for batch in tqdm(val_loader, desc="[1b] Val", leave=False):
+                        frames = torch.from_numpy(batch["frames"]).to(device)
+                        trajs = torch.from_numpy(batch["trajectories"]).float().to(device)
+                        texts = batch["texts"]
+                        if trajs.shape[-1] < 6:
+                            pad = torch.zeros(*trajs.shape[:-1], 6 - trajs.shape[-1], device=trajs.device)
+                            trajs = torch.cat([trajs, pad], dim=-1)
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                            mixed = model.encode_mixed(frames, trajs, texts)
+                        stats_val = criterion(mixed["z_v"], mixed["z_t"], mixed["z_text"])
+                        val_losses_1b.append(stats_val["loss"].item())
+                        val_vt_1b.append(stats_val["avg_cos_vt"].item())
+                        val_vl_1b.append(stats_val["avg_cos_vl"].item())
+                        val_tl_1b.append(stats_val["avg_cos_tl"].item())
+
+                avg_val_loss_1b = float(np.mean(val_losses_1b))
+                avg_val_vt_1b = float(np.mean(val_vt_1b))
+                avg_val_vl_1b = float(np.mean(val_vl_1b))
+                avg_val_tl_1b = float(np.mean(val_tl_1b))
+                val_msg = (f"  val: loss={avg_val_loss_1b:.4f} "
+                           f"cos_vt={avg_val_vt_1b:.3f} cos_vl={avg_val_vl_1b:.3f} cos_tl={avg_val_tl_1b:.3f}")
+                wandb_trainer.log({
+                    "val_loss": avg_val_loss_1b,
+                    "val_cos_vt": avg_val_vt_1b,
+                    "val_cos_vl": avg_val_vl_1b,
+                    "val_cos_tl": avg_val_tl_1b,
+                }, step=epochs_encoder + epoch + 1)
+                model.train()  # back to train mode
+
             print(f"  [1b] Epoch {epoch + 1:3d}  loss: {avg_loss:.4f}  "
-                  f"cos_vt: {avg_vt:.3f}  cos_vl: {avg_vl:.3f}  cos_tl: {avg_tl:.3f}")
+                  f"cos_vt: {avg_vt:.3f}  cos_vl: {avg_vl:.3f}  cos_tl: {avg_tl:.3f}"
+                  f"{val_msg}")
 
             wandb_trainer.log({
                 "phase": "1b_mixer", "epoch": epoch + 1, "loss": avg_loss,

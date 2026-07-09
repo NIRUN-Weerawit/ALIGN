@@ -157,6 +157,13 @@ def train_value(
                                cameras=cameras)
         ds_name = "+".join(Path(p).stem for p in data_paths)
 
+    # -- Train/val split --
+    n_total = len(ds)
+    n_val = max(1, int(n_total * val_split))
+    n_train = n_total - n_val
+    train_ds, val_ds = torch.utils.data.random_split(ds, [n_train, n_val])
+    print(f"  Samples:    {n_train} train, {n_val} val")
+
     # -- Derive output dir --
     base_dir = Path(output_dir) / ds_name
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -314,12 +321,20 @@ def train_value(
 
     # -- Build dataloader --
     loader = DataLoader(
-        ds,
+        train_ds,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=lambda b: world_model_collate(b, traj_window=traj_window),
         num_workers=num_workers,
         drop_last=True,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=lambda b: world_model_collate(b, traj_window=traj_window),
+        num_workers=num_workers,
+        drop_last=False,
     )
 
     # -- Training loop --
@@ -418,21 +433,72 @@ def train_value(
         mean_loss = np.mean(losses)
         mean_v = np.mean(val_v_means)
         mean_r = np.mean(val_r_means)
+
+        # -- Validation loop -----------------------------------
+        val_losses, val_vs, val_rs = [], [], []
+        with torch.no_grad():
+            for vbatch in val_loader:
+                vframe_t = torch.from_numpy(vbatch["frame_t"][:, -1]).to(device)
+                vtraj_t = torch.from_numpy(vbatch["traj_t"]).float().to(device)
+                vaction = torch.from_numpy(vbatch["action"]).float().to(device)
+                vtexts = vbatch["text"]
+                vframe_next = torch.from_numpy(vbatch["frame_next"]).to(device)
+                vtraj_next = torch.from_numpy(vbatch["traj_next"]).float().to(device)
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    vmixed_t = model.encode_mixed(vframe_t, vtraj_t, vtexts)
+                    vmixed_next = model.encode_mixed(vframe_next, vtraj_next, vtexts)
+                vz_v_t = vmixed_t["z_v"].float()
+                vz_t_t = vmixed_t["z_t"].float()
+                vz_text_t = vmixed_t["z_text"].float()
+                vz_v_next = vmixed_next["z_v"].float()
+                vz_t_next = vmixed_next["z_t"].float()
+
+                # GAIL reward
+                vgail_logits = gail_disc(vz_v_t, vz_t_t, vz_text_t, vaction)
+                vr_t = compute_reward(vgail_logits)
+                vr_t = torch.clamp(vr_t, min=-reward_clip, max=reward_clip)
+
+                # V(s_t) and TD target
+                vv_t = value_head(vz_v_t, vz_t_t, vz_text_t)
+                if use_target_net:
+                    vv_next = v_target(vz_v_next, vz_t_next, vz_text_t)
+                else:
+                    vv_next = value_head(vz_v_next, vz_t_next, vz_text_t).detach()
+                vv_target = vr_t + gamma * vv_next
+                if use_huber_loss:
+                    vloss = torch.nn.functional.smooth_l1_loss(vv_t, vv_target.detach())
+                else:
+                    vloss = value_loss(vv_t, vv_target)
+                val_losses.append(vloss.item())
+                val_vs.append(vv_t.mean().item())
+                val_rs.append(vr_t.mean().item())
+
+        mean_val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+        mean_val_v = float(np.mean(val_vs)) if val_vs else 0.0
+        mean_val_r = float(np.mean(val_rs)) if val_rs else 0.0
+
         log_entry = {
             "stage": "value", "epoch": epoch + 1,
             "loss": mean_loss, "v_mean": mean_v, "r_mean": mean_r,
+            "val_loss": mean_val_loss, "val_v_mean": mean_val_v, "val_r_mean": mean_val_r,
             "timestamp": datetime.now().isoformat(),
         }
         log_fp.write(json.dumps(log_entry) + "\n")
         log_fp.flush()
 
-        print(f"  Epoch {epoch+1}/{epochs}  loss: {mean_loss:.4f}  V: {mean_v:.4f}  r: {mean_r:.4f}")
+        print(f"  Epoch {epoch+1}/{epochs}  "
+              f"train: loss={mean_loss:.4f} V={mean_v:.4f} r={mean_r:.4f}  |  "
+              f"val: loss={mean_val_loss:.4f} V={mean_val_v:.4f} r={mean_val_r:.4f}")
 
         wandb_trainer.log({
             "epoch": epoch + 1,
             "train/loss": mean_loss,
             "train/v_mean": mean_v,
             "train/r_mean": mean_r,
+            "val/loss": mean_val_loss,
+            "val/v_mean": mean_val_v,
+            "val/r_mean": mean_val_r,
         }, step=epoch + 1)
 
         if mean_loss < best_loss:

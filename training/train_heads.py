@@ -184,6 +184,15 @@ def train_heads_hdf5(
         num_workers=num_workers,
         pin_memory=True,
     )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size, vision_window_size=chunk_size),
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
     # -- Model --
     num_cameras = len(cameras) if cameras else 1
@@ -299,14 +308,59 @@ def train_heads_hdf5(
         avg_loss = float(np.mean(losses_b))
         av_action = float(np.mean(actions_pred))
 
-        print(f"  [Δ] Epoch {epoch+1:3d}/{epochs_assistant}  MSE: {avg_loss:.4f}  Δ_mean: {av_action:.4f}")
+        # Validation loop
+        val_losses, val_actions = [], []
+        with torch.no_grad():
+            for vbatch in val_loader:
+                vframes = torch.from_numpy(vbatch["frames"]).to(device)
+                vtexts = vbatch["texts"]
+                vcurrent_action = torch.from_numpy(vbatch["current_action"]).float().to(device)
+                vtraj_view = torch.from_numpy(vbatch["trajectory"]).float().to(device)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    vmixed = model.encode_mixed(vframes, vtraj_view, vtexts)
+                    vz_v = vmixed["z_v"].float()
+                    vz_t = vmixed["z_t"].float()
+                    vz_text = vmixed["z_text"].float()
+                    if model.assistant_arch == "transformer":
+                        vK = model.assistant_head.chunk_size
+                        vframes_window = torch.from_numpy(vbatch["frames_window"]).to(device)
+                        vz_v_window_raw = model.encode_raw_vision_window(vframes_window)
+                        vz_v_window_mixed, _, _ = model.cross_attention_mixer(
+                            vz_v_window_raw, vz_t, vz_text
+                        )
+                        vz_t_window = vz_t[:, -vK:]
+                        vaction_pred = model.assistant_head(vz_v_window_mixed, vz_t_window, vz_text)
+                    else:
+                        vaction_pred = model.assistant_head(vz_v, vz_t, vz_text)
+                vloss = F.mse_loss(vaction_pred, vcurrent_action)
+                val_losses.append(vloss.item())
+                val_actions.append(vaction_pred.detach().abs().mean().item())
+
+        avg_val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+        avg_val_action = float(np.mean(val_actions)) if val_actions else 0.0
+
+        print(f"  [Δ] Epoch {epoch+1:3d}/{epochs_assistant}  "
+              f"train: MSE={avg_loss:.4f} a_mean={av_action:.4f}  |  "
+              f"val: MSE={avg_val_loss:.4f} a_mean={avg_val_action:.4f}")
 
         wandb_trainer.log({
             "stage": "assistant",
             "loss": avg_loss,
             "action_mean": av_action,
+            "val_loss": avg_val_loss,
+            "val_action_mean": avg_val_action,
             "epoch": epoch + 1,
         }, step=epoch + 1)
+
+        # Best checkpoint: use val_loss for selection
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            model.save_heads_checkpoint(
+                str(out_dir / "assistant_best.pt"), epoch, avg_val_loss,
+                optimizer.state_dict(), {"chunk_size": chunk_size,
+                                          "val_loss": avg_val_loss,
+                                          "val_action_mean": avg_val_action})
+            print(f"  ↳ new best (val_loss={avg_val_loss:.4f}), saved to assistant_best.pt")
 
         log_fp.write(json.dumps({
             "stage": "assistant", "epoch": epoch + 1,
@@ -314,13 +368,6 @@ def train_heads_hdf5(
             "timestamp": datetime.now().isoformat(),
         }) + "\n")
         log_fp.flush()
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            model.save_heads_checkpoint(
-                str(out_dir / "assistant_best.pt"), epoch, avg_loss,
-                optimizer.state_dict(), {"chunk_size": chunk_size})
-            print(f"  -> assistant_best.pt (loss: {avg_loss:.4f})")
 
     # Save final checkpoint
     model.train()
