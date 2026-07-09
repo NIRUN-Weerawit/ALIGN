@@ -401,6 +401,7 @@ def train_world_model(
         }, str(path))
 
     best_loss = float("inf")
+    best_val_loss = float("inf")
     t_start = time.time()
 
     for epoch in range(resume_start_epoch, epochs):
@@ -512,9 +513,71 @@ def train_world_model(
         avg_cos_t = float(np.mean(epoch_cos_t)) if epoch_cos_t else 0.0
         elapsed = time.time() - t_start
 
+        # -- Validation loop ------------------------------
+        # Iterate the val_loader once, computing the same loss/metrics
+        # as training but on held-out data. The world model is trained
+        # on (z_v_window, z_t_tokens, z_text, action) -> (z_v_target, z_t_target)
+        # where targets are encoded state at t+1.
+        val_losses: list = []
+        val_cos_v: list = []
+        val_cos_t: list = []
+        with torch.no_grad():
+            for val_batch in val_loader:
+                # Normalize batch schema (frame_t vs frames_t etc.)
+                if "frame_t" in val_batch:
+                    vf_t = torch.from_numpy(val_batch["frame_t"]).to(device)
+                    vt_t = torch.from_numpy(val_batch["traj_t"]).float().to(device)
+                    vf_next = torch.from_numpy(val_batch["frame_next"]).to(device)
+                    vt_next = torch.from_numpy(val_batch["traj_next"]).float().to(device)
+                    v_action = torch.from_numpy(val_batch["action"]).float().to(device)
+                    v_texts = val_batch["text"]
+                else:
+                    vf_t = torch.from_numpy(val_batch["frames_t"]).to(device)
+                    vt_t = torch.from_numpy(val_batch["trajectory_t"]).float().to(device)
+                    vf_next = torch.from_numpy(val_batch["frames_next"]).to(device)
+                    vt_next = torch.from_numpy(val_batch["trajectory_next"]).float().to(device)
+                    v_action = torch.from_numpy(val_batch["action"]).float().to(device)
+                    v_texts = val_batch["texts"]
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    # Encode state_t (input)
+                    z_v_w = align.encode_raw_vision_window(vf_t)
+                    z_t_tok = align.encode_raw_trajectory_tokens(vt_t)
+                    z_t_text = align.encode_raw_text(v_texts)
+                    if z_t_text is None:
+                        z_t_text = torch.zeros_like(z_v_w[:, 0])
+                    z_v_w, z_t_tok, z_t_text = align.cross_attention_mixer(
+                        z_v_w, z_t_tok, z_t_text
+                    )
+                    z_v_w = z_v_w[:, -window_size:]
+                    z_t_tok = z_t_tok[:, -window_size:]
+
+                    # Encode state_t+1 (target) — same convention as training
+                    mixed_next = align.encode_mixed(vf_next, vt_next, v_texts)
+                    z_v_tgt = mixed_next["z_v"].float()
+                    z_t_tgt = mixed_next["z_t"].float()
+
+                # Predict + loss
+                z_v_p, z_t_p = world_model(z_v_w, z_t_tok, z_t_text, v_action)
+                v_loss = world_model_loss(z_v_p, z_v_tgt, z_t_p, z_t_tgt)
+                v_cos_v = torch.nn.functional.cosine_similarity(
+                    z_v_p, z_v_tgt, dim=-1
+                ).mean().item()
+                v_cos_t = torch.nn.functional.cosine_similarity(
+                    z_t_p, z_t_tgt, dim=-1
+                ).mean().item()
+                val_losses.append(v_loss.item())
+                val_cos_v.append(v_cos_v)
+                val_cos_t.append(v_cos_t)
+
+        avg_val_loss = float(np.mean(val_losses)) if val_losses else float("inf")
+        avg_val_cos_v = float(np.mean(val_cos_v)) if val_cos_v else 0.0
+        avg_val_cos_t = float(np.mean(val_cos_t)) if val_cos_t else 0.0
+
         print(
             f"  Epoch {epoch+1:3d}/{epochs}  "
-            f"loss: {avg_loss:.4f}  cos_v: {avg_cos_v:.3f}  cos_t: {avg_cos_t:.3f}  "
+            f"train: loss={avg_loss:.4f} cos_v={avg_cos_v:.3f} cos_t={avg_cos_t:.3f}  |  "
+            f"val: loss={avg_val_loss:.4f} cos_v={avg_val_cos_v:.3f} cos_t={avg_val_cos_t:.3f}  "
             f"elapsed: {elapsed:.0f}s"
         )
 
@@ -523,17 +586,37 @@ def train_world_model(
             "train/loss": avg_loss,
             "train/cos_v": avg_cos_v,
             "train/cos_t": avg_cos_t,
+            "val/loss": avg_val_loss,
+            "val/cos_v": avg_val_cos_v,
+            "val/cos_t": avg_val_cos_t,
         }, step=epoch + 1)
 
         log_fp.write(json.dumps({
             "epoch": epoch + 1,
-            "stage": "train",
-            "loss": avg_loss,
-            "cos_v": avg_cos_v,
-            "cos_t": avg_cos_t,
+            "stage": "epoch",
+            "train_loss": avg_loss,
+            "train_cos_v": avg_cos_v,
+            "train_cos_t": avg_cos_t,
+            "val_loss": avg_val_loss,
+            "val_cos_v": avg_val_cos_v,
+            "val_cos_t": avg_val_cos_t,
             "timestamp": datetime.now().isoformat(),
         }) + "\n")
         log_fp.flush()
+
+        # -- Best checkpoint: use val/loss as the selection metric ----
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_path = out_dir / "best.pt"
+            torch.save({
+                "world_model_state": world_model.state_dict(),
+                "config": config_snapshot,
+                "epoch": epoch + 1,
+                "loss": avg_val_loss,
+                "val_cos_v": avg_val_cos_v,
+                "val_cos_t": avg_val_cos_t,
+            }, str(best_path))
+            print(f"  ↳ new best (val_loss={avg_val_loss:.4f}), saved to {best_path}")
 
         # -- Per-epoch checkpoint -----------------------------
         epoch_path = out_dir / f"world_model_epoch_{epoch+1:04d}.pt"
