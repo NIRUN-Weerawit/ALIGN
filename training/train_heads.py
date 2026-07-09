@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ALIGN Assistant Head training — delta pose correction.
-
-Inputs / Outputs / Metrics
-==========================
-
-Assistant head (delta pose correction)
-  Input:
-    - MLP arch: z_v (B, D), z_t (B, D), z_text (B, D) pooled embeddings
-    - Transformer arch: z_v_window (B, K, D), z_t_window (B, K, D), z_text (B, D)
-      K past per-timestep embeddings encoded via encode_raw_vision_window
-  Output:
-    - action_pred: (B, 6) single predicted action in OSC units
-  Target:
-    - current_action: (B, 6) the human's current OSC action
-  Loss:
-    - F.mse_loss(action_pred, current_action) -- single-step regression
-  Metrics:
-    - mse: MSE between predicted and ground-truth action (lower = better)
-    - action_mean: mean |action_pred| tracks if model produces reasonable actions
+"""ALIGN Assistant Head training — action prediction.
 
 Encoders + mixer are frozen. Only the assistant head trains.
 
@@ -28,6 +10,37 @@ Usage:
         --pretrained ./checkpoints/pretrain/best.pt \\
         --output-dir ./checkpoints/heads \\
         --epochs-assistant 10
+
+────────────────────────────────────────────────────────────────────────
+TRAINING CONTRACT — train_heads.py (Phase 3: Assistant Head)
+────────────────────────────────────────────────────────────────────────
+INPUT  (per sample, B = batch):
+  - MLP arch (default):
+      - z_v:     (B, 256)            — current visual embedding (mean-pooled)
+      - z_t:     (B, 256)            — trajectory embedding (mean-pooled over K)
+      - z_text:  (B, 256)            — text embedding
+  - Transformer arch (--assistant-arch transformer):
+      - z_v_window: (B, K, 256)       — K past vision embeddings (K = --chunk-size)
+      - z_t_window: (B, K, 256)       — K past trajectory tokens
+      - z_text:     (B, 256)          — text embedding (broadcast over K)
+  - current_action: (B, 6)           — the human's current OSC action (target)
+
+OUTPUT (per sample, B = batch):
+  - action_pred:     (B, 6)           — single predicted OSC action
+
+TARGET:
+  - current_action   (B, 6)           — ground-truth current OSC action
+
+LOSS:
+  - F.mse_loss(action_pred, current_action)  — single-step MSE regression
+
+METRICS (per epoch, logged to wandb + JSONL):
+  - loss        (float, OSC²):         MSE between action_pred and current_action (lower=better)
+  - action_mean (float, OSC units):     mean |action_pred| — sanity check for output magnitude
+
+BEST CHECKPOINT:
+  - Lowest avg_loss on validation set, saved as assistant_best.pt
+────────────────────────────────────────────────────────────────────────
 """
 
 import argparse

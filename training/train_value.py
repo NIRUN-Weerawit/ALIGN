@@ -14,13 +14,55 @@ cumulative future reward, and is used to compute alpha:
 where s'_m = world_model(s, a_m) and s'_h = world_model(s, a_h).
 
 Usage:
-    python training/train_value.py \
-        --data /path/to/libero.h5 \
-        --pretrained checkpoints/pretrain/.../best.pt \
-        --gail-checkpoint checkpoints/gail/.../gail_best.pt \
-        --output-dir ./checkpoints/value \
-        --epochs 30 --batch-size 32 --lr 1e-3 \
+    python training/train_value.py \\
+        --data /path/to/libero.h5 \\
+        --pretrained checkpoints/pretrain/.../best.pt \\
+        --gail-checkpoint checkpoints/gail/.../gail_best.pt \\
+        --output-dir ./checkpoints/value \\
+        --epochs 30 --batch-size 32 --lr 1e-3 \\
         --gamma 0.99 --lam 0.7
+
+────────────────────────────────────────────────────────────────────────
+TRAINING CONTRACT — train_value.py (Phase 5: Value Head V(s))
+────────────────────────────────────────────────────────────────────────
+INPUT  (per sample, B = batch):
+  - frames:    (B, H, W, 3) uint8         — current image
+  - traj:      (B, traj_window, 6)        — K past EEF poses
+  - text:      List[str]                  — task description
+  - actions:   (B, T, 6)                  — T-step action sequence (trajectory)
+  - frames_next: (B, T, H, W, 3) uint8    — T-step image sequence
+  - traj_next:  (B, T, traj_window, 6)    — T-step trajectory windows
+
+OUTPUT (per sample, B = batch):
+  - V(s_t):    (B,)                       — predicted value of each state
+  - V(s_{t+1}): (B,)                      — value of next state (for TD target)
+
+TARGET:
+  - V_target:  (B,) — TD(λ) return computed from per-step GAIL rewards
+    G_t^λ = (1-λ) * sum_n λ^{n-1} * G_t^{(n)} + λ^{T-t-1} * G_t^{(T-t)}
+
+LOSS:
+  - value_loss(v_pred, v_target):
+      - loss = MSE(v_pred, v_target.detach())
+  - Phase 9 stability (--use-huber-loss):
+      - loss = HuberLoss(v_pred, v_target.detach(), delta=1.0)
+  - Reward clipping (--reward-clip 1.0) prevents unbounded divergence
+  - Target network (--use-target-net, soft_update_tau=0.005) for stability
+
+METRICS (per epoch, logged to wandb + JSONL):
+  - loss        (float, lower=better):  MSE/Huber between v_pred and v_target
+  - v_mean      (float):                mean predicted V(s) over the batch
+  - r_mean      (float, ≥ 0):            mean per-step GAIL reward
+
+BEST CHECKPOINT:
+  - Lowest avg_loss, saved as value_best.pt
+  - MUST pass 5 sanity tests before use (see eval/eval_value.py):
+    1. V has reasonable variance
+    2. V is monotonically non-decreasing on expert trajectories
+    3. V correlates with task progress
+    4. V counterfactual: V(s'_m) ≠ V(s'_h) (the model can distinguish actions)
+    5. V is deterministic for the same state
+────────────────────────────────────────────────────────────────────────
 
 Training loop:
   For each batch (transitions from world_model_collate):

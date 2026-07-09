@@ -21,6 +21,43 @@ Usage:
     python training/pretrain.py --data ./align.h5 \\
         --encoder-checkpoint ./checkpoints/pretrain/encoder_best.pt \\
         --epochs-mixer 10
+
+────────────────────────────────────────────────────────────────────────
+TRAINING CONTRACT — pretrain.py (Phase 1: Encoder + Mixer Pretraining)
+────────────────────────────────────────────────────────────────────────
+INPUT  (per sample, B = batch):
+  - frames:  (B, 256, 256, 3) uint8  — current image (single timestep)
+  - traj:    (B, traj_window, 6)     — K past EEF poses (x,y,z,ax,ay,az)
+  - text:    List[str] of length B   — task description
+
+OUTPUT (per sample, B = batch):
+  - z_v:     (B, 256) — single visual embedding (frozen DINOv2 + proj)
+  - z_t:     (B, 256) — mean-pooled trajectory embedding
+  - z_text:  (B, 256) — text embedding
+  All passed through the cross-attention mixer in Phase 1b.
+
+TARGET:
+  - Implicit (batch contrast): each sample is its own positive
+  - Negatives = all other samples in the same batch
+
+LOSS:
+  - compute_contrastive_loss(z_v, z_t, z_text, temperature=0.07)
+    For each pair (v,t), (v,l), (t,l):
+      - L2-normalize both embeddings
+      - Compute (B, B) cosine similarity matrix
+      - Symmetric cross-entropy: CE(logits, labels) + CE(logits.T, labels)
+    Total = mean of the 3 pair losses.
+
+METRICS (per step / per epoch, logged to wandb + JSONL):
+  - loss       (float, lower=better):  mean of 3 InfoNCE losses
+  - cos_vt     (float, in [-1, 1]):     mean cosine sim of z_v vs z_t (positive pairs, target=1)
+  - cos_vl     (float, in [-1, 1]):     mean cosine sim of z_v vs z_text (target=1)
+  - cos_tl     (float, in [-1, 1]):     mean cosine sim of z_t vs z_text (target=1)
+  - lr         (float):                 current learning rate
+
+BEST CHECKPOINT:
+  - Lowest avg_val_loss on held-out split of ALIGNDataset(mode="pretrain")
+────────────────────────────────────────────────────────────────────────
 """
 import argparse
 import json

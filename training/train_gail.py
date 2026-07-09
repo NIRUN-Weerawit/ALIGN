@@ -21,7 +21,50 @@ Usage:
         --output-dir ./checkpoints/gail \\
         --epochs 20 --batch-size 64 --lr 1e-3
 
-For each batch:
+────────────────────────────────────────────────────────────────────────
+TRAINING CONTRACT — train_gail.py (Phase 4: GAIL Discriminator)
+────────────────────────────────────────────────────────────────────────
+INPUT  (per sample, B = batch):
+  - frames:  (B, H, W, 3) uint8  — current image
+  - traj:    (B, traj_window, 6) — K past EEF poses
+  - text:    List[str]           — task description
+  - action_expert:  (B, 6)       — the human's actual OSC action at t
+  - action_rollout: (B, 6)       — a random action (sampled from --rollout-mode)
+
+OUTPUT (per sample, B = batch):
+  - expert_logit:  (B,) — D(s, a_expert) raw logit
+  - rollout_logit: (B,) — D(s, a_rollout) raw logit
+
+TARGET:
+  - expert_label:  (B,) all 1.0  — expert should be classified as expert
+  - rollout_label: (B,) all 0.0  — rollout should be classified as non-expert
+
+LOSS:
+  - gail_loss(expert_logit, rollout_logit):
+      - loss_expert  = BCEWithLogits(expert_logit,  ones)
+      - loss_rollout = BCEWithLogits(rollout_logit, zeros)
+      - total = (loss_expert + loss_rollout) / 2
+
+REWARD (downstream, not part of training):
+  - r(s, a) = softplus(D(s, a)) = log(1 + exp(D(s, a)))
+  - Higher reward = more "expert-like" (range [0, +∞))
+
+METRICS (per epoch, logged to wandb + JSONL):
+  - loss             (float, lower=better):  mean BCE loss
+  - expert_acc       (float, in [0, 1]):     fraction of expert (s,a) classified as expert
+  - rollout_acc      (float, in [0, 1]):     fraction of rollout (s,a) classified as non-expert
+  - reward_expert    (float, ≥ 0):           mean reward on expert (s, a)
+  - reward_rollout   (float, ≥ 0):           mean reward on rollout (s, a_random)
+
+BEST CHECKPOINT:
+  - Lowest avg_loss, saved as gail_best.pt
+  - MUST pass 5 sanity tests before use (see eval/eval_gail.py):
+    1. Reward variance > 0.1
+    2. Expert reward > Random reward (margin > 0.3)
+    3. Reward increases along expert trajectories (>60% episodes)
+    4. Reward is calibrated to action distance (corr < -0.3)
+    5. Reward is deterministic (max_diff < 1e-5)
+────────────────────────────────────────────────────────────────────────
   - Get expert (s, a) from the dataset
   - Get rollout (s, a_random) by sampling random actions
   - Pass both through the discriminator

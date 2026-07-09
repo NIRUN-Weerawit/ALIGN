@@ -16,6 +16,47 @@ Usage:
 The world model is a SEPARATE component from the existing FuturePredictionHead:
   - FuturePredictionHead: predicts K parallel future embeddings (no action)
   - WorldModel: predicts 1 next embedding from current state + action
+
+────────────────────────────────────────────────────────────────────────
+TRAINING CONTRACT — train_world_model.py (Phase 2: World Model)
+────────────────────────────────────────────────────────────────────────
+INPUT  (per sample, B = batch):
+  - frames_t:   (B, K, H, W, 3) uint8       — K past images ending at time t
+  - traj_t:     (B, K, 6)                   — K past EEF poses ending at time t
+  - action:     (B, 6)                      — OSC action at time t (the action applied)
+  - text:       List[str]                   — task description
+  - frame_next: (B, H, W, 3) uint8          — single image at time t+1 (target)
+  - traj_next:  (B, K, 6)                   — K past EEF poses ending at time t+1 (target)
+
+OUTPUT (per sample, B = batch):
+  - z_v_pred:   (B, 256)                    — predicted next visual embedding
+  - z_t_pred:   (B, 256)                    — predicted next trajectory embedding
+
+TARGET (one step ahead, t+1):
+  - z_v_target: (B, 256)                    — encoded frame at t+1
+  - z_t_target: (B, 256)                    — mean-pooled encoded trajectory at t+1
+  Both computed via align.encode_mixed(frames_next, traj_next, texts).
+
+LOSS:
+  - world_model_loss(z_v_pred, z_v_target, z_t_pred, z_t_target):
+      - loss_v = MSE(z_v_pred, z_v_target.detach())  — visual embedding MSE
+      - loss_t = MSE(z_t_pred, z_t_target.detach())  — trajectory embedding MSE
+      - total = (loss_v + loss_t) / 2
+  - Why MSE (not cosine): imagined states must have the right SCALE
+    for V(s') to be meaningful. Cosine only captures direction.
+
+METRICS (per epoch, logged to wandb + JSONL):
+  - train/loss     (float, lower=better):  train MSE
+  - train/cos_v    (float, [-1, 1]):       cosine sim of pred vs true z_v
+  - train/cos_t    (float, [-1, 1]):       cosine sim of pred vs true z_t
+  - val/loss       (float, lower=better):  val MSE
+  - val/cos_v      (float, [-1, 1]):       val cosine sim z_v
+  - val/cos_t      (float, [-1, 1]):       val cosine sim z_t
+
+BEST CHECKPOINT:
+  - Lowest val_loss on held-out split, saved as best.pt
+  - Old world_model_best.pt (using train loss) is preserved for backward compat
+────────────────────────────────────────────────────────────────────────
 """
 
 import argparse

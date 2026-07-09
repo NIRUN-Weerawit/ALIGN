@@ -28,6 +28,52 @@ Usage:
         --pretrained checkpoints/pretrain/best.pt \\
         --epochs 10
 
+────────────────────────────────────────────────────────────────────────
+TRAINING CONTRACT — train_task_head.py (Phase 3.5: Task Identification)
+────────────────────────────────────────────────────────────────────────
+INPUT  (per sample, B = batch):
+  - frames:  (B, H, W, 3) uint8           — current image
+  - traj:    (B, traj_window, 6)          — K past EEF poses
+  - text:    List[str]                    — task description (any of K + OOD tasks)
+  - task_label: (B,) int64                 — ground-truth task ID in [0, K-1], or -100 (ignore)
+  - ood_label:  (B,) float32               — 0 if in-distribution, 1 if OOD
+
+OUTPUT (per sample, B = batch):
+  - logits:    (B, K+1) — task logits over K known classes + 1 OOD class
+  - ood_logit: (B,)     — OOD detection logit (rejection head)
+
+TARGET:
+  - task_label (int, in [0, K-1] or -100) — classification target
+  - ood_label  (float, 0 or 1)             — OOD detection target
+
+LOSS (combined):
+  - CE loss:   F.cross_entropy(logits, task_label)  — task classification
+  - OOD BCE:   F.binary_cross_entropy_with_logits(ood_logit, ood_label)  — OOD detection
+  - total = ce_loss + ood_bce_loss
+
+METRICS (per epoch, logged to wandb + JSONL):
+  - train_loss     (float, lower=better):  CE + OOD BCE
+  - train_ce       (float, lower=better):  Cross-entropy on task classification
+  - train_ood_bce  (float, lower=better):  BCE on OOD detection
+  - val_accuracy        (float, [0, 1]):   Top-1 accuracy on known tasks
+  - val_top3_accuracy   (float, [0, 1]):   Top-3 accuracy on known tasks
+  - val_mean_entropy    (float, [0, 1]):   Mean normalized entropy (1 = confident, 0 = uniform)
+  - val_ood_recall      (float, [0, 1]):   OOD detection recall (only if OOD in val)
+
+BEST CHECKPOINT:
+  - Highest val_accuracy, saved as task_head_best.pt
+────────────────────────────────────────────────────────────────────────
+
+OOD training:
+  - --num-ood-tasks N reserves N randomly chosen task descriptions as
+    "held-out OOD" — they are never used as K known classes, only as
+    OOD training samples. Default 0 (no held-out tasks; uses augmented
+    OOD only).
+  - On-the-fly Gaussian-noise augmentation produces synthetic OOD
+    frames from in-distribution data, controlled by
+    --ood-augment-prob (default 0.2, i.e. ~20% of in-distribution
+    samples get an OOD label).
+
     # With held-out real OOD tasks
     PYTHONNOUSERSITE=1 python training/train_task_head.py \\
         --data h5_data/libero_10.h5 \\
