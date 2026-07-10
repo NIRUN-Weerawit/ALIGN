@@ -27,6 +27,7 @@ Reference: Flamingo (Alayrac 2022) gated cross-attention,
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 # Add project root to path so 'models.X' imports work whether this file is
 # imported as part of the package OR run as a script (e.g. `python models/cross_attention_mixer.py`)
@@ -143,15 +144,28 @@ class GatedCrossAttention(nn.Module):
 class CrossAttentionMixer(nn.Module):
     """Bidirectional cross-attention mixer for ALIGN.
 
-    Input:  z_v [B, 256], z_t [B, K, 256], z_text [B, 256]
-    Output: z_v' [B, 256], z_t' [B, K, 256], z_text' [B, 256]
+    Input:  z_v [B, 256] or [B, P, 256] (vision, single or patch tokens)
+            z_t [B, K, 256] (state / trajectory)
+            z_text [B, 256] (text)
+    Output: z_v' [B, 256] or [B, P, 256]
+            z_t' [B, K, 256]
+            z_text' [B, 256]
 
     The mixer is two stacked blocks. Each block has 3 cross-attention
     operations in this order: T → V → Text (trajectory conditions
     the sparser modalities first).
 
+    v2 supports per-modality embedding dimensions (vision_dim, state_dim,
+    text_dim). v1 callers can pass the legacy single ``enc_dim`` and it
+    will be used for all three modalities.
+
     Args:
-        enc_dim: encoder output dim (256) — input/output
+        enc_dim: legacy single encoder dim (256). Used for all three
+                 modalities if the per-modality dims are not given.
+        vision_dim: per-modality dim for vision (defaults to ``enc_dim``).
+        state_dim: per-modality dim for state / trajectory (defaults to
+                   ``enc_dim``).
+        text_dim: per-modality dim for text (defaults to ``enc_dim``).
         mixer_dim: hidden dim of the mixer (512)
         num_blocks: number of mixer blocks (2)
         nhead: number of attention heads per block (8)
@@ -167,30 +181,45 @@ class CrossAttentionMixer(nn.Module):
         nhead: int = 8,
         max_traj_len: int = 64,
         dropout: float = 0.1,
+        # v2 per-modality dims (default to enc_dim for v1 callers)
+        vision_dim: Optional[int] = None,
+        state_dim: Optional[int] = None,
+        text_dim: Optional[int] = None,
     ):
         super().__init__()
+        # Resolve per-modality dims (fall back to enc_dim for v1)
+        if vision_dim is None:
+            vision_dim = enc_dim
+        if state_dim is None:
+            state_dim = enc_dim
+        if text_dim is None:
+            text_dim = enc_dim
+
         self.enc_dim = enc_dim
+        self.vision_dim = vision_dim
+        self.state_dim = state_dim
+        self.text_dim = text_dim
         self.mixer_dim = mixer_dim
         self.num_blocks = num_blocks
 
-        # Input projections: enc_dim → mixer_dim
+        # Input projections: per-modality dim → mixer_dim
         self.input_proj = nn.ModuleDict({
             "vision": nn.Sequential(
-                nn.Linear(enc_dim, mixer_dim), nn.LayerNorm(mixer_dim)
+                nn.Linear(vision_dim, mixer_dim), nn.LayerNorm(mixer_dim)
             ),
             "trajectory": nn.Sequential(
-                nn.Linear(enc_dim, mixer_dim), nn.LayerNorm(mixer_dim)
+                nn.Linear(state_dim, mixer_dim), nn.LayerNorm(mixer_dim)
             ),
             "text": nn.Sequential(
-                nn.Linear(enc_dim, mixer_dim), nn.LayerNorm(mixer_dim)
+                nn.Linear(text_dim, mixer_dim), nn.LayerNorm(mixer_dim)
             ),
         })
 
-        # Output projections: mixer_dim → enc_dim
+        # Output projections: mixer_dim → per-modality dim
         self.output_proj = nn.ModuleDict({
-            "vision": nn.Linear(mixer_dim, enc_dim),
-            "trajectory": nn.Linear(mixer_dim, enc_dim),
-            "text": nn.Linear(mixer_dim, enc_dim),
+            "vision": nn.Linear(mixer_dim, vision_dim),
+            "trajectory": nn.Linear(mixer_dim, state_dim),
+            "text": nn.Linear(mixer_dim, text_dim),
         })
 
         # Position embedding for trajectory (sinusoidal + learned offset)

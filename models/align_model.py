@@ -37,13 +37,22 @@ class VisionEncoder(nn.Module):
     """Frozen DINOv2 ViT-B + trainable projection head.
 
     Supports single-camera (4D: (B, H, W, 3)) and multi-camera (5D:
-    (B, V, H, W, 3)) inputs. For multi-camera, each view is processed
-    through DINOv2 separately and the resulting V * embed_dim features
-    are fused via a learnable linear layer back to embed_dim.
+    (B, V, H, W, 3)) inputs.
+
+    v2 (default): uses DINOv2 patch tokens — 256 patches per image,
+    projected to ``embed_dim``. Returns:
+        single camera: (B, num_patches, embed_dim)
+        multi camera:  (B, V * num_patches, embed_dim)
+    The per-patch features preserve spatial information that the older
+    CLS-only head collapsed away.
+
+    v1 (use_patch_tokens=False): keeps the original CLS-token behavior.
+    Returns (B, embed_dim) regardless of camera count (multi-camera
+    views are fused via a learnable linear layer back to embed_dim).
     """
 
     def __init__(self, backbone: str = "dinov2_vitb14", embed_dim: int = 256,
-                 num_cameras: int = 1):
+                 num_cameras: int = 1, use_patch_tokens: bool = True):
         super().__init__()
         try:
             self.backbone = torch.hub.load("facebookresearch/dinov2", backbone, pretrained=True)
@@ -53,13 +62,16 @@ class VisionEncoder(nn.Module):
             )
         self.num_cameras = num_cameras
         self.embed_dim = embed_dim
+        # v2: use patch tokens by default; v1 falls back to CLS
+        self.use_patch_tokens = use_patch_tokens
+
         # Per-camera projection: DINOv2 feature (768) → embed_dim (256)
         self.projection = nn.Sequential(
             nn.Linear(768, embed_dim),
             nn.LayerNorm(embed_dim),
         )
-        # Multi-camera fusion: concatenate V * embed_dim → embed_dim
-        if num_cameras > 1:
+        # Multi-camera fusion (v1 only): concatenate V * embed_dim → embed_dim
+        if num_cameras > 1 and not use_patch_tokens:
             self.fusion = nn.Sequential(
                 nn.Linear(num_cameras * embed_dim, embed_dim),
                 nn.LayerNorm(embed_dim),
@@ -73,7 +85,10 @@ class VisionEncoder(nn.Module):
                Multi-camera: (B, V, H, W, 3) uint8 RGB, V = num_cameras.
 
         Returns:
-            (B, embed_dim) fused vision embedding.
+            v2 (use_patch_tokens=True):
+                single camera: (B, num_patches, embed_dim)
+                multi camera:  (B, V * num_patches, embed_dim)
+            v1 (use_patch_tokens=False): (B, embed_dim) (fused if multi-cam)
         """
         # Detect multi-camera input
         if x.ndim == 5:
@@ -102,13 +117,24 @@ class VisionEncoder(nn.Module):
         x = (x - mean) / std
 
         with torch.no_grad():
-            features = self.backbone(x)  # (B*V, 768)
-        features = self.projection(features)  # (B*V, embed_dim)
-
-        if V > 1:
-            # Fuse multi-camera features
-            features = features.reshape(B, V * self.embed_dim)
-            features = self.fusion(features)  # (B, embed_dim)
+            if self.use_patch_tokens:
+                # v2: get all patch tokens (no CLS) — preserves spatial info
+                features_dict = self.backbone.forward_features(x)
+                patch_features = features_dict["x_norm_patchtokens"]
+                # (B*V, num_patches, 768)
+                features = self.projection(patch_features)  # (B*V, num_patches, embed_dim)
+                # Reshape to (B, V * num_patches, embed_dim) — multi-cam stacks
+                # patches along the sequence dim; single-cam is unchanged.
+                P = features.size(1)
+                features = features.reshape(B, V * P, self.embed_dim)
+            else:
+                # v1: CLS token only — collapses spatial info
+                features = self.backbone(x)  # (B*V, 768)
+                features = self.projection(features)  # (B*V, embed_dim)
+                if V > 1:
+                    # Fuse multi-camera features
+                    features = features.reshape(B, V * self.embed_dim)
+                    features = self.fusion(features)  # (B, embed_dim)
 
         return features
 
@@ -169,6 +195,52 @@ class TrajectoryEncoder(nn.Module):
         x = self.input_proj(x)  # (B, K, d_model)
         x = self.transformer(x)  # (B, K, d_model)
         return self.projection(x)  # (B, K, 256)
+
+
+# ================================================================
+# Robot State Encoder (v2)
+# ================================================================
+
+class RobotStateEncoder(nn.Module):
+    """One-step robot state encoder.
+
+    Input layout (B, 7): [pos(3), orientation(3), gripper(1)]
+    Output: (B, state_dim)
+
+    v2 replaces the v1 ``TrajectoryEncoder`` (which took (B, K, 6)
+    windows and used a transformer). The new model conditions on a
+    single current state vector rather than a window of past poses —
+    the temporal context lives elsewhere in the architecture.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 7,
+        state_dim: int = 256,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.state_dim = state_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, state_dim),
+            nn.LayerNorm(state_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode a one-step robot state vector.
+
+        Args:
+            x: (B, input_dim) — [pos(3), orientation(3), gripper(1)].
+
+        Returns:
+            (B, state_dim) state embedding.
+        """
+        return self.mlp(x)  # (B, state_dim)
 
 
 # ================================================================
@@ -499,11 +571,22 @@ class AssistantHeadTransformer(nn.Module):
 
 def _create_mixer(embed_dim: int = 256, mixer_dim: int = 512,
                   num_blocks: int = 2, nhead: int = 8,
-                  max_traj_len: int = 64) -> nn.Module:
-    """Import and create CrossAttentionMixer (lazy import)."""
+                  max_traj_len: int = 64,
+                  # v2 per-modality dims (default to embed_dim for v1 callers)
+                  vision_dim: Optional[int] = None,
+                  state_dim: Optional[int] = None,
+                  text_dim: Optional[int] = None) -> nn.Module:
+    """Import and create CrossAttentionMixer (lazy import).
+
+    v2 passes per-modality dims; v1 callers can pass ``embed_dim`` only
+    and it will be used for all three modalities inside the mixer.
+    """
     from models.cross_attention_mixer import CrossAttentionMixer
     return CrossAttentionMixer(
         enc_dim=embed_dim,
+        vision_dim=vision_dim if vision_dim is not None else embed_dim,
+        state_dim=state_dim if state_dim is not None else embed_dim,
+        text_dim=text_dim if text_dim is not None else embed_dim,
         mixer_dim=mixer_dim,
         num_blocks=num_blocks,
         nhead=nhead,
@@ -517,7 +600,8 @@ def _create_mixer(embed_dim: int = 256, mixer_dim: int = 512,
 
 TRAINABLE_MODULES = {
     "vision_encoder.projection",   # vision_proj
-    "traj_encoder",                # full trajectory encoder
+    "state_encoder",               # v2: state encoder (one-step)
+    "traj_encoder",                # v1: trajectory encoder (kept for back-compat)
     "text_encoder.projection",     # text_proj
     "cross_attention_mixer",       # mixer (always present)
     "decision_head",               # α predictor
@@ -526,6 +610,7 @@ TRAINABLE_MODULES = {
 
 ENCODER_MODULES = {
     "vision_encoder.projection",
+    "state_encoder",
     "traj_encoder",
     "text_encoder.projection",
     "cross_attention_mixer",
@@ -543,15 +628,37 @@ class ALIGNModel(nn.Module):
     Combines three encoders, a cross-attention mixer, and two heads.
     Cross-attention mixer is always present (identity-initialized).
     Text encoder is optional (``use_text=False`` for text-free mode).
+
+    v2 architecture (default):
+        - VisionEncoder uses DINOv2 patch tokens → (B, P, vision_dim)
+        - RobotStateEncoder encodes one-step state (B, 7) → (B, state_dim)
+        - TextEncoder (B, 512) → (B, text_dim)
+        - CrossAttentionMixer mixes per-modality dims, returns per-modality dims
+        - Heads consume the mixed embeddings
+
+    v1 backward compat (set ``use_patch_tokens=False``, ``embed_dim=256``):
+        - All dims collapse to 256 — old checkpoints load unchanged.
     """
 
     def __init__(
         self,
-        embed_dim: int = 256,
+        # ── Backward-compat single dim (v1) ────────────────────
+        # If the caller passes embed_dim (v1), it is used for ALL three
+        # per-modality dims unless they are explicitly overridden.
+        embed_dim: Optional[int] = None,
+        # ── v2 per-modality dims ───────────────────────────────
+        vision_dim: Optional[int] = None,
+        state_dim: Optional[int] = None,
+        text_dim: Optional[int] = None,
+        # ── Vision / state architecture flags ──────────────────
+        use_patch_tokens: bool = True,
+        state_input_dim: int = 7,
+        # ── Legacy trajectory-encoder params (ignored in v2) ────
         traj_input_dim: int = 6,
         traj_d_model: int = 128,
         traj_nhead: int = 4,
         traj_num_layers: int = 3,
+        # ── Standard head / model params ────────────────────────
         chunk_size: int = 5,
         action_dim: int = 6,
         use_text: bool = True,
@@ -586,7 +693,34 @@ class ALIGNModel(nn.Module):
         assistant_dim_ff: int = 1024,
     ):
         super().__init__()
-        self.embed_dim = embed_dim
+
+        # Resolve per-modality dims.
+        #   - If embed_dim is given (v1 backward compat), use it for all three
+        #     modalities unless a per-modality dim is also given.
+        #   - Otherwise fall back to v2 defaults: vision=512, state=256, text=256.
+        if embed_dim is not None:
+            # v1 caller: route embed_dim into the missing per-modality dims
+            if vision_dim is None:
+                vision_dim = embed_dim
+            if state_dim is None:
+                state_dim = embed_dim
+            if text_dim is None:
+                text_dim = embed_dim
+        else:
+            # v2 defaults
+            if vision_dim is None:
+                vision_dim = 512
+            if state_dim is None:
+                state_dim = 256
+            if text_dim is None:
+                text_dim = 256
+
+        # Keep the legacy attribute for any external code that reads it.
+        self.embed_dim = embed_dim if embed_dim is not None else vision_dim
+        self.vision_dim = vision_dim
+        self.state_dim = state_dim
+        self.text_dim = text_dim
+        self.use_patch_tokens = use_patch_tokens
         self.use_text = use_text
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.decision_K = decision_K
@@ -594,19 +728,39 @@ class ALIGNModel(nn.Module):
 
         # Encoders
         self.num_cameras = num_cameras
-        self.vision_encoder = VisionEncoder(embed_dim=embed_dim, num_cameras=num_cameras)
+        self.vision_encoder = VisionEncoder(
+            embed_dim=vision_dim, num_cameras=num_cameras,
+            use_patch_tokens=use_patch_tokens,
+        )
+        # v2: state encoder (one-step). v1 TrajectoryEncoder is also
+        # constructed (marked as `state_encoder_legacy`) so old checkpoints
+        # that have `traj_encoder.*` keys can still be loaded — those
+        # parameters are simply ignored at inference.
+        self.state_encoder = RobotStateEncoder(
+            input_dim=state_input_dim,
+            state_dim=state_dim,
+            hidden_dim=state_dim,
+            dropout=0.1,
+        )
+        # Keep the legacy TrajectoryEncoder around for backward compat
+        # (so old checkpoints load without missing-key errors). Marked as
+        # not-trained-by-default since the new pipeline uses the state
+        # encoder. The legacy module is reachable via ``traj_encoder``.
         self.traj_encoder = TrajectoryEncoder(
             input_dim=traj_input_dim,
             d_model=traj_d_model,
             nhead=traj_nhead,
             num_layers=traj_num_layers,
-            embed_dim=embed_dim,
+            embed_dim=embed_dim if embed_dim is not None else vision_dim,
         )
-        self.text_encoder = TextEncoder(embed_dim=embed_dim) if use_text else None
+        self.text_encoder = TextEncoder(embed_dim=text_dim) if use_text else None
 
         # Cross-attention mixer (always present, identity-initialized)
         self.cross_attention_mixer = _create_mixer(
-            embed_dim=embed_dim,
+            embed_dim=embed_dim if embed_dim is not None else vision_dim,
+            vision_dim=vision_dim,
+            state_dim=state_dim,
+            text_dim=text_dim,
             mixer_dim=mixer_dim,
             num_blocks=num_mixer_blocks,
             nhead=mixer_nhead,
@@ -614,17 +768,21 @@ class ALIGNModel(nn.Module):
         )
 
         # Heads
+        # The heads still use a single latent dim (vision_dim, which is
+        # the largest). State and text are projected to that dim inside
+        # the heads if needed (see ``_align_for_head`` helper).
+        head_dim = vision_dim
         # Decision Head = Future Prediction Head.
         # Predicts K future embeddings from K past ones. The prediction
         # error becomes the alpha signal at inference time.
         if decision_arch == "mlp":
             self.decision_head = FuturePredictionHeadMLP(
-                embed_dim=embed_dim, K=decision_K,
+                embed_dim=head_dim, K=decision_K,
                 hidden_dim=mlp_hidden_dim, num_layers=mlp_num_layers,
             )
         elif decision_arch == "transformer":
             self.decision_head = FuturePredictionHeadTransformer(
-                embed_dim=embed_dim, K=decision_K,
+                embed_dim=head_dim, K=decision_K,
                 d_model=d_model, nhead=nhead,
                 num_layers=num_layers, dropout=dropout,
                 dim_feedforward=dim_feedforward,
@@ -637,14 +795,14 @@ class ALIGNModel(nn.Module):
         self.assistant_arch = assistant_arch
         if assistant_arch == "mlp":
             self.assistant_head = AssistantHead(
-                latent_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim,
+                latent_dim=head_dim, chunk_size=chunk_size, action_dim=action_dim,
                 hidden_dim=assistant_hidden,
                 num_hidden_layers=assistant_layers,
                 dropout=assistant_dropout,
             )
         elif assistant_arch == "transformer":
             self.assistant_head = AssistantHeadTransformer(
-                embed_dim=embed_dim, chunk_size=chunk_size, action_dim=action_dim,
+                embed_dim=head_dim, chunk_size=chunk_size, action_dim=action_dim,
                 d_model=assistant_d_model,
                 nhead=assistant_nhead,
                 num_layers=assistant_num_layers,
@@ -657,50 +815,96 @@ class ALIGNModel(nn.Module):
             )
 
         # Register which modules are trainable vs frozen
-        self._trainable_prefixes = {"vision_encoder.projection", "traj_encoder",
-                                     "text_encoder.projection", "cross_attention_mixer",
+        # v2: state_encoder replaces traj_encoder. We list BOTH prefixes
+        # so old checkpoints that save "traj_encoder.*" still find a
+        # matching module, AND the new "state_encoder.*" is also trainable.
+        self._trainable_prefixes = {"vision_encoder.projection", "state_encoder",
+                                     "traj_encoder", "text_encoder.projection",
+                                     "cross_attention_mixer",
                                      "decision_head", "assistant_head"}
-        self._encoder_prefixes = {"vision_encoder.projection", "traj_encoder",
-                                   "text_encoder.projection", "cross_attention_mixer"}
+        self._encoder_prefixes = {"vision_encoder.projection", "state_encoder",
+                                   "traj_encoder", "text_encoder.projection",
+                                   "cross_attention_mixer"}
         self._backbone_prefixes = {"vision_encoder.backbone", "text_encoder.model"}
+
+        # Build head input adapters so heads see a common dim.
+        # The mixer outputs per-modality dims (vision_dim, state_dim, text_dim).
+        # The heads want a single latent_dim = head_dim. For the v2 default
+        # (vision_dim == head_dim) these are identity-shaped no-ops.
+        self._head_state_proj = nn.Linear(state_dim, head_dim, bias=False) if state_dim != head_dim else None
+        self._head_text_proj = nn.Linear(text_dim, head_dim, bias=False) if text_dim != head_dim else None
 
     # ── Phase 1a helpers: raw encoder outputs (no mixer) ─────────
 
     def encode_raw_vision(self, frames: torch.Tensor) -> torch.Tensor:
         """Encode frames, return raw vision embedding (no mixer).
 
+        v2 returns patch tokens (no mean-pooling). Callers that want a
+        single vector per frame should use ``encode_raw_vision_pooled``
+        or mean-pool over the patch dim.
+
         Supports:
-          - (B, H, W, 3) — single camera, single timestep → (B, D)
-          - (B, V, H, W, 3) — multi-camera, single timestep → (B, D)
-          - (B, K, H, W, 3) — single camera, K timesteps → (B, K, D)
-          - (B, K, V, H, W, 3) — multi-camera, K timesteps → (B, K, D)
+          - (B, H, W, 3) — single camera, single timestep
+                          → (B, num_patches, vision_dim)
+          - (B, V, H, W, 3) — multi-camera, single timestep
+                          → (B, V * num_patches, vision_dim)
+          - (B, K, H, W, 3) — single camera, K timesteps
+                          → (B, K, num_patches, vision_dim)
+          - (B, K, V, H, W, 3) — multi-camera, K timesteps
+                          → (B, K, V * num_patches, vision_dim)
         """
         return self.vision_encoder(frames)
+
+    def encode_raw_vision_pooled(self, frames: torch.Tensor) -> torch.Tensor:
+        """Mean-pool patch tokens into a single vector per frame.
+
+        v2 only. Returns (B, vision_dim) for single-step input or
+        (B, K, vision_dim) for windowed input.
+        """
+        z = self.encode_raw_vision(frames)
+        if z.ndim == 3:
+            # (B, P, D) or (B, K, D) — pool over the middle dim
+            return z.mean(dim=1)
+        elif z.ndim == 4:
+            # (B, K, P, D) — pool over the patch dim
+            return z.mean(dim=2)
+        return z
 
     def encode_raw_vision_window(
         self, frames_window: torch.Tensor
     ) -> torch.Tensor:
-        """Encode a window of K frames, return per-timestep embeddings.
+        """Encode a window of K frames, return per-timestep patch embeddings.
 
         Args:
             frames_window: (B, K, H, W, 3) for single-camera or
                            (B, K, V, H, W, 3) for multi-camera.
 
         Returns:
-            (B, K, embed_dim) -- per-timestep vision embeddings.
-            (Multi-camera views are fused by VisionEncoder before this step.)
+            v2: (B, K, num_patches, vision_dim) — per-timestep patch tokens.
+            v1 (use_patch_tokens=False): (B, K, vision_dim) — single CLS token
+                  per timestep, fused across cameras.
+
+        For v2 the caller can mean-pool over the patch dim to recover a
+        per-timestep summary embedding.
         """
         if frames_window.ndim == 5:
             B, K, H, W, C = frames_window.shape
             frames_flat = frames_window.reshape(B * K, H, W, C)
-            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, D)
+            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, P, D) or (B*K, D)
+            if self.use_patch_tokens:
+                P = z_v_flat.size(1)
+                D = z_v_flat.size(2)
+                return z_v_flat.reshape(B, K, P, D)
             return z_v_flat.reshape(B, K, -1)
         elif frames_window.ndim == 6:
             # Multi-camera window: (B, K, V, H, W, 3)
-            # Reshape to (B*K, V, H, W, C) so VisionEncoder fuses V cameras per timestep
             B, K, V, H, W, C = frames_window.shape
             frames_flat = frames_window.reshape(B * K, V, H, W, C)
-            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, D) — V fused per timestep
+            z_v_flat = self.vision_encoder(frames_flat)  # (B*K, V*P, D) or (B*K, D)
+            if self.use_patch_tokens:
+                VP = z_v_flat.size(1)
+                D = z_v_flat.size(2)
+                return z_v_flat.reshape(B, K, VP, D)
             return z_v_flat.reshape(B, K, -1)
         else:
             raise ValueError(
@@ -708,13 +912,36 @@ class ALIGNModel(nn.Module):
                 f"got {frames_window.ndim}D"
             )
 
+    def encode_state(self, state: torch.Tensor) -> torch.Tensor:
+        """Encode a one-step robot state vector (v2).
+
+        Args:
+            state: (B, 7) — [pos(3), orientation(3), gripper(1)].
+
+        Returns:
+            (B, state_dim) state embedding.
+        """
+        return self.state_encoder(state)
+
     def encode_raw_trajectory(self, poses: torch.Tensor) -> torch.Tensor:
-        """Encode trajectory, return raw mean-pooled trajectory embedding (no mixer)."""
+        """[v1 only] Encode trajectory, return raw mean-pooled trajectory embedding (no mixer).
+
+        In v2 this is a backward-compat wrapper around the legacy
+        ``TrajectoryEncoder``. New code should use ``encode_state``.
+        """
         return self.traj_encoder(poses)
 
-    def encode_raw_trajectory_tokens(self, poses: torch.Tensor) -> torch.Tensor:
-        """Encode trajectory, return per-token embeddings (no mixer, no pooling)."""
-        return self.traj_encoder.encode_tokens(poses)
+    def encode_raw_trajectory_tokens(self, state: torch.Tensor) -> torch.Tensor:
+        """[v2] Encode a one-step state — alias for ``encode_state``.
+
+        Kept as a backward-compat name. Old callers that passed
+        ``(B, K, 6)`` trajectory windows can still call this method;
+        the result is now a (B, state_dim) state embedding (no K dim).
+        """
+        # Backward compat: if input is (B, K, D), take the last step
+        if state.ndim == 3:
+            state = state[:, -1, :]
+        return self.state_encoder(state)
 
     def encode_raw_text(self, texts: List[str]) -> Optional[torch.Tensor]:
         if self.text_encoder is None:
@@ -729,10 +956,12 @@ class ALIGNModel(nn.Module):
         Phase 1a uses this: InfoNCE on raw encoder outputs with mixer frozen.
         """
         z_v = self.encode_raw_vision(frames)
-        z_t = self.encode_raw_trajectory(traj)
+        z_t = self.encode_raw_trajectory_tokens(traj)
         z_text = self.encode_raw_text(texts)
         if z_text is None:
-            z_text = torch.zeros_like(z_v)
+            # Match the modality dim of z_v (vision is the largest in v2)
+            z_text = torch.zeros(z_v.shape[0], self.text_dim, device=z_v.device,
+                                  dtype=z_v.dtype)
         return {"z_v": z_v, "z_t": z_t, "z_text": z_text}
 
     # ── Phase 1b helper: full encode-through-mixer ─────────────
@@ -744,34 +973,82 @@ class ALIGNModel(nn.Module):
 
         Phase 1b uses this: InfoNCE on mixer outputs, mixer unfrozen.
 
+        v2 changes the input contract: ``traj`` is now a one-step state
+        ``(B, 7)`` (forwarded to ``encode_state``) instead of a window
+        ``(B, K, 6)``. Old callers passing ``(B, K, 6)`` still work — the
+        last step is used as the current state.
+
         Returns:
-            Dict with 'z_v', 'z_t', 'z_text' (all (B, 256)) from mixer output.
-            'z_t' is mean-pooled for head consumption.
+            Dict with:
+              'z_v'        — (B, P, vision_dim) v2 patch tokens, or
+                              (B, vision_dim) v1 CLS token.
+              'z_v_pooled' — (B, vision_dim) v2 mean of patches (for back-compat).
+              'z_t'        — (B, state_dim) state embedding (one-step).
+              'z_text'     — (B, text_dim) text embedding.
+              'z_t_tokens' — (B, 1, state_dim) state token in mixer format
+                              (kept for back-compat with v1 callers that
+                              expect a K-dim window).
         """
-        z_v = self.encode_raw_vision(frames)
-        z_t_tokens = self.encode_raw_trajectory_tokens(traj)  # (B, K, 256)
+        z_v = self.encode_raw_vision(frames)            # v2: (B, P, vision_dim)
+        z_state = self.encode_raw_trajectory_tokens(traj)  # v2: (B, state_dim)
         z_text = self.encode_raw_text(texts)
         if z_text is None:
-            z_text = torch.zeros_like(z_v)
+            z_text = torch.zeros(z_v.shape[0], self.text_dim,
+                                  device=z_v.device, dtype=z_v.dtype)
 
-        # Through mixer
-        z_v, z_t_tokens, z_text = self.cross_attention_mixer(z_v, z_t_tokens, z_text)
+        # Mean-pool patch tokens for the v1-shaped "z_v_pooled" output.
+        # v1 callers expect a single (B, D) vector here.
+        if z_v.ndim == 3:
+            z_v_pooled = z_v.mean(dim=1)  # (B, vision_dim)
+        else:
+            z_v_pooled = z_v
 
-        # Mean-pool trajectory tokens for head/InfoNCE consumption
-        z_t = z_t_tokens.mean(dim=1)
+        # The mixer expects z_t as (B, K, D). We have a one-step state
+        # (B, state_dim). Add a K=1 dim — the position encoding slot for
+        # the current frame is well-defined (position 0 = now).
+        z_state_for_mixer = z_state.unsqueeze(1)  # (B, 1, state_dim)
 
-        return {"z_v": z_v, "z_t": z_t, "z_text": z_text,
-                "z_t_tokens": z_t_tokens}
+        # Through mixer. The mixer's per-modality input/output projections
+        # handle the (possibly different) per-modality dims.
+        z_v_out, z_state_out, z_text_out = self.cross_attention_mixer(
+            z_v, z_state_for_mixer, z_text
+        )
+
+        # Squeeze back to (B, state_dim) for the one-step state output.
+        z_state_out = z_state_out.squeeze(1)  # (B, state_dim)
+
+        # Mean-pool the mixer's vision output for back-compat
+        if z_v_out.ndim == 3:
+            z_v_pooled_out = z_v_out.mean(dim=1)
+        else:
+            z_v_pooled_out = z_v_out
+
+        return {
+            "z_v": z_v_out,
+            "z_v_pooled": z_v_pooled_out,
+            "z_t": z_state_out,
+            "z_text": z_text_out,
+            # K=1 window form, kept for back-compat with old training code
+            "z_t_tokens": z_state_out.unsqueeze(1),
+            # Also keep the original raw pooled vision for downstream use
+            "z_v_pooled_pre_mixer": z_v_pooled,
+        }
 
     # ── Standard encode (for compatibility and Phase 2) ────────
 
     def encode_vision(self, frames: torch.Tensor) -> torch.Tensor:
+        """[v2] Returns patch tokens (B, P, vision_dim).
+
+        For v1 (use_patch_tokens=False): returns (B, vision_dim).
+        """
         return self.vision_encoder(frames)
 
     def encode_trajectory(self, poses: torch.Tensor) -> torch.Tensor:
+        """[v1 legacy] Mean-pooled trajectory embedding. Use ``encode_state`` in v2."""
         return self.traj_encoder(poses)
 
     def encode_trajectory_tokens(self, poses: torch.Tensor) -> torch.Tensor:
+        """[v1 legacy] Per-token trajectory embeddings. Use ``encode_state`` in v2."""
         return self.traj_encoder.encode_tokens(poses)
 
     def encode_text(self, texts: List[str]) -> Optional[torch.Tensor]:
@@ -890,7 +1167,8 @@ class ALIGNModel(nn.Module):
 
         Args:
             frames: (B, H, W, 3) RGB images.
-            traj: (B, K, 6) trajectory window.
+            traj: (B, 7) one-step state vector (v2) or (B, K, 6)
+                  trajectory window (v1 backward compat — last step is used).
             texts: Optional list of task descriptions.
             compute_decision: Whether to compute α.
             compute_assistant: Whether to compute Δposes.
@@ -899,23 +1177,39 @@ class ALIGNModel(nn.Module):
             Dict with 'alpha', 'delta' keys as present.
         """
         mixed = self.encode_mixed(frames, traj, texts)
-        z_v, z_t = mixed["z_v"], mixed["z_t"]
+        # v2: z_v is (B, P, vision_dim); z_v_pooled is (B, vision_dim).
+        #     z_t is (B, state_dim); z_t_tokens is (B, 1, state_dim).
+        z_v_pooled = mixed["z_v_pooled"]
+        z_t = mixed["z_t"]  # (B, state_dim)
         z_text = mixed["z_text"]
-        z_t_tokens = mixed["z_t_tokens"]  # (B, K, embed_dim)
+        z_t_tokens = mixed["z_t_tokens"]  # (B, 1, head_dim)
+
+        # Project state and text to the head's common dim if needed.
+        # For the v2 default (state_dim=256, text_dim=256, head_dim=vision_dim=512)
+        # this is a (256, 512) linear projection. When all dims are equal
+        # (e.g. embed_dim=256 path), the projections are skipped and the
+        # tensors are used as-is.
+        if self._head_state_proj is not None:
+            z_t_for_head = self._head_state_proj(z_t)
+            z_t_tokens_for_head = self._head_state_proj(z_t_tokens) if z_t_tokens.ndim == 2 else self._head_state_proj(z_t_tokens.view(-1, self.state_dim)).view(z_t_tokens.shape[0], z_t_tokens.shape[1], -1)
+        else:
+            z_t_for_head = z_t
+            z_t_tokens_for_head = z_t_tokens
+        if self._head_text_proj is not None:
+            z_text_for_head = self._head_text_proj(z_text)
+        else:
+            z_text_for_head = z_text
 
         result: Dict[str, torch.Tensor] = {}
         if compute_decision:
-            # The new Decision head takes a window of past embeddings.
-            # We use the trajectory per-token embeddings (one per timestep)
-            # and broadcast the current vision embedding as a single context.
-            # NOTE: the actual alpha signal at inference is computed
-            # separately via compute_alpha_from_predictions() once the
-            # actual future embeddings are available. This forward pass
-            # returns the predicted embeddings, not a scalar alpha.
-            B, K, D = z_t_tokens.shape
-            z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
+            # The Decision head takes a window of past embeddings and predicts
+            # K future ones. In v2 the window is K=1 (the current one-step
+            # state), and the head still predicts K=decision_K future states.
+            B = z_v_pooled.shape[0]
+            K_input = z_t_tokens_for_head.shape[1]
+            z_v_window = z_v_pooled.unsqueeze(1).expand(-1, K_input, -1)  # (B, K, head_dim)
             predicted_z_v, predicted_z_t = self.decision_head(
-                z_v_window, z_t_tokens, z_text
+                z_v_window, z_t_tokens_for_head, z_text_for_head
             )
             result["predicted_z_v"] = predicted_z_v
             result["predicted_z_t"] = predicted_z_t
@@ -923,7 +1217,7 @@ class ALIGNModel(nn.Module):
             # assuming the predictions match the inputs (degenerate case).
             # In practice, callers should use compute_alpha_from_predictions()
             # with the actual future embeddings.
-            result["alpha"] = torch.ones(B, 1, device=z_v.device)
+            result["alpha"] = torch.ones(B, 1, device=z_v_pooled.device)
         if compute_assistant:
             # Call the appropriate assistant head based on architecture.
             # Both MLP and transformer heads take (z_v, z_t, z_text).
@@ -933,11 +1227,15 @@ class ALIGNModel(nn.Module):
                 # timesteps. In practice, callers should pass a real window
                 # (see encode_mixed_windowed for the proper API).
                 K = self.assistant_head.chunk_size
-                z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)
-                z_t_window = z_t.unsqueeze(1).expand(-1, K, -1)
-                result["delta"] = self.assistant_head(z_v_window, z_t_window, z_text)
+                z_v_window = z_v_pooled.unsqueeze(1).expand(-1, K, -1)
+                z_t_window = z_t_for_head.unsqueeze(1).expand(-1, K, -1)
+                result["delta"] = self.assistant_head(
+                    z_v_window, z_t_window, z_text_for_head
+                )
             else:
-                result["delta"] = self.assistant_head(z_v, z_t, z_text)
+                result["delta"] = self.assistant_head(
+                    z_v_pooled, z_t_for_head, z_text_for_head
+                )
         return result
 
     # ── Freeze helpers ─────────────────────────────────────────
@@ -955,7 +1253,8 @@ class ALIGNModel(nn.Module):
                 p.requires_grad = False
 
     def freeze_all_encoders(self):
-        """Freeze ALL encoders (vision_proj, traj_encoder, text_proj, mixer).
+        """Freeze ALL encoders (vision_proj, state_encoder, traj_encoder,
+        text_proj, mixer).
 
         Called in Phase 2 (head training) so gradients only flow
         into decision_head and assistant_head.
@@ -963,7 +1262,8 @@ class ALIGNModel(nn.Module):
         for name, module in self.named_modules():
             # Check if this module is an encoder (not backbone, not head)
             is_encoder = any(prefix in name for prefix in
-                             ["vision_encoder.projection", "traj_encoder",
+                             ["vision_encoder.projection", "state_encoder",
+                              "traj_encoder",
                               "text_encoder.projection", "cross_attention_mixer"])
             if is_encoder:
                 for p in module.parameters():
@@ -1041,11 +1341,12 @@ class ALIGNModel(nn.Module):
                                   phase: str, optimizer_state: dict, config: dict):
         """Save a Phase 1 checkpoint (trainable params only, ~14MB)."""
         if phase == "encoder":
-            prefixes = {"vision_encoder.projection", "traj_encoder",
-                        "text_encoder.projection"}
+            prefixes = {"vision_encoder.projection", "state_encoder",
+                        "traj_encoder", "text_encoder.projection"}
         else:  # full pretrain (includes mixer)
-            prefixes = {"vision_encoder.projection", "traj_encoder",
-                        "text_encoder.projection", "cross_attention_mixer"}
+            prefixes = {"vision_encoder.projection", "state_encoder",
+                        "traj_encoder", "text_encoder.projection",
+                        "cross_attention_mixer"}
 
         torch.save({
             "format_version": 2,

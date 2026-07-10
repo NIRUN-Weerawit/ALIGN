@@ -145,6 +145,37 @@ class ALIGNDataset(Dataset):
         except Exception:
             self._has_actions = False
 
+        # Detect optional gripper dataset per episode.  Gripper may be:
+        #   - /ep_XXX/gripper  -- (N,) float32   (preferred, dedicated field)
+        #   - last column of /ep_XXX/actions    (fallback: 7D OSC_POSE)
+        #   - missing                            (use 0.0 default)
+        self._has_gripper = False
+        self._gripper_keys: List[str] = []
+        if not self._single_episode:
+            for key in self._episode_keys:
+                ep_group = self._h5[key]
+                if "gripper" in ep_group:
+                    self._gripper_keys.append("gripper")
+                else:
+                    # no dedicated gripper field -- fall back to actions[:, -1]
+                    self._gripper_keys.append("__actions_last__")
+            # Mark as available if ANY episode has a dedicated field, OR if
+            # the actions array is wide enough to contain a gripper column.
+            self._has_gripper = (
+                any(k == "gripper" for k in self._gripper_keys)
+                or self._has_actions
+            )
+        else:
+            if "gripper" in self._h5:
+                self._gripper_keys.append("gripper")
+                self._has_gripper = True
+            elif "actions" in self._h5:
+                self._gripper_keys.append("__actions_last__")
+                self._has_gripper = True
+            else:
+                self._gripper_keys.append("__none__")
+                self._has_gripper = False
+
         # Determine the pose field name per episode. Older HDF5 files use
         # "noisy_poses" (misnomer -- actually contains clean poses).
         # Newer files use "poses". Store the resolved name per episode.
@@ -294,6 +325,108 @@ class ALIGNDataset(Dataset):
             raw = np.concatenate([raw, pad], axis=1)
         return raw.astype(np.float32)
 
+    def _read_gripper(self, ep_idx: int, t: int = -1) -> float:
+        """Read the gripper value for a given episode and (absolute) timestep.
+
+        Looks up `ep_XXX/gripper` first; falls back to the last column of
+        `ep_XXX/actions` if the dedicated field is absent.  Returns 0.0
+        when no gripper source is available.
+        """
+        if not getattr(self, "_has_gripper", False):
+            return 0.0
+        key = self._episode_keys[ep_idx]
+        gk = self._gripper_keys[ep_idx]
+        try:
+            if gk == "gripper":
+                if self._single_episode:
+                    arr = self._h5["gripper"]
+                else:
+                    arr = self._h5[f"{key}/gripper"]
+                idx = t if t >= 0 else (len(arr) - 1)
+                idx = max(0, min(idx, len(arr) - 1))
+                return float(arr[idx])
+            elif gk == "__actions_last__":
+                if self._single_episode:
+                    arr = self._h5["actions"]
+                else:
+                    arr = self._h5[f"{key}/actions"]
+                    # For the actions-array fallback the caller is expected
+                    # to pass a LOCAL timestep (t = len(poses) - 1, no offset).
+                idx = t if t >= 0 else (len(arr) - 1)
+                idx = max(0, min(idx, len(arr) - 1))
+                return float(arr[idx, -1])
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _read_robot_state(self, ep_idx: int, t: int) -> np.ndarray:
+        """Read the one-step robot state at absolute timestep `t` within an
+        episode. Returns a (7,) float32 vector:
+
+            [pos_x, pos_y, pos_z, roll, pitch, yaw, gripper]
+        """
+        # Read just the single pose we need.
+        key = self._episode_keys[ep_idx]
+        if self._single_episode:
+            pose_key = getattr(self, "_pose_keys", ["noisy_poses"])[0]
+            pose = self._h5[pose_key][t, :6]
+        else:
+            offset = self._ep_pose_offsets[ep_idx]
+            pose_key = self._pose_keys[ep_idx]
+            pose = self._h5[f"{key}/{pose_key}"][offset + t, :6]
+        pose = np.asarray(pose, dtype=np.float32).reshape(6)
+        gripper = np.float32(self._read_gripper(ep_idx, t))
+        return np.concatenate([pose, [gripper]], axis=0).astype(np.float32)
+
+    def _read_poses_gripper(self, ep_idx: int, start: int, count: int) -> np.ndarray:
+        """Read a (count,) gripper array from a dedicated /ep_XXX/gripper field.
+
+        Handles the same cumulative-poses offset as `_read_poses` and pads
+        with zeros at episode boundaries.
+        """
+        key = self._episode_keys[ep_idx]
+        try:
+            if self._single_episode:
+                abs_start = start
+                arr = self._h5["gripper"]
+            else:
+                offset = self._ep_pose_offsets[ep_idx]
+                abs_start = offset + start
+                arr = self._h5[f"{key}/gripper"]
+        except Exception:
+            return np.zeros(count, dtype=np.float32)
+        chunk = np.asarray(arr[abs_start:abs_start + count], dtype=np.float32).reshape(-1)
+        if len(chunk) < count:
+            chunk = np.concatenate(
+                [chunk, np.zeros(count - len(chunk), dtype=np.float32)]
+            )
+        return chunk
+
+    def _read_actions_gripper_col(self, ep_idx: int, start: int, count: int) -> np.ndarray:
+        """Read a (count,) gripper array from the last column of /ep_XXX/actions.
+
+        Returns zeros if the actions array has fewer than 7 columns.
+        """
+        key = self._episode_keys[ep_idx]
+        try:
+            if self._single_episode:
+                arr = self._h5["actions"]
+                abs_start = start
+            else:
+                offset = self._ep_pose_offsets[ep_idx]
+                abs_start = offset + start
+                arr = self._h5[f"{key}/actions"]
+        except Exception:
+            return np.zeros(count, dtype=np.float32)
+        if arr.ndim < 2 or arr.shape[1] < 7:
+            return np.zeros(count, dtype=np.float32)
+        chunk = np.asarray(arr[abs_start:abs_start + count, -1], dtype=np.float32).reshape(-1)
+        if len(chunk) < count:
+            chunk = np.concatenate(
+                [chunk, np.zeros(count - len(chunk), dtype=np.float32)]
+            )
+        return chunk
+
     def _read_text(self, ep_idx: int) -> str:
         key = self._episode_keys[ep_idx]
         if self._single_episode:
@@ -357,6 +490,23 @@ class ALIGNDataset(Dataset):
         poses = self._read_poses(ep_idx, start, count + self.traj_window)
         actions = self._read_actions(ep_idx, start, count + self.traj_window) if getattr(self, '_has_actions', False) else np.zeros((count + self.traj_window, 6), dtype=np.float32)
         text = self._read_text(ep_idx)
+        # Per-step gripper array (N,) sourced from the dedicated gripper
+        # field when available, or the last column of the 7D actions array.
+        n = count + self.traj_window
+        if getattr(self, "_has_gripper", False):
+            gk = self._gripper_keys[ep_idx]
+            if gk == "gripper":
+                grippers = self._read_poses_gripper(ep_idx, start, n)
+            elif gk == "__actions_last__":
+                grippers = self._read_actions_gripper_col(ep_idx, start, n)
+            else:
+                grippers = np.zeros(n, dtype=np.float32)
+        else:
+            grippers = np.zeros(n, dtype=np.float32)
+        # New v2 one-step robot state: last pose in the window + gripper (7,).
+        # Anchored at the END of the read window so it's a "current" state.
+        last_t_local = n - 1
+        robot_state = self._read_robot_state(ep_idx, start + last_t_local)
 
         return {
             "frames": frames,
@@ -364,6 +514,8 @@ class ALIGNDataset(Dataset):
             "actions": actions,
             "text": text,
             "ep_idx": ep_idx,
+            "grippers": grippers,           # (N,) float32 per-step gripper
+            "robot_state": robot_state,  # (7,) — [pos(3), euler(3), gripper(1)]
         }
 
 
@@ -555,6 +707,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
     all_action = []
     all_frame_next = []
     all_traj_next = []
+    all_state = []  # v2 one-step state (B, 7) at t
     all_text = []
     all_ep_idx = []
 
@@ -564,6 +717,14 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         actions = item.get("actions")  # (N, 6) or (N, 7)
         text = item["text"]
         ep_idx = item["ep_idx"]
+        # New v2 one-step state.  Prefer the dataset-provided `robot_state`
+        # when present; fall back to the last pose + zero gripper otherwise.
+        if "robot_state" in item and item["robot_state"] is not None:
+            state = np.asarray(item["robot_state"], dtype=np.float32).reshape(7)
+        else:
+            state = np.concatenate(
+                [poses[-1, :6], [0.0]], axis=0
+            ).astype(np.float32)
 
         N = len(frames)
         # Need at least traj_window past + 1 transition
@@ -619,6 +780,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         all_action.append(action_t)
         all_frame_next.append(frame_next)
         all_traj_next.append(traj_next.astype(np.float32))
+        all_state.append(state)
         all_text.append(text_pick)
         all_ep_idx.append(ep_idx)
 
@@ -628,6 +790,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         "action": np.stack(all_action, axis=0),
         "frame_next": np.stack(all_frame_next, axis=0),
         "traj_next": np.stack(all_traj_next, axis=0),
+        "state": np.stack(all_state, axis=0).astype(np.float32),  # (B, 7) v2
         "text": all_text,
         "ep_idx": np.array(all_ep_idx, dtype=np.int64),
     }
@@ -683,6 +846,7 @@ def head_collate(batch: list, chunk_size: int = 5,
     all_trajs_future = []
     all_needs = []
     all_deltas = []
+    all_robot_state = []  # v2 one-step state (B, 7)
     all_texts = []
     all_frames_window = []  # K past frames for the transformer assistant head
 
@@ -700,6 +864,23 @@ def head_collate(batch: list, chunk_size: int = 5,
         N = len(poses_clean)
         max_t = N - chunk_size
         t = rng.integers(0, min(max(max_t + 1, 1), N)) if max_t >= 0 else min(rng.integers(0, 2), N - 1)
+
+        # --- v2 one-step robot state at the head's anchor t ---
+        # [pos(3), euler(3), gripper(1)].  Gripper sourced from the
+        # dataset-provided `grippers` array (per-step, length N) when
+        # available, else 0.0.  Aligned with the current_clean_pose /
+        # current_action used by the rest of the head.
+        item_grippers = item.get("grippers")
+        if item_grippers is not None and t < len(item_grippers):
+            gripper_t = float(item_grippers[t])
+        elif item_actions is not None and t < len(item_actions) and item_actions.shape[1] >= 7:
+            # Backward-compat fallback (older datasets without grippers field)
+            gripper_t = float(item_actions[t, 6])
+        else:
+            gripper_t = 0.0
+        robot_state_t = np.concatenate(
+            [poses_clean[t, :6].astype(np.float32), [gripper_t]], axis=0
+        ).astype(np.float32)
 
         # --- Past Trajectory Window (Clean for encoding) -- fixed to always be chunk_size ---
         start = max(0, t - chunk_size + 1)
@@ -788,6 +969,7 @@ def head_collate(batch: list, chunk_size: int = 5,
         all_trajs_future.append(traj_future)
         all_needs.append(need)
         all_deltas.append(delta)
+        all_robot_state.append(robot_state_t)
         all_texts.append(text)
 
     return_dict = {
@@ -799,6 +981,7 @@ def head_collate(batch: list, chunk_size: int = 5,
         "trajectory_future": np.stack(all_trajs_future, axis=0).astype(np.float32),
         "alpha_need": np.array(all_needs, dtype=np.float32),
         "delta_target": np.stack(all_deltas, axis=0).astype(np.float32),
+        "robot_state": np.stack(all_robot_state, axis=0).astype(np.float32),  # v2 (B, 7)
         "texts": all_texts,
     }
 
