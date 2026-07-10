@@ -507,12 +507,16 @@ def train_gail(
                 break
 
             # -- To device --
-            # world_model_collate schema: frame_t (B, K, H, W, 3), traj_t (B, K, 6),
-            # action, frame_next, traj_next, text, ep_idx.
-            # We only need (frame_t, traj_t, action, text) — use the LAST frame
-            # in the window (current timestep).
+            # world_model_collate schema (v2): frame_t (B, K, H, W, 3),
+            # traj_t (B, K, 6), action, frame_next, traj_next, text,
+            # state (B, 7), state_next (B, 7). v2 GAIL uses the one-step
+            # state (B, 7) for the encoder; fall back to the legacy
+            # (B, K, 6) window which `encode_mixed` reduces internally.
             frame_t = torch.from_numpy(batch["frame_t"][:, -1]).to(device)  # (B, H, W, 3) or (B, V, H, W, 3) for multi-cam
-            traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)   # (B, K, 6)
+            if "state" in batch:
+                traj_t = torch.from_numpy(batch["state"]).float().to(device)  # (B, 7) v2
+            else:
+                traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)  # (B, K, 6) legacy
             action_exp = torch.from_numpy(batch["action"]).float().to(device)
             texts = batch["text"]
             B = frame_t.shape[0]
@@ -575,14 +579,20 @@ def train_gail(
         val_losses, val_exp_accs, val_rol_accs, val_r_exp, val_r_rol = [], [], [], [], []
         with torch.no_grad():
             for vbatch in val_loader:
+                # v2 contract: use the one-step state (B, 7) when
+                # available; fall back to the legacy trajectories (B, K, 6)
+                # window which encode_mixed reduces internally.
                 vframes = torch.from_numpy(vbatch["frames"]).to(device)
-                vtrajs = torch.from_numpy(vbatch["trajectories"]).float().to(device)
+                if "state" in vbatch:
+                    vtrajs = torch.from_numpy(vbatch["state"]).float().to(device)  # (B, 7) v2
+                else:
+                    vtrajs = torch.from_numpy(vbatch["trajectories"]).float().to(device)  # (B, K, 6) legacy
                 vtexts = vbatch["texts"]
                 vactions = torch.from_numpy(vbatch["actions"]).float().to(device)
                 B = vframes.shape[0]
 
-                # Pad trajectories if needed
-                if vtrajs.shape[-1] < 6:
+                # Pad trajectories if needed (legacy (B, K, 6) only)
+                if vtrajs.ndim == 3 and vtrajs.shape[-1] < 6:
                     pad = torch.zeros(*vtrajs.shape[:-1], 6 - vtrajs.shape[-1], device=vtrajs.device)
                     vtrajs = torch.cat([vtrajs, pad], dim=-1)
 

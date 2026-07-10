@@ -358,7 +358,12 @@ def train_value(
             # 1. Encode current state s_t
             # world_model_collate returns frame_t as (B, K, H, W, 3) — use last frame
             frame_t = torch.from_numpy(batch["frame_t"][:, -1]).to(device)
-            traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)
+            # v2 contract: prefer one-step state (B, 7); fall back to the
+            # legacy (B, K, 6) window (encode_mixed reduces it internally).
+            if "state" in batch:
+                traj_t = torch.from_numpy(batch["state"]).float().to(device)
+            else:
+                traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)
             action = torch.from_numpy(batch["action"]).float().to(device)
             texts = batch["text"]
 
@@ -375,7 +380,12 @@ def train_value(
 
             # 3. Encode next state s_{t+1} (for TD target)
             frame_next = torch.from_numpy(batch["frame_next"]).to(device)
-            traj_next = torch.from_numpy(batch["traj_next"]).float().to(device)
+            # v2 contract: prefer one-step state_next (B, 7); fall back
+            # to the legacy (B, K, 6) window.
+            if "state_next" in batch:
+                traj_next = torch.from_numpy(batch["state_next"]).float().to(device)
+            else:
+                traj_next = torch.from_numpy(batch["traj_next"]).float().to(device)
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed_next = model.encode_mixed(frame_next, traj_next, texts)
             z_v_next = mixed_next["z_v"].float()
@@ -439,11 +449,19 @@ def train_value(
         with torch.no_grad():
             for vbatch in val_loader:
                 vframe_t = torch.from_numpy(vbatch["frame_t"][:, -1]).to(device)
-                vtraj_t = torch.from_numpy(vbatch["traj_t"]).float().to(device)
+                # v2 contract: prefer one-step state (B, 7); fall back to
+                # the legacy (B, K, 6) window.
+                if "state" in vbatch:
+                    vtraj_t = torch.from_numpy(vbatch["state"]).float().to(device)
+                else:
+                    vtraj_t = torch.from_numpy(vbatch["traj_t"]).float().to(device)
                 vaction = torch.from_numpy(vbatch["action"]).float().to(device)
                 vtexts = vbatch["text"]
                 vframe_next = torch.from_numpy(vbatch["frame_next"]).to(device)
-                vtraj_next = torch.from_numpy(vbatch["traj_next"]).float().to(device)
+                if "state_next" in vbatch:
+                    vtraj_next = torch.from_numpy(vbatch["state_next"]).float().to(device)
+                else:
+                    vtraj_next = torch.from_numpy(vbatch["traj_next"]).float().to(device)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     vmixed_t = model.encode_mixed(vframe_t, vtraj_t, vtexts)

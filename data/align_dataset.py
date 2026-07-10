@@ -507,6 +507,13 @@ class ALIGNDataset(Dataset):
         # Anchored at the END of the read window so it's a "current" state.
         last_t_local = n - 1
         robot_state = self._read_robot_state(ep_idx, start + last_t_local)
+        # v2 one-step state at t+1 (next state). Only meaningful if the
+        # episode has at least one more frame.  If we're at the end, the
+        # state is identical to `robot_state` (no transition possible).
+        if self._get_episode_length(ep_idx) > (start + last_t_local + 1):
+            robot_state_next = self._read_robot_state(ep_idx, start + last_t_local + 1)
+        else:
+            robot_state_next = robot_state.copy()
 
         return {
             "frames": frames,
@@ -516,6 +523,7 @@ class ALIGNDataset(Dataset):
             "ep_idx": ep_idx,
             "grippers": grippers,           # (N,) float32 per-step gripper
             "robot_state": robot_state,  # (7,) — [pos(3), euler(3), gripper(1)]
+            "robot_state_next": robot_state_next,  # (7,) — state at t+1
         }
 
 
@@ -708,6 +716,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
     all_frame_next = []
     all_traj_next = []
     all_state = []  # v2 one-step state (B, 7) at t
+    all_state_next = []  # v2 one-step state (B, 7) at t+1
     all_text = []
     all_ep_idx = []
 
@@ -725,6 +734,13 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
             state = np.concatenate(
                 [poses[-1, :6], [0.0]], axis=0
             ).astype(np.float32)
+        # New v2 one-step state at t+1. Prefer the dataset-provided
+        # `robot_state_next`; fall back to the same state (no transition
+        # is possible at the episode boundary).
+        if "robot_state_next" in item and item["robot_state_next"] is not None:
+            state_next = np.asarray(item["robot_state_next"], dtype=np.float32).reshape(7)
+        else:
+            state_next = state.copy()
 
         N = len(frames)
         # Need at least traj_window past + 1 transition
@@ -781,6 +797,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         all_frame_next.append(frame_next)
         all_traj_next.append(traj_next.astype(np.float32))
         all_state.append(state)
+        all_state_next.append(state_next)
         all_text.append(text_pick)
         all_ep_idx.append(ep_idx)
 
@@ -791,6 +808,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         "frame_next": np.stack(all_frame_next, axis=0),
         "traj_next": np.stack(all_traj_next, axis=0),
         "state": np.stack(all_state, axis=0).astype(np.float32),  # (B, 7) v2
+        "state_next": np.stack(all_state_next, axis=0).astype(np.float32),  # (B, 7) v2
         "text": all_text,
         "ep_idx": np.array(all_ep_idx, dtype=np.int64),
     }

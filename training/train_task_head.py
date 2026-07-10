@@ -281,13 +281,18 @@ def evaluate(
 
     for batch in loader:
         frames = batch["frames"]
-        traj = batch["trajectory"]
+        # v2 one-step state (B, 7); fall back to the legacy
+        # "trajectory" field (B, K, 6) which encode_state still handles.
+        if "robot_state" in batch:
+            state = batch["robot_state"]
+        else:
+            state = batch["trajectory"]
         task_ids = batch["task_id"].to(device)
         ood_labels = batch["ood_label"].to(device)
 
         with autocast_ctx:
             # Run encoders + mixer (text not used — task head only sees z_v, z_t)
-            z_v, z_t = _encode_zv_zt(model, frames, traj)
+            z_v, z_t = _encode_zv_zt(model, frames, state)
             logits = task_head(z_v, z_t)         # (B, K+1)
         logits = logits.float()
         p = F.softmax(logits, dim=-1)
@@ -338,21 +343,26 @@ def evaluate(
 def _encode_zv_zt(
     model: ALIGNModel,
     frames,                 # (B, H, W, 3) uint8 — np.ndarray or torch.Tensor
-    traj,                   # (B, K, 6) float32 — np.ndarray or torch.Tensor
+    state,                  # (B, 7) float32 v2 one-step state; (B, K, 6) legacy
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Encode a batch through vision, trajectory, and the cross-attention
-    mixer, returning (z_v, z_t) — both (B, 256) post-mixer.
+    """Encode a batch through vision, state, and the cross-attention
+    mixer, returning (z_v, z_t) — both (B, D) post-mixer.
 
-    The TaskHead doesn't consume text, so we skip the text path entirely:
-      1. Encode raw vision and trajectory to (B, 256) and (B, K, 256)
-      2. Run through the cross-attention mixer with a zero text vector
-         (no information, but keeps the mixer's K/V contract valid)
-      3. Mean-pool the trajectory tokens to (B, 256)
+    v2 contract: ``state`` is a one-step (B, 7) robot state
+    [pos(3), orientation(3), gripper(1)]. Legacy callers passing
+    (B, K, 6) trajectory windows are still supported — the v2 state
+    encoder accepts both shapes.
+
+    The TaskHead doesn't consume text, so we skip the text path:
+      1. Encode raw vision (pooled) and state → (B, D) and (B, D)
+      2. Pass through the cross-attention mixer with a zero text
+         vector (no information, but keeps the mixer's K/V contract)
+      3. Return (z_v, z_t) — both (B, D)
 
     At training time the mixer is frozen, so the fact that text is
     always zero means z_v and z_t are deterministic functions of
-    (vision, trajectory) alone. At inference, the assistant head will
-    use the *task head's* z_text in its forward pass, not this one.
+    (vision, state) alone. At inference, the assistant head will use
+    the *task head's* z_text in its forward pass, not this one.
 
     Accepts numpy arrays (the default from `head_collate`) and torch
     tensors. If numpy, converts to float/uint8 tensors and moves them
@@ -363,21 +373,23 @@ def _encode_zv_zt(
         frames = torch.as_tensor(frames, dtype=torch.uint8, device=device)
     else:
         frames = frames.to(device)
-    if not torch.is_tensor(traj):
-        traj = torch.as_tensor(traj, dtype=torch.float32, device=device)
+    if not torch.is_tensor(state):
+        state = torch.as_tensor(state, dtype=torch.float32, device=device)
     else:
-        traj = traj.to(device).float()
+        state = state.to(device).float()
 
     # Raw encoders (no mixer yet)
-    z_v_raw = model.encode_vision(frames)                              # (B, 256)
-    z_t_tokens_raw = model.encode_trajectory_tokens(traj)              # (B, K, 256)
+    z_v_raw = model.encode_raw_vision_pooled(frames)                    # (B, D)
+    z_t_raw = model.encode_state(state)                                 # (B, D) — handles (B, 7) and (B, K, 6)
+    # Add a K=1 dim for the mixer's (B, K, D) traj contract
+    z_t_tokens_raw = z_t_raw.unsqueeze(1)                               # (B, 1, D)
     # Cross-attention mixer with a zero text vector
     z_v_mixed, z_t_tokens_mixed, _ = model.cross_attention_mixer(
         z_v_raw, z_t_tokens_raw, torch.zeros_like(z_v_raw),
     )
     # Mean-pool trajectory tokens — this is what the assistant head
     # and TaskHead both consume
-    z_t = z_t_tokens_mixed.mean(dim=1)                                # (B, 256)
+    z_t = z_t_tokens_mixed.mean(dim=1)                                  # (B, D)
     return z_v_mixed, z_t
 
 
@@ -612,12 +624,16 @@ def train_task_head(
                 break
 
             frames = batch["frames"]
-            traj = batch["trajectory"]
+            # v2 one-step state (B, 7); fall back to "trajectory"
+            if "robot_state" in batch:
+                state = batch["robot_state"]
+            else:
+                state = batch["trajectory"]
             task_ids = batch["task_id"].to(device)
             ood_labels = batch["ood_label"].to(device)
 
             with autocast_ctx:
-                z_v, z_t = _encode_zv_zt(model, frames, traj)
+                z_v, z_t = _encode_zv_zt(model, frames, state)
                 logits = task_head(z_v, z_t)
                 loss, comps = task_head_loss(logits, task_ids, ood_labels)
             loss = loss.float()

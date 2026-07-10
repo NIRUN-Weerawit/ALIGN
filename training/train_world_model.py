@@ -22,11 +22,16 @@ TRAINING CONTRACT — train_world_model.py (Phase 2: World Model)
 ────────────────────────────────────────────────────────────────────────
 INPUT  (per sample, B = batch):
   - frames_t:   (B, K, H, W, 3) uint8       — K past images ending at time t
-  - traj_t:     (B, K, 6)                   — K past EEF poses ending at time t
+                                              (the LAST frame is the current frame)
+  - state:      (B, 7) float32              — one-step robot state at t
+                                              (v2; legacy traj_t (B, K, 6) is
+                                              still available for back-compat)
   - action:     (B, 6)                      — OSC action at time t (the action applied)
   - text:       List[str]                   — task description
   - frame_next: (B, H, W, 3) uint8          — single image at time t+1 (target)
-  - traj_next:  (B, K, 6)                   — K past EEF poses ending at time t+1 (target)
+  - state_next: (B, 7) float32              — one-step robot state at t+1 (target)
+                                              (v2; legacy traj_next (B, K, 6)
+                                              is still available for back-compat)
 
 OUTPUT (per sample, B = batch):
   - z_v_pred:   (B, 256)                    — predicted next visual embedding
@@ -469,10 +474,13 @@ def train_world_model(
                 break
 
             # -- To device --
-            # The batch schema is the one produced by world_model_collate:
-            #   frame_t, traj_t, action, frame_next, traj_next, text
-            # The fallback collate above uses an alias
-            # (frames_t, trajectory_t, ...). Normalize here.
+            # v2 batch schema (from world_model_collate):
+            #   frame_t, traj_t, action, frame_next, traj_next, text,
+            #   state (B,7), state_next (B,7)
+            # The mixer still consumes a K-step traj window (z_t_tokens
+            # shape (B, K, D)); the v2 one-step `state` field is used as
+            # the next-state target (matches `state_next` from the collate).
+            # Fallback (frames_t/trajectory_t/...) is the legacy v1 schema.
             if "frame_t" in batch:
                 frames_t = torch.from_numpy(batch["frame_t"]).to(device)
                 traj_t = torch.from_numpy(batch["traj_t"]).float().to(device)
@@ -480,6 +488,17 @@ def train_world_model(
                 traj_next = torch.from_numpy(batch["traj_next"]).float().to(device)
                 action = torch.from_numpy(batch["action"]).float().to(device)
                 texts = batch["text"]
+                # v2 one-step next state. `state_next` is (B, 7). If
+                # absent (e.g. legacy dataset), fall back to encoding the
+                # last pose in the legacy traj_next window.
+                if "state_next" in batch:
+                    state_next_np = batch["state_next"]
+                else:
+                    state_next_np = np.concatenate(
+                        [traj_next[:, -1, :6].cpu().numpy(),
+                         np.zeros((traj_next.shape[0], 1), dtype=np.float32)],
+                        axis=1,
+                    ).astype(np.float32)
             else:
                 # Fallback collate schema (frames_t, trajectory_t, ...)
                 frames_t = torch.from_numpy(batch["frames_t"]).to(device)
@@ -488,6 +507,12 @@ def train_world_model(
                 traj_next = torch.from_numpy(batch["trajectory_next"]).float().to(device)
                 action = torch.from_numpy(batch["action"]).float().to(device)
                 texts = batch["texts"]
+                state_next_np = np.concatenate(
+                    [traj_next[:, -1, :6].cpu().numpy(),
+                     np.zeros((traj_next.shape[0], 1), dtype=np.float32)],
+                    axis=1,
+                ).astype(np.float32)
+            state_next = torch.from_numpy(state_next_np).float().to(device)
 
             # -- Encode state_t via frozen ALIGNModel --
             with torch.no_grad(), torch.amp.autocast(
@@ -513,9 +538,12 @@ def train_world_model(
                 z_t_tokens = z_t_tokens[:, -window_size:]
 
                 # -- Encode state_t+1 (target) via frozen ALIGNModel --
-                mixed_next = align.encode_mixed(frames_next, traj_next, texts)
-                z_v_target = mixed_next["z_v"].float()  # (B, D)
-                z_t_target = mixed_next["z_t"].float()  # (B, D)
+                # v2: target is the one-step next state (B, 7). We still
+                # need the v2 vision encoder to produce z_v_target, so
+                # pass the future frames through encode_raw_vision and
+                # the future one-step state through encode_raw_trajectory_tokens.
+                z_v_target = align.encode_raw_vision(frames_next).float()  # (B, D)
+                z_t_target = align.encode_raw_trajectory_tokens(state_next).float()  # (B, D)
 
             # -- Predict next state from window of past states + action --
             z_v_pred, z_t_pred = world_model(z_v_window, z_t_tokens, z_text, action)
@@ -572,6 +600,15 @@ def train_world_model(
                     vt_next = torch.from_numpy(val_batch["traj_next"]).float().to(device)
                     v_action = torch.from_numpy(val_batch["action"]).float().to(device)
                     v_texts = val_batch["text"]
+                    # v2 one-step next state (B, 7); fall back to legacy
+                    if "state_next" in val_batch:
+                        v_state_next_np = val_batch["state_next"]
+                    else:
+                        v_state_next_np = np.concatenate(
+                            [vt_next[:, -1, :6].cpu().numpy(),
+                             np.zeros((vt_next.shape[0], 1), dtype=np.float32)],
+                            axis=1,
+                        ).astype(np.float32)
                 else:
                     vf_t = torch.from_numpy(val_batch["frames_t"]).to(device)
                     vt_t = torch.from_numpy(val_batch["trajectory_t"]).float().to(device)
@@ -579,6 +616,12 @@ def train_world_model(
                     vt_next = torch.from_numpy(val_batch["trajectory_next"]).float().to(device)
                     v_action = torch.from_numpy(val_batch["action"]).float().to(device)
                     v_texts = val_batch["texts"]
+                    v_state_next_np = np.concatenate(
+                        [vt_next[:, -1, :6].cpu().numpy(),
+                         np.zeros((vt_next.shape[0], 1), dtype=np.float32)],
+                        axis=1,
+                    ).astype(np.float32)
+                v_state_next = torch.from_numpy(v_state_next_np).float().to(device)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     # Encode state_t (input)
@@ -593,10 +636,9 @@ def train_world_model(
                     z_v_w = z_v_w[:, -window_size:]
                     z_t_tok = z_t_tok[:, -window_size:]
 
-                    # Encode state_t+1 (target) — same convention as training
-                    mixed_next = align.encode_mixed(vf_next, vt_next, v_texts)
-                    z_v_tgt = mixed_next["z_v"].float()
-                    z_t_tgt = mixed_next["z_t"].float()
+                    # Encode state_t+1 (target) — v2 one-step next state
+                    z_v_tgt = align.encode_raw_vision(vf_next).float()
+                    z_t_tgt = align.encode_raw_trajectory_tokens(v_state_next).float()
 
                 # Predict + loss
                 z_v_p, z_t_p = world_model(z_v_w, z_t_tok, z_t_text, v_action)
