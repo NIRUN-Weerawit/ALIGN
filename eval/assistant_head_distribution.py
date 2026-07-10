@@ -207,7 +207,11 @@ def main():
             frames = torch.from_numpy(batch["frames"]).to(device)
             texts = batch["texts"]
             current_action = torch.from_numpy(batch["current_action"]).float().to(device)
-            traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
+            # v2: prefer one-step state (B, 7); fall back to legacy
+            # "trajectory" (B, K, 6). encode_mixed handles both.
+            traj_view = torch.from_numpy(
+                batch.get("robot_state", batch["trajectory"])
+            ).float().to(device)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                      enabled=device.type == "cuda"):

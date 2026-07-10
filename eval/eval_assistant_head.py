@@ -163,10 +163,11 @@ def main():
             texts = batch["texts"]
             noisy_pose = torch.from_numpy(batch["noisy_pose"]).float().to(device)
             current_action = torch.from_numpy(batch["current_action"]).float().to(device)
-            traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
+            # v2: one-step robot state (B, 7) — replaces the (B, K, 6) trajectory window
+            state = torch.from_numpy(batch["robot_state"]).float().to(device)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                mixed = model.encode_mixed(frames, traj_view, texts)
+                mixed = model.encode_mixed(frames, state, texts)
                 z_v = mixed["z_v"].float()
                 z_t = mixed["z_t"].float()
                 z_text = mixed["z_text"].float()
@@ -192,7 +193,7 @@ def main():
             # Collect first few predictions
             if i == 0:
                 pred_collected.append({
-                    "current_pose": traj_view[-1,:3].cpu().tolist(),
+                    "current_pose": state[:3].cpu().tolist(),
                     "current_action": current_action[:3].cpu().tolist(),
                     "pred_action": action_pred[:3].cpu().tolist(),
                     "text": texts[:3],

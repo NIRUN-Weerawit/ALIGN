@@ -172,7 +172,8 @@ def evaluate(
     with torch.no_grad():
         for step, batch in enumerate(loader):
             frames = torch.from_numpy(batch["frames"]).to(device)
-            traj_view = torch.from_numpy(batch["trajectory"]).float().to(device)
+            # v2: one-step robot state (B, 7) — replaces the (B, K, 6) trajectory window
+            state = torch.from_numpy(batch["robot_state"]).float().to(device)
             noisy_pose = torch.from_numpy(batch["noisy_pose"]).float().to(device)
             texts = batch["texts"]
             alpha_need = torch.from_numpy(batch["alpha_need"]).float().to(device)
@@ -180,22 +181,20 @@ def evaluate(
 
             # Encode via frozen mixer
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                mixed = model.encode_mixed(frames, traj_view, texts)
+                mixed = model.encode_mixed(frames, state, texts)
                 z_v = mixed["z_v"].float()
                 z_t_tokens = mixed["z_t_tokens"].float()
                 z_text = mixed["z_text"].float()
 
             # Decision head (now a future prediction head)
-            # Predict K future embeddings from K past ones, compare to actual future.
+            # Predict K future embeddings; compare against current-state embedding
+            # (the v2 dataset no longer exposes a future-state window).
             K = model.decision_K
-            # Get future trajectory targets
-            if "trajectory_future" in batch:
-                traj_future = torch.from_numpy(batch["trajectory_future"]).float().to(device)
-            else:
-                # Fallback: shift trajectory by K (won't match training distribution)
-                traj_future = torch.roll(traj_view, shifts=-K, dims=1)
             with torch.no_grad():
-                mixed_future = model.encode_mixed(frames, traj_future, texts)
+                # Re-encode the same current state as the "target" future.
+                # In v2 there's no separate future-state field, so we use the
+                # current state's embedding as the target for self-prediction.
+                mixed_future = model.encode_mixed(frames, state, texts)
                 z_t_future_tokens = mixed_future["z_t_tokens"].float()
                 z_v_target = z_v.unsqueeze(1).expand(-1, K, -1)
                 z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)

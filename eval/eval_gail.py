@@ -94,7 +94,7 @@ def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
     else:
         # Already (B, H, W, 3) or (B, V, H, W, 3)
         frames = frame_t
-    traj = batch["traj_t"]
+    traj = batch.get("state", batch["traj_t"])  # v2 (B,7) or legacy (B,K,6)
     texts = batch["text"]
 
     frames_t = torch.from_numpy(frames).to(device)

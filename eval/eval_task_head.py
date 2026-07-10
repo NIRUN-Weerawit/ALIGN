@@ -40,21 +40,25 @@ from data.align_dataset import ALIGNDataset, MultiALIGNDataset, head_collate
 # Helpers (mirrors train_task_head.py)
 # ================================================================
 
-def _encode_zv_zt(model, frames, traj):
-    """Encode (frames, traj) through frozen encoders + mixer with zero text."""
+def _encode_zv_zt(model, frames, state):
+    """Encode (frames, state) through frozen encoders + mixer with zero text.
+
+    v2: ``state`` is a one-step robot state (B, 7) — replaces the (B, K, 6)
+    trajectory window that older callers passed.
+    """
     device = next(model.parameters()).device
     if not torch.is_tensor(frames):
         frames = torch.as_tensor(frames, dtype=torch.uint8, device=device)
     else:
         frames = frames.to(device)
-    if not torch.is_tensor(traj):
-        traj = torch.as_tensor(traj, dtype=torch.float32, device=device)
+    if not torch.is_tensor(state):
+        state = torch.as_tensor(state, dtype=torch.float32, device=device)
     else:
-        traj = traj.to(device).float()
+        state = state.to(device).float()
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
         z_v_raw = model.encode_vision(frames)
-        z_t_tokens_raw = model.encode_trajectory_tokens(traj)
+        z_t_tokens_raw = model.encode_trajectory_tokens(state)
         z_v_mixed, z_t_tokens_mixed, _ = model.cross_attention_mixer(
             z_v_raw, z_t_tokens_raw, torch.zeros_like(z_v_raw),
         )
@@ -111,7 +115,8 @@ def test_1_classification(
 
     for batch in loader:
         frames = batch["frames"]
-        traj = batch["trajectory"]
+        # v2: one-step robot state (B, 7) — replaces (B, K, 6) trajectory
+        state = batch["robot_state"]
         task_ids = batch["task_id"]
         if not torch.is_tensor(task_ids):
             task_ids = torch.as_tensor(task_ids)
@@ -121,7 +126,7 @@ def test_1_classification(
         if not known_mask.any():
             continue
 
-        z_v, z_t = _encode_zv_zt(model, frames, traj)
+        z_v, z_t = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
             logits = task_head(z_v, z_t)
         logits = logits.float()
@@ -196,13 +201,14 @@ def test_2_ood_detection(
 
     for batch in loader:
         frames = batch["frames"]
-        traj = batch["trajectory"]
+        # v2: one-step robot state (B, 7) — replaces (B, K, 6) trajectory
+        state = batch["robot_state"]
         ood_labels = batch["ood_label"]
         if not torch.is_tensor(ood_labels):
             ood_labels = torch.as_tensor(ood_labels)
         ood_labels = ood_labels.to(device)
 
-        z_v, z_t = _encode_zv_zt(model, frames, traj)
+        z_v, z_t = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
             logits = task_head(z_v, z_t)
         logits = logits.float()
@@ -280,7 +286,8 @@ def test_3_calibration(
 
     for batch in loader:
         frames = batch["frames"]
-        traj = batch["trajectory"]
+        # v2: one-step robot state (B, 7) — replaces (B, K, 6) trajectory
+        state = batch["robot_state"]
         task_ids = batch["task_id"]
         if not torch.is_tensor(task_ids):
             task_ids = torch.as_tensor(task_ids)
@@ -290,7 +297,7 @@ def test_3_calibration(
         if not known_mask.any():
             continue
 
-        z_v, z_t = _encode_zv_zt(model, frames, traj)
+        z_v, z_t = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
             logits = task_head(z_v, z_t)
         logits = logits.float()
@@ -376,16 +383,14 @@ def test_4_alpha_quality(
                 continue
 
             alphas = []
-            traj_window = 20
             for t in range(N):
-                # Build trajectory window ending at t
-                end_p = min(t + 1, len(poses_i))
-                start_p = max(0, end_p - traj_window)
-                p_t = poses_i[start_p:end_p].astype(np.float32)
-                if p_t.shape[0] < traj_window:
-                    pad = np.zeros((traj_window - p_t.shape[0], 6), dtype=np.float32)
-                    p_t = np.concatenate([pad, p_t], axis=0)
-                p_t = p_t[np.newaxis]  # (1, K, 6)
+                # v2: one-step robot state at t — (1, 7) = [pos(3), euler(3), gripper(1)]
+                # Gripper is unknown here (the per-step `grippers` array isn't on
+                # the dataset item in this test path), so use 0.0 — the model
+                # falls back to the last-pose behavior for state inputs.
+                p_t = np.concatenate(
+                    [poses_i[t].astype(np.float32), [0.0]], axis=0
+                )[np.newaxis]  # (1, 7)
 
                 f_t = frames_i[t]
                 if f_t.ndim == 3:
@@ -473,7 +478,8 @@ def test_5_ztext_quality(
 
     for batch in loader:
         frames = batch["frames"]
-        traj = batch["trajectory"]
+        # v2: one-step robot state (B, 7) — replaces (B, K, 6) trajectory
+        state = batch["robot_state"]
         task_ids = batch["task_id"]
         if not torch.is_tensor(task_ids):
             task_ids = torch.as_tensor(task_ids)
@@ -483,7 +489,7 @@ def test_5_ztext_quality(
         if not known_mask.any():
             continue
 
-        z_v, z_t = _encode_zv_zt(model, frames, traj)
+        z_v, z_t = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
             logits = task_head(z_v, z_t)
         logits = logits.float()

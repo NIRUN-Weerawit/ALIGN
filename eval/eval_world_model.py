@@ -50,6 +50,23 @@ except ImportError:
     _HAS_WM_COLLATE = False
 
 
+def _to_one_step_state(traj_window: torch.Tensor) -> torch.Tensor:
+    """Reduce a (B, K, 6) trajectory window to a (B, 7) one-step state.
+
+    Takes the last step's pose (6D) and appends a zero gripper — matches
+    the v2 contract expected by ``ALIGNModel.encode_mixed`` / the world
+    model head.
+    """
+    if traj_window.dim() == 3:
+        last = traj_window[:, -1, :6]   # (B, 6)
+    elif traj_window.dim() == 2:
+        last = traj_window[:, :6]        # (B, 6) already
+    else:
+        raise ValueError(f"Unexpected traj_window shape: {tuple(traj_window.shape)}")
+    gripper = torch.zeros(last.shape[0], 1, device=last.device, dtype=last.dtype)
+    return torch.cat([last, gripper], dim=-1)  # (B, 7)
+
+
 # ================================================================
 # Fallback collate (matches training/train_world_model.py)
 # ================================================================
@@ -392,22 +409,43 @@ def evaluate(
         return mixed["z_v"].float(), mixed["z_t"].float()
 
     def _batch_to_tensors(batch: dict) -> dict:
-        """Normalize batch keys (frame_t vs frames_t) and to-device."""
+        """Normalize batch keys (frame_t vs frames_t) and to-device.
+
+        v2: the world_model_collate emits ``state`` and ``state_next``
+        (B, 7) one-step states. Older fallback collate emits
+        ``trajectory_t`` / ``trajectory_next`` (B, K, 6) windows — we
+        downsample those to the last step so the rest of the pipeline
+        only sees one-step state.
+        """
         if "frame_t" in batch:
+            # world_model_collate (preferred v2 path)
+            if "state" in batch:
+                state = torch.from_numpy(batch["state"]).float().to(device)
+            else:
+                # backward compat: world_model_collate w/o state field
+                state = torch.from_numpy(batch["traj_t"]).float().to(device)
+            if "state_next" in batch:
+                state_next = torch.from_numpy(batch["state_next"]).float().to(device)
+            else:
+                state_next = torch.from_numpy(batch["traj_next"]).float().to(device)
             result = {
                 "frames_t": torch.from_numpy(batch["frame_t"]).to(device),
-                "traj_t": torch.from_numpy(batch["traj_t"]).float().to(device),
+                "state_t": state,
                 "frames_next": torch.from_numpy(batch["frame_next"]).to(device),
-                "traj_next": torch.from_numpy(batch["traj_next"]).float().to(device),
+                "state_next": state_next,
                 "action": torch.from_numpy(batch["action"]).float().to(device),
                 "texts": batch["text"],
             }
         else:
+            # Fallback collate (frames_t / trajectory_t / ...)
+            # Downsample (B, K, 6) → (B, 6) by taking the last step
+            traj_t_raw = torch.from_numpy(batch["trajectory_t"]).float().to(device)
+            traj_next_raw = torch.from_numpy(batch["trajectory_next"]).float().to(device)
             result = {
                 "frames_t": torch.from_numpy(batch["frames_t"]).to(device),
-                "traj_t": torch.from_numpy(batch["trajectory_t"]).float().to(device),
+                "state_t": _to_one_step_state(traj_t_raw),
                 "frames_next": torch.from_numpy(batch["frames_next"]).to(device),
-                "traj_next": torch.from_numpy(batch["trajectory_next"]).float().to(device),
+                "state_next": _to_one_step_state(traj_next_raw),
                 "action": torch.from_numpy(batch["action"]).float().to(device),
                 "texts": batch["texts"],
             }
@@ -425,8 +463,8 @@ def evaluate(
             n_seen_batches += 1
 
             t = _batch_to_tensors(batch)
-            frames_t, traj_t = t["frames_t"], t["traj_t"]
-            frames_next, traj_next = t["frames_next"], t["traj_next"]
+            frames_t, state_t = t["frames_t"], t["state_t"]
+            frames_next, state_next = t["frames_next"], t["state_next"]
             action = t["action"]
             texts = t["texts"]
             B = frames_t.shape[0]
@@ -436,11 +474,11 @@ def evaluate(
             # -- Encode state_t and state_t+1 --
             if _is_old_arch:
                 # Old architecture: single embeddings (B, D)
-                z_v, z_t, z_text = _encode_state_target(frames_t, traj_t, texts)
-                z_v_next, z_t_next = _encode_state_target(frames_next, traj_next, texts)
+                z_v, z_t, z_text = _encode_state_target(frames_t, state_t, texts)
+                z_v_next, z_t_next = _encode_state_target(frames_next, state_next, texts)
             else:
-                z_v, z_t, z_text = _encode_state_window(frames_t, traj_t, texts, window_size=cfg.get("window_size", 5))
-                z_v_next, z_t_next = _encode_state_target(frames_next, traj_next, texts)
+                z_v, z_t, z_text = _encode_state_window(frames_t, state_t, texts, window_size=cfg.get("window_size", 5))
+                z_v_next, z_t_next = _encode_state_target(frames_next, state_next, texts)
 
             # ============== TEST 1: real (s, a) -> predicted s' ====
             z_v_pred, z_t_pred = world_model(z_v, z_t, z_text, action)
