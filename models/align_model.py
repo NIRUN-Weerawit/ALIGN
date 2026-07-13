@@ -70,6 +70,88 @@ class CrossCameraTransformer(nn.Module):
 
 
 # ================================================================
+# Language-Conditioned Visual Attention (Phase 4)
+# ================================================================
+
+class LanguageConditionedVisualAttention(nn.Module):
+    """Apply text-conditioned attention to patch features (v2 only).
+
+    The text embedding modulates which patch features are emphasized
+    before cross-modal mixing. This implements the "language as attention
+    prior" principle from the v2 design doc: language biases perception
+    toward task-relevant information, not the other way around.
+
+    Two effects are applied:
+
+      1. A text-derived **gate** (B, 1, vision_dim) is computed by
+         projecting the text embedding to ``vision_dim`` and applying
+         sigmoid. Patch features are element-wise multiplied by this
+         gate so text-relevant patches are emphasized (others are
+         suppressed toward zero).
+      2. A small **cross-attention** lets each gated patch attend to
+         the text embedding. The output is added back as a residual,
+         scaled by a learnable ``gate_scale`` parameter.
+
+    The result is normalized via ``LayerNorm`` and returned in the
+    same shape as the input patches — (B, P, vision_dim).
+
+    Note: v1 (CLS tokens) does not use this module — it's v2-specific
+    and only built when ``lang_as_prior=True`` AND
+    ``use_patch_tokens=True``.
+
+    Args:
+        vision_dim: per-patch feature dim (typically 256 or 512)
+        text_dim:   text embedding dim
+        hidden_dim: internal projection dim (defaults to ``vision_dim``)
+        dropout:    dropout for the cross-attention layer
+    """
+
+    def __init__(self, vision_dim: int, text_dim: int, hidden_dim: int = None,
+                 dropout: float = 0.0):
+        super().__init__()
+        hidden_dim = hidden_dim or vision_dim
+        # Text -> gate: project text to vision_dim, then sigmoid
+        self.text_to_gate = nn.Sequential(
+            nn.Linear(text_dim, vision_dim),
+            nn.LayerNorm(vision_dim),
+        )
+        # Optional cross-attention from patches to text
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=vision_dim, num_heads=4, batch_first=True,
+            dropout=dropout,
+        )
+        self.norm = nn.LayerNorm(vision_dim)
+        self.gate_scale = nn.Parameter(torch.tensor(1.0))  # learnable scale
+
+    def forward(self, patch_features: torch.Tensor,
+                z_text: torch.Tensor) -> torch.Tensor:
+        """Args:
+            patch_features: (B, P, vision_dim) — patch tokens
+            z_text: (B, text_dim) — text embedding (single vector per sample)
+        Returns:
+            (B, P, vision_dim) — gated patch features
+        """
+        # Compute text-derived gate (B, 1, vision_dim)
+        gate = torch.sigmoid(self.text_to_gate(z_text)).unsqueeze(1)
+        # Gated patches: text-relevant patches are emphasized
+        gated = patch_features * gate
+        # Cross-attention: patches attend to text (text as a single key/value).
+        # Reshape text to (B, 1, text_dim) for attention. Note that the
+        # attention module's embed_dim must match the patch dim (vision_dim),
+        # so we project text through text_to_gate's first linear for the K/V
+        # path — but to keep parameter count low and let attention learn its
+        # own projection, we use a minimal adaptation: apply the same linear
+        # used for the gate (a no-op when text_dim == vision_dim) to lift
+        # text to vision_dim for K/V.
+        text_for_kv = self.text_to_gate[0](z_text).unsqueeze(1)  # (B, 1, vision_dim)
+        attn_out, _ = self.cross_attn(
+            query=gated, key=text_for_kv, value=text_for_kv,
+        )
+        out = self.norm(patch_features + self.gate_scale * attn_out)
+        return out
+
+
+# ================================================================
 # Vision Encoder
 # ================================================================
 
@@ -756,6 +838,11 @@ class ALIGNModel(nn.Module):
         assistant_nhead: int = 4,
         assistant_num_layers: int = 2,
         assistant_dim_ff: int = 1024,
+        # Phase 4: when True, build a LanguageConditionedVisualAttention
+        # that uses the text embedding to gate patch features BEFORE
+        # cross-modal mixing. Only effective in v2 (use_patch_tokens=True).
+        # Backward compatible default: False (module is None, no change).
+        lang_as_prior: bool = False,
     ):
         super().__init__()
 
@@ -820,6 +907,19 @@ class ALIGNModel(nn.Module):
         )
         self.text_encoder = TextEncoder(embed_dim=text_dim) if use_text else None
 
+        # Phase 4: language-conditioned visual attention. Text biases
+        # which patches the model "sees" as task-relevant before the
+        # cross-attention mixer. Only built in v2 (patch tokens exist);
+        # v1 (CLS token) keeps the legacy un-gated path. Old checkpoints
+        # still load — this module is new and just initializes fresh.
+        self.lang_as_prior = lang_as_prior
+        if lang_as_prior and use_patch_tokens and use_text:
+            self.lang_visual_attn = LanguageConditionedVisualAttention(
+                vision_dim=vision_dim, text_dim=text_dim,
+            )
+        else:
+            self.lang_visual_attn = None
+
         # Cross-attention mixer (always present, identity-initialized)
         self.cross_attention_mixer = _create_mixer(
             embed_dim=embed_dim if embed_dim is not None else vision_dim,
@@ -883,12 +983,16 @@ class ALIGNModel(nn.Module):
         # v2: state_encoder replaces traj_encoder. We list BOTH prefixes
         # so old checkpoints that save "traj_encoder.*" still find a
         # matching module, AND the new "state_encoder.*" is also trainable.
+        # Phase 4: include "lang_visual_attn" so the language-gating
+        # parameters are trained alongside the rest of the encoders.
         self._trainable_prefixes = {"vision_encoder.projection", "state_encoder",
                                      "traj_encoder", "text_encoder.projection",
+                                     "lang_visual_attn",
                                      "cross_attention_mixer",
                                      "decision_head", "assistant_head"}
         self._encoder_prefixes = {"vision_encoder.projection", "state_encoder",
                                    "traj_encoder", "text_encoder.projection",
+                                   "lang_visual_attn",
                                    "cross_attention_mixer"}
         self._backbone_prefixes = {"vision_encoder.backbone", "text_encoder.model"}
 
@@ -1054,12 +1158,21 @@ class ALIGNModel(nn.Module):
                               (kept for back-compat with v1 callers that
                               expect a K-dim window).
         """
-        z_v = self.encode_raw_vision(frames)            # v2: (B, P, vision_dim)
+        z_v_raw = self.encode_raw_vision(frames)       # v2: (B, P, vision_dim)
         z_state = self.encode_raw_trajectory_tokens(traj)  # v2: (B, state_dim)
         z_text = self.encode_raw_text(texts)
         if z_text is None:
-            z_text = torch.zeros(z_v.shape[0], self.text_dim,
-                                  device=z_v.device, dtype=z_v.dtype)
+            z_text = torch.zeros(z_v_raw.shape[0], self.text_dim,
+                                 device=z_v_raw.device, dtype=z_v_raw.dtype)
+
+        # Phase 4: language-conditioned visual attention (v2 only).
+        # Text biases which patches the model attends to before
+        # cross-modal mixing. v1 (CLS-only) and `lang_as_prior=False`
+        # fall back to the un-gated raw patches.
+        if self.lang_visual_attn is not None and z_v_raw.ndim == 3:
+            z_v = self.lang_visual_attn(z_v_raw, z_text)
+        else:
+            z_v = z_v_raw
 
         # Mean-pool patch tokens for the v1-shaped "z_v_pooled" output.
         # v1 callers expect a single (B, D) vector here.
