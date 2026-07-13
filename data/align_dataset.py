@@ -865,6 +865,8 @@ def head_collate(batch: list, chunk_size: int = 5,
     all_needs = []
     all_deltas = []
     all_robot_state = []  # v2 one-step state (B, 7)
+    all_robot_state_window = []  # v3: K past states (B, K, 7) for intention head
+    all_actions_window = []  # v3: K past actions (B, K, 6) as head targets
     all_texts = []
     all_frames_window = []  # K past frames for the transformer assistant head
 
@@ -979,6 +981,48 @@ def head_collate(batch: list, chunk_size: int = 5,
                 window_frames = np.concatenate([pad, window_frames], axis=0)
             all_frames_window.append(window_frames)
 
+        # --- v3: state_window (K past robot states) and actions_window (K past actions) ---
+        # Both anchored at t: [t-K+1, ..., t-1, t]
+        # Padded at the episode boundary by replicating the earliest state.
+        item_grippers_all = item.get("grippers")
+        window_size = chunk_size
+        win_start = max(0, t - window_size + 1)
+        win_end = t + 1  # inclusive
+        # State window: collect past states
+        state_window = []
+        for k_t in range(win_start, win_end):
+            if item_grippers_all is not None and k_t < len(item_grippers_all):
+                gk_t = float(item_grippers_all[k_t])
+            elif item_actions is not None and k_t < len(item_actions) and item_actions.shape[1] >= 7:
+                gk_t = float(item_actions[k_t, 6])
+            else:
+                gk_t = 0.0
+            state_t_k = np.concatenate(
+                [poses_clean[k_t, :6].astype(np.float32), [gk_t]], axis=0
+            ).astype(np.float32)
+            state_window.append(state_t_k)
+        # Pad if needed
+        if len(state_window) < window_size:
+            pad_count = window_size - len(state_window)
+            state_window = [state_window[0]] * pad_count + state_window
+        all_robot_state_window.append(np.stack(state_window, axis=0).astype(np.float32))
+
+        # Actions window: K past actions [t-K+1, ..., t-1, t]
+        actions_window = []
+        for k_t in range(win_start, win_end):
+            if item_actions is not None and k_t < len(item_actions):
+                actions_window.append(item_actions[k_t, :6].astype(np.float32))
+            elif k_t > 0:
+                actions_window.append(
+                    (poses_clean[k_t, :6] - poses_clean[k_t - 1, :6]).astype(np.float32)
+                )
+            else:
+                actions_window.append(np.zeros(6, dtype=np.float32))
+        if len(actions_window) < window_size:
+            pad_count = window_size - len(actions_window)
+            actions_window = [actions_window[0]] * pad_count + actions_window
+        all_actions_window.append(np.stack(actions_window, axis=0).astype(np.float32))
+
         all_frames.append(frames[t])
         all_noisy.append(noisy_pose[:6])
         all_clean.append(current_clean_pose[:6])
@@ -1000,6 +1044,8 @@ def head_collate(batch: list, chunk_size: int = 5,
         "alpha_need": np.array(all_needs, dtype=np.float32),
         "delta_target": np.stack(all_deltas, axis=0).astype(np.float32),
         "robot_state": np.stack(all_robot_state, axis=0).astype(np.float32),  # v2 (B, 7)
+        "robot_state_window": np.stack(all_robot_state_window, axis=0).astype(np.float32),  # v3 (B, K, 7)
+        "actions_window": np.stack(all_actions_window, axis=0).astype(np.float32),  # v3 (B, K, 6) head targets
         "texts": all_texts,
     }
 
