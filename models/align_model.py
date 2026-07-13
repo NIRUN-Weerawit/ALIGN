@@ -30,6 +30,46 @@ import torch.nn.functional as F  # noqa: N812
 
 
 # ================================================================
+# Cross-Camera Transformer (Phase 3)
+# ================================================================
+
+class CrossCameraTransformer(nn.Module):
+    """Cross-camera attention: each patch attends to patches in other cameras.
+
+    Used in v2 (use_patch_tokens=True, num_cameras>1) instead of just
+    concatenating patch tokens across cameras. Lets the model learn
+    correspondences between views (e.g., the same object seen from
+    different angles), so 3D structure can be inferred from overlapping
+    but distinct views.
+
+    Applied to the (B, V * num_patches, embed_dim) tensor after the
+    per-camera projection + reshape. Adds a residual + LayerNorm so
+    the cross-camera signal augments (rather than replaces) the
+    per-view features.
+    """
+
+    def __init__(self, embed_dim: int, num_layers: int = 2, num_heads: int = 4,
+                 dim_feedforward: int = 1024, dropout: float = 0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads,
+            dim_feedforward=dim_feedforward, batch_first=True,
+            dropout=dropout, activation='gelu',
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # LayerNorm to stabilize the post-attention features
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, V*P, embed_dim) — concatenated patch features from V cameras.
+        Returns (B, V*P, embed_dim) with cross-camera attention applied.
+        """
+        out = self.transformer(x)
+        return self.norm(out + x)  # residual + norm
+
+
+# ================================================================
 # Vision Encoder
 # ================================================================
 
@@ -44,7 +84,11 @@ class VisionEncoder(nn.Module):
         single camera: (B, num_patches, embed_dim)
         multi camera:  (B, V * num_patches, embed_dim)
     The per-patch features preserve spatial information that the older
-    CLS-only head collapsed away.
+    CLS-only head collapsed away. When ``num_cameras>1`` and
+    ``fusion_type="transformer"`` (default in v2), a small
+    ``CrossCameraTransformer`` is applied to the concatenated
+    (B, V*P, embed_dim) tensor so patches from different views attend
+    to each other (see :class:`CrossCameraTransformer`).
 
     v1 (use_patch_tokens=False): keeps the original CLS-token behavior.
     Returns (B, embed_dim) regardless of camera count (multi-camera
@@ -52,7 +96,14 @@ class VisionEncoder(nn.Module):
     """
 
     def __init__(self, backbone: str = "dinov2_vitb14", embed_dim: int = 256,
-                 num_cameras: int = 1, use_patch_tokens: bool = True):
+                 num_cameras: int = 1, use_patch_tokens: bool = True,
+                 fusion_type: str = "transformer"):
+        """fusion_type: "transformer" (default for v2) applies a small
+        CrossCameraTransformer over the V*P concatenated patch tokens.
+        "linear" keeps the legacy behavior of just concatenating with
+        no cross-camera attention. The transformer is only built when
+        v2 is used (``use_patch_tokens=True``) and ``num_cameras>1``.
+        """
         super().__init__()
         try:
             self.backbone = torch.hub.load("facebookresearch/dinov2", backbone, pretrained=True)
@@ -62,6 +113,7 @@ class VisionEncoder(nn.Module):
             )
         self.num_cameras = num_cameras
         self.embed_dim = embed_dim
+        self.fusion_type = fusion_type
         # v2: use patch tokens by default; v1 falls back to CLS
         self.use_patch_tokens = use_patch_tokens
 
@@ -76,6 +128,12 @@ class VisionEncoder(nn.Module):
                 nn.Linear(num_cameras * embed_dim, embed_dim),
                 nn.LayerNorm(embed_dim),
             )
+        # v2 multi-camera: optional cross-camera attention transformer.
+        # Only added when v2 is used AND num_cameras>1 AND the caller
+        # requested it. This keeps v1, single-cam, and "linear" fallback
+        # checkpoints free of any new parameters.
+        if num_cameras > 1 and use_patch_tokens and fusion_type == "transformer":
+            self.cross_cam_attn = CrossCameraTransformer(embed_dim=embed_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode camera frame(s).
@@ -127,6 +185,13 @@ class VisionEncoder(nn.Module):
                 # patches along the sequence dim; single-cam is unchanged.
                 P = features.size(1)
                 features = features.reshape(B, V * P, self.embed_dim)
+                # Phase 3: cross-camera attention over the V*P patch tokens.
+                # Only present when v2 is used AND num_cameras>1 AND the
+                # caller requested the transformer fusion. With
+                # ``fusion_type="linear"`` or v1, the reshape above is
+                # the only multi-cam fusion.
+                if V > 1 and hasattr(self, "cross_cam_attn"):
+                    features = self.cross_cam_attn(features)
             else:
                 # v1: CLS token only — collapses spatial info
                 features = self.backbone(x)  # (B*V, 768)
