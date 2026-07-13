@@ -1,184 +1,183 @@
 #!/usr/bin/env python3
-"""ALIGN inference — runs the full shared autonomy pipeline at 30Hz.
+"""ALIGN v3 inference — runs the intention-estimation pipeline at 30Hz.
+
+Uses ALIGNIntentionModel with Mamba recurrence. Maintains persistent
+mamba state (conv_state, ssm_state) across control cycles.
 
 Usage:
     # Quick smoke test with synthetic data
-    python inference/align_inference.py \
-        --checkpoint checkpoints/heads_libero_haruka/heads_best.pt \
-        --task "pick up the red mug"
+    python inference/align_inference.py \\
+        --checkpoint checkpoints/intention/libero_spatial/intention_best.pt \\
+        --num-cameras 1
 
     # Real deployment (provide a camera callback)
-    python inference/align_inference.py \
-        --checkpoint checkpoints/heads_libero_haruka/heads_best.pt \
-        --task "pick up the red mug" \
+    python inference/align_inference.py \\
+        --checkpoint checkpoints/intention/libero_spatial/intention_best.pt \\
         --camera 0
 """
 
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, List
 
 import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from models.align_model import ALIGNModel
+from models.align_intention import ALIGNIntentionModel
 
 
-class ALIGNInference:
-    """Real-time ALIGN inference engine.
+class ALIGNIntentionInference:
+    """Real-time intention-estimation inference engine.
 
     Runs a 30Hz control loop:
-        1. Capture camera frame → encode via mixer → z_v
-        2. Buffer K noisy EEF poses → encode via mixer → z_t
-        3. Compute z_text once per task (cached)
-        4. Decision head → α (from z_v, z_t, z_text + internal cosines)
-        5. Assistant head → chunk of K corrective Δposes
-        6. Blend: final = raw_pose + α · chunk[0]
+        1. Capture camera frame(s) → encode via VisionEncoder → patch tokens
+        2. Read current robot state (7-D) → encode via StateEncoder
+        3. State-Conditioned Attention Pool → z_v_pooled
+        4. Mamba step (with persistent state) → h(t)
+        5. Buffer K past (z_v_pooled, z_t) for the head
+        6. IntentionTransformerHead → K future actions
+        7. Use first predicted action as the next command
     """
 
     def __init__(
         self,
         checkpoint_path: str,
-        task_description: str,
-        traj_window: int = 20,
-        chunk_size: int = 10,
         device: Optional[str] = None,
-        encoder_checkpoint: Optional[str] = None,
     ):
-        self.traj_window = traj_window
-        self.chunk_size = chunk_size
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Load heads checkpoint first to detect chunk_size
-        ckpt = torch.load(checkpoint_path, map_location=self.device)
+        # Load checkpoint
+        ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         cfg = ckpt.get("config", {})
-        if cfg.get("chunk_size"):
-            self.chunk_size = cfg["chunk_size"]
-            print(f"[ALIGN] Detected chunk_size={self.chunk_size} from checkpoint")
 
-        # Build model with correct chunk_size
-        self.model = ALIGNModel(
-            embed_dim=256,
+        # Extract model config
+        self.chunk_size = cfg.get("chunk_size", 10)
+        self.vision_dim = cfg.get("vision_dim", 256)
+        self.state_dim = cfg.get("state_dim", 256)
+        self.mamba_output_dim = cfg.get("mamba_output_dim", 512)
+        self.action_dim = cfg.get("action_dim", 6)
+        self.num_cameras = cfg.get("num_cameras", 1)
+        self.loss_mode = cfg.get("loss_mode", "action")
+        print(f"[ALIGN] Loaded config: chunk={self.chunk_size}, "
+              f"vision={self.vision_dim}, state={self.state_dim}, "
+              f"mamba={self.mamba_output_dim}, action={self.action_dim}, "
+              f"cams={self.num_cameras}, loss={self.loss_mode}")
+
+        # Build model
+        self.model = ALIGNIntentionModel(
+            vision_dim=self.vision_dim,
+            state_dim=self.state_dim,
+            mamba_output_dim=self.mamba_output_dim,
+            action_dim=self.action_dim,
             chunk_size=self.chunk_size,
-            use_text=True,
-            device=self.device,
+            num_cameras=self.num_cameras,
         ).to(self.device)
 
-        # Load encoder backbone (Phase 1 checkpoint) if provided
-        if encoder_checkpoint:
-            enc_ckpt = torch.load(encoder_checkpoint, map_location=self.device)
-            if "trainable_state_dict" in enc_ckpt:
-                self.model.load_trainable_state_dict(enc_ckpt["trainable_state_dict"])
-            print(f"[ALIGN] Loaded encoder backbone: {encoder_checkpoint}")
-        else:
-            print("[ALIGN] WARNING: No encoder checkpoint provided. Encoders are randomly initialized!")
-
-        # Load heads on top (overwrites head params from encoder checkpoint if any)
-        if "trainable_state_dict" in ckpt:
-            self.model.load_trainable_state_dict(ckpt["trainable_state_dict"])
-        elif "model_state_dict" in ckpt:
+        # Load weights
+        if "model_state_dict" in ckpt:
             self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
         else:
             self.model.load_state_dict(ckpt, strict=False)
-
         self.model.eval()
-        print(f"[ALIGN] Loaded heads: {checkpoint_path}  (phase={ckpt.get('phase','?')}, "
-              f"epoch={ckpt.get('epoch','?')})")
 
-        # Precompute text embedding (cached for episode)
-        self.z_text = self.model.encode_text([task_description])
-        print(f"[ALIGN] Task:   {task_description}")
+        print(f"[ALIGN] Loaded weights: {checkpoint_path}  "
+              f"(epoch={ckpt.get('epoch','?')}, val_loss={ckpt.get('val_loss','?')})")
 
-        # Running buffers
-        self.pose_buffer: list = []  # last K noisy poses
-        self.chunk_cache: Optional[np.ndarray] = None
-
-        # Stats
+        # Buffers
+        self.z_v_pooled_buffer: List[torch.Tensor] = []  # K past pooled visions
+        self.z_t_buffer: List[torch.Tensor] = []         # K past states
+        self.h_states: Optional[tuple] = None            # (conv_state, ssm_state)
         self.step_count = 0
-        self.alpha_history: list[float] = []
 
-    def reset(self, task_description: Optional[str] = None):
+    def reset(self):
         """Reset for a new episode."""
-        self.pose_buffer = []
-        self.chunk_cache = None
-        self.alpha_history = []
+        self.z_v_pooled_buffer = []
+        self.z_t_buffer = []
+        self.h_states = None
         self.step_count = 0
-        self._prev_pose = None  # for delta computation
-        if task_description is not None:
-            self.z_text = self.model.encode_text([task_description])
 
     @torch.no_grad()
-    def step(self, frame: np.ndarray, raw_pose: np.ndarray) -> dict:
+    def step(self, frames: np.ndarray, robot_state: np.ndarray) -> dict:
         """One control step (call at 30Hz).
 
         Args:
-            frame: (H, W, 3) uint8 RGB camera image (ideally wrist).
-            raw_pose: (6,) noisy teleoperation EEF pose [x,y,z,rx,ry,rz].
-                      This is the ABSOLUTE pose, not a delta — the delta
-                      is computed internally as (raw_pose - prev_pose).
+            frames: (H, W, 3) or (V, H, W, 3) uint8 RGB camera image(s)
+            robot_state: (7,) — [pos(3), euler(3), gripper(1)]
 
         Returns:
-            dict with 'commanded_pose' (6,), 'alpha' (float), 'chunk' (K,6).
+            dict with:
+              - action: (action_dim,) — predicted current action
+              - chunk: (K, action_dim) — predicted K future actions
+              - z_v_pooled: (vision_dim,) — current pooled visual
+              - z_t: (state_dim,) — current state
+              - h: (mamba_output_dim,) — current mamba state
         """
-        if self.step_count == 0:
-            self.pose_buffer = [raw_pose.copy() for _ in range(self.traj_window)]
-            self._prev_pose = raw_pose.copy()
-
-        # Compute the current action (delta) from pose change.
-        # The Assistant head is trained to see the human's delta command,
-        # not the absolute pose. At inference, we derive the delta by
-        # differencing the current vs previous pose.
-        current_action = raw_pose - self._prev_pose
-        self._prev_pose = raw_pose.copy()
-
-        # Update buffer (ring buffer)
-        self.pose_buffer.append(raw_pose.copy())
-        if len(self.pose_buffer) > self.traj_window:
-            self.pose_buffer.pop(0)
-
-        # Prepare tensors
-        frame_t = torch.from_numpy(frame).unsqueeze(0).to(self.device, non_blocking=True)  # (1, H, W, 3)
-        traj_t = torch.from_numpy(np.stack(self.pose_buffer, axis=0)).unsqueeze(0).float().to(self.device)  # (1, K, 6)
-
-        # Encode through mixer (Phase 1b/2: frozen encoders + mixer)
-        mixed = self.model.encode_mixed(frame_t, traj_t, [""])  # text used from cache below
-        z_v = mixed["z_v"]
-        z_t = mixed["z_t"]
-        # Use precomputed text embedding (overwrite the dummy empty string)
-        z_text = self.z_text
-
-        # Decision head (computes cosines internally)
-        alpha = self.model.decision_head(z_v, z_t, z_text)
-        alpha_val = float(alpha.squeeze().cpu())
-
-        # Assistant head: input is the current ACTION (delta), not the pose.
-        # The current EEF pose is already encoded in z_t.
-        action_t = torch.from_numpy(current_action).unsqueeze(0).float().to(self.device)
-        chunk = self.model.assistant_head(z_v, z_t, z_text, action_t)
-        chunk_np = chunk.squeeze(0).cpu().numpy()
-
-        # Blend: commanded = raw + α × corrective delta
-        if self.chunk_cache is not None:
-            commanded_pose = raw_pose + alpha_val * (0.7 * chunk_np[0] + 0.3 * self.chunk_cache[-1])
+        # Preprocess
+        if frames.ndim == 3:
+            # Single camera
+            frames_t = torch.from_numpy(frames).unsqueeze(0).to(
+                self.device, non_blocking=True
+            )  # (1, H, W, 3)
         else:
-            commanded_pose = raw_pose + alpha_val * chunk_np[0]
+            # Multi-camera
+            frames_t = torch.from_numpy(frames).unsqueeze(0).to(
+                self.device, non_blocking=True
+            )  # (1, V, H, W, 3)
+        state_t = torch.from_numpy(robot_state).unsqueeze(0).float().to(
+            self.device
+        )  # (1, 7)
 
-        self.chunk_cache = chunk_np
+        # One step encoding
+        z_v_pooled, z_t, h_new, h_states_new = self.model.encode_step(
+            frames_t, state_t, self.h_states,
+        )
+        self.h_states = h_states_new
+
+        # Update buffers (rolling window)
+        self.z_v_pooled_buffer.append(z_v_pooled)
+        self.z_t_buffer.append(z_t)
+        if len(self.z_v_pooled_buffer) > self.chunk_size:
+            self.z_v_pooled_buffer.pop(0)
+            self.z_t_buffer.pop(0)
+
+        # First step: not enough history for head, return zero action
+        if len(self.z_v_pooled_buffer) < self.chunk_size:
+            self.step_count += 1
+            return {
+                "action": np.zeros(self.action_dim, dtype=np.float32),
+                "chunk": np.zeros((self.chunk_size, self.action_dim), dtype=np.float32),
+                "z_v_pooled": z_v_pooled.squeeze(0).cpu().numpy(),
+                "z_t": z_t.squeeze(0).cpu().numpy(),
+                "h": h_new.squeeze(0).cpu().numpy(),
+            }
+
+        # Build head input: K past (z_v_pooled, z_t) + 1 latest h
+        z_v_pooled_window = torch.stack(
+            self.z_v_pooled_buffer[-self.chunk_size:], dim=1
+        )  # (1, K, vision_dim * num_cameras)
+        z_t_window = torch.stack(
+            self.z_t_buffer[-self.chunk_size:], dim=1
+        )  # (1, K, state_dim)
+        h_current = h_new  # (1, mamba_output_dim)
+
+        # Predict actions
+        chunk = self.model.predict_actions(
+            z_v_pooled_window, z_t_window, h_current
+        )  # (1, K, action_dim)
+        chunk_np = chunk.squeeze(0).cpu().numpy()  # (K, action_dim)
+        action = chunk_np[0]  # use first action
+
         self.step_count += 1
-        self.alpha_history.append(alpha_val)
-
         return {
-            "commanded_pose": commanded_pose,
-            "alpha": alpha_val,
+            "action": action,
             "chunk": chunk_np,
+            "z_v_pooled": z_v_pooled.squeeze(0).cpu().numpy(),
+            "z_t": z_t.squeeze(0).cpu().numpy(),
+            "h": h_new.squeeze(0).cpu().numpy(),
         }
-
-    @property
-    def mean_alpha(self) -> float:
-        return float(np.mean(self.alpha_history)) if self.alpha_history else 0.0
 
 
 # ================================================================
@@ -186,63 +185,38 @@ class ALIGNInference:
 # ================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ALIGN Inference Runtime")
-    parser.add_argument("--checkpoint", required=True, help="Path to heads checkpoint (.pt)")
-    parser.add_argument("--task", default="pick and place", help="Task description")
-    parser.add_argument("--device", default=None, help="Inference device")
+    parser = argparse.ArgumentParser(description="ALIGN v3 Intention Inference")
+    parser.add_argument("--checkpoint", required=True,
+                        help="Path to intention_best.pt")
+    parser.add_argument("--device", default=None)
     parser.add_argument("--camera", type=int, default=None,
                         help="Camera device ID for live feed (optional)")
+    parser.add_argument("--n-steps", type=int, default=10,
+                        help="Number of synthetic steps for smoke test")
     args = parser.parse_args()
 
-    engine = ALIGNInference(
+    engine = ALIGNIntentionInference(
         checkpoint_path=args.checkpoint,
-        task_description=args.task,
         device=args.device,
     )
 
-    if args.camera is not None:
-        # ── Live deployment ──
-        try:
-            import cv2
-        except ImportError:
-            print("[ALIGN] OpenCV not installed. Install: pip install opencv-python")
-            sys.exit(1)
-
-        cap = cv2.VideoCapture(args.camera)
-        print(f"[ALIGN] Live camera {args.camera} opened. Press Ctrl+C to stop.")
-
-        try:
-            from pynput import keyboard
-            # Integrate with robot control here
-        except ImportError:
-            pass
-
-        while True:
-            ret, frame_bgr = cap.read()
-            if not ret:
-                break
-            # Convert BGR → RGB, resize to 224×224
-            frame = cv2.cvtColor(cv2.resize(frame_bgr, (224, 224)), cv2.COLOR_BGR2RGB)
-            # raw_pose comes from the teleoperation device (e.g., VR controller)
-            raw_pose = np.zeros(6, dtype=np.float32)
-
-            result = engine.step(frame, raw_pose)
-            print(f"  α={result['alpha']:.3f}  cmd=[{result['commanded_pose'][:3].round(3)}]")
+    if args.camera is None:
+        # Synthetic smoke test
+        H, W = 256, 256
+        print(f"\n  Running {args.n_steps} synthetic steps...")
+        for t in range(args.n_steps):
+            # Random frame
+            frame = np.random.randint(0, 256, (H, W, 3), dtype=np.uint8)
+            # Random state
+            state = np.random.randn(7).astype(np.float32)
+            state[6] = float(np.random.randint(0, 2))  # gripper
+            out = engine.step(frame, state)
+            print(f"  Step {t+1}: action mean={out['action'].mean():.4f}, "
+                  f"chunk shape={out['chunk'].shape}, h shape={out['h'].shape}")
+        print(f"\n  Smoke test passed. Final step_count={engine.step_count}")
     else:
-        # ── Smoke test with synthetic data ──
-        print("[ALIGN] Running 100 synthetic steps...")
-        N = 100
-        for i in range(N):
-            frame = (np.random.rand(224, 224, 3) * 255).astype(np.uint8)
-            raw = np.array([0.5 + 0.01 * np.sin(i * 0.3), 0.0, 0.25, 0.0, 0.0, 0.0])
-            result = engine.step(frame, raw)
-            if i < 3 or i % 30 == 0:
-                print(f"  Step {i:3d}: α={result['alpha']:.3f}  "
-                      f"Δ={np.linalg.norm(result['chunk'][0]):.3f}  "
-                      f"cmd=[{result['commanded_pose'][:3].round(3)}]")
-
-        print(f"\n[ALIGN] Smoke test complete. Mean α: {engine.mean_alpha:.3f}")
-        print(f"[ALIGN] Pipeline: ✓ Encode(mixed) → Decision(α) → Assistant(Δ) → Blend")
+        print(f"  Live camera mode: device={args.camera}")
+        print("  Not yet implemented — please use a custom camera callback.")
 
 
 if __name__ == "__main__":
