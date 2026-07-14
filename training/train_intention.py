@@ -340,6 +340,8 @@ def parse_args():
     parser.add_argument("--head-dim-ff", type=int, default=1024)
     # Training
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--run-name", default=None,
+                        help="Custom run folder name (default: run_N auto-incremented).")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -380,6 +382,21 @@ def main():
         ds_name = "+".join(Path(p).stem for p in args.data)
     out_dir = out_dir / ds_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    if args.run_name:
+        # Custom name provided
+        out_dir = out_dir / args.run_name
+        out_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # Auto-create a new run_N subfolder to avoid overwriting previous runs.
+        # e.g. checkpoints/v3/libero_object/run_1, run_2, ...
+        existing_runs = sorted(
+            int(p.name.split("_")[1])
+            for p in out_dir.glob("run_*")
+            if p.is_dir() and p.name.split("_")[1].isdigit()
+        )
+        next_run = (existing_runs[-1] + 1) if existing_runs else 1
+        out_dir = out_dir / f"run_{next_run}"
+        out_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Output dir: {out_dir}")
 
     # Wandb
