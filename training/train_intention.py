@@ -125,7 +125,7 @@ def build_model(args, num_cameras, device):
     model = ALIGNIntentionModel(
         vision_dim=args.vision_dim,
         state_dim=args.state_dim,
-        mamba_output_dim=args.mamba_output_dim,
+        mamba_output_dim=args.mamba_output_dim if args.use_history else 0,
         action_dim=args.action_dim,
         chunk_size=args.chunk_size,
         num_cameras=num_cameras,
@@ -133,6 +133,7 @@ def build_model(args, num_cameras, device):
         mamba_d_state=args.mamba_d_state,
         mamba_d_conv=args.mamba_d_conv,
         mamba_expand=args.mamba_expand,
+        head_type=args.head_type,
         head_d_model=args.head_d_model,
         head_nhead=args.head_nhead,
         head_num_layers=args.head_num_layers,
@@ -285,6 +286,14 @@ def parse_args():
                         action="store_false")
     parser.add_argument("--action-dim", type=int, default=6)
     parser.add_argument("--chunk-size", type=int, default=10)
+    # Head selection
+    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid"],
+                        default="mamba",
+                        help="Which head architecture: transformer, mamba, or hybrid")
+    parser.add_argument("--use-history", action="store_true", default=True,
+                        help="Include Mamba history component (h) in head input.")
+    parser.add_argument("--no-history", dest="use_history", action="store_false",
+                        help="Disable Mamba history component.")
     # IntentionTransformerHead params
     parser.add_argument("--head-d-model", type=int, default=384)
     parser.add_argument("--head-nhead", type=int, default=4)
@@ -355,15 +364,10 @@ def main():
     full_ds, train_ds, val_ds = build_datasets(args)
     train_loader, val_loader = build_loaders(train_ds, val_ds, args)
 
-    # Auto-derive num_cameras from the actual data shape
-    sample = train_ds[0]
-    frames_shape = sample["frames_window"].shape
-    if frames_shape.ndim == 5:
-        # (K, V, H, W, 3) — multi-cam
-        num_cameras = frames_shape[1]
-    else:
-        num_cameras = 1
-    print(f"  Cameras detected: {num_cameras}")
+    # Determine num_cameras from --cameras argument (not from data shape,
+    # because single-cam and multi-cam have ambiguous shapes)
+    num_cameras = len(args.cameras) if args.num_cameras <= 0 else args.num_cameras
+    print(f"  Cameras: {num_cameras} (from --cameras {args.cameras})")
 
     # Model
     print("\n  Building model...")
@@ -371,8 +375,9 @@ def main():
 
     # Freeze vision and state encoders; train intention encoder + head
     model.freeze_encoders()
-    for p in model.intention_encoder.parameters():
-        p.requires_grad = True
+    if model.intention_encoder is not None:
+        for p in model.intention_encoder.parameters():
+            p.requires_grad = True
     for p in model.intention_head.parameters():
         p.requires_grad = True
     trainable = [p for p in model.parameters() if p.requires_grad]
@@ -380,7 +385,10 @@ def main():
     n_total = sum(p.numel() for p in model.parameters())
     print(f"  Trainable params:   {n_trainable:,}")
     print(f"  Total model params: {n_total:,}")
-    print(f"  Vision + state encoders frozen; training IntentionEncoder + Head")
+    if model.intention_encoder is not None:
+        print("  Vision + state encoders frozen; training IntentionEncoder + Head")
+    else:
+        print("  Vision + state encoders frozen; training Head only (no Mamba history)")
 
     # Optimizer
     optimizer = torch.optim.AdamW(

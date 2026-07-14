@@ -38,8 +38,8 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
 from models.align_model import VisionEncoder, RobotStateEncoder
-from models.intention_encoder import IntentionEncoder
-from models.intention_head import IntentionTransformerHead
+from models.intention_encoder import IntentionEncoder, PerCameraStateConditionedPool
+from models.intention_head import IntentionTransformerHead, MambaActionHead
 
 
 class ALIGNIntentionModel(nn.Module):
@@ -56,10 +56,11 @@ class ALIGNIntentionModel(nn.Module):
         mamba_d_state:    SSM state dim (default 16)
         mamba_d_conv:     local conv width (default 4)
         mamba_expand:     Mamba block expand (default 2)
-        head_d_model:     head transformer dim (default 384)
-        head_nhead:       head attention heads (default 4)
-        head_num_layers:  head transformer layers (default 2)
-        head_dim_ff:      head FFN dim (default 1024)
+        head_type:        'transformer' or 'mamba' or 'hybrid' (default 'mamba')
+        head_d_model:     head transformer dim (default 384, only for transformer)
+        head_nhead:       head attention heads (default 4, only for transformer)
+        head_num_layers:  head transformer layers (default 2, only for transformer)
+        head_dim_ff:      head FFN dim (default 1024, only for transformer)
     """
     def __init__(
         self,
@@ -73,6 +74,7 @@ class ALIGNIntentionModel(nn.Module):
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
+        head_type: str = "mamba",
         head_d_model: int = 384,
         head_nhead: int = 4,
         head_num_layers: int = 2,
@@ -101,28 +103,65 @@ class ALIGNIntentionModel(nn.Module):
             state_dim=state_dim,
         )
         # Intention encoder (state-conditioned pool + Mamba)
-        self.intention_encoder = IntentionEncoder(
-            vision_dim=vision_dim,
-            state_dim=state_dim,
-            mamba_output_dim=mamba_output_dim,
+        # If mamba_output_dim=0, skip the Mamba history component entirely.
+        self.use_history = mamba_output_dim > 0
+        # Pool is always present (per-camera state-conditioned attention pool)
+        self.pool = PerCameraStateConditionedPool(
+            vision_dim=vision_dim, state_dim=state_dim,
             num_cameras=num_cameras,
-            mamba_d_state=mamba_d_state,
-            mamba_d_conv=mamba_d_conv,
-            mamba_expand=mamba_expand,
         )
-        # Intention head (transformer: K past + 1 h → K future actions)
-        self.intention_head = IntentionTransformerHead(
-            vision_dim=vision_dim,
-            state_dim=state_dim,
-            mamba_output_dim=mamba_output_dim,
-            action_dim=action_dim,
-            chunk_size=chunk_size,
-            d_model=head_d_model,
-            nhead=head_nhead,
-            num_layers=head_num_layers,
-            dim_feedforward=head_dim_ff,
-            pool_out_dim=self.pool_out_dim,
-        )
+        if self.use_history:
+            self.intention_encoder = IntentionEncoder(
+                vision_dim=vision_dim,
+                state_dim=state_dim,
+                mamba_output_dim=mamba_output_dim,
+                num_cameras=num_cameras,
+                mamba_d_state=mamba_d_state,
+                mamba_d_conv=mamba_d_conv,
+                mamba_expand=mamba_expand,
+            )
+        else:
+            self.intention_encoder = None
+        # Intention head: transformer OR mamba
+        self.head_type = head_type
+        if head_type == "transformer":
+            self.intention_head = IntentionTransformerHead(
+                pool_out_dim=self.pool_out_dim,
+                state_dim=state_dim,
+                mamba_output_dim=mamba_output_dim,
+                action_dim=action_dim,
+                chunk_size=chunk_size,
+                vision_dim=vision_dim,  # for backwards compat
+                d_model=head_d_model,
+                nhead=head_nhead,
+                num_layers=head_num_layers,
+                dim_feedforward=head_dim_ff,
+            )
+        elif head_type == "mamba":
+            self.intention_head = MambaActionHead(
+                pool_out_dim=self.pool_out_dim,
+                state_dim=state_dim,
+                mamba_output_dim=mamba_output_dim,
+                action_dim=action_dim,
+                chunk_size=chunk_size,
+                mamba_d_state=mamba_d_state,
+                mamba_d_conv=mamba_d_conv,
+                mamba_expand=mamba_expand,
+            )
+        elif head_type == "hybrid":
+            # For now, hybrid = Mamba (TODO: add hybrid head)
+            self.intention_head = MambaActionHead(
+                pool_out_dim=self.pool_out_dim,
+                state_dim=state_dim,
+                mamba_output_dim=mamba_output_dim,
+                action_dim=action_dim,
+                chunk_size=chunk_size,
+                mamba_d_state=mamba_d_state,
+                mamba_d_conv=mamba_d_conv,
+                mamba_expand=mamba_expand,
+            )
+        else:
+            raise ValueError(f"Unknown head_type: {head_type}")
 
         # Trainable prefixes (for freezing encoders)
         self._trainable_prefixes = {
@@ -144,6 +183,19 @@ class ALIGNIntentionModel(nn.Module):
             (B, P, vision_dim) or (B, V, P, vision_dim) — patch tokens
         """
         return self.vision_encoder(frames)
+
+    def _pool_patches(self, z_v_patches: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
+        """Apply state-conditioned attention pool.
+
+        Args:
+            z_v_patches: (B, P, vision_dim) or (B, V, P, vision_dim)
+            z_t: (B, state_dim)
+        Returns:
+            (B, V*vision_dim) — pooled vector
+        """
+        if z_v_patches.ndim == 3:
+            z_v_patches = z_v_patches.unsqueeze(1)
+        return self.pool(z_v_patches, z_t)
 
     # ----------------------------------------------------------------
     # Batched training forward
@@ -180,15 +232,19 @@ class ALIGNIntentionModel(nn.Module):
         # Encode states (batched)
         z_t_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
 
-        # Forward through intention encoder
-        h_seq = self.intention_encoder(z_v_patches_seq, z_t_seq)  # (B, T, mamba_output_dim)
+        # Forward through intention encoder (if history is enabled)
+        if self.use_history:
+            h_seq = self.intention_encoder(z_v_patches_seq, z_t_seq)  # (B, T, mamba_output_dim)
+        else:
+            # No history: dummy h_seq (zeros of the right shape, but the head may not use it)
+            h_seq = torch.zeros(z_t_seq.shape[0], z_t_seq.shape[1], 1, device=z_t_seq.device)
 
         # Get pooled vision per timestep (B, T, pool_out_dim)
         z_v_pooled_seq = []
         for t in range(T):
             z_v_t = z_v_patches_seq[:, t]  # (B, V, P, vision_dim)
             z_t_t = z_t_seq[:, t]          # (B, state_dim)
-            z_v_pooled_t = self.intention_encoder.pool_patches(z_v_t, z_t_t)
+            z_v_pooled_t = self._pool_patches(z_v_t, z_t_t)
             z_v_pooled_seq.append(z_v_pooled_t)
         z_v_pooled_seq = torch.stack(z_v_pooled_seq, dim=1)
 
@@ -226,11 +282,15 @@ class ALIGNIntentionModel(nn.Module):
         # State
         z_t = self.state_encoder(robot_state)  # (B, state_dim)
         # Pool
-        z_v_pooled = self.intention_encoder.pool_patches(z_v_patches, z_t)
-        # Mamba step
-        h_new, h_states_new = self.intention_encoder.forward_step(
-            z_v_patches, z_t, h_states,
-        )
+        z_v_pooled = self._pool_patches(z_v_patches, z_t)
+        # Mamba step (only if history is enabled)
+        if self.use_history:
+            h_new, h_states_new = self.intention_encoder.forward_step(
+                z_v_patches, z_t, h_states,
+            )
+        else:
+            h_new = torch.zeros(z_t.shape[0], 1, device=z_t.device)
+            h_states_new = h_states  # pass through (None or empty)
         return z_v_pooled, z_t, h_new, h_states_new
 
     # ----------------------------------------------------------------
