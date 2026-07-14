@@ -115,8 +115,13 @@ class IntentionTransformerHead(nn.Module):
         # Add positional encoding (size matches x)
         x = x + self.pos_emb[:x.size(1)].unsqueeze(0)
 
-        # Transformer
-        x = self.transformer(x)  # (B, K or K+1, d_model)
+        # Transformer (use math backend to avoid cuDNN issues with Mamba)
+        try:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            with sdpa_kernel(backends=[SDPBackend.MATH]):
+                x = self.transformer(x)
+        except ImportError:
+            x = self.transformer(x)  # fallback if SDPA API not available
 
         # If h was prepended, drop it; otherwise keep all K
         if self.use_history and h_current is not None:

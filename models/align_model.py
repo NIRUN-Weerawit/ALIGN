@@ -33,6 +33,13 @@ import torch.nn.functional as F  # noqa: N812
 # on the first conv2d or scaled_dot_product_attention. The slowdown is ~10-20%
 # on modern GPUs but ensures stable training.
 torch.backends.cudnn.enabled = False
+# Force scaled_dot_product_attention to use the math backend.
+# cuDNN's SDPA can fail with CUDNN_STATUS_NOT_INITIALIZED on some
+# driver/torch combinations, and just disabling cuDNN globally doesn't
+# always prevent SDPA from using it. The math backend is the most stable
+# (slightly slower but always works).
+from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
+SDPA_MATH_CONTEXT = sdpa_kernel(backends=[SDPBackend.MATH])
 
 
 # ================================================================
@@ -71,7 +78,9 @@ class CrossCameraTransformer(nn.Module):
         """x: (B, V*P, embed_dim) — concatenated patch features from V cameras.
         Returns (B, V*P, embed_dim) with cross-camera attention applied.
         """
-        out = self.transformer(x)
+        # Use math backend for SDPA to avoid cuDNN issues with Mamba's CUDA kernel
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            out = self.transformer(x)
         return self.norm(out + x)  # residual + norm
 
 
