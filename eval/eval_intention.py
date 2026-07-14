@@ -31,6 +31,9 @@ from typing import Optional, Dict, List
 import numpy as np
 import torch
 import torch.nn.functional as F
+# Disable cuDNN — see align_model.py for the full explanation.
+torch.backends.cudnn.enabled = False
+from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 from torch.utils.data import DataLoader, random_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -155,8 +158,6 @@ def evaluate(
     val_split: float = 0.1,
     n_batches: int = 20,
     device_str: Optional[str] = None,
-    use_bf16: bool = True,
-    loss_mode: str = "action",
     override_chunk_size: Optional[int] = None,
     override_num_cameras: Optional[int] = None,
 ):
@@ -164,7 +165,6 @@ def evaluate(
     print(f"\n=== ALIGN Intention (Mamba) Evaluation ===")
     print(f"  Device:   {device}")
     print(f"  Data:     {data_paths}")
-    print(f"  Loss:     {loss_mode}")
 
     # -- Model
     model, cfg = load_intention_model(
@@ -224,13 +224,11 @@ def evaluate(
 
             frames = torch.from_numpy(batch["frames_window"]).to(device)  # (B, K, H, W, 3) or (B, K, V, H, W, 3)
             state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
-            if loss_mode == "delta":
-                target = torch.from_numpy(batch["delta_target"]).float().to(device)  # (B, K, 6)
-            else:
-                target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
+            # Always use 'actions_window' (target) for error computation
+            target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                    enabled=use_bf16 and device.type == "cuda"):
+                                    enabled=device.type == "cuda"):
                 out = model(frames, state)
                 h_current = out["h_seq"][:, -1]
                 actions_pred = model.predict_actions(
@@ -293,7 +291,7 @@ def evaluate(
     print(f"\n{'='*68}")
     print(f"=== Results ({n_samples} samples, K={chunk_size} steps, 6 dims) ===")
     print(f"{'='*68}")
-    print(f"\nLoss mode: {loss_mode}")
+    print(f"\nLoss mode: action (only)")
     print(f"\nOverall metrics (flattened over K and 6 dims):")
     print(f"  MSE:  {overall_mse:.6f}")
     print(f"  RMSE: {overall_rmse:.6f}")
@@ -380,12 +378,7 @@ def main():
     parser.add_argument("--n-batches", type=int, default=20,
                         help="Max number of batches to evaluate.")
     parser.add_argument("--device", default=None)
-    parser.add_argument("--bf16", action="store_true", default=True)
-    parser.add_argument("--no-bf16", dest="bf16", action="store_false")
-    parser.add_argument("--loss-mode", choices=["action", "delta"],
-                        default="action",
-                        help="Target used for error computation: 'action' "
-                             "(default) or 'delta'.")
+    # NOTE: --bf16 / --loss-mode removed; BF16 always on, loss mode always 'action'.
     parser.add_argument("--chunk-size", type=int, default=None,
                         help="Override chunk_size (default: read from ckpt).")
     parser.add_argument("--num-cameras", type=int, default=None,
@@ -400,8 +393,6 @@ def main():
         val_split=args.val_split,
         n_batches=args.n_batches,
         device_str=args.device,
-        use_bf16=args.bf16,
-        loss_mode=args.loss_mode,
         override_chunk_size=args.chunk_size,
         override_num_cameras=args.num_cameras,
     )
