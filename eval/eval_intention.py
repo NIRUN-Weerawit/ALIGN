@@ -1,240 +1,416 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ALIGN Intention Head eval — Mamba-based.
+"""Evaluate a trained ALIGNIntentionModel (Mamba) checkpoint.
 
-Loads a trained ALIGNIntentionModel and evaluates on a held-out split.
+Loads an `intention_best.pt` checkpoint, builds the corresponding
+ALIGNIntentionModel, runs a forward pass over a held-out validation
+split of an HDF5 dataset, and reports:
+
+  - Per-dimension MSE / MAE between actions_pred and actions_window
+  - Per-step RMSE/MAE for the K future actions
+  - Mode-collapse diagnostics (output std across batch)
+  - Step-1 alignment check (cosine similarity, magnitude comparison)
+
+The script reads model hyperparameters (chunk_size, mamba dims, head
+dims, num_cameras, etc.) from the checkpoint's `config` field when
+present, falling back to sensible defaults.
 
 Usage:
-    python3 eval/eval_intention.py --data data/libero_spatial.h5 \\
-        --checkpoint checkpoints/intention/.../intention_best.pt \\
-        --cameras wrist_image --chunk-size 10
+    python eval/eval_intention.py \\
+        --data /path/to/align.h5 \\
+        --checkpoint checkpoints/intention/libero_spatial/run_1/intention_best.pt \\
+        --n-batches 20 --batch-size 32
 """
+
 import argparse
 import json
 import sys
-import time
 from pathlib import Path
-from typing import Optional
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-# Disable cuDNN band-aid
-import torch
-torch.backends.cudnn.enabled = False
+from typing import Optional, Dict, List
 
 import numpy as np
+import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
-from data.align_dataset import ALIGNDataset, MultiALIGNDataset, head_collate
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from models.align_intention import ALIGNIntentionModel
+from data.align_dataset import ALIGNDataset, head_collate
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="ALIGN Intention Head eval (v3: Mamba-based)"
-    )
-    parser.add_argument("--data", nargs="+", required=True,
-                        help="Path(s) to HDF5 data file(s)")
-    parser.add_argument("--cameras", nargs="+", default=["wrist_image"])
-    parser.add_argument("--checkpoint", required=True,
-                        help="Path to intention_best.pt")
-    parser.add_argument("--val-split", type=float, default=0.1)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--chunk-size", type=int, default=10)
-    parser.add_argument("--vision-dim", type=int, default=256)
-    parser.add_argument("--state-dim", type=int, default=256)
-    parser.add_argument("--mamba-output-dim", type=int, default=512)
-    parser.add_argument("--action-dim", type=int, default=6)
-    parser.add_argument("--num-cameras", type=int, default=0,
-                        help="0 = auto-detect from data")
-    parser.add_argument("--loss-mode", choices=["action", "delta"], default="action")
-    parser.add_argument("--device", default=None)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--n-batches", type=int, default=0,
-                        help="If >0, limit eval to N batches (for quick smoke)")
-    parser.add_argument("--out-json", default=None,
-                        help="Optional path to write metrics as JSON")
-    return parser.parse_args()
+# ================================================================
+# Defaults & config
+# ================================================================
+
+# Used when the checkpoint's `config` field is missing or incomplete.
+DEFAULT_CONFIG: Dict[str, int] = dict(
+    chunk_size=5,
+    vision_dim=256,
+    state_dim=256,
+    mamba_output_dim=512,
+    mamba_d_state=16,
+    mamba_d_conv=4,
+    mamba_expand=2,
+    head_d_model=384,
+    head_nhead=4,
+    head_num_layers=2,
+    head_dim_ff=1024,
+    num_cameras=1,
+    use_patch_tokens=True,
+)
 
 
-@torch.no_grad()
-def evaluate(model, loader, device, args):
-    """Run the model on the val split and report metrics."""
+def _merge_config(ckpt_cfg: Optional[Dict]) -> Dict:
+    """Merge checkpoint config with defaults (ckpt takes precedence)."""
+    cfg = dict(DEFAULT_CONFIG)
+    if isinstance(ckpt_cfg, dict):
+        for k, v in ckpt_cfg.items():
+            if v is not None:
+                cfg[k] = v
+    return cfg
+
+
+# ================================================================
+# Model loading
+# ================================================================
+
+def load_intention_model(
+    checkpoint_path: str,
+    device: torch.device,
+    override_chunk_size: Optional[int] = None,
+    override_num_cameras: Optional[int] = None,
+):
+    """Load an ALIGNIntentionModel from `intention_best.pt`.
+
+    The checkpoint is expected to contain:
+      - "model_state_dict": state dict of the full model
+      - "config":           dict of hyperparameters
+
+    If the checkpoint's chunk_size or num_cameras doesn't match the
+    defaults, the model is rebuilt with the right shape before loading
+    weights (so we can correctly load older checkpoints that were
+    trained with a different K or number of cameras).
+    """
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    cfg = _merge_config(ckpt.get("config", {}))
+    if override_chunk_size is not None:
+        cfg["chunk_size"] = override_chunk_size
+    if override_num_cameras is not None:
+        cfg["num_cameras"] = override_num_cameras
+
+    print(f"  Loading:    {checkpoint_path}")
+    print(f"  Epoch:      {ckpt.get('epoch', '?')}")
+    print(f"  Val loss:   {ckpt.get('val_loss', ckpt.get('loss', '?'))}")
+    print(f"  Chunk (K):  {cfg['chunk_size']}")
+    print(f"  Cameras:    {cfg['num_cameras']}")
+    print(f"  Mamba dim:  {cfg['mamba_output_dim']}")
+
+    model = ALIGNIntentionModel(
+        vision_dim=cfg["vision_dim"],
+        state_dim=cfg["state_dim"],
+        mamba_output_dim=cfg["mamba_output_dim"],
+        action_dim=6,
+        chunk_size=cfg["chunk_size"],
+        num_cameras=cfg["num_cameras"],
+        use_patch_tokens=cfg["use_patch_tokens"],
+        mamba_d_state=cfg["mamba_d_state"],
+        mamba_d_conv=cfg["mamba_d_conv"],
+        mamba_expand=cfg["mamba_expand"],
+        head_d_model=cfg["head_d_model"],
+        head_nhead=cfg["head_nhead"],
+        head_num_layers=cfg["head_num_layers"],
+        head_dim_ff=cfg["head_dim_ff"],
+    ).to(device)
+
+    # Load the state dict. We try a strict load first; if that fails
+    # (e.g. checkpoint was trained with slightly different head config)
+    # we fall back to a non-strict load and report mismatches.
+    sd = ckpt.get("model_state_dict", ckpt)
+    try:
+        model.load_state_dict(sd, strict=True)
+        print(f"  Loaded state_dict strictly ({len(sd)} tensors)")
+    except RuntimeError as e:
+        print(f"  Strict load failed ({type(e).__name__}); "
+              f"falling back to non-strict load.")
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing:
+            print(f"    Missing keys:   {len(missing)} (e.g. {missing[:3]})")
+        if unexpected:
+            print(f"    Unexpected keys: {len(unexpected)} (e.g. {unexpected[:3]})")
+
     model.eval()
-    all_losses = []
-    all_per_dim_mse = []
-    all_per_dim_mae = []
-    all_targets = []
-    all_preds = []
-    for batch_idx, batch in enumerate(loader):
-        if args.n_batches > 0 and batch_idx >= args.n_batches:
-            break
-        frames = batch["frames_window"].to(device)
-        state = batch["robot_state_window"].to(device).float()
-        if args.loss_mode == "action":
-            target = batch["actions_window"].to(device).float()
-        else:
-            target = batch["delta_target"].to(device).float()
+    return model, cfg
 
-        out = model(frames, state)
-        h_current = out["h_seq"][:, -1]
-        actions_pred = model.predict_actions(
-            out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+
+# ================================================================
+# Evaluation
+# ================================================================
+
+def evaluate(
+    data_paths: List[str],
+    checkpoint_path: str,
+    batch_size: int = 32,
+    traj_window: int = 20,
+    val_split: float = 0.1,
+    n_batches: int = 20,
+    device_str: Optional[str] = None,
+    use_bf16: bool = True,
+    loss_mode: str = "action",
+    override_chunk_size: Optional[int] = None,
+    override_num_cameras: Optional[int] = None,
+):
+    device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
+    print(f"\n=== ALIGN Intention (Mamba) Evaluation ===")
+    print(f"  Device:   {device}")
+    print(f"  Data:     {data_paths}")
+    print(f"  Loss:     {loss_mode}")
+
+    # -- Model
+    model, cfg = load_intention_model(
+        checkpoint_path, device,
+        override_chunk_size=override_chunk_size,
+        override_num_cameras=override_num_cameras,
+    )
+    chunk_size = cfg["chunk_size"]
+    cameras = ["wrist_image"] if cfg["num_cameras"] == 1 else None  # let dataset auto-detect
+
+    # -- Dataset (held-out split)
+    if len(data_paths) == 1:
+        ds = ALIGNDataset(
+            data_paths[0], mode="head",
+            traj_window=traj_window, cameras=cameras,
         )
-        loss = F.mse_loss(actions_pred, target)
-        all_losses.append(loss.item())
+    else:
+        from data.align_dataset import MultiALIGNDataset
+        ds = MultiALIGNDataset(
+            data_paths, mode="head",
+            traj_window=traj_window, cameras=cameras,
+        )
+    n_total = len(ds)
+    n_val = max(1, int(n_total * val_split))
+    n_train = n_total - n_val
+    g = torch.Generator().manual_seed(42)
+    _, val_ds = random_split(ds, [n_train, n_val], generator=g)
+    print(f"  Dataset:  {n_train} train, {n_val} val  (using {n_val} for eval)")
 
-        # Per-dim metrics
-        diff = (actions_pred - target).detach().cpu().numpy()  # (B, K, 6)
-        per_dim_mse = (diff ** 2).mean(axis=(0, 1))  # (6,)
-        per_dim_mae = np.abs(diff).mean(axis=(0, 1))  # (6,)
-        all_per_dim_mse.append(per_dim_mse)
-        all_per_dim_mae.append(per_dim_mae)
+    loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        collate_fn=lambda b: head_collate(b, chunk_size=chunk_size,
+                                          vision_window_size=chunk_size),
+    )
 
-        all_targets.append(target.cpu().numpy())
-        all_preds.append(actions_pred.detach().cpu().numpy())
+    # -- Evaluation loop
+    n_samples = 0
+    sum_se = 0.0   # sum of squared errors (overall)
+    sum_ae = 0.0   # sum of absolute errors (overall)
+    per_dim_se = np.zeros(6, dtype=np.float64)  # per-output-dim squared errors
+    per_dim_ae = np.zeros(6, dtype=np.float64)  # per-output-dim absolute errors
+    per_step_mse: List[List[float]] = [[] for _ in range(chunk_size)]
+    per_step_cos: List[List[float]] = [[] for _ in range(chunk_size)]
+    per_step_mag_pred: List[List[float]] = [[] for _ in range(chunk_size)]
+    per_step_mag_target: List[List[float]] = [[] for _ in range(chunk_size)]
+    all_pred_stds: List[float] = []
+    sample_collected: Optional[Dict] = None
 
-    if not all_losses:
-        return None
+    print(f"\n  Running up to {n_batches} batches...")
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if i >= n_batches:
+                break
 
-    avg_loss = float(np.mean(all_losses))
-    avg_per_dim_mse = np.mean(all_per_dim_mse, axis=0)  # (6,)
-    avg_per_dim_mae = np.mean(all_per_dim_mae, axis=0)
-    targets = np.concatenate(all_targets, axis=0)
-    preds = np.concatenate(all_preds, axis=0)
+            frames = torch.from_numpy(batch["frames_window"]).to(device)  # (B, K, H, W, 3) or (B, K, V, H, W, 3)
+            state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
+            if loss_mode == "delta":
+                target = torch.from_numpy(batch["delta_target"]).float().to(device)  # (B, K, 6)
+            else:
+                target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
 
-    # Relative error (per-dim)
-    target_std = targets.std(axis=(0, 1)) + 1e-6
-    rel_err = avg_per_dim_mse ** 0.5 / target_std
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=use_bf16 and device.type == "cuda"):
+                out = model(frames, state)
+                h_current = out["h_seq"][:, -1]
+                actions_pred = model.predict_actions(
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                )  # (B, K, 6)
 
+            actions_pred_f = actions_pred.float()
+            target_f = target.float()
+
+            # ---- Aggregate errors ----
+            B = actions_pred_f.shape[0]
+            n_samples += B
+            err = actions_pred_f - target_f        # (B, K, 6)
+            sum_se += (err ** 2).sum().item()
+            sum_ae += err.abs().sum().item()
+            # per-dim (collapsed over B and K)
+            per_dim_se += (err ** 2).sum(dim=(0, 1)).cpu().numpy()
+            per_dim_ae += err.abs().sum(dim=(0, 1)).cpu().numpy()
+            # per-step
+            for k in range(chunk_size):
+                e_k = err[:, k]  # (B, 6)
+                per_step_mse[k].append((e_k ** 2).mean().item())
+                cos_k = F.cosine_similarity(
+                    actions_pred_f[:, k], target_f[:, k], dim=-1,
+                )
+                per_step_cos[k].extend(cos_k.cpu().tolist())
+                per_step_mag_pred[k].extend(
+                    actions_pred_f[:, k].norm(dim=-1).cpu().tolist()
+                )
+                per_step_mag_target[k].extend(
+                    target_f[:, k].norm(dim=-1).cpu().tolist()
+                )
+
+            # Mode collapse: per-batch std of predictions
+            all_pred_stds.append(actions_pred_f.std(dim=0).mean().item())
+
+            # Capture first batch for inspection
+            if i == 0:
+                sample_collected = {
+                    "current_state_0": state[0, -1, :3].cpu().tolist(),
+                    "target_step0": target_f[0, 0, :3].cpu().tolist(),
+                    "pred_step0": actions_pred_f[0, 0, :3].cpu().tolist(),
+                }
+
+    if n_samples == 0:
+        print("  No samples evaluated (n_batches too small or val split empty).")
+        return
+
+    # ---- Aggregate metrics ----
+    total_elements = n_samples * chunk_size * 6
+    overall_mse = sum_se / total_elements
+    overall_mae = sum_ae / total_elements
+    overall_rmse = float(np.sqrt(overall_mse))
+    n_dim_elements = n_samples * chunk_size
+    per_dim_mse = per_dim_se / n_dim_elements
+    per_dim_mae = per_dim_ae / n_dim_elements
+    per_dim_rmse = np.sqrt(per_dim_mse)
+
+    # ---- Print results ----
+    print(f"\n{'='*68}")
+    print(f"=== Results ({n_samples} samples, K={chunk_size} steps, 6 dims) ===")
+    print(f"{'='*68}")
+    print(f"\nLoss mode: {loss_mode}")
+    print(f"\nOverall metrics (flattened over K and 6 dims):")
+    print(f"  MSE:  {overall_mse:.6f}")
+    print(f"  RMSE: {overall_rmse:.6f}")
+    print(f"  MAE:  {overall_mae:.6f}")
+
+    dim_names = ["x", "y", "z", "roll", "pitch", "yaw"]
+    print(f"\nPer-dimension metrics (averaged over K steps):")
+    print(f"  {'dim':<6}{'MSE':<14}{'RMSE':<14}{'MAE':<14}")
+    for d in range(6):
+        print(f"  {dim_names[d]:<6}"
+              f"{per_dim_mse[d]:<14.6f}"
+              f"{per_dim_rmse[d]:<14.6f}"
+              f"{per_dim_mae[d]:<14.6f}")
+
+    print(f"\nPer-step metrics (averaged over 6 dims):")
+    print(f"  {'step':<6}{'MSE':<14}{'cos':<10}{'|pred|':<12}{'|target|':<12}")
+    for k in range(chunk_size):
+        step_mse = float(np.mean(per_step_mse[k]))
+        step_cos = float(np.mean(per_step_cos[k]))
+        step_pred = float(np.mean(per_step_mag_pred[k]))
+        step_tgt = float(np.mean(per_step_mag_target[k]))
+        print(f"  k={k:<4}"
+              f"{step_mse:<14.6f}"
+              f"{step_cos:<10.4f}"
+              f"{step_pred:<12.4f}"
+              f"{step_tgt:<12.4f}")
+
+    # ---- Mode collapse check ----
+    avg_pred_std = float(np.mean(all_pred_stds))
+    print(f"\nMode collapse check:")
+    print(f"  Avg prediction std across batch: {avg_pred_std:.6f}")
+    if avg_pred_std < 0.001:
+        print(f"  ⚠️  WARNING: predictions have near-zero variance. Model may "
+              f"have mode-collapsed.")
+    else:
+        print(f"  ✓ predictions have meaningful variance across samples.")
+
+    # ---- Step-1 alignment ----
+    step1_cos = float(np.mean(per_step_cos[0])) if per_step_cos[0] else 0.0
+    print(f"\nStep-1 alignment (most important for inference):")
+    print(f"  Step-1 mean cosine: {step1_cos:.4f}")
+    if step1_cos > 0.7:
+        print(f"  ✓ Step-1 alignment is good (cos > 0.7)")
+    elif step1_cos > 0.3:
+        print(f"  ⚠️  Step-1 alignment is moderate (0.3 < cos < 0.7)")
+    else:
+        print(f"  ⚠️  Step-1 alignment is poor (cos < 0.3)")
+
+    # ---- Sample inspection ----
+    if sample_collected is not None:
+        print(f"\nSample inspection (first batch, sample 0):")
+        print(f"  current_state[0:3]:    {sample_collected['current_state_0']}")
+        print(f"  target_action[0:3]:    {sample_collected['target_step0']}")
+        print(f"  pred_action[0:3]:      {sample_collected['pred_step0']}")
+
+    # Return a small summary so the script can be called programmatically
     return {
-        "mse": avg_loss,
-        "per_dim_mse": avg_per_dim_mse.tolist(),
-        "per_dim_mae": avg_per_dim_mae.tolist(),
-        "per_dim_rel_error": rel_err.tolist(),
-        "n_samples": int(targets.shape[0]),
+        "mse": overall_mse,
+        "rmse": overall_rmse,
+        "mae": overall_mae,
+        "per_dim_mse": per_dim_mse.tolist(),
+        "per_dim_mae": per_dim_mae.tolist(),
+        "per_step_mse": [float(np.mean(per_step_mse[k])) for k in range(chunk_size)],
+        "step1_cos": step1_cos,
+        "n_samples": n_samples,
     }
 
 
+# ================================================================
+# CLI
+# ================================================================
+
 def main():
-    args = parse_args()
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser(
+        description="Evaluate a trained ALIGNIntentionModel (Mamba) checkpoint."
     )
-    print(f"  Device: {device}")
+    parser.add_argument("--data", required=True, nargs="+",
+                        help="Path(s) to HDF5 dataset(s).")
+    parser.add_argument("--checkpoint", required=True,
+                        help="Path to intention_best.pt")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--traj-window", type=int, default=20)
+    parser.add_argument("--val-split", type=float, default=0.1)
+    parser.add_argument("--n-batches", type=int, default=20,
+                        help="Max number of batches to evaluate.")
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--bf16", action="store_true", default=True)
+    parser.add_argument("--no-bf16", dest="bf16", action="store_false")
+    parser.add_argument("--loss-mode", choices=["action", "delta"],
+                        default="action",
+                        help="Target used for error computation: 'action' "
+                             "(default) or 'delta'.")
+    parser.add_argument("--chunk-size", type=int, default=None,
+                        help="Override chunk_size (default: read from ckpt).")
+    parser.add_argument("--num-cameras", type=int, default=None,
+                        help="Override num_cameras (default: read from ckpt).")
 
-    # Load checkpoint first to get config
-    print(f"  Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    cfg = ckpt.get("config", {})
-    # Override args with ckpt config
-    if "chunk_size" in cfg:
-        args.chunk_size = cfg["chunk_size"]
-    if "vision_dim" in cfg:
-        args.vision_dim = cfg["vision_dim"]
-    if "state_dim" in cfg:
-        args.state_dim = cfg["state_dim"]
-    if "mamba_output_dim" in cfg:
-        args.mamba_output_dim = cfg["mamba_output_dim"]
-    if "action_dim" in cfg:
-        args.action_dim = cfg["action_dim"]
-    if "num_cameras" in cfg:
-        args.num_cameras = cfg["num_cameras"]
-    if "loss_mode" in cfg:
-        args.loss_mode = cfg["loss_mode"]
-    print(f"  Config: chunk_size={args.chunk_size}, vision_dim={args.vision_dim}, "
-          f"state_dim={args.state_dim}, mamba_dim={args.mamba_output_dim}, "
-          f"num_cameras={args.num_cameras}, loss_mode={args.loss_mode}")
-
-    # Build dataset
-    if len(args.data) == 1:
-        ds = ALIGNDataset(
-            args.data[0], mode="head",
-            traj_window=args.chunk_size, cameras=args.cameras,
-        )
-    else:
-        ds = MultiALIGNDataset(
-            args.data, mode="head",
-            traj_window=args.chunk_size, cameras=args.cameras,
-        )
-    n_total = len(ds)
-    n_val = max(1, int(n_total * args.val_split))
-    n_train = n_total - n_val
-    train_ds, val_ds = random_split(
-        ds, [n_train, n_val],
-        generator=torch.Generator().manual_seed(args.seed),
+    args = parser.parse_args()
+    summary = evaluate(
+        data_paths=args.data,
+        checkpoint_path=args.checkpoint,
+        batch_size=args.batch_size,
+        traj_window=args.traj_window,
+        val_split=args.val_split,
+        n_batches=args.n_batches,
+        device_str=args.device,
+        use_bf16=args.bf16,
+        loss_mode=args.loss_mode,
+        override_chunk_size=args.chunk_size,
+        override_num_cameras=args.num_cameras,
     )
-    print(f"  Dataset: {n_total} total, {n_val} val samples")
-
-    # Build loader
-    collate_fn = lambda b: head_collate(
-        b, chunk_size=args.chunk_size, vision_window_size=args.chunk_size,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False,
-        drop_last=False, collate_fn=collate_fn, num_workers=0,
-    )
-
-    # Auto-detect num_cameras if not specified
-    if args.num_cameras == 0:
-        sample = val_ds[0]
-        frames_shape = sample["frames_window"].shape
-        if frames_shape.ndim == 5:
-            num_cameras = frames_shape[2]
-        else:
-            num_cameras = 1
-        args.num_cameras = num_cameras
-        print(f"  Auto-detected num_cameras={num_cameras}")
-
-    # Build model
-    print(f"\n  Building model...")
-    model = ALIGNIntentionModel(
-        vision_dim=args.vision_dim,
-        state_dim=args.state_dim,
-        mamba_output_dim=args.mamba_output_dim,
-        action_dim=args.action_dim,
-        chunk_size=args.chunk_size,
-        num_cameras=args.num_cameras,
-    ).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Params: {n_params:,}")
-
-    # Load weights
-    if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    else:
-        model.load_state_dict(ckpt, strict=False)
-    print(f"  Loaded weights from {args.checkpoint}")
-
-    # Evaluate
-    print(f"\n  Evaluating on val split ({n_val} samples)...")
-    t_start = time.time()
-    metrics = evaluate(model, val_loader, device, args)
-    elapsed = time.time() - t_start
-    if metrics is None:
-        print("  No samples evaluated!")
-        return
-
-    dim_names = ["pos_x", "pos_y", "pos_z", "rot_x", "rot_y", "rot_z"]
-    print(f"\n=== Intention Head Eval Results ({elapsed:.1f}s) ===")
-    print(f"  N samples:     {metrics['n_samples']}")
-    print(f"  MSE:           {metrics['mse']:.4f}")
-    print(f"\n  Per-dimension:")
-    print(f"    {'dim':<10} {'MSE':>10} {'MAE':>10} {'rel_err':>10}")
-    for i, name in enumerate(dim_names):
-        print(f"    {name:<10} {metrics['per_dim_mse'][i]:>10.6f} "
-              f"{metrics['per_dim_mae'][i]:>10.6f} "
-              f"{metrics['per_dim_rel_error'][i]:>10.3f}")
-
-    # Save metrics
-    if args.out_json:
-        with open(args.out_json, "w") as f:
-            json.dump(metrics, f, indent=2)
-        print(f"\n  Saved metrics to {args.out_json}")
+    # Optional: dump a JSON summary next to the checkpoint
+    if summary is not None:
+        out_json = Path(args.checkpoint).with_suffix(".eval.json")
+        with open(out_json, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n  Summary written to: {out_json}")
 
 
 if __name__ == "__main__":

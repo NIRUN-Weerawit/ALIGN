@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """ALIGN Intention Head training — Mamba-based.
 
 Trains the ALIGNIntentionModel (state-conditioned attention pool +
 Mamba recurrence + IntentionTransformerHead).
 
+Training stages (recommended):
+  Stage 1: pretrain_visual.py (or use ImageNet-pretrained DINOv2)
+  Stage 2: this script (intention encoder + head, vision/state frozen)  <-- DEFAULT
+  Stage 3: this script with --unfreeze-vision (end-to-end fine-tune)
+
 Usage:
-    python3 training/train_intention.py --data data/libero_spatial.h5 \\
-        --output-dir checkpoints/intention \\
-        --cameras wrist_image --chunk-size 10 --epochs 20
+  # Default: vision/state frozen, train Mamba + head
+  python3 training/train_intention.py --data data/libero_spatial.h5 \\
+      --output-dir checkpoints/intention \\
+      --cameras wrist_image --chunk-size 10 --epochs 20
+
+  # End-to-end fine-tune (small LR for vision, large for head)
+  python3 training/train_intention.py --data data/libero_spatial.h5 \\
+      --output-dir checkpoints/intention_ft \\
+      --unfreeze-vision --vision-lr-mult 0.1 --lr 1e-4
 
 ────────────────────────────────────────────────────────────────────────
 TRAINING CONTRACT — train_intention.py (v3: Intention Head)
 ────────────────────────────────────────────────────────────────────────
-INPUT  (per sample, B = batch; K = --chunk-size):
+
   - frames_window:     (B, K, H, W, 3) uint8  — K past frames (new v3)
   - robot_state_window:(B, K, 7)             — K past robot states (new v3)
   - cameras:           (B, K, V, H, W, 3) optional — multi-cam variant
@@ -223,9 +234,15 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
 
 @torch.no_grad()
 def validate(model, loader, device, args):
-    """Validate on the val set. Returns (avg_loss, avg_action_mean)."""
+    """Validate on the val set. Returns (avg_loss, avg_action_mean, per_dim_metrics).
+
+    per_dim_metrics: dict like {"pos_mse": 0.04, "rot_mse": 0.05, "grip_mse": 0.02}
+    """
     model.eval()
     losses, actions_pred_list = [], []
+    per_dim_squared = np.zeros(6, dtype=np.float64)
+    per_dim_abs = np.zeros(6, dtype=np.float64)
+    n_samples = 0
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False)
     for batch in pbar:
         frames = torch.from_numpy(batch["frames_window"]).to(device)
@@ -244,13 +261,42 @@ def validate(model, loader, device, args):
             )
             loss = F.mse_loss(actions_pred, target)
 
+        # Per-dim error accumulation (across batch and time)
+        diff = (actions_pred - target).detach().float().cpu().numpy()
+        B, T, D = diff.shape
+        per_dim_squared += (diff ** 2).sum(axis=(0, 1))  # (D,)
+        per_dim_abs += np.abs(diff).sum(axis=(0, 1))      # (D,)
+        n_samples += B * T
+
         losses.append(loss.item())
         actions_pred_list.append(actions_pred.detach().abs().mean().item())
         pbar.set_postfix(mse=f"{loss.item():.5f}")
 
     avg_loss = float(np.mean(losses)) if losses else float("inf")
     avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
-    return avg_loss, avg_action
+
+    # Per-dim metrics (only meaningful if action_dim=6)
+    per_dim_metrics = {}
+    if n_samples > 0:
+        # Per-dim MSE and MAE
+        per_dim_mse = per_dim_squared / n_samples
+        per_dim_mae = per_dim_abs / n_samples
+        per_dim_metrics = {
+            "pos_mse": float((per_dim_mse[0] + per_dim_mse[1] + per_dim_mse[2]) / 3),
+            "rot_mse": float((per_dim_mse[3] + per_dim_mse[4] + per_dim_mse[5]) / 3),
+            "grip_mse": float(per_dim_mse[5]) if len(per_dim_mse) > 5 else 0.0,
+            "pos_mae": float((per_dim_mae[0] + per_dim_mae[1] + per_dim_mae[2]) / 3),
+            "rot_mae": float((per_dim_mae[3] + per_dim_mae[4] + per_dim_mae[5]) / 3),
+            # Per-axis (for fine-grained debugging)
+            "px_mse": float(per_dim_mse[0]),
+            "py_mse": float(per_dim_mse[1]),
+            "pz_mse": float(per_dim_mse[2]),
+            "rx_mse": float(per_dim_mse[3]),
+            "ry_mse": float(per_dim_mse[4]),
+            "rz_mse": float(per_dim_mse[5]),
+        }
+
+    return avg_loss, avg_action, per_dim_metrics
 
 
 # ================================================================
@@ -284,6 +330,16 @@ def parse_args():
                         help="Use DINOv2 patch tokens (default on).")
     parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
                         action="store_false")
+    # Training mode flags
+    parser.add_argument("--unfreeze-vision", action="store_true", default=False,
+                        help="Unfreeze vision encoder (DINOv2) for end-to-end training. "
+                             "Default: vision encoder is frozen (faster, less data needed).")
+    parser.add_argument("--unfreeze-state", action="store_true", default=False,
+                        help="Unfreeze state encoder for end-to-end training. "
+                             "Default: state encoder is frozen (small, can be trained either way).")
+    parser.add_argument("--vision-lr-mult", type=float, default=0.1,
+                        help="LR multiplier for vision encoder when unfrozen (default 0.1). "
+                             "Vision encoder usually trains slower than the head.")
     parser.add_argument("--action-dim", type=int, default=6)
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
@@ -323,7 +379,7 @@ def parse_args():
     parser.add_argument("--wandb-project", default="align-intention")
     parser.add_argument("--wandb-run", default=None)
     # Other
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
 
@@ -373,8 +429,19 @@ def main():
     print("\n  Building model...")
     model = build_model(args, num_cameras, device)
 
-    # Freeze vision and state encoders; train intention encoder + head
-    model.freeze_encoders()
+    # Configure trainable parameters
+    # Default: freeze vision backbone and state encoders, train intention encoder + head
+    model.freeze_encoders()  # freeze all encoders by default
+    if args.unfreeze_vision:
+        # Unfreeze vision backbone (DINOv2) for end-to-end training
+        for p in model.vision_encoder.backbone.parameters():
+            p.requires_grad = True
+        print("  [unfreeze-vision] Vision encoder (DINOv2) will be trained")
+    # The vision projection was never frozen by freeze_encoders(), so it's always trainable
+    if args.unfreeze_state:
+        for p in model.state_encoder.parameters():
+            p.requires_grad = True
+        print("  [unfreeze-state] State encoder will be trained")
     if model.intention_encoder is not None:
         for p in model.intention_encoder.parameters():
             p.requires_grad = True
@@ -395,14 +462,35 @@ def main():
         # Watch gradients (for monitoring)
         wandb_trainer.watch(model, log="gradients", log_freq=200, log_graph=False)
     if model.intention_encoder is not None:
-        print("  Vision + state encoders frozen; training IntentionEncoder + Head")
+        if args.unfreeze_vision or args.unfreeze_state:
+            print("  End-to-end mode: vision + state encoders trainable, "
+                  "IntentionEncoder + Head trainable")
+        else:
+            print("  Vision + state encoders frozen; training IntentionEncoder + Head")
     else:
-        print("  Vision + state encoders frozen; training Head only (no Mamba history)")
+        if args.unfreeze_vision or args.unfreeze_state:
+            print("  End-to-end mode (no history): vision + state trainable, "
+                  "Head trainable")
+        else:
+            print("  Vision + state encoders frozen; training Head only (no Mamba history)")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        trainable, lr=args.lr, weight_decay=args.weight_decay,
-    )
+    # Optimizer — separate LR groups for vision encoder vs everything else
+    if args.unfreeze_vision:
+        vision_params_set = {id(p) for p in model.vision_encoder.backbone.parameters() if p.requires_grad}
+        vision_params = [p for p in model.vision_encoder.backbone.parameters() if p.requires_grad]
+        other_params = [p for p in model.parameters()
+                        if p.requires_grad and id(p) not in vision_params_set]
+        optimizer = torch.optim.AdamW([
+            {"params": vision_params, "lr": args.lr * args.vision_lr_mult},
+            {"params": other_params, "lr": args.lr},
+        ], weight_decay=args.weight_decay)
+        print(f"  Optimizer: 2 LR groups (vision={args.lr * args.vision_lr_mult:.2e}, "
+              f"other={args.lr:.2e})")
+    else:
+        optimizer = torch.optim.AdamW(
+            trainable, lr=args.lr, weight_decay=args.weight_decay,
+        )
+        print(f"  Optimizer: 1 LR group (lr={args.lr:.2e})")
 
     # Save config snapshot
     config_snapshot = vars(args).copy()
@@ -426,23 +514,30 @@ def main():
             model, train_loader, optimizer, device, args,
             max_steps=args.max_steps_per_epoch,
         )
-        val_loss, val_action = validate(model, val_loader, device, args)
+        val_loss, val_action, val_per_dim = validate(model, val_loader, device, args)
         elapsed = time.time() - t_start
 
         print(f"  Epoch {epoch:3d}/{args.epochs}  "
               f"train: loss={train_loss:.5f} a_mean={train_action:.4f}  |  "
               f"val: loss={val_loss:.5f} a_mean={val_action:.4f}  "
+              f"pos_mse={val_per_dim.get('pos_mse', 0):.4f} "
+              f"rot_mse={val_per_dim.get('rot_mse', 0):.4f}  "
               f"({elapsed:.0f}s)")
 
-        wandb_trainer.log({
+        # Build log dict
+        log_dict = {
             "train/loss": train_loss,
             "train/action_mean": train_action,
             "val/loss": val_loss,
             "val/action_mean": val_action,
             "epoch": epoch,
-        }, step=epoch)
+        }
+        # Add per-dim metrics (only if action_dim == 6)
+        for k, v in val_per_dim.items():
+            log_dict[f"val/{k}"] = v
+        wandb_trainer.log(log_dict, step=epoch)
 
-        log_fp.write(json.dumps({
+        log_record = {
             "stage": "intention",
             "epoch": epoch,
             "train/loss": train_loss,
@@ -451,10 +546,14 @@ def main():
             "val/action_mean": val_action,
             "elapsed_s": elapsed,
             "timestamp": datetime.now().isoformat(),
-        }) + "\n")
+        }
+        # Add per-dim to JSONL log
+        for k, v in val_per_dim.items():
+            log_record[f"val/{k}"] = v
+        log_fp.write(json.dumps(log_record) + "\n")
         log_fp.flush()
 
-        # Save best
+        # Save best (based on val_loss)
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             ckpt = {
@@ -463,6 +562,7 @@ def main():
                 "epoch": epoch,
                 "val_loss": val_loss,
                 "val_action_mean": val_action,
+                "val_per_dim": val_per_dim,
                 "phase": "intention_head",
             }
             torch.save(ckpt, out_dir / "intention_best.pt")
