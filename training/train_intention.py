@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
 """ALIGN Intention Head training — Mamba-based.
 
-Trains the ALIGNIntentionModel (state-conditioned attention pool +
-Mamba recurrence + IntentionTransformerHead).
+Trains the ALIGNIntentionModel end-to-end (one training pass, no separate
+pretraining needed for v3).
 
-Training stages (recommended):
-  Stage 1: pretrain_visual.py (or use ImageNet-pretrained DINOv2)
-  Stage 2: this script (intention encoder + head, vision/state frozen)  <-- DEFAULT
-  Stage 3: this script with --unfreeze-vision (end-to-end fine-tune)
+What's trained (default):
+  - Vision projection (Linear 768→256)        — adapts generic DINOv2 features
+  - State encoder (MLP 7→256)                 — no pretrained weights available
+  - Per-camera state-conditioned pool         — small, learnable
+  - Mamba history encoder (optional)          — controlled by --use-history
+  - Head (transformer or mamba)               — always trainable
+
+What's frozen (default):
+  - DINOv2 backbone                           — ImageNet-pretrained, kept frozen
+
+There is no flag to train DINOv2: it's always frozen.
 
 Usage:
-  # Default: vision/state frozen, train Mamba + head
+  # Default training (single-stage, no pretraining needed)
   python3 training/train_intention.py --data data/libero_spatial.h5 \\
       --output-dir checkpoints/intention \\
-      --cameras wrist_image --chunk-size 10 --epochs 20
+      --cameras wrist_image --chunk-size 10 --epochs 200
 
-  # End-to-end fine-tune (small LR for vision, large for head)
-  python3 training/train_intention.py --data data/libero_spatial.h5 \\
-      --output-dir checkpoints/intention_ft \\
-      --unfreeze-vision --vision-lr-mult 0.1 --lr 1e-4
+  # Ablation: try all 6 head+history combinations
+  for head in transformer mamba hybrid; do
+    for hist in --use-history --no-history; do
+      name="${head}_$(echo $hist | tr -d --)"
+      python3 training/train_intention.py \\
+        --data data/libero_spatial.h5 \\
+        --output-dir checkpoints/$name \\
+        --cameras wrist_image --chunk-size 10 \\
+        --head-type $head $hist --epochs 100
+    done
+  done
 
 ────────────────────────────────────────────────────────────────────────
 TRAINING CONTRACT — train_intention.py (v3: Intention Head)
@@ -330,16 +343,8 @@ def parse_args():
                         help="Use DINOv2 patch tokens (default on).")
     parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
                         action="store_false")
-    # Training mode flags
-    parser.add_argument("--unfreeze-vision", action="store_true", default=False,
-                        help="Unfreeze vision encoder (DINOv2) for end-to-end training. "
-                             "Default: vision encoder is frozen (faster, less data needed).")
-    parser.add_argument("--unfreeze-state", action="store_true", default=False,
-                        help="Unfreeze state encoder for end-to-end training. "
-                             "Default: state encoder is frozen (small, can be trained either way).")
-    parser.add_argument("--vision-lr-mult", type=float, default=0.1,
-                        help="LR multiplier for vision encoder when unfrozen (default 0.1). "
-                             "Vision encoder usually trains slower than the head.")
+    # NOTE: DINOv2 is always frozen (no flag). State encoder is always
+    # trainable (no flag) since we don't have pretrained weights for it.
     parser.add_argument("--action-dim", type=int, default=6)
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
@@ -430,23 +435,23 @@ def main():
     model = build_model(args, num_cameras, device)
 
     # Configure trainable parameters
-    # Default: freeze vision backbone and state encoders, train intention encoder + head
-    model.freeze_encoders()  # freeze all encoders by default
-    if args.unfreeze_vision:
-        # Unfreeze vision backbone (DINOv2) for end-to-end training
-        for p in model.vision_encoder.backbone.parameters():
-            p.requires_grad = True
-        print("  [unfreeze-vision] Vision encoder (DINOv2) will be trained")
-    # The vision projection was never frozen by freeze_encoders(), so it's always trainable
-    if args.unfreeze_state:
-        for p in model.state_encoder.parameters():
-            p.requires_grad = True
-        print("  [unfreeze-state] State encoder will be trained")
+    # - DINOv2 backbone: always frozen (ImageNet-pretrained)
+    # - Vision projection: always trainable (small, adapts generic features)
+    # - State encoder: always trainable (no pretrained weights available)
+    # - Intention encoder + head: always trainable
+    # Freeze the DINOv2 backbone (the only frozen component)
+    for p in model.vision_encoder.backbone.parameters():
+        p.requires_grad = False
+    print("  DINOv2 backbone: frozen (ImageNet-pretrained)")
+    # Enable training for everything else
     if model.intention_encoder is not None:
         for p in model.intention_encoder.parameters():
             p.requires_grad = True
     for p in model.intention_head.parameters():
         p.requires_grad = True
+    # State encoder and vision projection are trainable by default (no action needed)
+    print("  Trainable: vision projection + state encoder + intention encoder + head")
+    # Collect trainable params
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in model.parameters())
@@ -462,35 +467,17 @@ def main():
         # Watch gradients (for monitoring)
         wandb_trainer.watch(model, log="gradients", log_freq=200, log_graph=False)
     if model.intention_encoder is not None:
-        if args.unfreeze_vision or args.unfreeze_state:
-            print("  End-to-end mode: vision + state encoders trainable, "
-                  "IntentionEncoder + Head trainable")
-        else:
-            print("  Vision + state encoders frozen; training IntentionEncoder + Head")
+        print("  Training: vision projection + state encoder + intention encoder + head")
+        print("  (DINOv2 backbone frozen)")
     else:
-        if args.unfreeze_vision or args.unfreeze_state:
-            print("  End-to-end mode (no history): vision + state trainable, "
-                  "Head trainable")
-        else:
-            print("  Vision + state encoders frozen; training Head only (no Mamba history)")
+        print("  Training: vision projection + state encoder + head (no Mamba history)")
+        print("  (DINOv2 backbone frozen)")
 
-    # Optimizer — separate LR groups for vision encoder vs everything else
-    if args.unfreeze_vision:
-        vision_params_set = {id(p) for p in model.vision_encoder.backbone.parameters() if p.requires_grad}
-        vision_params = [p for p in model.vision_encoder.backbone.parameters() if p.requires_grad]
-        other_params = [p for p in model.parameters()
-                        if p.requires_grad and id(p) not in vision_params_set]
-        optimizer = torch.optim.AdamW([
-            {"params": vision_params, "lr": args.lr * args.vision_lr_mult},
-            {"params": other_params, "lr": args.lr},
-        ], weight_decay=args.weight_decay)
-        print(f"  Optimizer: 2 LR groups (vision={args.lr * args.vision_lr_mult:.2e}, "
-              f"other={args.lr:.2e})")
-    else:
-        optimizer = torch.optim.AdamW(
-            trainable, lr=args.lr, weight_decay=args.weight_decay,
-        )
-        print(f"  Optimizer: 1 LR group (lr={args.lr:.2e})")
+    # Optimizer — single LR group (only trainable params receive gradients)
+    optimizer = torch.optim.AdamW(
+        trainable, lr=args.lr, weight_decay=args.weight_decay,
+    )
+    print(f"  Optimizer: 1 LR group (lr={args.lr:.2e}, {n_trainable:,} trainable params)")
 
     # Save config snapshot
     config_snapshot = vars(args).copy()
