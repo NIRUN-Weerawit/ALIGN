@@ -102,6 +102,13 @@ CORE_PIP=(
     # "PyAV"
 )
 
+# v3 architecture (Mamba) — required for ALIGNIntentionModel
+# Install AFTER torch so the CUDA kernel builds against the right torch.
+MAMBA_PIP=(
+    "mamba-ssm"
+    "causal-conv1d"
+)
+
 # Optional: data collection / Isaac Sim / VR deps
 OPTIONAL_PIP=(
     "paho-mqtt"
@@ -129,6 +136,11 @@ install_conda() {
     info "Installing xformers (separately — avoids dependency conflicts)..."
     conda run -n "$env_name" pip install xformers \
         --index-url https://download.pytorch.org/whl/cu128
+
+    info "Installing Mamba (v3 architecture)..."
+    # mamba-ssm's CUDA kernel must build against the installed torch
+    # (2.10.0+cu128). Use --no-deps to avoid pip's resolver upgrading torch.
+    conda run -n "$env_name" pip install --no-deps mamba-ssm causal-conv1d
 
     info "Installing core ML deps via pip..."
     conda run -n "$env_name" pip install "${CORE_PIP[@]}"
@@ -158,6 +170,10 @@ import libero; print(f'  libero:     {libero.__version__}')
 import torch; print(f'  torch:       {torch.__version__}  CUDA:{torch.cuda.is_available()}')
 import transformers; print(f'  transformers:{transformers.__version__}')
 import wandb; print(f'  wandb:       {wandb.__version__}')
+try:
+    from mamba_ssm import Mamba; print('  mamba_ssm:   OK')
+except ImportError as e:
+    print(f'  mamba_ssm:   FAILED ({e})')
 print('All deps OK')
 "
 }
@@ -169,6 +185,11 @@ install_pip() {
 
     info "Installing xformers (separately — avoids dependency conflicts)..."
     pip install xformers --index-url https://download.pytorch.org/whl/cu128
+
+    info "Installing Mamba (v3 architecture)..."
+    # mamba-ssm's CUDA kernel must build against the installed torch
+    # (2.10.0+cu128). Use --no-deps to avoid pip's resolver upgrading torch.
+    pip install --no-deps mamba-ssm causal-conv1d
 
     info "Installing core deps..."
     pip install numpy scipy h5py Pillow wandb tqdm requests
