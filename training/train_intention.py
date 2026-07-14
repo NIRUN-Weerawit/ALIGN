@@ -85,6 +85,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import torch
 import torch.nn.functional as F
+# Disable cuDNN — needed when DINOv2 (with torch.no_grad) and Mamba's CUDA
+# kernel interact badly. Without this, you get CUDNN_STATUS_NOT_INITIALIZED
+# on the first conv2d inside DINOv2. See setup.sh for the same fix.
+torch.backends.cudnn.enabled = False
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
