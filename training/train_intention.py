@@ -142,45 +142,38 @@ def build_loaders(train_ds, val_ds, args):
 # Model
 # ================================================================
 
+# ================================================================
+# V3 defaults (hardcoded)
+# ================================================================
+VISION_DIM = 256
+STATE_DIM = 256
+MAMBA_OUTPUT_DIM = 512
+MAMBA_D_STATE = 16
+MAMBA_D_CONV = 4
+MAMBA_EXPAND = 2
+ACTION_DIM = 6
+USE_PATCH_TOKENS = True
+
+
 def build_model(args, num_cameras, device):
-    """Build ALIGNIntentionModel. Optionally warm-start from a pretrained
-    encoder+mixer checkpoint for the vision/state encoders.
-    """
+    """Build ALIGNIntentionModel with v3 hardcoded dimensions."""
     model = ALIGNIntentionModel(
-        vision_dim=args.vision_dim,
-        state_dim=args.state_dim,
-        mamba_output_dim=args.mamba_output_dim if args.use_history else 0,
-        action_dim=args.action_dim,
+        vision_dim=VISION_DIM,
+        state_dim=STATE_DIM,
+        mamba_output_dim=MAMBA_OUTPUT_DIM if args.use_history else 0,
+        action_dim=ACTION_DIM,
         chunk_size=args.chunk_size,
         num_cameras=num_cameras,
-        use_patch_tokens=args.use_patch_tokens,
-        mamba_d_state=args.mamba_d_state,
-        mamba_d_conv=args.mamba_d_conv,
-        mamba_expand=args.mamba_expand,
+        use_patch_tokens=USE_PATCH_TOKENS,
+        mamba_d_state=MAMBA_D_STATE,
+        mamba_d_conv=MAMBA_D_CONV,
+        mamba_expand=MAMBA_EXPAND,
         head_type=args.head_type,
         head_d_model=args.head_d_model,
         head_nhead=args.head_nhead,
         head_num_layers=args.head_num_layers,
         head_dim_ff=args.head_dim_ff,
     )
-    if args.pretrained:
-        # Load only the encoder parts (vision_encoder.backbone, state_encoder)
-        # by name-matching compatible weights. Shape mismatches are skipped
-        # so we can warm-start from an older / differently-shaped checkpoint.
-        ckpt = torch.load(args.pretrained, map_location="cpu", weights_only=False)
-        sd = ckpt.get("trainable_state_dict",
-                      ckpt.get("model_state_dict", ckpt))
-        own = model.state_dict()
-        loaded, skipped = 0, 0
-        for k, v in sd.items():
-            if k in own and own[k].shape == v.shape:
-                own[k] = v
-                loaded += 1
-            else:
-                skipped += 1
-        model.load_state_dict(own, strict=False)
-        print(f"  Loaded {loaded} params from {args.pretrained} "
-              f"({skipped} skipped due to shape/key mismatch)")
     model = model.to(device)
     return model
 
@@ -207,17 +200,12 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         frames = torch.from_numpy(batch["frames_window"]).to(device)  # (B, K, H, W, 3) or (B, K, V, H, W, 3)
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
-        if args.loss_mode == "action":
-            target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
-        else:  # delta
-            target = torch.from_numpy(batch["delta_target"]).float().to(device)  # (B, K, 6)
+        target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
 
-        # Forward
+        # Forward (BF16 always on for speed; disabled automatically on CPU)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=args.bf16 and device.type == "cuda"):
+                                enabled=device.type == "cuda"):
             out = model(frames, state)
-            # out: z_v_pooled_seq (B, K, pool_out_dim), z_t_seq (B, K, state_dim),
-            #      h_seq (B, K, mamba_output_dim)
             h_current = out["h_seq"][:, -1]  # (B, mamba_output_dim) — latest
             actions_pred = model.predict_actions(
                 out["z_v_pooled_seq"], out["z_t_seq"], h_current,
@@ -260,13 +248,10 @@ def validate(model, loader, device, args):
     for batch in pbar:
         frames = torch.from_numpy(batch["frames_window"]).to(device)
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)
-        if args.loss_mode == "action":
-            target = torch.from_numpy(batch["actions_window"]).float().to(device)
-        else:
-            target = torch.from_numpy(batch["delta_target"]).float().to(device)
+        target = torch.from_numpy(batch["actions_window"]).float().to(device)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                enabled=args.bf16 and device.type == "cuda"):
+                                enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]
             actions_pred = model.predict_actions(
@@ -325,27 +310,16 @@ def parse_args():
                         help="Path(s) to HDF5 data file(s).")
     parser.add_argument("--cameras", nargs="+", default=["wrist_image"],
                         help="Camera names to load (e.g. 'wrist_image image').")
-    parser.add_argument("--num-cameras", type=int, default=1,
-                        help="Number of cameras. Auto-derived from --cameras "
-                             "if not specified.")
+    # NOTE: --num-cameras removed; auto-derived from --cameras.
     parser.add_argument("--val-split", type=float, default=0.1)
     # Model
-    parser.add_argument("--pretrained", default=None,
-                        help="Path to pretrained encoder checkpoint "
-                             "(optional — vision/state encoders only).")
-    parser.add_argument("--vision-dim", type=int, default=256)
-    parser.add_argument("--state-dim", type=int, default=256)
-    parser.add_argument("--mamba-output-dim", type=int, default=512)
-    parser.add_argument("--mamba-d-state", type=int, default=16)
-    parser.add_argument("--mamba-d-conv", type=int, default=4)
-    parser.add_argument("--mamba-expand", type=int, default=2)
-    parser.add_argument("--use-patch-tokens", action="store_true", default=True,
-                        help="Use DINOv2 patch tokens (default on).")
-    parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
-                        action="store_false")
+    # NOTE: --pretrained removed; warm-starting is rare and complicates the CLI.
+    # NOTE: --vision-dim, --state-dim, --mamba-output-dim hardcoded to v3 defaults.
+    # NOTE: --mamba-d-state, --mamba-d-conv, --mamba-expand are Mamba internals; hardcoded.
+    # NOTE: --use-patch-tokens / --no-patch-tokens removed; always on for v3.
     # NOTE: DINOv2 is always frozen (no flag). State encoder is always
     # trainable (no flag) since we don't have pretrained weights for it.
-    parser.add_argument("--action-dim", type=int, default=6)
+    # NOTE: --action-dim hardcoded to 6 (OSC pose deltas).
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
     parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid"],
@@ -368,14 +342,8 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--loss-mode", choices=["action", "delta"],
-                        default="action",
-                        help="'action' = predict human's K past actions; "
-                             "'delta' = predict pose-relative goals.")
-    parser.add_argument("--bf16", action="store_true", default=True,
-                        help="Use BF16 autocast (default on).")
-    parser.add_argument("--no-bf16", dest="bf16", action="store_false",
-                        help="Disable BF16 autocast.")
+    # NOTE: --loss-mode removed; always 'action' for v3.
+    # NOTE: --bf16 / --no-bf16 removed; BF16 is always on for speed.
     parser.add_argument("--max-steps-per-epoch", type=int, default=0,
                         help="Cap steps per epoch (0 = use full loader).")
     # Wandb
@@ -399,8 +367,6 @@ def main():
     print(f"  Device:     {device}")
     print(f"  Chunk (K):  {args.chunk_size}")
     print(f"  Cameras:    {args.cameras}")
-    print(f"  Loss mode:  {args.loss_mode}")
-    print(f"  Pretrained: {args.pretrained or '(none — training from scratch)'}")
 
     # Output dir
     out_dir = Path(args.output_dir)
@@ -425,9 +391,8 @@ def main():
     full_ds, train_ds, val_ds = build_datasets(args)
     train_loader, val_loader = build_loaders(train_ds, val_ds, args)
 
-    # Determine num_cameras from --cameras argument (not from data shape,
-    # because single-cam and multi-cam have ambiguous shapes)
-    num_cameras = len(args.cameras) if args.num_cameras <= 0 else args.num_cameras
+    # Determine num_cameras from --cameras argument (auto-derived)
+    num_cameras = len(args.cameras)
     print(f"  Cameras: {num_cameras} (from --cameras {args.cameras})")
 
     # Model
