@@ -22,6 +22,7 @@ Architecture:
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 
 
@@ -253,3 +254,223 @@ class MambaActionHead(nn.Module):
         # Output projection: per-timestep action
         actions = self.output_proj(out)  # (B, K, action_dim)
         return actions
+
+
+# ================================================================
+# Flow-Matching Action Head
+# ================================================================
+
+class FlowMatchingActionHead(nn.Module):
+    """Flow-matching action head (Lipman et al. 2023).
+
+    Architecture:
+      - Per-step condition: concat[z_v_pooled[t], z_t[t], z_text?, h_current]
+      - Velocity field: small MLP that takes (noisy_action, t, cond) → velocity
+      - Training: predict velocity field
+      - Inference: integrate ODE from t=0 to t=1 to get actions
+
+    Args:
+        cond_dim:          dimension of per-step condition (z_v + z_t + text + h)
+        action_dim:        action output dim (default 6)
+        hidden_dim:        velocity MLP hidden dim (default 256)
+        num_inference_steps: ODE integration steps (default 10)
+        time_dim:          time embedding dim (default 64)
+        chunk_size:        K — number of past steps / future actions
+
+    Compared to direct regression (Mamba/Transformer head):
+      + Can model multi-modal action distributions
+      + Better sample quality on complex tasks
+      - Slower inference (N forward passes vs 1)
+      - More training compute
+
+    Flow-matching recap (for context):
+      Training:
+        Sample x0 ~ N(0, I), t ~ U[0, 1]
+        x_t = (1-t) * x0 + t * a    (linear interpolation)
+        v_target = a - x0           (velocity)
+        v_pred = v_net(x_t, t, cond)
+        loss = ||v_pred - v_target||^2
+      Inference (Euler ODE):
+        x_0 ~ N(0, I)
+        for i in 0..N-1:
+          t = i / N
+          x_{i+1} = x_i + v_net(x_i, t, cond) * dt
+        return x_N
+    """
+    def __init__(self, cond_dim: int = 768, action_dim: int = 6,
+                 hidden_dim: int = 256, num_inference_steps: int = 10,
+                 time_dim: int = 64, chunk_size: int = 10,
+                 use_history: bool = True):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_inference_steps = num_inference_steps
+        self.time_dim = time_dim
+        self.chunk_size = chunk_size
+        self.use_history = use_history
+        self.cond_dim = cond_dim
+
+        # Time embedding (sinusoidal → MLP)
+        self.time_emb = nn.Sequential(
+            SinusoidalPositionalEncoding(time_dim),
+            nn.Linear(time_dim, time_dim),
+            nn.SiLU(),
+            nn.Linear(time_dim, time_dim),
+        )
+
+        # Velocity field network: (noisy_action, t_emb, cond) → velocity
+        self.v_net = nn.Sequential(
+            nn.Linear(action_dim + time_dim + cond_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, action_dim),
+        )
+        # Initialize last layer small for stable training
+        nn.init.normal_(self.v_net[-1].weight, std=1e-3)
+        nn.init.zeros_(self.v_net[-1].bias)
+
+    def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
+                              z_t_window: torch.Tensor,
+                              h_current: torch.Tensor = None,
+                              z_text: torch.Tensor = None) -> torch.Tensor:
+        """Build per-step condition (B, K, cond_dim)."""
+        B, K = z_v_pooled_window.shape[:2]
+        per_step_parts = [z_v_pooled_window, z_t_window]
+        if z_text is not None:
+            z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
+            per_step_parts.append(z_text_expanded)
+        per_step_in = torch.cat(per_step_parts, dim=-1)
+        if self.use_history and h_current is not None:
+            h_repeated = h_current.unsqueeze(1).expand(-1, K, -1)
+            per_step_in = torch.cat([per_step_in, h_repeated], dim=-1)
+        return per_step_in
+
+    def compute_velocity(self, noisy_actions: torch.Tensor, t: torch.Tensor,
+                         cond: torch.Tensor) -> torch.Tensor:
+        """Predict velocity field.
+
+        Args:
+            noisy_actions: (B, K, action_dim)
+            t:             (B, K) or (B, K, 1) timestep in [0, 1]
+            cond:          (B, K, cond_dim)
+        Returns:
+            velocity: (B, K, action_dim)
+        """
+        # Squeeze trailing dim if present (B, K, 1) → (B, K)
+        if t.ndim == 3 and t.shape[-1] == 1:
+            t = t.squeeze(-1)
+        # Time embedding: t (B, K) → t_emb (B, K, time_dim)
+        t_emb = self.time_emb(t)  # (B, K, time_dim)
+        # If t was (B, 1) (for sample() with single t), broadcast over K
+        if t_emb.shape[1] == 1 and cond.shape[1] != 1:
+            t_emb = t_emb.expand(-1, cond.shape[1], -1)
+        # Concatenate inputs: noisy_actions (B, K, action_dim) +
+        #                    t_emb (B, K, time_dim) +
+        #                    cond (B, K, cond_dim)
+        inp = torch.cat([noisy_actions, t_emb, cond], dim=-1)
+        return self.v_net(inp)
+
+    def loss(self, actions_target: torch.Tensor,
+             cond: torch.Tensor) -> torch.Tensor:
+        """Flow-matching training loss.
+
+        Args:
+            actions_target: (B, K, action_dim) — ground truth actions
+            cond:           (B, K, cond_dim) — per-step condition
+        Returns:
+            loss: scalar — MSE between predicted and target velocity
+        """
+        B, K, D = actions_target.shape
+        # Sample noise
+        x0 = torch.randn_like(actions_target)
+        # Sample timestep uniformly in [0, 1]
+        t = torch.rand(B, K, 1, device=actions_target.device)
+        # Linear interpolation
+        x_t = (1 - t) * x0 + t * actions_target
+        # Velocity target: derivative of x_t w.r.t. t
+        v_target = actions_target - x0
+        # Predicted velocity
+        v_pred = self.compute_velocity(x_t, t, cond)
+        return F.mse_loss(v_pred, v_target)
+
+    def forward(self, z_v_pooled_window: torch.Tensor,
+                z_t_window: torch.Tensor,
+                h_current: torch.Tensor = None,
+                z_text: torch.Tensor = None) -> torch.Tensor:
+        """Training forward: returns per-step condition for loss computation.
+
+        Args:
+            z_v_pooled_window: (B, K, pool_out_dim)
+            z_t_window:        (B, K, state_dim)
+            h_current:         (B, mamba_output_dim) or None
+            z_text:            (B, text_dim) or None
+        Returns:
+            cond: (B, K, cond_dim) — per-step condition (passed to loss())
+        """
+        return self._build_per_step_cond(
+            z_v_pooled_window, z_t_window, h_current, z_text,
+        )
+
+    @torch.no_grad()
+    def sample(self, cond: torch.Tensor, num_steps: int = None) -> torch.Tensor:
+        """ODE integration: x_0 ~ N(0, I) → x_1 = action via Euler.
+
+        Args:
+            cond: (B, K, cond_dim) — per-step condition
+            num_steps: ODE integration steps (default: self.num_inference_steps)
+        Returns:
+            actions: (B, K, action_dim)
+        """
+        if num_steps is None:
+            num_steps = self.num_inference_steps
+        B, K, D = cond.shape[0], cond.shape[1], self.action_dim
+        device = cond.device
+        # Initialize from noise
+        x = torch.randn(B, K, D, device=device)
+        # Euler integration
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.full((B, K, 1), i * dt, device=device)
+            v = self.compute_velocity(x, t, cond)
+            x = x + v * dt
+        return x
+
+
+# ================================================================
+# Sinusoidal time embedding (used by FlowMatchingActionHead)
+# ================================================================
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Sinusoidal positional encoding for timesteps (used by diffusion/FM).
+
+    Input: t of any shape, e.g. (B, K) or (B, 1, 1)
+    Output: same shape with last dim = time_dim
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: any shape, e.g. (B, K, 1), (B, 1, 1), (B, K), (B, 1)
+        # We want output of shape t.shape + (dim,)
+        device = t.device
+        half_dim = self.dim // 2
+        if half_dim < 1:
+            half_dim = 1
+        # Frequency factors: (half_dim,)
+        # Standard sinusoidal: 1 / 10000^(2k/dim) for k in [0, half_dim)
+        exponent = torch.arange(half_dim, device=device, dtype=t.dtype)
+        exponent = exponent * (-torch.log(torch.tensor(10000.0)) / max(half_dim - 1, 1))
+        freqs = torch.exp(exponent)
+        # Flatten t to (N,) where N = prod(t.shape)
+        original_shape = t.shape
+        t_flat = t.reshape(-1)  # (N,)
+        # Compute angles: (N, half_dim)
+        angles = t_flat.unsqueeze(-1) * freqs.unsqueeze(0)  # (N, half_dim)
+        # Concat sin and cos: (N, dim)
+        emb = torch.cat([angles.sin(), angles.cos()], dim=-1)
+        # Reshape back: t.shape + (dim,)
+        out_shape = original_shape + (self.dim,)
+        return emb.reshape(out_shape)

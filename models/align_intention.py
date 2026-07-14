@@ -39,7 +39,7 @@ from typing import Optional, Tuple, List
 
 from models.align_model import VisionEncoder, RobotStateEncoder
 from models.intention_encoder import IntentionEncoder, PerCameraStateConditionedPool
-from models.intention_head import IntentionTransformerHead, MambaActionHead
+from models.intention_head import IntentionTransformerHead, MambaActionHead, FlowMatchingActionHead
 
 
 class ALIGNIntentionModel(nn.Module):
@@ -56,7 +56,7 @@ class ALIGNIntentionModel(nn.Module):
         mamba_d_state:    SSM state dim (default 16)
         mamba_d_conv:     local conv width (default 4)
         mamba_expand:     Mamba block expand (default 2)
-        head_type:        'transformer' or 'mamba' or 'hybrid' (default 'mamba')
+        head_type:        'transformer' or 'mamba' or 'hybrid' or 'flow' (default 'mamba')
         head_d_model:     head transformer dim (default 384, only for transformer)
         head_nhead:       head attention heads (default 4, only for transformer)
         head_num_layers:  head transformer layers (default 2, only for transformer)
@@ -168,6 +168,23 @@ class ALIGNIntentionModel(nn.Module):
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
+            )
+        elif head_type == "flow":
+            # Flow-matching head: cond_dim = pool + state + text + h
+            cond_dim = (
+                self.pool_out_dim
+                + state_dim
+                + (text_dim if use_text else 0)
+                + (mamba_output_dim if mamba_output_dim > 0 else 0)
+            )
+            self.intention_head = FlowMatchingActionHead(
+                cond_dim=cond_dim,
+                action_dim=action_dim,
+                hidden_dim=head_d_model,  # reuse head_d_model as hidden_dim
+                num_inference_steps=10,
+                time_dim=64,
+                chunk_size=chunk_size,
+                use_history=mamba_output_dim > 0,
             )
         else:
             raise ValueError(f"Unknown head_type: {head_type}")
@@ -318,17 +335,53 @@ class ALIGNIntentionModel(nn.Module):
                         z_text: torch.Tensor = None) -> torch.Tensor:
         """Predict K future actions from K past states + 1 h.
 
+        For direct-regression heads (transformer/mamba/hybrid): returns
+        the predicted actions directly.
+
+        For flow-matching head: returns the per-step CONDITION (not actions).
+        Use sample_actions() to get actual actions via ODE integration.
+        Use the head's .loss() method to compute the flow-matching loss.
+
         Args:
             z_v_pooled_window: (B, K, pool_out_dim)
             z_t_window:        (B, K, state_dim)
             h_current:         (B, mamba_output_dim)
             z_text:            (B, text_dim) — task text embedding (or None)
         Returns:
-            actions: (B, K, action_dim)
+            actions or cond: (B, K, action_dim) or (B, K, cond_dim)
         """
         return self.intention_head(
             z_v_pooled_window, z_t_window, h_current, z_text=z_text,
         )
+
+    @torch.no_grad()
+    def sample_actions(self, z_v_pooled_window: torch.Tensor,
+                       z_t_window: torch.Tensor,
+                       h_current: torch.Tensor,
+                       z_text: torch.Tensor = None,
+                       num_steps: int = None) -> torch.Tensor:
+        """Sample actions via ODE integration (only for flow-matching head).
+
+        For non-flow heads, this just calls predict_actions() (no ODE needed).
+
+        Args:
+            z_v_pooled_window: (B, K, pool_out_dim)
+            z_t_window:        (B, K, state_dim)
+            h_current:         (B, mamba_output_dim)
+            z_text:            (B, text_dim) or None
+            num_steps:         ODE integration steps (default: head's default)
+        Returns:
+            actions: (B, K, action_dim)
+        """
+        if isinstance(self.intention_head, FlowMatchingActionHead):
+            cond = self.intention_head(
+                z_v_pooled_window, z_t_window, h_current, z_text=z_text,
+            )
+            return self.intention_head.sample(cond, num_steps=num_steps)
+        else:
+            return self.intention_head(
+                z_v_pooled_window, z_t_window, h_current, z_text=z_text,
+            )
 
     # ----------------------------------------------------------------
     # Encoder freeze helpers

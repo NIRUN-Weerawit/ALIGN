@@ -226,10 +226,17 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]  # (B, mamba_output_dim) — latest
+            # predict_actions returns actions (direct regression) or cond (flow head)
             actions_pred = model.predict_actions(
                 out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
-            )  # (B, K, 6)
-            loss = F.mse_loss(actions_pred, target)
+            )  # (B, K, 6) or (B, K, cond_dim)
+            # Loss depends on head type
+            if args.head_type == "flow":
+                # Flow-matching: cond → velocity field loss
+                loss = model.intention_head.loss(target, actions_pred)
+            else:
+                # Direct regression: MSE on actions
+                loss = F.mse_loss(actions_pred, target)
 
         optimizer.zero_grad()
         loss.backward()
@@ -285,10 +292,21 @@ def validate(model, loader, device, args):
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]
-            actions_pred = model.predict_actions(
-                out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
-            )
-            loss = F.mse_loss(actions_pred, target)
+            if args.head_type == "flow":
+                # For flow head, sample actions via ODE integration
+                actions_pred = model.sample_actions(
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                )
+                # For loss reporting, also compute the flow-matching loss
+                cond = model.intention_head(
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                )
+                loss = model.intention_head.loss(target, cond)
+            else:
+                actions_pred = model.predict_actions(
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                )
+                loss = F.mse_loss(actions_pred, target)
 
         # Per-dim error accumulation (across batch and time)
         diff = (actions_pred - target).detach().float().cpu().numpy()
@@ -353,9 +371,9 @@ def parse_args():
     # NOTE: --action-dim hardcoded to 6 (OSC pose deltas).
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
-    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid"],
+    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "flow"],
                         default="mamba",
-                        help="Which head architecture: transformer, mamba, or hybrid")
+                        help="Which head architecture: transformer, mamba, hybrid, or flow")
     parser.add_argument("--use-history", action="store_true", default=True,
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
