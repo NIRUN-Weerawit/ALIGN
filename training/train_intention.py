@@ -385,6 +385,15 @@ def main():
     n_total = sum(p.numel() for p in model.parameters())
     print(f"  Trainable params:   {n_trainable:,}")
     print(f"  Total model params: {n_total:,}")
+    # Update wandb config with model-derived info
+    if wandb_trainer.enabled:
+        wandb_trainer.run.config.update({
+            "num_cameras": num_cameras,
+            "n_params": n_total,
+            "n_trainable_params": n_trainable,
+        })
+        # Watch gradients (for monitoring)
+        wandb_trainer.watch(model, log="gradients", log_freq=200, log_graph=False)
     if model.intention_encoder is not None:
         print("  Vision + state encoders frozen; training IntentionEncoder + Head")
     else:

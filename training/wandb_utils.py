@@ -89,6 +89,21 @@ class WandBTrainer:
             except Exception:
                 pass  # silently ignore if connection drops mid-training
 
+    def watch(self, model, log="gradients", log_freq=100, log_graph=False):
+        """Watch a model's gradients/parameters.
+
+        Args:
+            model: torch.nn.Module to watch
+            log: "gradients", "parameters", "all", or None
+            log_freq: how often to log (in batches)
+            log_graph: whether to log the computation graph
+        """
+        if self._enabled and self._run is not None:
+            try:
+                self._run.watch(model, log=log, log_freq=log_freq, log_graph=log_graph)
+            except Exception as e:
+                print(f"[W&B] watch failed: {e}", file=sys.stderr)
+
     def save(self, path: str):
         if self._enabled and self._run is not None:
             try:
