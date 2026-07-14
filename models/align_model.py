@@ -28,6 +28,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 
+# Disable cuDNN — needed when DINOv2 (with torch.no_grad) and Mamba's CUDA
+# kernel interact badly. Without this, you get CUDNN_STATUS_NOT_INITIALIZED
+# on the first conv2d or scaled_dot_product_attention. The slowdown is ~10-20%
+# on modern GPUs but ensures stable training.
+torch.backends.cudnn.enabled = False
+
 
 # ================================================================
 # Cross-Camera Transformer (Phase 3)
