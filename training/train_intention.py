@@ -177,6 +177,8 @@ def build_model(args, num_cameras, device):
         head_nhead=args.head_nhead,
         head_num_layers=args.head_num_layers,
         head_dim_ff=args.head_dim_ff,
+        use_text=args.use_text,
+        text_dim=args.text_dim,
     )
     model = model.to(device)
     return model
@@ -206,13 +208,26 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
         target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
 
+        # Optional text encoding (only if --use-text was set)
+        z_text = None
+        if args.use_text:
+            # Build text list: use --task-text for all items, or pull from batch if present
+            B = frames.shape[0]
+            if "texts" in batch and batch["texts"]:
+                texts = batch["texts"]
+            elif args.task_text:
+                texts = [args.task_text] * B
+            else:
+                texts = ["default task"] * B
+            z_text = model.text_encoder(texts)  # (B, text_dim)
+
         # Forward (BF16 always on for speed; disabled automatically on CPU)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]  # (B, mamba_output_dim) — latest
             actions_pred = model.predict_actions(
-                out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
             )  # (B, K, 6)
             loss = F.mse_loss(actions_pred, target)
 
@@ -254,12 +269,24 @@ def validate(model, loader, device, args):
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)
         target = torch.from_numpy(batch["actions_window"]).float().to(device)
 
+        # Optional text encoding (only if --use-text was set)
+        z_text = None
+        if args.use_text:
+            B = frames.shape[0]
+            if "texts" in batch and batch["texts"]:
+                texts = batch["texts"]
+            elif args.task_text:
+                texts = [args.task_text] * B
+            else:
+                texts = ["default task"] * B
+            z_text = model.text_encoder(texts)
+
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]
             actions_pred = model.predict_actions(
-                out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
             )
             loss = F.mse_loss(actions_pred, target)
 
@@ -333,6 +360,13 @@ def parse_args():
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
                         help="Disable Mamba history component.")
+    # Text modality (optional)
+    parser.add_argument("--use-text", action="store_true", default=False,
+                        help="Enable text encoder + text-conditioned head.")
+    parser.add_argument("--text-dim", type=int, default=256,
+                        help="Text encoder output dim (default 256).")
+    parser.add_argument("--task-text", type=str, default=None,
+                        help="Task description for text conditioning (default: auto from dataset).")
     # IntentionTransformerHead params
     parser.add_argument("--head-d-model", type=int, default=384)
     parser.add_argument("--head-nhead", type=int, default=4)
@@ -435,8 +469,14 @@ def main():
             p.requires_grad = True
     for p in model.intention_head.parameters():
         p.requires_grad = True
+    # If text encoder exists, train the projection (frozen CLIP under it)
+    if model.text_encoder is not None:
+        for p in model.text_encoder.projection.parameters():
+            p.requires_grad = True
+        print("  Text encoder: CLIP frozen, projection trainable")
     # State encoder and vision projection are trainable by default (no action needed)
-    print("  Trainable: vision projection + state encoder + intention encoder + head")
+    print("  Trainable: vision projection + state encoder + intention encoder + head"
+          + (" + text projection" if model.text_encoder is not None else ""))
     # Collect trainable params
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)

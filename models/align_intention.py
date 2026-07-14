@@ -61,6 +61,8 @@ class ALIGNIntentionModel(nn.Module):
         head_nhead:       head attention heads (default 4, only for transformer)
         head_num_layers:  head transformer layers (default 2, only for transformer)
         head_dim_ff:      head FFN dim (default 1024, only for transformer)
+        use_text:         enable text encoder + text-conditioned head (default False)
+        text_dim:         text encoder output dim (default 256)
     """
     def __init__(
         self,
@@ -79,6 +81,8 @@ class ALIGNIntentionModel(nn.Module):
         head_nhead: int = 4,
         head_num_layers: int = 2,
         head_dim_ff: int = 1024,
+        use_text: bool = False,
+        text_dim: int = 256,
     ):
         super().__init__()
         self.vision_dim = vision_dim
@@ -88,6 +92,8 @@ class ALIGNIntentionModel(nn.Module):
         self.chunk_size = chunk_size
         self.num_cameras = num_cameras
         self.use_patch_tokens = use_patch_tokens
+        self.use_text = use_text
+        self.text_dim = text_dim
         # Pool output dim: num_cameras * vision_dim (per-camera pools concatenated)
         self.pool_out_dim = num_cameras * vision_dim
 
@@ -129,6 +135,7 @@ class ALIGNIntentionModel(nn.Module):
                 pool_out_dim=self.pool_out_dim,
                 state_dim=state_dim,
                 mamba_output_dim=mamba_output_dim,
+                text_dim=text_dim if use_text else 0,
                 action_dim=action_dim,
                 chunk_size=chunk_size,
                 vision_dim=vision_dim,  # for backwards compat
@@ -142,6 +149,7 @@ class ALIGNIntentionModel(nn.Module):
                 pool_out_dim=self.pool_out_dim,
                 state_dim=state_dim,
                 mamba_output_dim=mamba_output_dim,
+                text_dim=text_dim if use_text else 0,
                 action_dim=action_dim,
                 chunk_size=chunk_size,
                 mamba_d_state=mamba_d_state,
@@ -154,6 +162,7 @@ class ALIGNIntentionModel(nn.Module):
                 pool_out_dim=self.pool_out_dim,
                 state_dim=state_dim,
                 mamba_output_dim=mamba_output_dim,
+                text_dim=text_dim if use_text else 0,
                 action_dim=action_dim,
                 chunk_size=chunk_size,
                 mamba_d_state=mamba_d_state,
@@ -162,6 +171,13 @@ class ALIGNIntentionModel(nn.Module):
             )
         else:
             raise ValueError(f"Unknown head_type: {head_type}")
+
+        # Text encoder (optional — only built if use_text=True)
+        if use_text:
+            from models.align_model import TextEncoder
+            self.text_encoder = TextEncoder(embed_dim=text_dim)
+        else:
+            self.text_encoder = None
 
         # Trainable prefixes (for freezing encoders)
         self._trainable_prefixes = {
@@ -298,17 +314,21 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     def predict_actions(self, z_v_pooled_window: torch.Tensor,
                         z_t_window: torch.Tensor,
-                        h_current: torch.Tensor) -> torch.Tensor:
+                        h_current: torch.Tensor,
+                        z_text: torch.Tensor = None) -> torch.Tensor:
         """Predict K future actions from K past states + 1 h.
 
         Args:
             z_v_pooled_window: (B, K, pool_out_dim)
             z_t_window:        (B, K, state_dim)
             h_current:         (B, mamba_output_dim)
+            z_text:            (B, text_dim) — task text embedding (or None)
         Returns:
             actions: (B, K, action_dim)
         """
-        return self.intention_head(z_v_pooled_window, z_t_window, h_current)
+        return self.intention_head(
+            z_v_pooled_window, z_t_window, h_current, z_text=z_text,
+        )
 
     # ----------------------------------------------------------------
     # Encoder freeze helpers
