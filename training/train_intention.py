@@ -286,6 +286,13 @@ def validate(model, loader, device, args):
     per_dim_squared = None  # will be sized to target.shape[-1]
     per_dim_abs = None
     n_samples = 0
+    # Track whether the model is genuinely predicting gripper or just
+    # getting it from the target via padding. This is critical for
+    # interpreting the grip_mse / grip_acc metrics.
+    padded_gripper_batches = 0     # batches where gripper was padded
+    genuine_gripper_batches = 0   # batches where model predicted gripper
+    grip_correct_total = 0.0      # # of correct gripper open/close
+    grip_total_total = 0          # # of gripper predictions
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False)
     for batch in pbar:
         frames = torch.from_numpy(batch["frames_window"]).to(device)
@@ -337,6 +344,8 @@ def validate(model, loader, device, args):
             actions_pred_for_metric = np.concatenate(
                 [actions_pred.detach().float().cpu().numpy(), pad], axis=-1,
             )
+            # Mark this batch as using padded gripper (grip_mse is uninformative)
+            padded_gripper_batches += 1
         else:
             actions_pred_for_metric = actions_pred.detach().float().cpu().numpy()
         target_np = target.detach().float().cpu().numpy()
@@ -348,6 +357,21 @@ def validate(model, loader, device, args):
         per_dim_squared += (diff ** 2).sum(axis=(0, 1))  # (D,)
         per_dim_abs += np.abs(diff).sum(axis=(0, 1))      # (D,)
         n_samples += B * T
+
+        # Gripper accuracy (only meaningful if model output has >=7 dims
+        # AND the model is actually predicting gripper, not just padded).
+        # We track this only when the model's gripper prediction is genuine.
+        if actions_pred.shape[-1] >= 7 and target.shape[-1] >= 7:
+            genuine_gripper_batches += 1
+            grip_pred = actions_pred[..., 6]  # model's gripper prediction
+            grip_target = target[..., 6]
+            # Convert continuous values to binary open/close
+            grip_pred_binary = (grip_pred > 0).float()
+            grip_target_binary = (grip_target > 0).float()
+            grip_correct = (grip_pred_binary == grip_target_binary).float().sum().item()
+            grip_total = B * T
+            grip_correct_total += grip_correct
+            grip_total_total += grip_total
 
         losses.append(loss.item())
         actions_pred_list.append(actions_pred.detach().abs().mean().item())
@@ -369,6 +393,13 @@ def validate(model, loader, device, args):
         grip_mse = float(per_dim_mse[6]) if D >= 7 else 0.0
         pos_mae = float((per_dim_mae[0] + per_dim_mae[1] + per_dim_mae[2]) / 3) if D >= 3 else 0.0
         rot_mae = float((per_dim_mae[3] + per_dim_mae[4] + per_dim_mae[5]) / 3) if D >= 6 else 0.0
+        # Gripper accuracy (only meaningful if model genuinely predicts
+        # gripper, i.e. action_dim >= 7). If the model was padded, the
+        # accuracy is meaningless (would always be 100%).
+        if genuine_gripper_batches > 0 and grip_total_total > 0:
+            grip_acc = float(grip_correct_total / grip_total_total)
+        else:
+            grip_acc = 0.0
         per_dim_metrics = {
             "pos_mse": pos_mse,
             "rot_mse": rot_mse,
@@ -382,7 +413,10 @@ def validate(model, loader, device, args):
             "rx_mse": float(per_dim_mse[3]) if D >= 4 else 0.0,
             "ry_mse": float(per_dim_mse[4]) if D >= 5 else 0.0,
             "rz_mse": float(per_dim_mse[5]) if D >= 6 else 0.0,
-            "grip_acc": 0.0,  # filled in below if applicable
+            "grip_acc": grip_acc,
+            # Diagnostics to disambiguate padded vs genuine
+            "gripper_padded_batches": padded_gripper_batches,
+            "gripper_genuine_batches": genuine_gripper_batches,
         }
 
     return avg_loss, avg_action, per_dim_metrics
@@ -633,6 +667,15 @@ def main():
               f"pos_mse={val_per_dim.get('pos_mse', 0):.4f} "
               f"rot_mse={val_per_dim.get('rot_mse', 0):.4f}  "
               f"({elapsed:.0f}s)")
+        # Show gripper diagnostic if model is genuinely predicting gripper
+        genuine = val_per_dim.get('gripper_genuine_batches', 0)
+        padded = val_per_dim.get('gripper_padded_batches', 0)
+        grip_acc = val_per_dim.get('grip_acc', 0)
+        if genuine > 0:
+            print(f"           gripper: genuine prediction, acc={grip_acc:.3f} "
+                  f"({genuine} genuine batches)")
+        elif padded > 0:
+            print(f"           gripper: PAD-PADDED (model output dim < 7)")
 
         # Build log dict
         log_dict = {
