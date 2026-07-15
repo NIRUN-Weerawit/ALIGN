@@ -529,6 +529,20 @@ def main():
             "n_params": n_total,
             "n_trainable_params": n_trainable,
         })
+        # Explicitly log v3 architecture dimensions (in case args rename)
+        wandb_trainer.run.config.update({
+            "v3/vision_dim": args.vision_dim,
+            "v3/state_dim": args.state_dim,
+            "v3/mamba_output_dim": args.mamba_output_dim,
+            "v3/mamba_d_state": args.mamba_d_state,
+            "v3/mamba_d_conv": args.mamba_d_conv,
+            "v3/mamba_expand": args.mamba_expand,
+            "v3/action_dim": args.action_dim,
+            "v3/use_patch_tokens": args.use_patch_tokens,
+            "v3/use_history": args.use_history,
+            "v3/use_text": args.use_text,
+            "v3/text_dim": args.text_dim,
+        })
         # Watch gradients (for monitoring)
         wandb_trainer.watch(model, log="gradients", log_freq=200, log_graph=False)
     if model.intention_encoder is not None:
