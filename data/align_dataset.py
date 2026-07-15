@@ -845,14 +845,14 @@ def head_collate(batch: list, chunk_size: int = 5,
             "frames": (B, H, W, 3) uint8,
             "noisy_pose": (B, 6) float32 - corrupted pose (for alpha target),
             "clean_pose": (B, 6) float32 - ground truth pose (for alpha target),
-            "current_action": (B, 6) float32 - the human's delta-pose command at
+            "current_action": (B, 7) float32 - the human's delta-pose command at
                               this timestep (input to Assistant head). Sourced
                               from the dataset's `actions` field.
-            "trajectory": (B, K, 6) float32 - past window of clean poses,
-            "trajectory_future": (B, K, 6) float32 - NEXT K poses after the
+            "trajectory": (B, K, 7) float32 - past window of clean poses,
+            "trajectory_future": (B, K, 7) float32 - NEXT K poses after the
                               current timestep (targets for future prediction).
             "alpha_need": (B,) float32 - kinematic error part of alpha_target,
-            "delta_target":(B, chunk_size, 6) float32,
+            "delta_target":(B, chunk_size, 7) float32,
             "texts": list of strings,
         }
     """

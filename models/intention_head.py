@@ -34,7 +34,7 @@ class IntentionTransformerHead(nn.Module):
         state_dim:        robot state dim (e.g., 256)
         mamba_output_dim: mamba hidden state dim (e.g., 512). Set to 0 to disable.
         text_dim:         text encoder dim (e.g., 256). Set to 0 to disable.
-        action_dim:       action output dim (e.g., 6)
+        action_dim:       action output dim (e.g., 7)
         chunk_size:       K — number of past steps / future actions
         d_model:          internal transformer dim
         nhead:            attention heads
