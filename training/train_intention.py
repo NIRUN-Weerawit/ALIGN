@@ -147,31 +147,33 @@ def build_loaders(train_ds, val_ds, args):
 # ================================================================
 
 # ================================================================
-# V3 defaults (hardcoded)
+# V3 defaults — these are now CLI-configurable.
+# Kept here only as documentation of the default values.
+# The training script reads them from `args` (see argparse below).
 # ================================================================
-VISION_DIM = 256
-STATE_DIM = 256
-MAMBA_OUTPUT_DIM = 512
-MAMBA_D_STATE = 16
-MAMBA_D_CONV = 4
-MAMBA_EXPAND = 2
-ACTION_DIM = 6
-USE_PATCH_TOKENS = True
+# VISION_DIM = 256          (--vision-dim)
+# STATE_DIM = 256           (--state-dim)
+# MAMBA_OUTPUT_DIM = 512    (--mamba-output-dim)
+# MAMBA_D_STATE = 16        (--mamba-d-state)
+# MAMBA_D_CONV = 4          (--mamba-d-conv)
+# MAMBA_EXPAND = 2          (--mamba-expand)
+# ACTION_DIM = 6            (--action-dim)
+# USE_PATCH_TOKENS = True   (--no-patch-tokens to disable)
 
 
 def build_model(args, num_cameras, device):
-    """Build ALIGNIntentionModel with v3 hardcoded dimensions."""
+    """Build ALIGNIntentionModel. All dimensions come from `args`."""
     model = ALIGNIntentionModel(
-        vision_dim=VISION_DIM,
-        state_dim=STATE_DIM,
-        mamba_output_dim=MAMBA_OUTPUT_DIM if args.use_history else 0,
-        action_dim=ACTION_DIM,
+        vision_dim=args.vision_dim,
+        state_dim=args.state_dim,
+        mamba_output_dim=args.mamba_output_dim if args.use_history else 0,
+        action_dim=args.action_dim,
         chunk_size=args.chunk_size,
         num_cameras=num_cameras,
-        use_patch_tokens=USE_PATCH_TOKENS,
-        mamba_d_state=MAMBA_D_STATE,
-        mamba_d_conv=MAMBA_D_CONV,
-        mamba_expand=MAMBA_EXPAND,
+        use_patch_tokens=args.use_patch_tokens,
+        mamba_d_state=args.mamba_d_state,
+        mamba_d_conv=args.mamba_d_conv,
+        mamba_expand=args.mamba_expand,
         head_type=args.head_type,
         head_d_model=args.head_d_model,
         head_nhead=args.head_nhead,
@@ -378,6 +380,25 @@ def parse_args():
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
                         help="Disable Mamba history component.")
+    # V3 architecture dimensions (configurable, no longer hardcoded)
+    parser.add_argument("--vision-dim", type=int, default=256,
+                        help="Per-patch vision dim after projection (default 256).")
+    parser.add_argument("--state-dim", type=int, default=256,
+                        help="Robot state encoder output dim (default 256).")
+    parser.add_argument("--mamba-output-dim", type=int, default=512,
+                        help="Mamba output dim (history state h). Default 512.")
+    parser.add_argument("--mamba-d-state", type=int, default=16,
+                        help="Mamba inner state dim (default 16).")
+    parser.add_argument("--mamba-d-conv", type=int, default=4,
+                        help="Mamba conv kernel size (default 4).")
+    parser.add_argument("--mamba-expand", type=int, default=2,
+                        help="Mamba block expansion factor (default 2).")
+    parser.add_argument("--action-dim", type=int, default=6,
+                        help="Action output dim (default 6 for OSC).")
+    parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
+                        action="store_false", default=True,
+                        help="Use CLS token instead of patch tokens from DINOv2.")
+    parser.set_defaults(use_patch_tokens=True)
     # Text modality (optional)
     parser.add_argument("--use-text", action="store_true", default=True,
                         help="Enable text encoder + text-conditioned head.")

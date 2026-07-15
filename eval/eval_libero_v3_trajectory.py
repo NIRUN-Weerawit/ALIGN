@@ -787,7 +787,7 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Blend factor: action = (1-alpha) * a_human + alpha * a_model. "
                              "Default 1.0 (use model only).")
-    parser.add_argument("--action-scale", type=float, default=None,
+    parser.add_argument("--action-scale", type=float, default=1.0,
                         help="Scale factor applied to model actions before applying to sim. "
                              "Useful if model outputs are too small/large. "
                              "Example: 10.0 multiplies model action by 10. "
