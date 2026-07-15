@@ -915,13 +915,13 @@ def head_collate(batch: list, chunk_size: int = 5,
 
         # --- Current action (the human's command at this timestep) ---
         if item_actions is not None and t < len(item_actions):
-            current_action = item_actions[t, :6].astype(np.float32)
+            current_action = item_actions[t, :7].astype(np.float32)
         elif t > 0:
             # Fallback: derive action from pose difference if dataset
             # has no actions field
-            current_action = (poses_clean[t, :6] - poses_clean[t - 1, :6]).astype(np.float32)
+            current_action = (poses_clean[t, :7] - poses_clean[t - 1, :7]).astype(np.float32)
         else:
-            current_action = np.zeros(6, dtype=np.float32)
+            current_action = np.zeros(7, dtype=np.float32)
 
         # --- Compute "Need" (Kinematic Error / D_MAX) ---
         pos_error = np.linalg.norm(current_clean_pose[:3] - noisy_pose[:3])
@@ -1011,13 +1011,13 @@ def head_collate(batch: list, chunk_size: int = 5,
         actions_window = []
         for k_t in range(win_start, win_end):
             if item_actions is not None and k_t < len(item_actions):
-                actions_window.append(item_actions[k_t, :6].astype(np.float32))
+                actions_window.append(item_actions[k_t, :7].astype(np.float32))
             elif k_t > 0:
                 actions_window.append(
-                    (poses_clean[k_t, :6] - poses_clean[k_t - 1, :6]).astype(np.float32)
+                    (poses_clean[k_t, :7] - poses_clean[k_t - 1, :7]).astype(np.float32)
                 )
             else:
-                actions_window.append(np.zeros(6, dtype=np.float32))
+                actions_window.append(np.zeros(7, dtype=np.float32))
         if len(actions_window) < window_size:
             pad_count = window_size - len(actions_window)
             actions_window = [actions_window[0]] * pad_count + actions_window
