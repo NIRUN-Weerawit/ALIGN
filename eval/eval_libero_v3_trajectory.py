@@ -454,6 +454,7 @@ def run_replay_in_sim(
         frame = get_sim_frame(env, key=use_camera, render_size=render_size,
                                 flip_vertical=flip_vertical,
                                 flip_horizontal=flip_horizontal)
+        
         if frame is not None and frame.size > 0:
             frames.append(frame.copy())
         sim_eef = get_sim_eef_pose(obs)
@@ -494,11 +495,13 @@ def run_model_in_sim(
     chunk_size: int = 5,
     max_steps: int = 200,
     alpha: float = 1.0,
+    action_scale: float = 1.0,
     z_text: Optional[torch.Tensor] = None,
     render_size: int = 256,
     use_camera: str = "agentview_image",
     flip_vertical: bool = True,
     flip_horizontal: bool = False,
+    debug: bool = False,
 ) -> Dict:
     """Run v3 model in MuJoCo sim. Record frames.
 
@@ -524,17 +527,17 @@ def run_model_in_sim(
     if actions.shape[1] < 7:
         pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
         actions = np.concatenate([actions, pad], axis=1)
-
     obs = env.reset()
     frames = []
     sim_positions = []
     errors = []
     stored_actions = []
+    init_frames = []
 
     # State buffer (K-window)
     pose_buffer = []
-    frame_buffer = []
-
+    frame_buffers = []
+    
     def _normalize_frame(f):
         """Make sure frame is (H, W, 3) uint8."""
         if f is None:
@@ -546,23 +549,31 @@ def run_model_in_sim(
     # Get initial sim state to populate buffer
     init_eef = get_sim_eef_pose(obs)
     init_state = np.concatenate([init_eef, [0.0]]).astype(np.float32)  # (7,)
-    init_frame = _normalize_frame(get_sim_frame(env, key=use_camera,
-                                                  render_size=render_size,
-                                                  flip_vertical=flip_vertical,
-                                                  flip_horizontal=flip_horizontal))
-
-    # Pad initial buffers
-    for _ in range(chunk_size):
-        pose_buffer.append(init_state.copy())
-        if init_frame is not None:
-            frame_buffer.append(init_frame.copy())
-
-    for step in range(min(len(actions), max_steps)):
-        # 1. Render current sim frame BEFORE step
-        sim_frame = _normalize_frame(get_sim_frame(env, key=use_camera,
+    for camera_view in use_camera:
+        init_frame = _normalize_frame(get_sim_frame(env, key=camera_view,
                                                     render_size=render_size,
                                                     flip_vertical=flip_vertical,
                                                     flip_horizontal=flip_horizontal))
+        init_frames.append(init_frame.copy())
+        
+    # Pad initial buffers
+    for k in range(chunk_size):
+        pose_buffer.append(init_state.copy())
+        frame_buffers.append([])
+        for cam_id,frame in enumerate(init_frames):
+            frame_buffers[k].append([])
+            if frame is not None:
+                frame_buffers[k][cam_id].append(frame.copy()) 
+    
+    for step in range(min(len(actions), max_steps)):
+        # 1. Render current sim frame BEFORE step\
+        for cam_id, camera_view in enumerate(use_camera):
+            sim_frame = _normalize_frame(get_sim_frame(env, key=camera_view,
+                                                        render_size=render_size,
+                                                        flip_vertical=flip_vertical,
+                                                        flip_horizontal=flip_horizontal))
+            if len(frame_buffers) > chunk_size:
+                frame_buffers.pop(0)
         if sim_frame is not None:
             frames.append(sim_frame.copy())
         sim_eef = get_sim_eef_pose(obs)
@@ -571,19 +582,14 @@ def run_model_in_sim(
         # Update buffers
         sim_state = np.concatenate([sim_eef, [0.0]]).astype(np.float32)
         pose_buffer.append(sim_state)
-        if sim_frame is not None:
-            frame_buffer.append(sim_frame)
         if len(pose_buffer) > chunk_size:
             pose_buffer.pop(0)
-        if len(frame_buffer) > chunk_size:
-            frame_buffer.pop(0)
-
         # 2. Build K-window tensors
         win_states = np.stack(pose_buffer, axis=0).astype(np.float32)  # (K, 7)
-        win_frames = np.stack(frame_buffer, axis=0)  # (K, H, W, 3) uint8
-        f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)
+        win_frames = np.stack(frame_buffers, axis=0).squeeze(2)  # (K, V, H, W, 3) uint8
+        f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device) # (1, K, V, H, W, 3) uint8
         s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
-
+        # print(f"shape of f_t: {f_t.shape}, shape of s_t: {s_t.shape}")
         # 3. Run v3 model
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
@@ -604,12 +610,17 @@ def run_model_in_sim(
         a_model = a_model_full[0, 0, :].float().cpu().numpy()  # (6,)
 
         # 4. Build the final action
+        # Apply action_scale to model output (useful if model output scale doesn't match sim)
+        a_model_scaled = a_model * action_scale
         base_action = actions[step].copy()  # (7,)
         final_action = (1.0 - alpha) * base_action.copy()
-        final_action[:6] = final_action[:6] + alpha * a_model
+        final_action[:6] = final_action[:6] + alpha * a_model_scaled
         if final_action.shape[0] >= 7:
-            final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
-        stored_actions.append(a_model.copy())
+            # final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
+            final_action[6] = -1.0
+        if debug:
+            print(f"Model action: {a_model}")
+        stored_actions.append(a_model_scaled.copy())
 
         # 5. Step sim
         obs, reward, done, info = env.step(final_action)
@@ -631,6 +642,12 @@ def run_model_in_sim(
         "errors": np.array(errors),
         "stored_actions": np.array(stored_actions) if stored_actions else np.zeros((0, 6)),
         "n_steps": len(frames),
+        "action_magnitude_model": float(np.mean(np.linalg.norm(
+            np.array(stored_actions), axis=1
+        ))) if stored_actions else 0.0,
+        "action_magnitude_dataset": float(np.mean(np.linalg.norm(
+            actions[:, :6], axis=1
+        ))),
     }
 
 
@@ -742,7 +759,7 @@ def main():
                         help="Path to intention_best.pt")
     parser.add_argument("--cameras", nargs="+", default=["wrist_image"],
                         help="Camera names (default: wrist_image).")
-    parser.add_argument("--n-episodes", type=int, default=5,
+    parser.add_argument("--n-episodes", type=int, default=1,
                         help="Number of episodes to evaluate.")
     parser.add_argument("--noise-std", type=float, default=0.05,
                         help="Gaussian noise std for noised actions.")
@@ -768,6 +785,13 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Blend factor: action = (1-alpha) * a_human + alpha * a_model. "
                              "Default 1.0 (use model only).")
+    parser.add_argument("--action-scale", type=float, default=None,
+                        help="Scale factor applied to model actions before applying to sim. "
+                             "Useful if model outputs are too small/large. "
+                             "Example: 10.0 multiplies model action by 10. "
+                             "Default: 1.0 (no scaling).")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print per-step model action values.")
     parser.add_argument("--libero-suite", default="libero_spatial",
                         choices=["libero_spatial", "libero_object",
                                  "libero_goal", "libero_10", "libero_90"],
@@ -808,6 +832,7 @@ def main():
     # Output directory for plots
     if args.out_dir is None:
         args.out_dir = str(Path(args.checkpoint).parent)
+        
         # Make sure it exists
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     else:
@@ -911,11 +936,13 @@ def main():
             chunk_size=chunk_size,
             max_steps=args.max_steps,
             alpha=args.alpha,
+            action_scale=args.action_scale if args.action_scale is not None else 1.0,
             z_text=z_text_eval,
             render_size=args.render_size,
-            use_camera="agentview_image",
+            use_camera=args.cameras,
             flip_vertical=flip_vertical,
             flip_horizontal=flip_horizontal,
+            debug=args.debug,
         )
         t_model = time.time() - t0
 
@@ -928,6 +955,16 @@ def main():
               f"EEF err: {eef_err_replay:.4f} m  ({t_replay:.1f}s)")
         print(f"    Model run:   {model_result['n_steps']:3d} steps  "
               f"EEF err: {eef_err_model:.4f} m  ({t_model:.1f}s)")
+        # Diagnostic: action magnitude comparison
+        mag_model = model_result.get("action_magnitude_model", 0.0)
+        mag_dataset = model_result.get("action_magnitude_dataset", 0.0)
+        if mag_dataset > 0:
+            scale_ratio = mag_model / mag_dataset
+            print(f"    Action magnitudes: model={mag_model:.4f}  "
+                  f"dataset={mag_dataset:.4f}  ratio={scale_ratio:.3f}")
+            if scale_ratio < 0.5:
+                print(f"    ⚠️  Model output is {scale_ratio:.1%} of dataset action scale")
+                print(f"      Try: --action-scale {1.0/max(scale_ratio, 0.01):.1f}")
 
         # ── Save video (3-panel side-by-side) ──
         if args.save_video:
@@ -936,8 +973,8 @@ def main():
                 dataset_frames = _extract_dataset_frames(
                     traj, max_steps=args.max_steps,
                     target_camera="image",  # agentview
-                    flip_vertical=flip_vertical,
-                    flip_horizontal=flip_horizontal,
+                    flip_vertical=False,
+                    flip_horizontal=False,
                 )
                 video_path = os.path.join(
                     args.out_dir, f"{ep_key}_{args.libero_suite}.mp4",
@@ -956,24 +993,38 @@ def main():
         # ── Save trajectory plot ──
         if args.plot and len(model_result["sim_positions"]) > 0:
             try:
-                fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
                 t_arr = np.arange(len(model_result["sim_positions"]))
-                for i, (ax, name) in enumerate(zip(axes, ["x", "y"])):
-                    ax.plot(t_arr, model_result["sim_positions"][:, i],
+                # fig, axes = plt.subplots(3, 1, figsize=(10, 6), sharex=True)
+                # for i, (ax, name) in enumerate(zip(axes, ["x", "y", "z"])):
+                #     ax.plot(t_arr, model_result["sim_positions"][:, i],
+                #             label="model_sim", color="C0")
+                #     if len(replay_result["sim_positions"]) == len(t_arr):
+                #         ax.plot(t_arr, replay_result["sim_positions"][:, i],
+                #                 label="replay_sim", color="C2", alpha=0.6)
+                #     if traj["poses"] is not None:
+                #         ax.plot(t_arr[:len(traj["poses"])],
+                #                 traj["poses"][:len(t_arr), i],
+                #                 label="expert (dataset)", color="C1", linestyle="--")
+                #     ax.set_ylabel(f"pos_{name}")
+                #     ax.legend()
+                # axes[0].set_title(
+                #     f"{ep_key} — {task_name} (alpha={args.alpha})"
+                # )
+                # axes[-1].set_xlabel("timestep")
+                
+                fig, axes = plt.subplots(6, 1, figsize=(10, 6), sharex=True)
+                for i, (ax, name) in enumerate(zip(axes, ["x", "y", "z", "ax", "ay", "az"])):
+                    ax.plot(t_arr, model_result["stored_actions"][:, i],
                             label="model_sim", color="C0")
-                    if len(replay_result["sim_positions"]) == len(t_arr):
-                        ax.plot(t_arr, replay_result["sim_positions"][:, i],
+                    if len(traj["actions"]) == len(t_arr):
+                        ax.plot(t_arr, traj["actions"][:, i],
                                 label="replay_sim", color="C2", alpha=0.6)
-                    if traj["poses"] is not None:
-                        ax.plot(t_arr[:len(traj["poses"])],
-                                traj["poses"][:len(t_arr), i],
-                                label="expert (dataset)", color="C1", linestyle="--")
-                    ax.set_ylabel(f"pos_{name}")
-                    ax.legend()
+                    ax.set_ylabel(f"action_{name}")
+                    ax.legend()  
                 axes[0].set_title(
                     f"{ep_key} — {task_name} (alpha={args.alpha})"
                 )
-                axes[-1].set_xlabel("timestep")
+                axes[-1].set_xlabel("timestep")      
                 fig.tight_layout()
                 plot_path = os.path.join(args.out_dir, f"{ep_key}_mujoco_traj.png")
                 fig.savefig(plot_path)
