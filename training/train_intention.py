@@ -208,7 +208,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         frames = torch.from_numpy(batch["frames_window"]).to(device)  # (B, K, H, W, 3) or (B, K, V, H, W, 3)
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
-        target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
+        target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 7)
 
         # Optional text encoding (only if --use-text was set)
         z_text = None
@@ -231,8 +231,9 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
             # predict_actions returns actions (direct regression) or cond (flow head)
             actions_pred = model.predict_actions(
                 out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
-            )  # (B, K, 6) or (B, K, cond_dim)
+            )  # (B, K, 7) or (B, K, cond_dim)
             # Loss depends on head type
+            print(f"size of target ={target.shape}, size of prediction = {actions_pred.shape}")
             if args.head_type == "flow":
                 # Flow-matching: cond → velocity field loss
                 loss = model.intention_head.loss(target, actions_pred)
