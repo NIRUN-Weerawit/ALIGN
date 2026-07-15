@@ -150,6 +150,17 @@ def load_intention_model(
             print(f"    Missing keys:   {len(missing)} (e.g. {missing[:3]})")
         if unexpected:
             print(f"    Unexpected keys: {len(unexpected)} (e.g. {unexpected[:3]})")
+        # Count actual param-level mismatch
+        n_missing_params = sum(
+            1 for k in missing
+            if "num_batches_tracked" not in k  # ignore batch norm stats
+        )
+        n_unexpected_params = len(unexpected)
+        if n_missing_params > 0 or n_unexpected_params > 0:
+            print(f"  ⚠️  Architecture mismatch detected!")
+            print(f"     {n_missing_params} missing + {n_unexpected_params} unexpected")
+            print(f"     The eval will run with random-init values for missing keys.")
+            print(f"     For reliable results, re-train with the current code.")
 
     model.eval()
     return model, cfg
