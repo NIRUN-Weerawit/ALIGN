@@ -758,7 +758,9 @@ def main():
     parser.add_argument("--checkpoint", required=True,
                         help="Path to intention_best.pt")
     parser.add_argument("--cameras", nargs="+", default=["wrist_image"],
-                        help="Camera names (default: wrist_image).")
+                        help="Camera names (default: wrist_image). "
+                             "MUST match the cameras used during training "
+                             "(e.g. 'image wrist_image' for 2-cam checkpoints).")
     parser.add_argument("--n-episodes", type=int, default=1,
                         help="Number of episodes to evaluate.")
     parser.add_argument("--noise-std", type=float, default=0.05,
@@ -819,6 +821,13 @@ def main():
     chunk_size = cfg["chunk_size"]
     print(f"  Chunk (K):   {chunk_size}")
     print(f"  Head:        {cfg.get('head_type', 'mamba')}")
+    # Verify camera count matches the model
+    model_cameras = cfg.get("num_cameras", 1)
+    args_cameras = len(args.cameras)
+    if model_cameras != args_cameras:
+        print(f"  ⚠️  Camera count mismatch!")
+        print(f"      Model expects {model_cameras} cameras, but you passed {args_cameras} ({args.cameras})")
+        print(f"      Use --cameras to match the training config.")
     if cfg.get("use_text", False):
         print(f"  Text:        enabled (dim={cfg.get('text_dim', 256)})")
 
