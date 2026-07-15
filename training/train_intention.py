@@ -379,7 +379,7 @@ def parse_args():
     parser.add_argument("--no-history", dest="use_history", action="store_false",
                         help="Disable Mamba history component.")
     # Text modality (optional)
-    parser.add_argument("--use-text", action="store_true", default=False,
+    parser.add_argument("--use-text", action="store_true", default=True,
                         help="Enable text encoder + text-conditioned head.")
     parser.add_argument("--text-dim", type=int, default=256,
                         help="Text encoder output dim (default 256).")
