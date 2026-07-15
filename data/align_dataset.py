@@ -300,13 +300,13 @@ class ALIGNDataset(Dataset):
             try:
                 raw = self._h5["actions"][start:start + count]
             except Exception:
-                return np.zeros((count, 6), dtype=np.float32)
+                return np.zeros((count, 7), dtype=np.float32)
             if len(raw) < count:
                 pad = np.zeros((count - len(raw), raw.shape[1]), dtype=raw.dtype)
                 raw = np.concatenate([raw, pad], axis=0)
         else:
             if not self._has_actions:
-                return np.zeros((count, 6), dtype=np.float32)
+                return np.zeros((count, 7), dtype=np.float32)
             offset = self._ep_pose_offsets[ep_idx]
             abs_start = offset + start
             try:
@@ -317,11 +317,11 @@ class ALIGNDataset(Dataset):
                 pad = np.zeros((count - len(raw), raw.shape[1]), dtype=raw.dtype)
                 raw = np.concatenate([raw, pad], axis=0)
 
-        # Ensure 6 dims: trim or pad as needed
-        if raw.shape[1] > 6:
-            raw = raw[:, :6]
-        elif raw.shape[1] < 6:
-            pad = np.zeros((raw.shape[0], 6 - raw.shape[1]), dtype=raw.dtype)
+        # Ensure 7 dims: trim or pad as needed
+        if raw.shape[1] > 7:
+            raw = raw[:, :7]
+        elif raw.shape[1] < 7:
+            pad = np.zeros((raw.shape[0], 7 - raw.shape[1]), dtype=raw.dtype)
             raw = np.concatenate([raw, pad], axis=1)
         return raw.astype(np.float32)
 
@@ -816,7 +816,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
 
 def head_collate(batch: list, chunk_size: int = 5,
                  vision_window_size: int = 5) -> dict:
-    """Collate batch for head training (Decision + Assistant).
+    """Collate batch for head training (Assistant).
 
     Samples one timestep per item, builds past/future trajectory windows,
     and returns both:
@@ -833,12 +833,6 @@ def head_collate(batch: list, chunk_size: int = 5,
             Defaults to chunk_size so the transformer sees K past + predicts
             K future. Set to 0 to disable the window (saves memory).
     Collate batch for head training with on-the-fly noise injection.
-
-    Returns sequential chunks for Decision (alpha = need * consistency) + Assistant supervision.
-
-    Note: The 'consistency' part (cosine similarity of embeddings) is calculated
-    during the forward pass in train_heads.py using frozen encoders. This collate
-    function provides the 'need' component via kinematic error from noisy poses.
 
     Returns:
         {

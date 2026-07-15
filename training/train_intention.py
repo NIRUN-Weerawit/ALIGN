@@ -233,7 +233,6 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
             )  # (B, K, 7) or (B, K, cond_dim)
             # Loss depends on head type
-            print(f"size of target ={target.shape}, size of prediction = {actions_pred.shape}")
             if args.head_type == "flow":
                 # Flow-matching: cond → velocity field loss
                 loss = model.intention_head.loss(target, actions_pred)
