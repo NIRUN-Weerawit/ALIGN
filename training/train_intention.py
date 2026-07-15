@@ -231,14 +231,28 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
             # predict_actions returns actions (direct regression) or cond (flow head)
             actions_pred = model.predict_actions(
                 out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
-            )  # (B, K, 7) or (B, K, cond_dim)
+            )  # (B, K, action_dim) — may be < target.shape[-1] if model
+                #   doesn't predict gripper
+
+            # Pad model output with target's gripper if needed.
+            # Model may output fewer dims (e.g. 6 for OSC deltas) than
+            # the dataset's action (7, including gripper). We pad with
+            # the target's gripper so the per-dim metrics are comparable.
+            if actions_pred.shape[-1] < target.shape[-1]:
+                pad = target[..., actions_pred.shape[-1]:]
+                actions_pred_for_loss = torch.cat([actions_pred, pad], dim=-1)
+            else:
+                actions_pred_for_loss = actions_pred
+
             # Loss depends on head type
             if args.head_type == "flow":
                 # Flow-matching: cond → velocity field loss
+                # Flow head uses cond, not actions, so we pass the
+                # un-padded actions_pred (which is cond for flow head)
                 loss = model.intention_head.loss(target, actions_pred)
             else:
-                # Direct regression: MSE on actions
-                loss = F.mse_loss(actions_pred, target)
+                # Direct regression: MSE on actions (use padded for fair comparison)
+                loss = F.mse_loss(actions_pred_for_loss, target)
 
         optimizer.zero_grad()
         loss.backward()
@@ -269,8 +283,8 @@ def validate(model, loader, device, args):
     """
     model.eval()
     losses, actions_pred_list = [], []
-    per_dim_squared = np.zeros(6, dtype=np.float64)
-    per_dim_abs = np.zeros(6, dtype=np.float64)
+    per_dim_squared = None  # will be sized to target.shape[-1]
+    per_dim_abs = None
     n_samples = 0
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False)
     for batch in pbar:
@@ -308,11 +322,29 @@ def validate(model, loader, device, args):
                 actions_pred = model.predict_actions(
                     out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
                 )
-                loss = F.mse_loss(actions_pred, target)
+                # Pad with target's gripper if needed
+                if actions_pred.shape[-1] < target.shape[-1]:
+                    pad = target[..., actions_pred.shape[-1]:]
+                    actions_pred_loss = torch.cat([actions_pred, pad], dim=-1)
+                else:
+                    actions_pred_loss = actions_pred
+                loss = F.mse_loss(actions_pred_loss, target)
 
         # Per-dim error accumulation (across batch and time)
-        diff = (actions_pred - target).detach().float().cpu().numpy()
+        # Pad model output with target's gripper if needed so shapes match
+        if actions_pred.shape[-1] < target.shape[-1]:
+            pad = target[..., actions_pred.shape[-1]:].detach().float().cpu().numpy()
+            actions_pred_for_metric = np.concatenate(
+                [actions_pred.detach().float().cpu().numpy(), pad], axis=-1,
+            )
+        else:
+            actions_pred_for_metric = actions_pred.detach().float().cpu().numpy()
+        target_np = target.detach().float().cpu().numpy()
+        diff = actions_pred_for_metric - target_np  # (B, T, D)
         B, T, D = diff.shape
+        if per_dim_squared is None:
+            per_dim_squared = np.zeros(D, dtype=np.float64)
+            per_dim_abs = np.zeros(D, dtype=np.float64)
         per_dim_squared += (diff ** 2).sum(axis=(0, 1))  # (D,)
         per_dim_abs += np.abs(diff).sum(axis=(0, 1))      # (D,)
         n_samples += B * T
@@ -324,25 +356,33 @@ def validate(model, loader, device, args):
     avg_loss = float(np.mean(losses)) if losses else float("inf")
     avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
 
-    # Per-dim metrics (only meaningful if action_dim=6)
+    # Per-dim metrics (assumes 7 dims: x, y, z, rx, ry, rz, gripper)
     per_dim_metrics = {}
-    if n_samples > 0:
+    if n_samples > 0 and per_dim_squared is not None:
         # Per-dim MSE and MAE
         per_dim_mse = per_dim_squared / n_samples
         per_dim_mae = per_dim_abs / n_samples
+        # Defensive: handle different action_dim values
+        D = len(per_dim_mse)
+        pos_mse = float((per_dim_mse[0] + per_dim_mse[1] + per_dim_mse[2]) / 3) if D >= 3 else 0.0
+        rot_mse = float((per_dim_mse[3] + per_dim_mse[4] + per_dim_mse[5]) / 3) if D >= 6 else 0.0
+        grip_mse = float(per_dim_mse[6]) if D >= 7 else 0.0
+        pos_mae = float((per_dim_mae[0] + per_dim_mae[1] + per_dim_mae[2]) / 3) if D >= 3 else 0.0
+        rot_mae = float((per_dim_mae[3] + per_dim_mae[4] + per_dim_mae[5]) / 3) if D >= 6 else 0.0
         per_dim_metrics = {
-            "pos_mse": float((per_dim_mse[0] + per_dim_mse[1] + per_dim_mse[2]) / 3),
-            "rot_mse": float((per_dim_mse[3] + per_dim_mse[4] + per_dim_mse[5]) / 3),
-            "grip_mse": float(per_dim_mse[5]) if len(per_dim_mse) > 5 else 0.0,
-            "pos_mae": float((per_dim_mae[0] + per_dim_mae[1] + per_dim_mae[2]) / 3),
-            "rot_mae": float((per_dim_mae[3] + per_dim_mae[4] + per_dim_mae[5]) / 3),
+            "pos_mse": pos_mse,
+            "rot_mse": rot_mse,
+            "grip_mse": grip_mse,
+            "pos_mae": pos_mae,
+            "rot_mae": rot_mae,
             # Per-axis (for fine-grained debugging)
-            "px_mse": float(per_dim_mse[0]),
-            "py_mse": float(per_dim_mse[1]),
-            "pz_mse": float(per_dim_mse[2]),
-            "rx_mse": float(per_dim_mse[3]),
-            "ry_mse": float(per_dim_mse[4]),
-            "rz_mse": float(per_dim_mse[5]),
+            "px_mse": float(per_dim_mse[0]) if D >= 1 else 0.0,
+            "py_mse": float(per_dim_mse[1]) if D >= 2 else 0.0,
+            "pz_mse": float(per_dim_mse[2]) if D >= 3 else 0.0,
+            "rx_mse": float(per_dim_mse[3]) if D >= 4 else 0.0,
+            "ry_mse": float(per_dim_mse[4]) if D >= 5 else 0.0,
+            "rz_mse": float(per_dim_mse[5]) if D >= 6 else 0.0,
+            "grip_acc": 0.0,  # filled in below if applicable
         }
 
     return avg_loss, avg_action, per_dim_metrics
