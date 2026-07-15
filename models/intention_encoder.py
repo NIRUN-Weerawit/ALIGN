@@ -79,13 +79,15 @@ class StateConditionedAttentionPool(nn.Module):
             (B, vision_dim) — pooled, state-conditioned visual summary
         """
         # z_t as query (1 token, projected to vision_dim)
-        q = self.state_proj(z_t).unsqueeze(1)  # (B, 1, vision_dim)
+        z_t_proj = self.state_proj(z_t)  # (B, vision_dim)
+        q = z_t_proj.unsqueeze(1)        # (B, 1, vision_dim)
         # z_v patches as keys and values
-        k = v = z_v_patches                       # (B, P, vision_dim)
+        k = v = z_v_patches              # (B, P, vision_dim)
         # Cross-attention
-        attn_out, _ = self.cross_attn(q, k, v)   # (B, 1, vision_dim)
-        # Residual + LayerNorm: preserve z_t info even if attention is weak
-        out = self.norm(attn_out.squeeze(1) + z_t)  # (B, vision_dim)
+        attn_out, _ = self.cross_attn(q, k, v)  # (B, 1, vision_dim)
+        # Residual + LayerNorm: use PROJECTED z_t so shapes match
+        # (vision_dim may differ from state_dim, e.g. vision=512, state=256)
+        out = self.norm(attn_out.squeeze(1) + z_t_proj)  # (B, vision_dim)
         return out
 
 
