@@ -407,10 +407,14 @@ def parse_args():
     parser.add_argument("--task-text", type=str, default=None,
                         help="Task description for text conditioning (default: auto from dataset).")
     # IntentionTransformerHead params
-    parser.add_argument("--head-d-model", type=int, default=384)
-    parser.add_argument("--head-nhead", type=int, default=4)
-    parser.add_argument("--head-num-layers", type=int, default=2)
-    parser.add_argument("--head-dim-ff", type=int, default=1024)
+    parser.add_argument("--head-d-model", type=int, default=384,
+                        help="IntentionTransformerHead model dimension (default: 384)")
+    parser.add_argument("--head-nhead", type=int, default=4,
+                        help="IntentionTransformerHead number of head (default: 4)")
+    parser.add_argument("--head-num-layers", type=int, default=2,
+                        help="IntentionTransformerHead number of layer (default: 2)")
+    parser.add_argument("--head-dim-ff", type=int, default=1024,
+                        help="IntentionTransformerHead fead-forward dimension (default: 1024)")
     # Training
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-name", default=None,
