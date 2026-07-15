@@ -178,62 +178,9 @@ def inject_action_noise(actions: np.ndarray, std: float = 0.05,
 # Sliding-window prediction
 # ================================================================
 
-def predict_trajectory(model: torch.nn.Module, frames: np.ndarray,
-                        states: np.ndarray, K: int, chunk_size: int,
-                        device: torch.device,
-                        z_text: Optional[torch.Tensor] = None) -> np.ndarray:
-    """Run the v3 model in sliding-window mode over a trajectory.
-
-    For each timestep t (where t >= K-1), take the K frames
-    [t-K+1, t] and K states, predict K future actions, and use
-    actions[0] as the next-step prediction.
-
-    Args:
-        frames: (N, V, H, W, 3) uint8
-        states: (N, 7) float32
-        K: chunk size (model's K)
-        chunk_size: same as K (passed through)
-        device: torch device
-        z_text: (B, text_dim) or None
-    Returns:
-        (N,) array of predictions (NaN for early steps where we don't
-        have enough history)
-    """
-    N = frames.shape[0]
-    predictions = np.full((N, 6), np.nan, dtype=np.float32)
-    model.eval()
-
-    for t in range(K - 1, N):
-        # Window of K past frames/states
-        win_frames = frames[t - K + 1: t + 1]  # (K, V, H, W, 3)
-        win_states = states[t - K + 1: t + 1]  # (K, 7)
-        # To tensor: (1, K, V, H, W, 3) and (1, K, 7)
-        f = torch.from_numpy(win_frames).unsqueeze(0).to(device)
-        s = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                     enabled=device.type == "cuda"):
-                with sdpa_kernel(backends=[SDPBackend.MATH]):
-                    out = model(f, s)
-                    h_current = out["h_seq"][:, -1]
-                    # Use sample_actions for flow head, predict_actions otherwise
-                    if model.head_type == "flow":
-                        actions_pred = model.sample_actions(
-                            out["z_v_pooled_seq"], out["z_t_seq"],
-                            h_current, z_text=z_text,
-                        )
-                    else:
-                        actions_pred = model.predict_actions(
-                            out["z_v_pooled_seq"], out["z_t_seq"],
-                            h_current, z_text=z_text,
-                        )
-        # Use the FIRST predicted action (k=0) as the next-step prediction
-        predictions[t] = actions_pred[0, 0, :].float().cpu().numpy()
-    return predictions
-
-
 # ================================================================
 # Metrics
+# ================================================================
 # ================================================================
 
 def compute_metrics(predicted: np.ndarray, expert: np.ndarray,
@@ -449,94 +396,168 @@ def _try_load_libero_task_list(suite_name: str) -> List[str]:
     return []
 
 
-def run_episode_in_sim(
+def run_replay_in_sim(
+    env,
+    expert_actions: np.ndarray,
+    expert_poses: Optional[np.ndarray] = None,
+    max_steps: int = 200,
+    render_size: int = 256,
+    use_camera: str = "agentview_image",
+) -> Dict:
+    """Replay dataset's expert actions in MuJoCo sim. Record frames.
+
+    This shows what the sim looks like if you apply the expert actions
+    from the dataset. The sim state is reset, then each step applies
+    the expert action (with gripper sign).
+
+    Returns:
+        dict with:
+          - frames: list of (H, W, 3) uint8 sim frames (agentview)
+          - sim_positions: (T, 6) array of EEF poses
+          - errors: (T,) EEF position error vs dataset expert (if poses given)
+          - n_steps: number of steps run
+    """
+    obs = env.reset()
+    frames = []
+    sim_positions = []
+    errors = []
+
+    # Pad expert_actions to (N, 7) if needed
+    n_actions = len(expert_actions)
+    actions = expert_actions[:max_steps].copy()
+    if actions.shape[1] < 7:
+        # Pad with zero gripper
+        pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
+        actions = np.concatenate([actions, pad], axis=1)
+
+    for step in range(min(len(actions), max_steps)):
+        # Get current frame BEFORE step
+        frame = get_sim_frame(env, key=use_camera, render_size=render_size)
+        if frame is not None and frame.size > 0:
+            frames.append(frame.copy())
+        sim_eef = get_sim_eef_pose(obs)
+        sim_positions.append(sim_eef)
+        # Step sim with expert action
+        action = actions[step].copy()
+        # Clamp gripper to {-1, +1}
+        if action.shape[0] >= 7:
+            action[6] = 1.0 if action[6] <= 0.5 else -1.0
+        obs, reward, done, info = env.step(action)
+        # Get sim_eef AFTER step
+        sim_eef_after = get_sim_eef_pose(obs)
+        sim_positions[-1] = sim_eef_after
+        # Compute EEF error vs expert (if poses available)
+        if expert_poses is not None and step < len(expert_poses):
+            expert_eef = expert_poses[step]
+            err = float(np.linalg.norm(sim_eef_after[:3] - expert_eef[:3]))
+            errors.append(err)
+        else:
+            errors.append(0.0)
+        if done:
+            break
+
+    return {
+        "frames": frames,
+        "sim_positions": np.array(sim_positions),
+        "errors": np.array(errors),
+        "n_steps": len(frames),
+    }
+
+
+def run_model_in_sim(
     env,
     model: torch.nn.Module,
     device: torch.device,
     expert_actions: np.ndarray,
-    expert_poses: np.ndarray,
-    task_description: str,
-    z_text: Optional[torch.Tensor],
-    noise_std: float = 0.05,
+    expert_poses: Optional[np.ndarray] = None,
     chunk_size: int = 5,
     max_steps: int = 200,
     alpha: float = 1.0,
+    z_text: Optional[torch.Tensor] = None,
     render_size: int = 256,
     use_camera: str = "agentview_image",
 ) -> Dict:
-    """Run one episode in MuJoCo with the v3 model.
+    """Run v3 model in MuJoCo sim. Record frames.
 
-    Pipeline (alpha fixed to `alpha`, default 1.0):
-      1. Reset sim
-      2. At each step:
-         a. Render current sim frame
-         b. Build K-window of past (frames, states) from sim
-         c. Run v3 model → predict K future actions (a_model)
-         d. Apply: action = (1 - alpha) * a_human + alpha * a_model
-         e. Step sim
-      3. Track EEF position error vs expert
+    At each step:
+      1. Render sim frame
+      2. Build K-window of past (frames, states) from sim
+      3. Run v3 model -> a_model
+      4. Apply: action = (1-alpha) * a_human + alpha * a_model
+      5. Step sim
+      6. Compute EEF position error vs dataset expert (if poses given)
 
     Returns:
-        dict with metrics: sim_positions, errors, etc.
+        dict with:
+          - frames: list of (H, W, 3) uint8 sim frames
+          - sim_positions: (T, 6) array of EEF poses
+          - errors: (T,) EEF position error vs dataset expert (if poses given)
+          - stored_actions: (T, 6) array of model predictions
+          - n_steps: number of steps run
     """
-    n_expert = min(len(expert_actions), max_steps, len(expert_poses))
+    # Pad expert_actions to (N, 7) for the "noised human" baseline (alpha-blend)
+    n_actions = len(expert_actions)
+    actions = expert_actions[:max_steps].copy()
+    if actions.shape[1] < 7:
+        pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
+        actions = np.concatenate([actions, pad], axis=1)
 
-    # Inject noise into expert actions (the "noisy human")
-    rng = np.random.default_rng(42)
-    if noise_std > 0:
-        noisy_actions = inject_action_noise(
-            expert_actions[:n_expert], std=noise_std, rng=rng,
-        )
-    else:
-        noisy_actions = expert_actions[:n_expert].copy()
-
-    # State buffer (K-window of past states for the v3 model)
-    pose_buffer = []  # list of (7,) states [pos(3), euler(3), gripper(1)]
-    frame_buffer = []  # list of (H, W, 3) frames
-
-    # Tracking
-    sim_positions = []  # list of (6,) sim EEF poses
-    errors_with_align = []  # EEF error vs expert at each step
-    stored_actions = []  # model predictions (a_model)
-    alpha_vals = []  # alpha used at each step
-
-    # Initialize
     obs = env.reset()
-    step = 0
-    done = False
+    frames = []
+    sim_positions = []
+    errors = []
+    stored_actions = []
 
-    # Pad the buffer for the first K-1 steps with the initial state
-    init_pose = get_sim_eef_pose(obs)
-    init_state = np.concatenate([init_pose, [0.0]])  # (7,) — gripper=0
-    init_frame = get_sim_frame(env, key=use_camera, render_size=render_size)
+    # State buffer (K-window)
+    pose_buffer = []
+    frame_buffer = []
 
-    while not done and step < n_expert:
-        # Update buffers with current sim state
-        sim_pose = get_sim_eef_pose(obs)
-        sim_state = np.concatenate([sim_pose, [0.0]]).astype(np.float32)  # (7,)
-        sim_frame = get_sim_frame(env, key=use_camera, render_size=render_size)
+    def _normalize_frame(f):
+        """Make sure frame is (H, W, 3) uint8."""
+        if f is None:
+            return None
+        if f.ndim == 4:
+            f = f[0]
+        return f.astype(np.uint8)
 
+    # Get initial sim state to populate buffer
+    init_eef = get_sim_eef_pose(obs)
+    init_state = np.concatenate([init_eef, [0.0]]).astype(np.float32)  # (7,)
+    init_frame = _normalize_frame(get_sim_frame(env, key=use_camera,
+                                                  render_size=render_size))
+
+    # Pad initial buffers
+    for _ in range(chunk_size):
+        pose_buffer.append(init_state.copy())
+        if init_frame is not None:
+            frame_buffer.append(init_frame.copy())
+
+    for step in range(min(len(actions), max_steps)):
+        # 1. Render current sim frame BEFORE step
+        sim_frame = _normalize_frame(get_sim_frame(env, key=use_camera,
+                                                    render_size=render_size))
+        if sim_frame is not None:
+            frames.append(sim_frame.copy())
+        sim_eef = get_sim_eef_pose(obs)
+        sim_positions.append(sim_eef)
+
+        # Update buffers
+        sim_state = np.concatenate([sim_eef, [0.0]]).astype(np.float32)
         pose_buffer.append(sim_state)
-        frame_buffer.append(sim_frame)
+        if sim_frame is not None:
+            frame_buffer.append(sim_frame)
         if len(pose_buffer) > chunk_size:
             pose_buffer.pop(0)
         if len(frame_buffer) > chunk_size:
             frame_buffer.pop(0)
-        # Pad if not enough history
-        while len(pose_buffer) < chunk_size:
-            pose_buffer.insert(0, sim_state.copy())
-        while len(frame_buffer) < chunk_size:
-            frame_buffer.insert(0, sim_frame.copy())
 
-        # Stack to (K, 7) and (K, H, W, 3)
+        # 2. Build K-window tensors
         win_states = np.stack(pose_buffer, axis=0).astype(np.float32)  # (K, 7)
         win_frames = np.stack(frame_buffer, axis=0)  # (K, H, W, 3) uint8
-
-        # To torch: (1, K, 7) and (1, K, H, W, 3)
         f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)
         s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
 
-        # Run v3 model
+        # 3. Run v3 model
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                      enabled=device.type == "cuda"):
@@ -553,45 +574,114 @@ def run_episode_in_sim(
                             out["z_v_pooled_seq"], out["z_t_seq"],
                             h_current, z_text=z_text,
                         )
-        # a_model_full: (1, K, 6) — take the first step's prediction
         a_model = a_model_full[0, 0, :].float().cpu().numpy()  # (6,)
 
-        # Build the final action
-        # Base action: noised human action (with gripper)
-        base_action = noisy_actions[step].copy()  # (7,)
-        # Apply alpha: action = (1 - alpha) * a_human + alpha * a_model
-        # a_human has 7 dims (pose deltas + gripper); a_model has 6 dims
+        # 4. Build the final action
+        base_action = actions[step].copy()  # (7,)
         final_action = (1.0 - alpha) * base_action.copy()
-        final_action[:6] = final_action[:6] + alpha * a_model  # 7-dim
-        # Keep gripper sign: clamp to {-1, +1}
-        if final_action[6] <= 0.5:
-            final_action[6] = 1.0
-        else:
-            final_action[6] = -1.0
-
-        # Track
+        final_action[:6] = final_action[:6] + alpha * a_model
+        if final_action.shape[0] >= 7:
+            final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
         stored_actions.append(a_model.copy())
-        alpha_vals.append(alpha)
 
-        # Step sim
+        # 5. Step sim
         obs, reward, done, info = env.step(final_action)
-        sim_eef = get_sim_eef_pose(obs)
-        sim_positions.append(sim_eef)
-        step += 1
-
-        # Compute EEF error vs expert
-        if step <= len(expert_poses):
-            expert_eef = expert_poses[step - 1]  # (6,) at this step
-            err = float(np.linalg.norm(sim_eef[:3] - expert_eef[:3]))
-            errors_with_align.append(err)
+        sim_eef_after = get_sim_eef_pose(obs)
+        sim_positions[-1] = sim_eef_after
+        # 6. Compute EEF error vs dataset expert
+        if expert_poses is not None and step < len(expert_poses):
+            expert_eef = expert_poses[step]
+            err = float(np.linalg.norm(sim_eef_after[:3] - expert_eef[:3]))
+            errors.append(err)
+        else:
+            errors.append(0.0)
+        if done:
+            break
 
     return {
-        "sim_positions": np.array(sim_positions) if sim_positions else np.zeros((0, 6)),
-        "errors_with_align": np.array(errors_with_align),
+        "frames": frames,
+        "sim_positions": np.array(sim_positions),
+        "errors": np.array(errors),
         "stored_actions": np.array(stored_actions) if stored_actions else np.zeros((0, 6)),
-        "alpha_vals": np.array(alpha_vals),
-        "n_steps": step,
+        "n_steps": len(frames),
     }
+
+
+def _extract_dataset_frames(
+    traj: Dict, max_steps: int = 200,
+    target_camera: str = "image",
+) -> List[np.ndarray]:
+    """Extract dataset frames for the given camera (default: agentview).
+
+    Returns a list of (H, W, 3) uint8 frames, up to max_steps.
+    """
+    frames_all = traj.get("frames")
+    if frames_all is None:
+        return []
+    # traj["frames"] is (N, V, H, W, 3) or (N, H, W, 3)
+    if frames_all.ndim == 5:
+        # (N, V, H, W, 3) — find target camera
+        cameras = traj.get("cam_name")
+        if isinstance(cameras, list) and target_camera in cameras:
+            cam_idx = cameras.index(target_camera)
+        else:
+            # Try to find by name in cam_name
+            cam_name = traj.get("cam_name", "wrist_image")
+            if isinstance(cam_name, list) and target_camera in cam_name:
+                cam_idx = cam_name.index(target_camera)
+            else:
+                cam_idx = 0  # default to first view
+        frames = frames_all[:, cam_idx]  # (N, H, W, 3)
+    else:
+        frames = frames_all  # (N, H, W, 3)
+    return [frames[i].astype(np.uint8) for i in range(min(len(frames), max_steps))]
+
+
+def save_video_3panel(
+    dataset_frames: List[np.ndarray],
+    replay_frames: List[np.ndarray],
+    model_frames: List[np.ndarray],
+    out_path: str,
+    fps: int = 20,
+) -> None:
+    """Save a 3-panel MP4 video: [dataset agentview, replay sim, model sim].
+
+    All three lists are stacked horizontally. If lengths differ, the
+    shortest is used (with looping for the dataset).
+    """
+    try:
+        import imageio
+    except ImportError:
+        print(f"    ⚠️  imageio not installed; cannot save video")
+        return
+
+    n = min(len(dataset_frames), len(replay_frames), len(model_frames))
+    if n == 0:
+        return
+
+    writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=8)
+    for i in range(n):
+        # Resize all to same H, W
+        d = dataset_frames[i]
+        r = replay_frames[i]
+        m = model_frames[i]
+        # Resize if needed
+        target_h, target_w = min(d.shape[0], r.shape[0], m.shape[0]), \
+                              min(d.shape[1], r.shape[1], m.shape[1])
+        # Ensure all are 3-channel
+        if d.ndim == 2:
+            d = np.stack([d] * 3, axis=-1)
+        if r.ndim == 2:
+            r = np.stack([r] * 3, axis=-1)
+        if m.ndim == 2:
+            m = np.stack([m] * 3, axis=-1)
+        # Crop to same size
+        d = d[:target_h, :target_w]
+        r = r[:target_h, :target_w]
+        m = m[:target_h, :target_w]
+        panel = np.concatenate([d, r, m], axis=1)  # horizontal stack
+        writer.append_data(panel)
+    writer.close()
 
 
 # ================================================================
@@ -623,8 +713,14 @@ def main():
                         help="Save trajectory plots (default: on).")
     parser.add_argument("--no-plot", dest="plot", action="store_false")
     # MuJoCo / LIBERO options
-    parser.add_argument("--use-mujoco", action="store_true", default=False,
-                        help="Run episodes in MuJoCo sim (requires libero + mujoco).")
+    parser.add_argument("--use-mujoco", action="store_true", default=True,
+                        help="Run episodes in MuJoCo sim (default on).")
+    parser.add_argument("--no-mujoco", dest="use_mujoco", action="store_false",
+                        help="Skip MuJoCo evaluation (offline only).")
+    parser.add_argument("--save-video", action="store_true", default=True,
+                        help="Save 3-panel side-by-side video (default on).")
+    parser.add_argument("--no-video", dest="save_video", action="store_false",
+                        help="Skip video saving.")
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Blend factor: action = (1-alpha) * a_human + alpha * a_model. "
                              "Default 1.0 (use model only).")
@@ -662,245 +758,220 @@ def main():
     # Output directory for plots
     if args.out_dir is None:
         args.out_dir = str(Path(args.checkpoint).parent)
-    print(f"  Output dir:  {args.out_dir}")
+        # Make sure it exists
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    else:
+        Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
-    # Run evaluation per episode
-    all_metrics = []
-    for ep_idx, ep_key in enumerate(episodes):
-        print(f"\n  Episode {ep_idx + 1}/{len(episodes)}: {ep_key}")
-        traj = load_trajectory(args.data, ep_key, args.cameras)
-        if traj is None:
-            print(f"    ⚠️  Skipping (could not load)")
-            continue
+    # Skip MuJoCo if --no-mujoco
+    if not args.use_mujoco:
+        print("  ⚠️  --no-mujoco passed; skipping MuJoCo sim eval.")
+        print("      (Offline-only eval was removed; this script is sim-focused.)")
+        return
 
-        frames = traj["frames"][:args.max_steps]
-        states = traj["states"][:args.max_steps]
-        expert = traj["actions"][:args.max_steps]
-        text = traj["text"]
-        print(f"    Frames:     {frames.shape}")
-        print(f"    States:     {states.shape}")
-        print(f"    Expert:     {expert.shape}")
-        print(f"    Text:       {text[:80] if text else '(none)'}")
-
-        # Inject noise
-        rng = np.random.default_rng(42)
-        noised = inject_action_noise(expert, std=args.noise_std, rng=rng)
-
-        # Encode text (if model has text encoder)
-        z_text = None
-        if getattr(model, "text_encoder", None) is not None:
-            task = args.task_text or text or "default task"
-            z_text = model.text_encoder([task] * 1)
-
-        # Run sliding-window prediction
-        t0 = time.time()
-        predicted = predict_trajectory(
-            model, frames, states, chunk_size, chunk_size, device, z_text=z_text,
-        )
-        elapsed = time.time() - t0
-        print(f"    Prediction: {predicted.shape} ({elapsed:.1f}s)")
-
-        # Compute metrics
-        metrics = compute_metrics(predicted, expert, noised)
-        metrics["episode"] = ep_key
-        metrics["text"] = text
-        metrics["n_total_steps"] = len(expert)
-        all_metrics.append(metrics)
-
-        print(f"    MSE (pred):  {metrics['overall_mse']:.5f}")
-        print(f"    MSE (noised): {metrics['noised_overall_mse']:.5f}")
-        print(f"    Error reduction: {metrics['error_reduction'] * 100:+.1f}%")
-        print(f"    Step-1 cos:  {metrics['step1_cos']:.4f}")
-        print(f"    Per-dim RMSE: {[f'{r:.4f}' for r in metrics['per_dim_rmse']]}")
-        if "gripper_acc" in metrics:
-            print(f"    Gripper acc:  pred={metrics['gripper_acc']:.3f}  "
-                  f"noised={metrics['noised_gripper_acc']:.3f}")
-
-        # Save plot
-        if args.plot:
-            plot_path = plot_trajectory(
-                ep_key, expert, noised, predicted, args.out_dir,
-            )
-            print(f"    Plot:       {plot_path}")
-
-    # ================================================================
-    # Optional: MuJoCo sim evaluation
-    # ================================================================
-    mujoco_results = []
-    if args.use_mujoco:
-        if not LIBERO_AVAILABLE:
-            print(f"\n  ⚠️  --use-mujoco requested but libero is not installed.")
-            print(f"      Run: pip install libero")
-        else:
-            print(f"\n{'='*68}")
-            print(f"=== MuJoCo Sim Evaluation (alpha={args.alpha}) ===")
-            print(f"{'='*68}")
-
-            # Try to load the LIBERO task list for this suite
-            task_list = _try_load_libero_task_list(args.libero_suite)
-            if not task_list:
-                print(f"  ⚠️  Could not load task list for suite '{args.libero_suite}'")
-                print(f"      Falling back to using trajectories from the HDF5")
-            else:
-                print(f"  Suite: {args.libero_suite} ({len(task_list)} tasks)")
-
-            for ep_idx, ep_key in enumerate(episodes):
-                traj = load_trajectory(args.data, ep_key, args.cameras)
-                if traj is None:
-                    continue
-                # Find a matching LIBERO task
-                task_name = traj.get("text", ep_key)
-                if task_list and task_name not in task_list:
-                    # Try to find a partial match
-                    best_match = None
-                    for t in task_list:
-                        if task_name.lower() in t.lower() or t.lower() in task_name.lower():
-                            best_match = t
-                            break
-                    if best_match:
-                        task_name = best_match
-                bddl_path = get_bddl_path(args.libero_suite, task_name)
-                if not os.path.exists(bddl_path):
-                    print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key}: BDDL not found: {bddl_path}")
-                    continue
-
-                print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key} → task='{task_name}'")
-                print(f"    BDDL: {bddl_path}")
-
-                try:
-                    if OffScreenRenderEnv is None:
-                        raise ImportError("OffScreenRenderEnv not available")
-                    env = OffScreenRenderEnv(
-                        bddl_file_name=bddl_path,
-                        use_camera_obs=True,
-                        camera_names=["agentview", "robot0_eye_in_hand"],
-                        camera_widths=args.render_size,
-                        camera_heights=args.render_size,
-                        reward_shaping=False,
-                        control_freq=20,
-                        initialization_noise=None,
-                    )
-                except Exception as e:
-                    print(f"    ⚠️  Failed to create env: {e}")
-                    continue
-
-                # Encode text (if model uses text)
-                z_text_eval = None
-                if getattr(model, "text_encoder", None) is not None:
-                    z_text_eval = model.text_encoder([task_name] * 1)
-
-                # Run the sim
-                t0 = time.time()
-                result = run_episode_in_sim(
-                    env=env,
-                    model=model,
-                    device=device,
-                    expert_actions=traj["actions"],
-                    expert_poses=traj["poses"] if traj["poses"] is not None else np.zeros((len(traj["actions"]), 6)),
-                    task_description=task_name,
-                    z_text=z_text_eval,
-                    noise_std=args.noise_std,
-                    chunk_size=chunk_size,
-                    max_steps=args.max_steps,
-                    alpha=args.alpha,
-                    render_size=args.render_size,
-                    use_camera="agentview_image",
-                )
-                elapsed = time.time() - t0
-
-                mean_err = float(np.mean(result["errors_with_align"])) if len(result["errors_with_align"]) > 0 else float("nan")
-                result["task_name"] = task_name
-                result["mean_error_with_align"] = mean_err
-                result["elapsed"] = elapsed
-                mujoco_results.append(result)
-
-                print(f"    Steps:        {result['n_steps']}")
-                print(f"    Mean EEF err: {mean_err:.4f} m ({elapsed:.1f}s)")
-
-                # Save plot
-                if args.plot and len(result["sim_positions"]) > 0:
-                    try:
-                        fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-                        t_arr = np.arange(len(result["sim_positions"]))
-                        for i, (ax, name) in enumerate(zip(axes, ["x", "y"])):
-                            ax.plot(t_arr, result["sim_positions"][:, i], label="sim", color="C0")
-                            if traj["poses"] is not None:
-                                ax.plot(t_arr[:len(traj["poses"])], traj["poses"][:len(t_arr), i],
-                                        label="expert", color="C1", linestyle="--")
-                            ax.set_ylabel(f"pos_{name}")
-                            ax.legend()
-                        axes[0].set_title(f"{ep_key} — {task_name} (alpha={args.alpha})")
-                        axes[-1].set_xlabel("timestep")
-                        fig.tight_layout()
-                        plot_path = os.path.join(args.out_dir, f"{ep_key}_mujoco_traj.png")
-                        fig.savefig(plot_path)
-                        plt.close(fig)
-                        print(f"    Plot: {plot_path}")
-                    except Exception as e:
-                        print(f"    ⚠️  Failed to save plot: {e}")
-
-                try:
-                    if env is not None and hasattr(env, "close"):
-                        env.close()
-                except Exception:
-                    pass
-
-            if mujoco_results:
-                mean_errs = [r["mean_error_with_align"] for r in mujoco_results
-                             if not np.isnan(r["mean_error_with_align"])]
-                if mean_errs:
-                    print(f"\n  MuJoCo aggregate (alpha={args.alpha}):")
-                    print(f"    Mean EEF err: {np.mean(mean_errs):.4f} m  (n={len(mean_errs)})")
-                    print(f"    Per-episode:")
-                    for r in mujoco_results:
-                        tn = r.get("task_name", "?")
-                        ep = r.get("n_steps", 0)
-                        err = r.get("mean_error_with_align", float("nan"))
-                        print(f"      {tn[:50]:<50}  err={err:.4f}  steps={ep}")
-
-    # Aggregate metrics
-    if not all_metrics:
-        print(f"\n  No episodes evaluated.")
+    if not LIBERO_AVAILABLE:
+        print(f"\n  ⚠️  libero is not installed. Run: pip install libero")
         return
 
     print(f"\n{'='*68}")
-    print(f"=== Aggregate over {len(all_metrics)} episodes ===")
+    print(f"=== MuJoCo Sim Evaluation (alpha={args.alpha}) ===")
     print(f"{'='*68}")
-    keys = ["overall_mse", "noised_overall_mse", "error_reduction", "step1_cos"]
-    for k in keys:
-        vals = [m[k] for m in all_metrics]
-        mean_val = np.mean(vals)
-        if "reduction" in k or "cos" in k:
-            print(f"  {k:25s}: {mean_val:+.4f}  (min={min(vals):+.4f}, max={max(vals):+.4f})")
-        else:
-            print(f"  {k:25s}: {mean_val:.5f}  (min={min(vals):.5f}, max={max(vals):.5f})")
 
-    # Per-dim aggregate
-    print(f"\n  Per-dim RMSE (averaged across episodes):")
-    dim_names = ["x", "y", "z", "roll", "pitch", "yaw"]
-    per_dim_avg = np.mean([m["per_dim_rmse"] for m in all_metrics], axis=0)
-    for i, d in enumerate(dim_names):
-        print(f"    {d:<6}: {per_dim_avg[i]:.5f}")
+    # Try to load the LIBERO task list for this suite
+    task_list = _try_load_libero_task_list(args.libero_suite)
+    if not task_list:
+        print(f"  ⚠️  Could not load task list for suite '{args.libero_suite}'")
+        print(f"      Falling back to using trajectories from the HDF5")
+    else:
+        print(f"  Suite: {args.libero_suite} ({len(task_list)} tasks)")
 
-    # Save JSON summary
-    summary = {
-        "checkpoint": args.checkpoint,
-        "data": args.data,
-        "noise_std": args.noise_std,
-        "n_episodes": len(all_metrics),
-        "episodes": all_metrics,
-        "aggregate": {
-            "overall_mse": float(np.mean([m["overall_mse"] for m in all_metrics])),
-            "noised_overall_mse": float(np.mean([m["noised_overall_mse"] for m in all_metrics])),
-            "error_reduction": float(np.mean([m["error_reduction"] for m in all_metrics])),
-            "step1_cos": float(np.mean([m["step1_cos"] for m in all_metrics])),
-            "per_dim_rmse": per_dim_avg.tolist(),
-        },
-    }
-    summary_path = Path(args.checkpoint).with_suffix(".traj_eval.json")
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"\n  Summary written to: {summary_path}")
+    mujoco_results = []
+    for ep_idx, ep_key in enumerate(episodes):
+        traj = load_trajectory(args.data, ep_key, args.cameras)
+        if traj is None:
+            continue
+        # Find a matching LIBERO task
+        task_name = traj.get("text", ep_key)
+        if task_list and task_name not in task_list:
+            best_match = None
+            for t in task_list:
+                if task_name.lower() in t.lower() or t.lower() in task_name.lower():
+                    best_match = t
+                    break
+            if best_match:
+                task_name = best_match
+        bddl_path = get_bddl_path(args.libero_suite, task_name)
+        if not os.path.exists(bddl_path):
+            print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key}: BDDL not found: {bddl_path}")
+            continue
+
+        print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key} → task='{task_name}'")
+        print(f"    BDDL: {bddl_path}")
+
+        # Encode text (if model uses text)
+        z_text_eval = None
+        if getattr(model, "text_encoder", None) is not None:
+            z_text_eval = model.text_encoder([task_name] * 1)
+
+        try:
+            if OffScreenRenderEnv is None:
+                raise ImportError("OffScreenRenderEnv not available")
+            env = OffScreenRenderEnv(
+                bddl_file_name=bddl_path,
+                use_camera_obs=True,
+                camera_names=["agentview", "robot0_eye_in_hand"],
+                camera_widths=args.render_size,
+                camera_heights=args.render_size,
+                reward_shaping=False,
+                control_freq=20,
+                initialization_noise=None,
+            )
+        except Exception as e:
+            print(f"    ⚠️  Failed to create env: {e}")
+            continue
+
+        # ── Run 1: Replay expert actions in sim ──
+        t0 = time.time()
+        replay_result = run_replay_in_sim(
+            env=env,
+            expert_actions=traj["actions"],
+            expert_poses=traj["poses"] if traj["poses"] is not None else None,
+            max_steps=args.max_steps,
+            render_size=args.render_size,
+            use_camera="agentview_image",
+        )
+        t_replay = time.time() - t0
+
+        # ── Run 2: Model rollout in sim ──
+        t0 = time.time()
+        model_result = run_model_in_sim(
+            env=env,
+            model=model,
+            device=device,
+            expert_actions=traj["actions"],
+            expert_poses=traj["poses"] if traj["poses"] is not None else None,
+            chunk_size=chunk_size,
+            max_steps=args.max_steps,
+            alpha=args.alpha,
+            z_text=z_text_eval,
+            render_size=args.render_size,
+            use_camera="agentview_image",
+        )
+        t_model = time.time() - t0
+
+        # ── Compute metrics ──
+        # EEF error for model rollout vs expert
+        eef_err_model = float(np.mean(model_result["errors"])) if len(model_result["errors"]) > 0 else float("nan")
+        eef_err_replay = float(np.mean(replay_result["errors"])) if len(replay_result["errors"]) > 0 else float("nan")
+
+        print(f"    Replay run:  {replay_result['n_steps']:3d} steps  "
+              f"EEF err: {eef_err_replay:.4f} m  ({t_replay:.1f}s)")
+        print(f"    Model run:   {model_result['n_steps']:3d} steps  "
+              f"EEF err: {eef_err_model:.4f} m  ({t_model:.1f}s)")
+
+        # ── Save video (3-panel side-by-side) ──
+        if args.save_video:
+            try:
+                # Get dataset frames (agentview camera, numpy uint8)
+                dataset_frames = _extract_dataset_frames(
+                    traj, max_steps=args.max_steps,
+                    target_camera="image",  # agentview
+                )
+                video_path = os.path.join(
+                    args.out_dir, f"{ep_key}_{args.libero_suite}.mp4",
+                )
+                save_video_3panel(
+                    dataset_frames=dataset_frames,
+                    replay_frames=replay_result["frames"],
+                    model_frames=model_result["frames"],
+                    out_path=video_path,
+                    fps=20,
+                )
+                print(f"    Video: {video_path}")
+            except Exception as e:
+                print(f"    ⚠️  Failed to save video: {e}")
+
+        # ── Save trajectory plot ──
+        if args.plot and len(model_result["sim_positions"]) > 0:
+            try:
+                fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+                t_arr = np.arange(len(model_result["sim_positions"]))
+                for i, (ax, name) in enumerate(zip(axes, ["x", "y"])):
+                    ax.plot(t_arr, model_result["sim_positions"][:, i],
+                            label="model_sim", color="C0")
+                    if len(replay_result["sim_positions"]) == len(t_arr):
+                        ax.plot(t_arr, replay_result["sim_positions"][:, i],
+                                label="replay_sim", color="C2", alpha=0.6)
+                    if traj["poses"] is not None:
+                        ax.plot(t_arr[:len(traj["poses"])],
+                                traj["poses"][:len(t_arr), i],
+                                label="expert (dataset)", color="C1", linestyle="--")
+                    ax.set_ylabel(f"pos_{name}")
+                    ax.legend()
+                axes[0].set_title(
+                    f"{ep_key} — {task_name} (alpha={args.alpha})"
+                )
+                axes[-1].set_xlabel("timestep")
+                fig.tight_layout()
+                plot_path = os.path.join(args.out_dir, f"{ep_key}_mujoco_traj.png")
+                fig.savefig(plot_path)
+                plt.close(fig)
+                print(f"    Plot: {plot_path}")
+            except Exception as e:
+                print(f"    ⚠️  Failed to save plot: {e}")
+
+        # Track aggregate
+        mujoco_results.append({
+            "episode": ep_key,
+            "task_name": task_name,
+            "n_steps": model_result["n_steps"],
+            "mean_error_replay": eef_err_replay,
+            "mean_error_model": eef_err_model,
+        })
+
+        try:
+            if env is not None and hasattr(env, "close"):
+                env.close()
+        except Exception:
+            pass
+
+    # ── Aggregate MuJoCo metrics ──
+    if mujoco_results:
+        replay_errs = [r["mean_error_replay"] for r in mujoco_results
+                        if not np.isnan(r["mean_error_replay"])]
+        model_errs = [r["mean_error_model"] for r in mujoco_results
+                       if not np.isnan(r["mean_error_model"])]
+        print(f"\n{'='*68}")
+        print(f"=== MuJoCo Aggregate (alpha={args.alpha}) ===")
+        print(f"{'='*68}")
+        if replay_errs:
+            print(f"  Replay EEF err:  {np.mean(replay_errs):.4f} m  (n={len(replay_errs)})")
+        if model_errs:
+            print(f"  Model  EEF err:  {np.mean(model_errs):.4f} m  (n={len(model_errs)})")
+        print(f"\n  Per-episode:")
+        for r in mujoco_results:
+            tn = r.get("task_name", "?")
+            print(f"    {tn[:50]:<50}  "
+                  f"replay={r['mean_error_replay']:.4f}  "
+                  f"model={r['mean_error_model']:.4f}  "
+                  f"steps={r['n_steps']}")
+
+        # Save JSON summary
+        summary = {
+            "checkpoint": args.checkpoint,
+            "data": args.data,
+            "alpha": args.alpha,
+            "n_episodes": len(mujoco_results),
+            "episodes": mujoco_results,
+            "aggregate": {
+                "mean_replay_err": float(np.mean(replay_errs)) if replay_errs else None,
+                "mean_model_err": float(np.mean(model_errs)) if model_errs else None,
+            },
+        }
+        summary_path = Path(args.checkpoint).with_suffix(".mujoco_eval.json")
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        print(f"\n  Summary written to: {summary_path}")
 
 
 if __name__ == "__main__":
