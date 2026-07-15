@@ -296,11 +296,21 @@ def quat_to_axisangle(quat: np.ndarray) -> np.ndarray:
 
 
 def get_sim_frame(env, key: str = "agentview_image",
-                  render_size: int = 256) -> np.ndarray:
+                  render_size: int = 256,
+                  flip_vertical: bool = True,
+                  flip_horizontal: bool = False) -> np.ndarray:
     """Render a single frame from the MuJoCo sim via observation dict.
 
     LIBERO with use_camera_obs=True puts frames in obs as
     obs["agentview_image"] and obs["robot0_eye_in_hand_image"].
+
+    Args:
+        env: LIBERO env
+        key: which camera key to use (image/agentview_image/wrist_image/...)
+        render_size: not used (kept for compat)
+        flip_vertical: if True, np.flipud() the frame (default True,
+            matches the old eval_libero_trajectory.py convention)
+        flip_horizontal: if True, np.fliplr() the frame (default False)
 
     Returns (H, W, 3) uint8.
     """
@@ -316,21 +326,28 @@ def get_sim_frame(env, key: str = "agentview_image",
     try:
         obs = env.env._get_observations() if hasattr(env, "env") else env._get_observations()
     except Exception:
-        return np.zeros((render_size, render_size, 3), dtype=np.uint8)
-    img = obs.get(sim_key)
-    if img is None:
-        # Fallback to any available camera
-        for k in ["agentview_image", "robot0_eye_in_hand_image"]:
-            img = obs.get(k)
-            if img is not None:
-                break
-    if img is None:
-        return np.zeros((render_size, render_size, 3), dtype=np.uint8)
-    if isinstance(img, torch.Tensor):
-        img = img.cpu().numpy()
-    if img.ndim == 4:
-        img = img[0]  # remove batch dim
-    return img.astype(np.uint8)
+        img = np.zeros((render_size, render_size, 3), dtype=np.uint8)
+    else:
+        img = obs.get(sim_key)
+        if img is None:
+            # Fallback to any available camera
+            for k in ["agentview_image", "robot0_eye_in_hand_image"]:
+                img = obs.get(k)
+                if img is not None:
+                    break
+        if img is None:
+            img = np.zeros((render_size, render_size, 3), dtype=np.uint8)
+        if isinstance(img, torch.Tensor):
+            img = img.cpu().numpy()
+        if img.ndim == 4:
+            img = img[0]  # remove batch dim
+        img = img.astype(np.uint8)
+    # Apply orientation flip (match old eval_libero_trajectory.py)
+    if flip_vertical:
+        img = np.flipud(img).copy()
+    if flip_horizontal:
+        img = np.fliplr(img).copy()
+    return img
 
 
 def get_sim_eef_pose(obs: dict) -> np.ndarray:
@@ -403,6 +420,8 @@ def run_replay_in_sim(
     max_steps: int = 200,
     render_size: int = 256,
     use_camera: str = "agentview_image",
+    flip_vertical: bool = True,
+    flip_horizontal: bool = False,
 ) -> Dict:
     """Replay dataset's expert actions in MuJoCo sim. Record frames.
 
@@ -432,7 +451,9 @@ def run_replay_in_sim(
 
     for step in range(min(len(actions), max_steps)):
         # Get current frame BEFORE step
-        frame = get_sim_frame(env, key=use_camera, render_size=render_size)
+        frame = get_sim_frame(env, key=use_camera, render_size=render_size,
+                                flip_vertical=flip_vertical,
+                                flip_horizontal=flip_horizontal)
         if frame is not None and frame.size > 0:
             frames.append(frame.copy())
         sim_eef = get_sim_eef_pose(obs)
@@ -476,6 +497,8 @@ def run_model_in_sim(
     z_text: Optional[torch.Tensor] = None,
     render_size: int = 256,
     use_camera: str = "agentview_image",
+    flip_vertical: bool = True,
+    flip_horizontal: bool = False,
 ) -> Dict:
     """Run v3 model in MuJoCo sim. Record frames.
 
@@ -524,7 +547,9 @@ def run_model_in_sim(
     init_eef = get_sim_eef_pose(obs)
     init_state = np.concatenate([init_eef, [0.0]]).astype(np.float32)  # (7,)
     init_frame = _normalize_frame(get_sim_frame(env, key=use_camera,
-                                                  render_size=render_size))
+                                                  render_size=render_size,
+                                                  flip_vertical=flip_vertical,
+                                                  flip_horizontal=flip_horizontal))
 
     # Pad initial buffers
     for _ in range(chunk_size):
@@ -535,7 +560,9 @@ def run_model_in_sim(
     for step in range(min(len(actions), max_steps)):
         # 1. Render current sim frame BEFORE step
         sim_frame = _normalize_frame(get_sim_frame(env, key=use_camera,
-                                                    render_size=render_size))
+                                                    render_size=render_size,
+                                                    flip_vertical=flip_vertical,
+                                                    flip_horizontal=flip_horizontal))
         if sim_frame is not None:
             frames.append(sim_frame.copy())
         sim_eef = get_sim_eef_pose(obs)
@@ -610,8 +637,17 @@ def run_model_in_sim(
 def _extract_dataset_frames(
     traj: Dict, max_steps: int = 200,
     target_camera: str = "image",
+    flip_vertical: bool = True,
+    flip_horizontal: bool = False,
 ) -> List[np.ndarray]:
     """Extract dataset frames for the given camera (default: agentview).
+
+    Args:
+        traj: trajectory dict with 'frames' key
+        max_steps: max number of frames to extract
+        target_camera: which camera to extract (default 'image' = agentview)
+        flip_vertical: if True, np.flipud() each frame (match sim convention)
+        flip_horizontal: if True, np.fliplr() each frame
 
     Returns a list of (H, W, 3) uint8 frames, up to max_steps.
     """
@@ -634,7 +670,15 @@ def _extract_dataset_frames(
         frames = frames_all[:, cam_idx]  # (N, H, W, 3)
     else:
         frames = frames_all  # (N, H, W, 3)
-    return [frames[i].astype(np.uint8) for i in range(min(len(frames), max_steps))]
+    out = []
+    for i in range(min(len(frames), max_steps)):
+        f = frames[i].astype(np.uint8)
+        if flip_vertical:
+            f = np.flipud(f).copy()
+        if flip_horizontal:
+            f = np.fliplr(f).copy()
+        out.append(f)
+    return out
 
 
 def save_video_3panel(
@@ -730,6 +774,12 @@ def main():
                         help="LIBERO benchmark suite.")
     parser.add_argument("--render-size", type=int, default=256,
                         help="Frame size for MuJoCo rendering.")
+    parser.add_argument("--no-flip-vertical", action="store_true",
+                        help="Skip vertical flip on sim and dataset frames "
+                             "(default: flip vertical like old eval).")
+    parser.add_argument("--no-flip-horizontal", action="store_true",
+                        help="Skip horizontal flip on sim and dataset frames "
+                             "(default: don't flip horizontal).")
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -785,6 +835,12 @@ def main():
     else:
         print(f"  Suite: {args.libero_suite} ({len(task_list)} tasks)")
 
+    # Compute flip flags (same convention as old eval_libero_trajectory.py)
+    flip_vertical = not args.no_flip_vertical
+    flip_horizontal = not args.no_flip_horizontal
+    print(f"  Flip vertical:   {flip_vertical}  (--no-flip-vertical to disable)")
+    print(f"  Flip horizontal: {flip_horizontal}  (--no-flip-horizontal to enable)")
+
     mujoco_results = []
     for ep_idx, ep_key in enumerate(episodes):
         traj = load_trajectory(args.data, ep_key, args.cameras)
@@ -839,6 +895,8 @@ def main():
             max_steps=args.max_steps,
             render_size=args.render_size,
             use_camera="agentview_image",
+            flip_vertical=flip_vertical,
+            flip_horizontal=flip_horizontal,
         )
         t_replay = time.time() - t0
 
@@ -856,6 +914,8 @@ def main():
             z_text=z_text_eval,
             render_size=args.render_size,
             use_camera="agentview_image",
+            flip_vertical=flip_vertical,
+            flip_horizontal=flip_horizontal,
         )
         t_model = time.time() - t0
 
@@ -876,6 +936,8 @@ def main():
                 dataset_frames = _extract_dataset_frames(
                     traj, max_steps=args.max_steps,
                     target_camera="image",  # agentview
+                    flip_vertical=flip_vertical,
+                    flip_horizontal=flip_horizontal,
                 )
                 video_path = os.path.join(
                     args.out_dir, f"{ep_key}_{args.libero_suite}.mp4",
