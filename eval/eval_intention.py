@@ -47,7 +47,7 @@ from data.align_dataset import ALIGNDataset, head_collate
 # ================================================================
 
 # Used when the checkpoint's `config` field is missing or incomplete.
-DEFAULT_CONFIG: Dict[str, int] = dict(
+DEFAULT_CONFIG: Dict[str, object] = dict(
     chunk_size=5,
     vision_dim=256,
     state_dim=256,
@@ -61,6 +61,9 @@ DEFAULT_CONFIG: Dict[str, int] = dict(
     head_dim_ff=1024,
     num_cameras=1,
     use_patch_tokens=True,
+    head_type="mamba",
+    use_text=False,
+    text_dim=256,
 )
 
 
@@ -108,6 +111,9 @@ def load_intention_model(
     print(f"  Chunk (K):  {cfg['chunk_size']}")
     print(f"  Cameras:    {cfg['num_cameras']}")
     print(f"  Mamba dim:  {cfg['mamba_output_dim']}")
+    print(f"  Head:       {cfg.get('head_type', 'mamba')}")
+    if cfg.get('use_text', False):
+        print(f"  Text:       enabled (dim={cfg.get('text_dim', 256)})")
 
     model = ALIGNIntentionModel(
         vision_dim=cfg["vision_dim"],
@@ -124,6 +130,9 @@ def load_intention_model(
         head_nhead=cfg["head_nhead"],
         head_num_layers=cfg["head_num_layers"],
         head_dim_ff=cfg["head_dim_ff"],
+        head_type=cfg.get("head_type", "mamba"),
+        use_text=cfg.get("use_text", False),
+        text_dim=cfg.get("text_dim", 256),
     ).to(device)
 
     # Load the state dict. We try a strict load first; if that fails
@@ -160,6 +169,7 @@ def evaluate(
     device_str: Optional[str] = None,
     override_chunk_size: Optional[int] = None,
     override_num_cameras: Optional[int] = None,
+    task_text: Optional[str] = None,
 ):
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"\n=== ALIGN Intention (Mamba) Evaluation ===")
@@ -227,13 +237,33 @@ def evaluate(
             # Always use 'actions_window' (target) for error computation
             target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
 
+            # Optional text encoding (only if model has text encoder)
+            z_text = None
+            if getattr(model, "text_encoder", None) is not None:
+                B_size = frames.shape[0]
+                if "texts" in batch and batch["texts"]:
+                    texts = batch["texts"]
+                elif task_text:
+                    texts = [task_text] * B_size
+                else:
+                    texts = ["default task"] * B_size
+                z_text = model.text_encoder(texts)
+
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
                 out = model(frames, state)
                 h_current = out["h_seq"][:, -1]
-                actions_pred = model.predict_actions(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
-                )  # (B, K, 6)
+                if model.head_type == "flow":
+                    # Flow head: use sample_actions (ODE integration)
+                    actions_pred = model.sample_actions(
+                        out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                    )
+                else:
+                    # Direct regression head
+                    actions_pred = model.predict_actions(
+                        out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                    )
+                # (B, K, 6)
 
             actions_pred_f = actions_pred.float()
             target_f = target.float()
@@ -383,6 +413,9 @@ def main():
                         help="Override chunk_size (default: read from ckpt).")
     parser.add_argument("--num-cameras", type=int, default=None,
                         help="Override num_cameras (default: read from ckpt).")
+    parser.add_argument("--task-text", type=str, default=None,
+                        help="Task text for text-conditioned models "
+                             "(default: 'default task' if model uses text).")
 
     args = parser.parse_args()
     summary = evaluate(
@@ -395,6 +428,7 @@ def main():
         device_str=args.device,
         override_chunk_size=args.chunk_size,
         override_num_cameras=args.num_cameras,
+        task_text=args.task_text,
     )
     # Optional: dump a JSON summary next to the checkpoint
     if summary is not None:
