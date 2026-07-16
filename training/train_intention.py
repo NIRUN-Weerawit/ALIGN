@@ -254,6 +254,15 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 # Direct regression: MSE on actions (use padded for fair comparison)
                 loss = F.mse_loss(actions_pred_for_loss, target)
 
+        if args.skip_nan and not torch.isfinite(loss):
+            # Skip NaN/Inf batch — common with high LR + Mamba + BF16
+            losses.append(loss.item())
+            actions_pred_list.append(0.0 if not torch.isfinite(actions_pred).all()
+                                      else actions_pred.detach().abs().mean().item())
+            pbar.set_postfix(mse=f"NAN", warn="skip")
+            optimizer.zero_grad()
+            continue
+
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -498,6 +507,11 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--skip-nan", dest="skip_nan", action="store_true",
+                        default=True,
+                        help="Skip batches with NaN/Inf loss (default on).")
+    parser.add_argument("--no-skip-nan", dest="skip_nan", action="store_false",
+                        help="Disable NaN skipping (will NaN out the run).")
     parser.add_argument("--num-workers", type=int, default=0)
     # NOTE: --loss-mode removed; always 'action' for v3.
     # NOTE: --bf16 / --no-bf16 removed; BF16 is always on for speed.
@@ -600,6 +614,14 @@ def main():
     n_total = sum(p.numel() for p in model.parameters())
     print(f"  Trainable params:   {n_trainable:,}")
     print(f"  Total model params: {n_total:,}")
+
+    # Warn if LR is high (common cause of NaN with Mamba + BF16)
+    if args.lr > 1e-3:
+        print(f"  ⚠️  WARNING: --lr {args.lr:.0e} is HIGH (default: 1e-4).")
+        print(f"     Mamba + BF16 can be unstable at this LR. If you see NaN,")
+        print(f"     lower --lr to 1e-4 (or 5e-4 for warmup).")
+    if args.skip_nan:
+        print(f"  NaN batches: SKIPPED (use --no-skip-nan to disable)")
     # Update wandb config with model-derived info
     if wandb_trainer.enabled:
         wandb_trainer.run.config.update({
