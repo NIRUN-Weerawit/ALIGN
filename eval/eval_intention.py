@@ -119,7 +119,7 @@ def load_intention_model(
         vision_dim=cfg["vision_dim"],
         state_dim=cfg["state_dim"],
         mamba_output_dim=cfg["mamba_output_dim"],
-        action_dim=6,
+        action_dim=cfg.get("action_dim", 6),
         chunk_size=cfg["chunk_size"],
         num_cameras=cfg["num_cameras"],
         use_patch_tokens=cfg["use_patch_tokens"],
