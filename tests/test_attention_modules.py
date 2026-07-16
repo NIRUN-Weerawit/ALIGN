@@ -78,11 +78,32 @@ def test_state_conditioned_pool(model, frames, states, device):
         z_v_patches_seq = torch.stack(z_v_patches_per_step, dim=1)
         # Encode states
         z_t_seq = model.state_encoder(s_t)  # (1, K, state_dim)
+
+        # Helper: split concatenated (V*P, vision_dim) → (B, V, P, vision_dim)
+        num_cams_cfg = (cfg or {}).get("num_cameras", 1) if False else 1  # not available
+        # We don't have cfg here; detect num_cams from the model
+        num_cams_cfg = intention_encoder.pool.num_cameras
+
+        def to_per_cam(z_v_t, B_inner):
+            # z_v_t: (B, P, vision_dim) or (B, V, P, vision_dim) or (B, V*P, vision_dim)
+            if z_v_t.ndim == 4:
+                return z_v_t  # already (B, V, P, vision_dim)
+            elif z_v_t.ndim == 3:
+                # Could be (B, P, vision_dim) (single cam) or (B, V*P, vision_dim) (multi)
+                P = z_v_t.shape[1]
+                if num_cams_cfg == 1:
+                    return z_v_t.unsqueeze(1)  # (B, 1, P, vision_dim)
+                else:
+                    # multi: split into V chunks
+                    P_per_cam = P // num_cams_cfg
+                    return z_v_t.reshape(B_inner, num_cams_cfg, P_per_cam, -1)
+            return z_v_t
+
         # 1. Original
         z_v_pooled_orig = []
         B, T = z_v_patches_seq.shape[:2]
         for t in range(T):
-            z_v_t = z_v_patches_seq[:, t]
+            z_v_t = to_per_cam(z_v_patches_seq[:, t], B)
             z_t_t = z_t_seq[:, t]
             pooled = intention_encoder.pool_patches(z_v_t, z_t_t)
             z_v_pooled_orig.append(pooled)
@@ -91,7 +112,7 @@ def test_state_conditioned_pool(model, frames, states, device):
         z_t_perturbed = z_t_seq + torch.randn_like(z_t_seq) * 0.5
         z_v_pooled_perturbed = []
         for t in range(T):
-            z_v_t = z_v_patches_seq[:, t]
+            z_v_t = to_per_cam(z_v_patches_seq[:, t], B)
             z_t_t = z_t_perturbed[:, t]
             pooled = intention_encoder.pool_patches(z_v_t, z_t_t)
             z_v_pooled_perturbed.append(pooled)
@@ -100,7 +121,7 @@ def test_state_conditioned_pool(model, frames, states, device):
         z_t_zero = torch.zeros_like(z_t_seq)
         z_v_pooled_zero = []
         for t in range(T):
-            z_v_t = z_v_patches_seq[:, t]
+            z_v_t = to_per_cam(z_v_patches_seq[:, t], B)
             z_t_t = z_t_zero[:, t]
             pooled = intention_encoder.pool_patches(z_v_t, z_t_t)
             z_v_pooled_zero.append(pooled)
@@ -149,6 +170,15 @@ def test_cross_camera_attention(model, frames, states, device):
             z_v_patches_per_step.append(z_v_t)
         z_v_patches_seq = torch.stack(z_v_patches_per_step, dim=1)
         z_t_seq = model.state_encoder(s_t)
+        # Reshape to per-camera format (B, K, V, P, vision_dim) for proper pooling
+        num_cams = intention_encoder.pool.num_cameras
+        # z_v_patches_seq: (1, K, V*P, vision_dim) for multi-cam
+        if num_cams > 1 and z_v_patches_seq.ndim == 4:
+            P_per_cam = z_v_patches_seq.shape[2] // num_cams
+            z_v_patches_seq = z_v_patches_seq.reshape(
+                z_v_patches_seq.shape[0], z_v_patches_seq.shape[1],
+                num_cams, P_per_cam, -1,
+            )
         B, T = z_v_patches_seq.shape[:2]
         # 1. Original (both cameras)
         z_v_pooled_orig = []
@@ -215,6 +245,14 @@ def test_z_t_recovery(model, frames, states, device):
             z_v_patches_per_step.append(z_v_t)
         z_v_patches_seq = torch.stack(z_v_patches_per_step, dim=1)
         z_t_seq = model.state_encoder(s_t)
+        # Reshape to per-camera format
+        num_cams = intention_encoder.pool.num_cameras
+        if num_cams > 1 and z_v_patches_seq.ndim == 4:
+            P_per_cam = z_v_patches_seq.shape[2] // num_cams
+            z_v_patches_seq = z_v_patches_seq.reshape(
+                z_v_patches_seq.shape[0], z_v_patches_seq.shape[1],
+                num_cams, P_per_cam, -1,
+            )
         B, T = z_v_patches_seq.shape[:2]
         z_v_pooled_list = []
         for t in range(T):
@@ -352,14 +390,51 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
             os.makedirs(out_dir, exist_ok=True)
-            # Get the original image (camera 0, view 1)
+            # Get per-camera attention weights (the user wants DIFFERENT
+            # heatmaps per camera, not the same heatmap duplicated)
+            saved_heatmaps_per_cam = []  # (label, [w_cam0, w_cam1, ...])
+            for label, z_t_test_for_viz in [
+                ("original", z_t_seq[0, 0]),
+                ("zero", torch.zeros_like(z_t_seq[0, 0])),
+                ("perturbed", z_t_seq[0, 0] + torch.randn_like(z_t_seq[0, 0]) * 0.3),
+            ]:
+                z_t_v = z_t_test_for_viz.detach()
+                z_t_proj_v = pool.state_proj(z_t_v.unsqueeze(0))  # (1, vision_dim)
+                q_v = z_t_proj_v.unsqueeze(1)  # (1, 1, vision_dim)
+                # Per-camera attention: run on each camera's patches separately
+                per_cam_weights = []
+                if z_v_seq.ndim == 2:
+                    # Concatenated: (V*P, vision_dim) — split per camera
+                    total = z_v_seq.shape[0]
+                    P_per_cam = total // num_cams
+                    for v_idx in range(num_cams):
+                        z_v_cam = z_v_seq[v_idx * P_per_cam : (v_idx + 1) * P_per_cam]
+                        k_v = v_v = z_v_cam.unsqueeze(0)
+                        with torch.no_grad():
+                            _, attn_w_v = pool.cross_attn(
+                                q_v, k_v, v_v, need_weights=True, average_attn_weights=False
+                            )
+                        w_v = attn_w_v[0, :, 0].mean(dim=0).cpu().numpy()  # (P,)
+                        per_cam_weights.append(w_v)
+                else:
+                    # Separate: (V, P, vision_dim)
+                    for v_idx in range(z_v_seq.shape[0]):
+                        z_v_cam = z_v_seq[v_idx]  # (P, vision_dim)
+                        k_v = v_v = z_v_cam.unsqueeze(0)
+                        with torch.no_grad():
+                            _, attn_w_v = pool.cross_attn(
+                                q_v, k_v, v_v, need_weights=True, average_attn_weights=False
+                            )
+                        w_v = attn_w_v[0, :, 0].mean(dim=0).cpu().numpy()  # (P,)
+                        per_cam_weights.append(w_v)
+                saved_heatmaps_per_cam.append((label, per_cam_weights))
+            # Save per-camera visualizations
             orig_frame = frames[0]
-            if orig_frame.ndim == 4:  # (V, H, W, 3)
-                # Use the first camera (typically wrist_image) for the overlay
-                # But also save the agentview (image) separately
+            if orig_frame.ndim == 4:  # (V, H, W, 3) multi-cam
                 for cam_idx, cam_name in enumerate(["cam0", "cam1"][:orig_frame.shape[0]]):
-                    img = orig_frame[cam_idx]  # (H, W, 3)
-                    self_attn_grid = saved_heatmaps[0][1]  # use original z_t attn
+                    # Use original z_t's attention for this camera
+                    img = orig_frame[cam_idx]
+                    self_attn_grid = saved_heatmaps_per_cam[0][1][cam_idx]
                     visualize_attention(
                         img=img,
                         attn_weights=self_attn_grid,
@@ -368,16 +443,52 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
                         ),
                         title=f"Attention ({cam_name}, z_t=original)",
                     )
-                # For 2-cam case, overlay both
-                if orig_frame.shape[0] == 2:
-                    side_by_side_attention(
-                        frames=orig_frame,
-                        attn_weights_list=[wh[1] for wh in saved_heatmaps],
-                        labels=[wh[0] for wh in saved_heatmaps],
-                        out_path=os.path.join(out_dir, "attention_comparison.png"),
+                # Side-by-side: rows = cameras, cols = z_t variants
+                if orig_frame.shape[0] >= 2:
+                    # Build a per-(cam, z_t) heatmap grid
+                    n_cams = orig_frame.shape[0]
+                    n_labels = len(saved_heatmaps_per_cam)
+                    fig, axes = plt.subplots(
+                        n_cams, n_labels,
+                        figsize=(4 * n_labels, 4 * n_cams),
                     )
+                    if n_cams == 1 and n_labels == 1:
+                        axes = np.array([[axes]])
+                    elif n_cams == 1:
+                        axes = axes.reshape(1, -1)
+                    elif n_labels == 1:
+                        axes = axes.reshape(-1, 1)
+                    for cam_idx in range(n_cams):
+                        img = orig_frame[cam_idx]
+                        for label_idx, (label, per_cam_w) in enumerate(saved_heatmaps_per_cam):
+                            ax = axes[cam_idx, label_idx]
+                            w = per_cam_w[cam_idx]
+                            P_here = len(w)
+                            grid_size = int(np.sqrt(P_here))
+                            if grid_size * grid_size != P_here:
+                                ax.text(0.5, 0.5, f"P={P_here} not square",
+                                        ha="center", va="center")
+                                ax.axis("off")
+                                continue
+                            attn_grid = w.reshape(grid_size, grid_size)
+                            attn_grid_norm = (attn_grid - attn_grid.min()) / (
+                                attn_grid.max() - attn_grid.min() + 1e-8
+                            )
+                            ax.imshow(img, alpha=0.6)
+                            ax.imshow(
+                                attn_grid_norm, cmap="hot", alpha=0.5,
+                                interpolation="bilinear",
+                                extent=(0, img.shape[1], img.shape[0], 0),
+                            )
+                            ax.set_title(f"cam {cam_idx}, z_t={label}")
+                            ax.axis("off")
+                    fig.suptitle("Per-camera state-conditioned attention: rows=cameras, cols=z_t")
+                    fig.tight_layout()
+                    out_path = os.path.join(out_dir, "attention_comparison.png")
+                    fig.savefig(out_path, dpi=80, bbox_inches="tight")
+                    plt.close(fig)
             else:  # (H, W, 3) single camera
-                self_attn_grid = saved_heatmaps[0][1]
+                self_attn_grid = saved_heatmaps_per_cam[0][1][0]
                 visualize_attention(
                     img=orig_frame,
                     attn_weights=self_attn_grid,

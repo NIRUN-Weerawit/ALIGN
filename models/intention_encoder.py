@@ -137,7 +137,9 @@ class PerCameraStateConditionedPool(nn.Module):
         # Apply per-camera pool
         outs = []
         for v in range(self.num_cameras):
-            z_v_v = z_v_patches_multi[:,:, v]  # (B, P, vision_dim)
+            # z_v_patches_multi: (B, V, P, vision_dim) — extract one camera
+            z_v_v = z_v_patches_multi[:, v]  # (B, P, vision_dim) — NOT z_v_patches_multi[:,:, v]
+            #                                     which would be (B, V, vision_dim) — wrong dim
             outs.append(self.pools[v](z_v_v, z_t))
         return torch.cat(outs, dim=-1)  # (B, V * vision_dim)
 
