@@ -207,6 +207,11 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     # Vision helpers
     # ----------------------------------------------------------------
+    def _V_from_input(self, frames: torch.Tensor) -> int:
+        """Get V (number of cameras) from the input frame tensor shape."""
+        # Input is (B, H, W, 3) (single) or (B, V, H, W, 3) (multi)
+        return frames.shape[1] if frames.ndim == 5 else 1
+
     def _vision_forward(self, frames: torch.Tensor) -> torch.Tensor:
         """Run vision encoder and return patch tokens (B, [V,] P, vision_dim).
 
@@ -251,16 +256,18 @@ class ALIGNIntentionModel(nn.Module):
         # Encode each frame
         z_v_patches_seq = []
         for t in range(T):
-            z_v_t = self._vision_forward(frames_seq[:, t])  # (B, [V,] P, vision_dim)
+            z_v_t = self._vision_forward(frames_seq[:, t])
+            # z_v_t is (B, V*P, vision_dim) for multi-cam, (B, P, vision_dim) for single-cam
+            # Reshape to (B, V, P, vision_dim) for proper per-camera handling
+            if z_v_t.ndim == 3:
+                B_t = z_v_t.shape[0]
+                total_patches = z_v_t.shape[1]
+                V_t = self._V_from_input(frames_seq[:, t])
+                P_t = total_patches // V_t
+                z_v_t = z_v_t.reshape(B_t, V_t, P_t, -1)
             z_v_patches_seq.append(z_v_t)
-        # Stack into (B, T, [V,] P, vision_dim)
-        if z_v_patches_seq[0].ndim == 4:
-            # Multi-cam: (B, V, P, vision_dim)
-            z_v_patches_seq = torch.stack(z_v_patches_seq, dim=1)  # (B, T, V, P, vision_dim)
-        else:
-            # Single-cam: (B, P, vision_dim)
-            z_v_patches_seq = torch.stack(z_v_patches_seq, dim=1)  # (B, T, P, vision_dim)
-            z_v_patches_seq = z_v_patches_seq.unsqueeze(2)         # (B, T, 1, P, vision_dim)
+        # Stack into (B, T, V, P, vision_dim)
+        z_v_patches_seq = torch.stack(z_v_patches_seq, dim=1)
 
         # Encode states (batched)
         z_t_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
