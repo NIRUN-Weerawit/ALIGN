@@ -17,6 +17,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Optional, List, Dict
 
 import h5py
 import numpy as np
@@ -263,10 +264,20 @@ def test_z_t_recovery(model, frames, states, device):
         print("  ✗ z_t info is NOT preserved (probe can't beat mean)")
 
 
-def test_attention_patterns(model, frames, states, device):
+def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] = None,
+                             out_dir: Optional[str] = None):
     """Visualize attention weights from the state-conditioned pool.
 
     Shows which patches the model attends to for different z_t.
+    Optionally saves heatmap visualizations overlaid on the image.
+
+    Args:
+        model: the model
+        frames: (K, V, H, W, 3) or (K, H, W, 3) uint8
+        states: (K, 7) float32
+        device: torch device
+        cfg: model config (used for num_cameras)
+        out_dir: if set, save heatmap images here
     """
     print("\n=== Test 4: Attention pattern visualization ===")
     f_t = torch.from_numpy(frames[:1]).unsqueeze(0).to(device)  # just 1 frame
@@ -290,10 +301,23 @@ def test_attention_patterns(model, frames, states, device):
         return
     pool = intention_encoder.pool.pools[0]
     # Try to get attention weights by calling the cross-attention directly
-    z_v_for_pool = z_v_patches_seq[0, 0, 0] if z_v_patches_seq.ndim == 5 else z_v_patches_seq[0, 0]
+    # z_v_patches_seq may be (1, 1, V*P, vision_dim) if concatenated, or
+    # (1, 1, V, P, vision_dim) if separate cameras.
+    # The PerCameraStateConditionedPool takes (B, V, P, vision_dim) input.
+    z_v_seq = z_v_patches_seq[0, 0]  # (V*P, vision_dim) or (V, P, vision_dim)
+    num_cams = (cfg or {}).get("num_cameras", 1)
+    # We need a single camera's patches for visualization: (P, vision_dim)
+    if z_v_seq.ndim == 2:
+        # Concatenated format: (V*P, vision_dim) — take first P (=total/num_cams)
+        P = z_v_seq.shape[0] // num_cams
+        z_v_for_pool = z_v_seq[:P]  # (P, vision_dim)
+    else:
+        # Separate format: (V, P, vision_dim) — take camera 0
+        z_v_for_pool = z_v_seq[0]  # (P, vision_dim)
     print(f"  z_v_for_pool shape: {z_v_for_pool.shape}")
     print(f"  z_t shape: {z_t_seq[0, 0].shape}")
     # Try to capture attention weights
+    saved_heatmaps = []  # for visualization
     for label, z_t_test in [
         ("original", z_t_seq[0, 0]),
         ("zero", torch.zeros_like(z_t_seq[0, 0])),
@@ -309,13 +333,158 @@ def test_attention_patterns(model, frames, states, device):
                     q, k, v, need_weights=True, average_attn_weights=False
                 )
             # attn_w: (B, num_heads, 1, P)
-            w = attn_w[0, 0, 0].cpu().numpy()  # head 0, (P,)
+            # Average over heads for cleaner visualization
+            w_per_head = attn_w[0, :, 0].cpu().numpy()  # (num_heads, P)
+            w = w_per_head.mean(axis=0)  # (P,) averaged over heads
             top_5 = np.argsort(w)[-5:][::-1]
             print(f"  z_t={label}: top-5 attended patches = {top_5.tolist()}, "
                   f"weights = {[f'{w[i]:.3f}' for i in top_5]}")
+            # Save for visualization
+            saved_heatmaps.append((label, w))
         except Exception as e:
             print(f"  z_t={label}: failed to get attn weights ({e})")
             return
+
+    # If out_dir specified, save visualizations
+    if out_dir and saved_heatmaps:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            os.makedirs(out_dir, exist_ok=True)
+            # Get the original image (camera 0, view 1)
+            orig_frame = frames[0]
+            if orig_frame.ndim == 4:  # (V, H, W, 3)
+                # Use the first camera (typically wrist_image) for the overlay
+                # But also save the agentview (image) separately
+                for cam_idx, cam_name in enumerate(["cam0", "cam1"][:orig_frame.shape[0]]):
+                    img = orig_frame[cam_idx]  # (H, W, 3)
+                    self_attn_grid = saved_heatmaps[0][1]  # use original z_t attn
+                    visualize_attention(
+                        img=img,
+                        attn_weights=self_attn_grid,
+                        out_path=os.path.join(
+                            out_dir, f"attention_{cam_name}_z_t_original.png"
+                        ),
+                        title=f"Attention ({cam_name}, z_t=original)",
+                    )
+                # For 2-cam case, overlay both
+                if orig_frame.shape[0] == 2:
+                    side_by_side_attention(
+                        frames=orig_frame,
+                        attn_weights_list=[wh[1] for wh in saved_heatmaps],
+                        labels=[wh[0] for wh in saved_heatmaps],
+                        out_path=os.path.join(out_dir, "attention_comparison.png"),
+                    )
+            else:  # (H, W, 3) single camera
+                self_attn_grid = saved_heatmaps[0][1]
+                visualize_attention(
+                    img=orig_frame,
+                    attn_weights=self_attn_grid,
+                    out_path=os.path.join(out_dir, "attention_z_t_original.png"),
+                    title="Attention (z_t=original)",
+                )
+            print(f"  Saved attention visualizations to {out_dir}")
+        except Exception as e:
+            print(f"  Failed to save visualizations: {e}")
+
+
+def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
+                         out_path: str, title: str = "Attention"):
+    """Overlay attention weights on the image as a heatmap.
+
+    Args:
+        img: (H, W, 3) uint8 image
+        attn_weights: (P,) flat attention weights, P = grid_size^2
+        out_path: where to save the visualization
+        title: plot title
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    P = len(attn_weights)
+    grid_size = int(np.sqrt(P))
+    if grid_size * grid_size != P:
+        print(f"  Skipping: P={P} is not a perfect square")
+        return
+    # Reshape to grid
+    attn_grid = attn_weights.reshape(grid_size, grid_size)
+    # Normalize for visualization
+    attn_grid_norm = (attn_grid - attn_grid.min()) / (
+        attn_grid.max() - attn_grid.min() + 1e-8
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    # 1. Original image
+    axes[0].imshow(img)
+    axes[0].set_title("Image")
+    axes[0].axis("off")
+    # 2. Attention heatmap
+    im = axes[1].imshow(
+        attn_grid_norm, cmap="hot", interpolation="bilinear",
+        extent=(0, img.shape[1], img.shape[0], 0),
+    )
+    axes[1].set_title("Attention (heatmap)")
+    axes[1].axis("off")
+    plt.colorbar(im, ax=axes[1], fraction=0.046)
+    # 3. Overlay
+    axes[2].imshow(img, alpha=0.6)
+    axes[2].imshow(
+        attn_grid_norm, cmap="hot", alpha=0.5, interpolation="bilinear",
+        extent=(0, img.shape[1], img.shape[0], 0),
+    )
+    axes[2].set_title("Overlay")
+    axes[2].axis("off")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=80, bbox_inches="tight")
+    plt.close(fig)
+
+
+def side_by_side_attention(frames: np.ndarray, attn_weights_list: list,
+                              labels: list, out_path: str):
+    """Side-by-side attention heatmaps for multiple z_t values.
+
+    Args:
+        frames: (V, H, W, 3) — V cameras
+        attn_weights_list: list of (P,) attention arrays, one per label
+        labels: list of strings (e.g. ['original', 'zero', 'perturbed'])
+        out_path: where to save
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    V = frames.shape[0]
+    n_labels = len(labels)
+    fig, axes = plt.subplots(V, n_labels, figsize=(4 * n_labels, 4 * V))
+    if V == 1 and n_labels == 1:
+        axes = np.array([[axes]])
+    elif V == 1:
+        axes = axes.reshape(1, -1)
+    elif n_labels == 1:
+        axes = axes.reshape(-1, 1)
+    for cam_idx in range(V):
+        img = frames[cam_idx]  # (H, W, 3)
+        for label_idx, (label, w) in enumerate(zip(labels, attn_weights_list)):
+            ax = axes[cam_idx, label_idx]
+            P = len(w)
+            grid_size = int(np.sqrt(P))
+            attn_grid = w.reshape(grid_size, grid_size)
+            attn_grid_norm = (attn_grid - attn_grid.min()) / (
+                attn_grid.max() - attn_grid.min() + 1e-8
+            )
+            ax.imshow(img, alpha=0.6)
+            ax.imshow(
+                attn_grid_norm, cmap="hot", alpha=0.5, interpolation="bilinear",
+                extent=(0, img.shape[1], img.shape[0], 0),
+            )
+            ax.set_title(f"cam {cam_idx}, z_t={label}")
+            ax.axis("off")
+    fig.suptitle("State-conditioned attention: rows=cameras, cols=z_t")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=80, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main():
@@ -329,6 +498,8 @@ def main():
     parser.add_argument("--n-frames", type=int, default=5,
                         help="Number of frames per sample")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--out-dir", default=None,
+                        help="Save attention heatmap visualizations to this dir")
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -365,7 +536,8 @@ def main():
         test_z_t_recovery(model, frames, states, device)
         if i == 0:
             # Only run attention viz once (it's slow)
-            test_attention_patterns(model, frames, states, device)
+            test_attention_patterns(model, frames, states, device, cfg=cfg,
+                                     out_dir=args.out_dir)
 
 
 if __name__ == "__main__":
