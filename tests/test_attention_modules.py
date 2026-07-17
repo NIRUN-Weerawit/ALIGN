@@ -416,60 +416,41 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
     # ---------------------------------------------------------------------------
     if out_dir and timeline_weights:
         try:
-            import matplotlib
-            matplotlib.use("Agg")
+            import matplotlib; matplotlib.use("Agg")
             import matplotlib.pyplot as plt
 
             os.makedirs(out_dir, exist_ok=True)
 
-            # Build one big image per camera so that columns = time steps.
             for cam_idx in range(num_cams_cfg):
-                # Extract frames correctly handling V-axis for multi-cam setups.
-                if frames[0].ndim == 4:  # Multi-cam: shape is (T, V, H, W, 3) -> grab cam_idx properly
-                    img_rows = np.array([frames[t, cam_idx] for t in range(T_ep)])  # (T, H, W, 3)
-                else:  # Single-cam: shape is (T, H, W, 3)
+                # Correctly extract per-camera frames regardless of stacking.
+                if frames.ndim == 5:        # (T, V, H, W, 3)
+                    img_rows = np.array([frames[t, cam_idx] for t in range(T_ep)])
+                else:                       # (T, H, W, 3)
                     img_rows = np.array([frames[t] for t in range(T_ep)])
 
-                fig, axes = plt.subplots(1, T_ep, figsize=(5 * T_ep, 5))
+                fig, axes = plt.subplots(1, T_ep, figsize=(4 * T_ep, 4))
                 if T_ep == 1:
-                    axes = np.array([axes])       # make it iterable for uniform loop.
+                    axes = np.array([axes])
 
                 for t_idx in range(T_ep):
                     ax   = axes[t_idx] if T_ep > 1 else axes[0]
-                    img  = img_rows[t_idx]           # (H, W, 3)
+                    img  = img_rows[t_idx]
                     att  = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
 
-                    # Normalise attention to [0,1] per-step.
                     att_min, att_max = att.min(), att.max()
-                    if att_max - att_min > 1e-8:
-                        norm_att = (att - att_min) / (att_max - att_min)
-                    else:
-                        norm_att = np.zeros_like(att)
+                    norm_att = (att - att_min)/(att_max - att_min + 1e-8) if att_max > att_min else np.zeros_like(att)
 
                     ax.imshow(img)
-                    ax.imshow(
-                        norm_att, cmap="hot", alpha=0.5, interpolation="bilinear",
-                        extent=(0, img.shape[1], img.shape[0], 0),
-                    )
-                    ax.set_title(f"t={t_idx}")
-                    ax.axis("off")
+                    ax.imshow(norm_att, cmap="hot", alpha=0.5, interpolation="bilinear", extent=(0, img.shape[1], img.shape[0], 0))
+                    ax.set_title(f"t={t_idx}"); ax.axis("off")
 
-                fig.suptitle(f"Camera {cam_idx}: state-conditioned attention over episode timeline")
+                fig.suptitle(f"Camera {cam_idx}: attention over timeline")
                 fig.tight_layout()
-                save_path = os.path.join(out_dir, f"attention_timeline_cam{cam_idx}.png")
-                fig.savefig(save_path, dpi=80, bbox_inches="tight")
+                fig.savefig(os.path.join(out_dir, f"attention_timeline_cam{cam_idx}.png"), dpi=80)
                 plt.close(fig)
-                print(f"  Saved timeline grid → {save_path}")
 
-                # ---- Also stitch individual frames into an MP4 video --------
-                _save_timeline_video(
-                    out_dir=out_dir,
-                    cam_idx=cam_idx,
-                    img_rows=img_rows,
-                    timeline_weights=timeline_weights,
-                    T_ep=T_ep,
-                    grid_dim=grid_dim,
-                )
+                # Also stitch frames into an MP4 video.
+                _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim)
 
         except Exception as e:
             import traceback; traceback.print_exc()
