@@ -424,8 +424,11 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
 
             # Build one big image per camera so that columns = time steps.
             for cam_idx in range(num_cams_cfg):
-                img_rows  = np.array([frames[t][:, cam_idx] if frames[0].ndim == 4 else
-                                      frames[t] for t in range(T_ep)])        # (T, H, W, 3)
+                # Extract frames correctly handling V-axis for multi-cam setups.
+                if frames[0].ndim == 4:  # Multi-cam: shape is (T, V, H, W, 3) -> grab cam_idx properly
+                    img_rows = np.array([frames[t, cam_idx] for t in range(T_ep)])  # (T, H, W, 3)
+                else:  # Single-cam: shape is (T, H, W, 3)
+                    img_rows = np.array([frames[t] for t in range(T_ep)])
 
                 fig, axes = plt.subplots(1, T_ep, figsize=(5 * T_ep, 5))
                 if T_ep == 1:
@@ -474,47 +477,47 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
 
 
 def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim):
-    """Render an MP4 video of individual frames overlaid with attention heatmaps."""
-    import os
-    import shutil
-    import subprocess
-    import tempfile
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    """Render an MP4 video where each frame is a full-size image with a heatmap overlay."""
+    import os, tempfile, shutil, subprocess
+    from PIL import Image
+    import numpy as np
+    
+    import matplotlib; matplotlib.use('Agg')
+    from matplotlib import cm
 
-    fps = max(1, T_ep)
     tmp_dir = tempfile.mkdtemp()
-
     try:
-        for t_idx in range(T_ep):
-            img = img_rows[t_idx]  # (H, W, 3)
-            att = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
-
+        for t in range(T_ep):
+            img = img_rows[t]                              # (H, W, 3) uint8
+            att = timeline_weights[t][cam_idx].reshape(grid_dim, grid_dim)
             H, W = img.shape[:2]
-            amax, amin = att.max(), att.min()
-            norm_att = (att - amin) / (amax - amin + 1e-8) if amax > amin else np.zeros_like(att)
 
-            fig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
-            ax = fig.add_axes([0, 0, 1, 1])
-            ax.imshow(img)
-            ax.imshow(norm_att, cmap="hot", alpha=0.5, interpolation="bilinear", extent=(0, W, H, 0))
-            ax.axis("off")
+            # Resize attention map to exact frame dimensions (bilinear interpolation)
+            att_resized = np.array(Image.fromarray(att, 'F').resize((W, H), Image.BILINEAR))
+            min_v, max_v = att_resized.min(), att_resized.max()
+            norm_att = (att_resized - min_v) / (max_v - min_v + 1e-8)
 
-            fig.savefig(os.path.join(tmp_dir, f"frame_{t_idx:04d}.png"), dpi=100)
-            plt.close(fig)
+            # Map normalized attention to the "hot" colormap 
+            heat_rgb = cm.hot(norm_att)[:,:,:3] * 255.0     # (H, W, 3) float32
+            alpha = np.stack([norm_att]*3, axis=-1)         # (H, W, 3)
+            
+            # Blend original image and heatmap based on attention intensity 
+            frame_out = np.clip( img.astype(np.float32)*(1.0 - alpha*0.6) + heat_rgb*(alpha*0.6), 0, 255 ).astype(np.uint8)
+            
+            Image.fromarray(frame_out).save(f"{tmp_dir}/f_{t:04d}.png")
 
+        # Stitch individual overlayed frames into a single MP4 
         vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
-        subprocess.run(
-            f"ffmpeg -y -framerate {fps} "
-            f"-i {tmp_dir}/frame_%04d.png "
-            f"-c:v mpeg4 -pix_fmt yuv420p {vid_path}",
-            shell=True
-        )
-        if os.path.exists(vid_path):
-            print(f"  Saved attention video -> {vid_path}")
+        if len(os.listdir(tmp_dir)) > 0:
+            subprocess.run(
+                f"ffmpeg -y -framerate {max(1, T_ep)} "
+                f"-i {tmp_dir}/f_%04d.png -c:v mpeg4 -pix_fmt yuv420p -qscale 0 {vid_path}",
+                shell=True, capture_output=True
+            )
+            if os.path.exists(vid_path):
+                print(f"  Saved attention video -> {vid_path}")
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(tmp_dir)
 
 
 def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
