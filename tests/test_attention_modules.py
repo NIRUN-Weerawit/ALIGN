@@ -304,212 +304,168 @@ def test_z_t_recovery(model, frames, states, device):
 
 def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] = None,
                              out_dir: Optional[str] = None):
-    """Visualize attention weights from the state-conditioned pool.
+    """Visualize attention weights from the state-conditioned pool across an episode.
 
-    Shows which patches the model attends to for different z_t.
-    Optionally saves heatmap visualizations overlaid on the image.
+    Instead of a single frame snapshot, this processes every frame in the sample and 
+    produces a timeline grid so you can see exactly how the state-conditioned focus 
+    shifts as the robot moves through the task.
 
     Args:
-        model: the model
-        frames: (K, V, H, W, 3) or (K, H, W, 3) uint8
-        states: (K, 7) float32
-        device: torch device
-        cfg: model config (used for num_cameras)
-        out_dir: if set, save heatmap images here
+        model: the intention model
+        frames: (T, V?, H, W, 3) uint8 images across time steps T.
+        states: (T, 7) float32 EEF pose + gripper values over the horizon T
+        device: torch device for inference.
+        cfg: optional model config dict used to look up camera count or patch layout.
+        out_dir: target folder if you want generated heatmaps saved to disk.
     """
-    print("\n=== Test 4: Attention pattern visualization ===")
-    f_t = torch.from_numpy(frames[:1]).unsqueeze(0).to(device)  # just 1 frame
-    s_t = torch.from_numpy(states[:1]).float().unsqueeze(0).to(device)
+    print("\n=== Test 4: Attention pattern visualization across timeline ===")
+
+    # ---------------------------------------------------------------------------
+    # 1. Forward pass through frozen DINOv2 + state encoder on the FULL horizon T 
+    # ---------------------------------------------------------------------------
+    T_ep = min(frames.shape[0], states.shape[0])
+    all_frames_t = torch.from_numpy(frames[:T_ep]).unsqueeze(0).to(device)   # (1, T, ...)
+    all_states_t = torch.from_numpy(states[:T_ep] ).float().unsqueeze(0).to(device)
+
     model.eval()
     intention_encoder = model.intention_encoder
     if intention_encoder is None:
         print("  SKIP: no intention encoder")
         return
-    with torch.no_grad():
-        B, K = f_t.shape[:2]
-        z_v_patches_per_step = []
-        for t in range(K):
-            z_v_t = model._vision_forward(f_t[:, t])
-            z_v_patches_per_step.append(z_v_t)
-        z_v_patches_seq = torch.stack(z_v_patches_per_step, dim=1)  # (1, 1, V, P, vision_dim)
-        z_t_seq = model.state_encoder(s_t)  # (1, 1, state_dim)
-    # Get the first pool
     if intention_encoder.pool.pools is None or len(intention_encoder.pool.pools) == 0:
         print("  SKIP: no pool layers")
         return
-    pool = intention_encoder.pool.pools[0]
-    # Try to get attention weights by calling the cross-attention directly
-    # z_v_patches_seq may be (1, 1, V*P, vision_dim) if concatenated, or
-    # (1, 1, V, P, vision_dim) if separate cameras.
-    # The PerCameraStateConditionedPool takes (B, V, P, vision_dim) input.
-    z_v_seq = z_v_patches_seq[0, 0]  # (V*P, vision_dim) or (V, P, vision_dim)
-    num_cams = (cfg or {}).get("num_cameras", 1)
-    # We need a single camera's patches for visualization: (P, vision_dim)
-    if z_v_seq.ndim == 2:
-        # Concatenated format: (V*P, vision_dim) — take first P (=total/num_cams)
-        P = z_v_seq.shape[0] // num_cams
-        z_v_for_pool = z_v_seq[:P]  # (P, vision_dim)
-    else:
-        # Separate format: (V, P, vision_dim) — take camera 0
-        z_v_for_pool = z_v_seq[0]  # (P, vision_dim)
-    print(f"  z_v_for_pool shape: {z_v_for_pool.shape}")
-    print(f"  z_t shape: {z_t_seq[0, 0].shape}")
-    # Try to capture attention weights
-    saved_heatmaps = []  # for visualization
-    for label, z_t_test in [
-        ("original", z_t_seq[0, 0]),
-        ("zero", torch.zeros_like(z_t_seq[0, 0])),
-        ("perturbed", z_t_seq[0, 0] + torch.randn_like(z_t_seq[0, 0]) * 0.3),
-    ]:
-        z_t_test = z_t_test.detach()
-        z_t_proj = pool.state_proj(z_t_test.unsqueeze(0))  # (1, vision_dim)
-        q = z_t_proj.unsqueeze(1)  # (1, 1, vision_dim)
-        k = v = z_v_for_pool.unsqueeze(0)  # (1, P, vision_dim)
-        try:
-            with torch.no_grad():
-                attn_out, attn_w = pool.cross_attn(
-                    q, k, v, need_weights=True, average_attn_weights=False
-                )
-            # attn_w: (B, num_heads, 1, P)
-            # Average over heads for cleaner visualization
-            w_per_head = attn_w[0, :, 0].cpu().numpy()  # (num_heads, P)
-            w = w_per_head.mean(axis=0)  # (P,) averaged over heads
-            top_5 = np.argsort(w)[-5:][::-1]
-            print(f"  z_t={label}: top-5 attended patches = {top_5.tolist()}, "
-                  f"weights = {[f'{w[i]:.3f}' for i in top_5]}")
-            # Save for visualization
-            saved_heatmaps.append((label, w))
-        except Exception as e:
-            print(f"  z_t={label}: failed to get attn weights ({e})")
-            return
 
-    # If out_dir specified, save visualizations
-    if out_dir and saved_heatmaps:
+    # First pool to extract per-step cross-attention weights from.
+    pool = intention_encoder.pool.pools[0]
+    num_cams_cfg = intention_encoder.pool.num_cameras
+
+    with torch.no_grad():
+        z_v_patches_per_t = []
+        for t_idx in range(T_ep):
+            # If input frames have camera dim stacked DINOv2 handles it.
+            z_v_t = model._vision_forward(all_frames_t[:, t_idx])
+            z_v_patches_per_t.append(z_v_t)
+        # patch tokens (1, T, total_patches_p_or_V_total, vision_dim).
+        patches_seq = torch.stack(z_v_patches_per_t, dim=1)
+        states_enc  = model.state_encoder(all_states_t)  # (1, T, state_dim).
+
+    # Detect per-camera geometry: how many raw patches each camera contributes?  
+    first_frame_raw = patches_seq[0, 0]  # shape either (total_patches, dim) or (V, P, dim)
+    if first_frame_raw.ndim == 2:        # concatenated multi-cam case
+        P_per_cam   = first_frame_raw.shape[0] // num_cams_cfg
+        is_concat   = True
+    else:                                 # separate per-camera case.
+        P_per_cam   = first_frame_raw.shape[1] if first_frame_raw.ndim == 3 else first_frame_raw.shape[0]
+        is_concat   = False
+
+    grid_dim = int(np.sqrt(P_per_cam))
+    print(f"  T = {T_ep} steps | patches_per_cam = {P_per_cam} (grid {grid_dim}x{grid_dim})")
+
+    # ---------------------------------------------------------------------------
+    # 2. Extract per-timestep cross-attention weights (original z_t queries)      #
+    # ---------------------------------------------------------------------------
+
+    def _extract_weights_for_step(pt: torch.Tensor, st: torch.Tensor):
+        """Return (num_cams, P_per_cam) averaged cross-attn from ``pool`."""
+        # pt could be concatenated or multi-camera depending on upstream encoder.
+        if is_concat:
+            # split back into camera chunks.
+            cam_patches = []
+            for c in range(num_cams_cfg):
+                start = c * P_per_cam
+                end   = (c + 1) * P_per_cam
+                cam_patches.append(pt[start:end])                       # (P, D)
+        else:
+            cam_patches = [pt[c] for c in range(num_cams_cfg)]         # (P, D).
+
+        # Query is state embedding projected through pool.state_proj.
+        q_proj = pool.state_proj(st.unsqueeze(0)).unsqueeze(1)  # (1, 1, D).
+
+        cam_weights = []  # one array per camera of shape (P,)
+        for c_idx in range(num_cams_cfg):
+            k_v = cam_patches[c_idx].unsqueeze(0)              # (1, P, D).
+            _, aw = pool.cross_attn(q_proj, k_v, k_v,
+                                    need_weights=True, average_attn_weights=False)
+            # aw : (B=1, heads, 1, P) -> avg over heads:
+            w_avg = aw[0, :, 0].mean(dim=0).cpu().numpy()    # (P,)
+            cam_weights.append(w_avg.astype(np.float32))
+
+        return np.stack(cam_weights, axis=0)   # (num_cams, P_per_cam)
+
+    # Store every step's heatmaps so we can plot the grid later.
+    timeline_weights = []  # list of (C, P) arrays; len == T_ep.
+
+    print("  Extracting attention per timestep ...")
+    for t_idx in range(T_ep):
+        pt_t = patches_seq[0, t_idx].detach()   # (total_patches,) or (V,P,D)
+        st_t = states_enc[0, t_idx].detach()      # (state_dim,)
+        wts  = _extract_weights_for_step(pt_t, st_t)     # (num_cams, P)
+        timeline_weights.append(wts)
+
+    # Print per-timestep top-attended patches to console for quick inspection.
+    for t_idx in range(T_ep):
+        for c_idx in range(num_cams_cfg):
+            w         = timeline_weights[t_idx][c_idx]      # (P,)
+            top5      = np.argsort(w)[-5:][::-1]
+            top_str   = " | ".join([f"idx={int(i)} w={w[i]:.3f}" for i in top5])
+            print(f"  t={t_idx} cam_{c_idx}: top-5 patches → {top_str}")
+
+    # ---------------------------------------------------------------------------
+    # 3. Visualisation (optional grid of overlaid images over time)               #
+    # ---------------------------------------------------------------------------
+    if out_dir and timeline_weights:
         try:
             import matplotlib
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
+
             os.makedirs(out_dir, exist_ok=True)
-            # Get per-camera attention weights (the user wants DIFFERENT
-            # heatmaps per camera, not the same heatmap duplicated)
-            saved_heatmaps_per_cam = []  # (label, [w_cam0, w_cam1, ...])
-            for label, z_t_test_for_viz in [
-                ("original", z_t_seq[0, 0]),
-                ("zero", torch.zeros_like(z_t_seq[0, 0])),
-                ("perturbed", z_t_seq[0, 0] + torch.randn_like(z_t_seq[0, 0]) * 0.3),
-            ]:
-                z_t_v = z_t_test_for_viz.detach()
-                z_t_proj_v = pool.state_proj(z_t_v.unsqueeze(0))  # (1, vision_dim)
-                q_v = z_t_proj_v.unsqueeze(1)  # (1, 1, vision_dim)
-                # Per-camera attention: run on each camera's patches separately
-                per_cam_weights = []
-                if z_v_seq.ndim == 2:
-                    # Concatenated: (V*P, vision_dim) — split per camera
-                    total = z_v_seq.shape[0]
-                    P_per_cam = total // num_cams
-                    for v_idx in range(num_cams):
-                        z_v_cam = z_v_seq[v_idx * P_per_cam : (v_idx + 1) * P_per_cam]
-                        k_v = v_v = z_v_cam.unsqueeze(0)
-                        with torch.no_grad():
-                            _, attn_w_v = pool.cross_attn(
-                                q_v, k_v, v_v, need_weights=True, average_attn_weights=False
-                            )
-                        w_v = attn_w_v[0, :, 0].mean(dim=0).cpu().numpy()  # (P,)
-                        per_cam_weights.append(w_v)
-                else:
-                    # Separate: (V, P, vision_dim)
-                    for v_idx in range(z_v_seq.shape[0]):
-                        z_v_cam = z_v_seq[v_idx]  # (P, vision_dim)
-                        k_v = v_v = z_v_cam.unsqueeze(0)
-                        with torch.no_grad():
-                            _, attn_w_v = pool.cross_attn(
-                                q_v, k_v, v_v, need_weights=True, average_attn_weights=False
-                            )
-                        w_v = attn_w_v[0, :, 0].mean(dim=0).cpu().numpy()  # (P,)
-                        per_cam_weights.append(w_v)
-                saved_heatmaps_per_cam.append((label, per_cam_weights))
-            # Save per-camera visualizations
-            orig_frame = frames[0]
-            if orig_frame.ndim == 4:  # (V, H, W, 3) multi-cam
-                for cam_idx, cam_name in enumerate(["cam0", "cam1"][:orig_frame.shape[0]]):
-                    # Use original z_t's attention for this camera
-                    img = orig_frame[cam_idx]
-                    self_attn_grid = saved_heatmaps_per_cam[0][1][cam_idx]
-                    visualize_attention(
-                        img=img,
-                        attn_weights=self_attn_grid,
-                        out_path=os.path.join(
-                            out_dir, f"attention_{cam_name}_z_t_original.png"
-                        ),
-                        title=f"Attention ({cam_name}, z_t=original)",
+
+            # Build one big image per camera so that columns = time steps.
+            for cam_idx in range(num_cams_cfg):
+                img_rows  = np.array([frames[t][:, cam_idx] if frames[0].ndim == 4 else
+                                      frames[t] for t in range(T_ep)])        # (T, H, W, 3)
+
+                fig, axes = plt.subplots(1, T_ep, figsize=(5 * T_ep, 5))
+                if T_ep == 1:
+                    axes = np.array([axes])       # make it iterable for uniform loop.
+
+                for t_idx in range(T_ep):
+                    ax   = axes[t_idx] if T_ep > 1 else axes[0]
+                    img  = img_rows[t_idx]           # (H, W, 3)
+                    att  = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
+
+                    # Normalise attention to [0,1] per-step.
+                    att_min, att_max = att.min(), att.max()
+                    if att_max - att_min > 1e-8:
+                        norm_att = (att - att_min) / (att_max - att_min)
+                    else:
+                        norm_att = np.zeros_like(att)
+
+                    ax.imshow(img)
+                    ax.imshow(
+                        norm_att, cmap="hot", alpha=0.5, interpolation="bilinear",
+                        extent=(0, img.shape[1], img.shape[0], 0),
                     )
-                # Side-by-side: rows = cameras, cols = z_t variants
-                if orig_frame.shape[0] >= 2:
-                    # Build a per-(cam, z_t) heatmap grid
-                    n_cams = orig_frame.shape[0]
-                    n_labels = len(saved_heatmaps_per_cam)
-                    fig, axes = plt.subplots(
-                        n_cams, n_labels,
-                        figsize=(4 * n_labels, 4 * n_cams),
-                    )
-                    if n_cams == 1 and n_labels == 1:
-                        axes = np.array([[axes]])
-                    elif n_cams == 1:
-                        axes = axes.reshape(1, -1)
-                    elif n_labels == 1:
-                        axes = axes.reshape(-1, 1)
-                    for cam_idx in range(n_cams):
-                        img = orig_frame[cam_idx]
-                        for label_idx, (label, per_cam_w) in enumerate(saved_heatmaps_per_cam):
-                            ax = axes[cam_idx, label_idx]
-                            w = per_cam_w[cam_idx]
-                            P_here = len(w)
-                            grid_size = int(np.sqrt(P_here))
-                            if grid_size * grid_size != P_here:
-                                ax.text(0.5, 0.5, f"P={P_here} not square",
-                                        ha="center", va="center")
-                                ax.axis("off")
-                                continue
-                            attn_grid = w.reshape(grid_size, grid_size)
-                            attn_grid_norm = (attn_grid - attn_grid.min()) / (
-                                attn_grid.max() - attn_grid.min() + 1e-8
-                            )
-                            ax.imshow(img, alpha=0.6)
-                            ax.imshow(
-                                attn_grid_norm, cmap="hot", alpha=0.5,
-                                interpolation="bilinear",
-                                extent=(0, img.shape[1], img.shape[0], 0),
-                            )
-                            ax.set_title(f"cam {cam_idx}, z_t={label}")
-                            ax.axis("off")
-                    fig.suptitle("Per-camera state-conditioned attention: rows=cameras, cols=z_t")
-                    fig.tight_layout()
-                    out_path = os.path.join(out_dir, "attention_comparison.png")
-                    fig.savefig(out_path, dpi=80, bbox_inches="tight")
-                    plt.close(fig)
-            else:  # (H, W, 3) single camera
-                self_attn_grid = saved_heatmaps_per_cam[0][1][0]
-                visualize_attention(
-                    img=orig_frame,
-                    attn_weights=self_attn_grid,
-                    out_path=os.path.join(out_dir, "attention_z_t_original.png"),
-                    title="Attention (z_t=original)",
-                )
-            print(f"  Saved attention visualizations to {out_dir}")
+                    ax.set_title(f"t={t_idx}")
+                    ax.axis("off")
+
+                fig.suptitle(f"Camera {cam_idx}: state-conditioned attention over episode timeline")
+                fig.tight_layout()
+                save_path = os.path.join(out_dir, f"attention_timeline_cam{cam_idx}.png")
+                fig.savefig(save_path, dpi=80, bbox_inches="tight")
+                plt.close(fig)
+                print(f"  Saved timeline grid → {save_path}")
+
         except Exception as e:
-            print(f"  Failed to save visualizations: {e}")
+            import traceback; traceback.print_exc()
+            print(f"  Failed to save visualisations: {e}")
 
 
 def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
                          out_path: str, title: str = "Attention"):
-    """Overlay attention weights on the image as a heatmap.
-
-    Args:
-        img: (H, W, 3) uint8 image
-        attn_weights: (P,) flat attention weights, P = grid_size^2
-        out_path: where to save the visualization
-        title: plot title
-    """
+    """Overlay attention weights on a single image as a heatmap."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
