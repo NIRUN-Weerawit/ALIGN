@@ -474,24 +474,11 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
 
 
 def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim):
-    """Render an MP4 video of individual frames overlaid with attention heatmaps.
-
-    Uses matplotlib figures written per-frame into a moviepy / imageio .mp4 writer
-    so the user can watch exactly how state-conditioned focus shifts over time.
-
-    If ``moviepy`` is not available we fall back to ``imageio.imwrite`` which will
-    silently skip video output (still saves every individual PNG frame).
-    """
+    """Render an MP4 video of individual frames overlaid with attention heatmaps."""
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    try:
-        from moviepy.editor import ImageSequenceClip   # type: ignore
-        has_moviepy = True
-    except ImportError:
-        has_moviepy = False
-
-    fps = max(1, T_ep)     # at most 1s per frame if few steps.
+    fps = max(1, T_ep)     # 1 second per frame if few time steps.
 
     frames_out: list[np.ndarray] = []
     for t_idx in range(T_ep):
@@ -519,22 +506,37 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
         ax.axis("off")
 
         fig.canvas.draw()
-        # buffer_rgba is the cross-version replacement for deprecated tostring_rgb
         rgba = np.asarray(fig.canvas.buffer_rgba())  # (H, W, 4)
         frames_out.append(rgba[:, :, :3])            # drop alpha → (H, W, 3) RGB
         plt.close(fig)
 
-    if has_moviepy and len(frames_out):
-        clip = ImageSequenceClip(frames_out, fps=fps)
-        vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
-        clip.write_videofile(vid_path, codec="libx264", logger=None)
-        print(f"  Saved attention video → {vid_path}")
-    else:
-        # Fallback: save each frame as an individual numbered PNG (useful for manual stitching).
-        for t_idx, frame_b in enumerate(frames_out):
-            p = os.path.join(out_dir, f"attn_frame_cam{cam_idx}_t{t_idx}.png")
-            plt.imsave(p, frame_b)
-        print(f"  (no moviepy – saved {len(frames_out)} individual PNG frames)")
+    if len(frames_out):
+        # Grab dimensions from the first frame to avoid scoping issues with H/W from above
+        sample_frame = frames_out[0]
+        F_H, F_W = sample_frame.shape[:2]
+
+        import subprocess
+        import tempfile
+        # Save each frame as a temporary PNG for ffmpeg to read.
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            for i, frame_b in enumerate(frames_out):
+                plt.figure(figsize=(F_W / 100, F_H / 100), dpi=100)
+                plt.imshow(frame_b); plt.axis('off')
+                plt.tight_layout(pad=0)
+                plt.savefig(f"{tmp_dir}/frame_{i:04d}.png", format='png')
+                plt.close()
+
+            vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
+            subprocess.run(
+                f"ffmpeg -y -framerate {fps} -i {tmp_dir}/frame_%04d.png "
+                "-c:v libx264 -pix_fmt yuv420p {vid_path}".format(tmp_dir=tmp_dir, fps=fps, vid_path=vid_path),
+                shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            print(f"  Saved attention video (via ffmpeg) → {vid_path}")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"  Failed to generate MP4 via ffmpeg ({e}); keeping individual frames.")
 
 
 def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
