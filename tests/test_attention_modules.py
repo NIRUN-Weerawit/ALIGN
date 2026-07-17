@@ -388,7 +388,7 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
             _, aw = pool.cross_attn(q_proj, k_v, k_v,
                                     need_weights=True, average_attn_weights=False)
             # aw : (B=1, heads, 1, P) -> avg over heads:
-            w_avg = aw[0, :, 0].mean(dim=0).cpu().numpy()    # (P,)
+            w_avg = aw[0, :, 0].mean(dim=0).detach().cpu().numpy()   # (P,)
             cam_weights.append(w_avg.astype(np.float32))
 
         return np.stack(cam_weights, axis=0)   # (num_cams, P_per_cam)
