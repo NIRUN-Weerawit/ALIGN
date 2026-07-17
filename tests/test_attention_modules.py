@@ -475,49 +475,46 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
 
 def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim):
     """Render an MP4 video of individual frames overlaid with attention heatmaps."""
-    import matplotlib; matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    import os
+    import shutil
     import subprocess
     import tempfile
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
 
     fps = max(1, T_ep)
-
     tmp_dir = tempfile.mkdtemp()
+
     try:
         for t_idx in range(T_ep):
-            img = img_rows[t_idx]                           # (H, W, 3) uint8
+            img = img_rows[t_idx]  # (H, W, 3)
             att = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
 
             H, W = img.shape[:2]
             amax, amin = att.max(), att.min()
-            n_att = (att - amin) / (amax - amin + 1e-8) if amax > amin else np.zeros_like(att)
+            norm_att = (att - amin) / (amax - amin + 1e-8) if amax > amin else np.zeros_like(att)
 
-            # figsize must be in inches; dpi=100 -> 1 inch == 100 pixels exactly.
-            fig, ax = plt.subplots(figsize=(W / 100.0, H / 100.0), dpi=100)
-            ax.set_position([0, 0, 1, 1])   # remove all padding
+            fig = plt.figure(figsize=(W / 100.0, H / 100.0), dpi=100)
+            ax = fig.add_axes([0, 0, 1, 1])
             ax.imshow(img)
-            ax.imshow(
-                n_att, cmap="hot", alpha=0.5, interpolation="bilinear",
-                extent=(0, W, H, 0), aspect='auto'
-            )
-            ax.text(W - 10, H - 15, f"t={t_idx}", fontsize=max(10, H // 40), color="white",
-                    ha="right", va="top", fontweight="bold",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.6))
+            ax.imshow(norm_att, cmap="hot", alpha=0.5, interpolation="bilinear", extent=(0, W, H, 0))
             ax.axis("off")
 
-            fig.savefig(f"{tmp_dir}/frame_{t_idx:04d}.png", dpi=100, bbox_inches='tight', pad_inches=0)
+            fig.savefig(os.path.join(tmp_dir, f"frame_{t_idx:04d}.png"), dpi=100)
             plt.close(fig)
 
         vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
         subprocess.run(
-            f"ffmpeg -y -framerate {fps} -i {tmp_dir}/frame_%04d.png "
-            "-c:v libx264 -pix_fmt yuv420p {vid_path}".format(tmp_dir=tmp_dir, fps=fps, vid_path=vid_path),
-            shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            f"ffmpeg -y -framerate {fps} "
+            f"-i {tmp_dir}/frame_%04d.png "
+            f"-c:v mpeg4 -pix_fmt yuv420p {vid_path}",
+            shell=True
         )
-        print(f"  Saved attention video (via ffmpeg) → {vid_path}")
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        print(f"  Failed to generate MP4 via ffmpeg ({e}); keeping individual frames.")
+        if os.path.exists(vid_path):
+            print(f"  Saved attention video -> {vid_path}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
