@@ -458,9 +458,83 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
                 plt.close(fig)
                 print(f"  Saved timeline grid → {save_path}")
 
+                # ---- Also stitch individual frames into an MP4 video --------
+                _save_timeline_video(
+                    out_dir=out_dir,
+                    cam_idx=cam_idx,
+                    img_rows=img_rows,
+                    timeline_weights=timeline_weights,
+                    T_ep=T_ep,
+                    grid_dim=grid_dim,
+                )
+
         except Exception as e:
             import traceback; traceback.print_exc()
             print(f"  Failed to save visualisations: {e}")
+
+
+def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim):
+    """Render an MP4 video of individual frames overlaid with attention heatmaps.
+
+    Uses matplotlib figures written per-frame into a moviepy / imageio .mp4 writer
+    so the user can watch exactly how state-conditioned focus shifts over time.
+
+    If ``moviepy`` is not available we fall back to ``imageio.imwrite`` which will
+    silently skip video output (still saves every individual PNG frame).
+    """
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    try:
+        from moviepy.editor import ImageSequenceClip   # type: ignore
+        has_moviepy = True
+    except ImportError:
+        has_moviepy = False
+
+    fps = max(1, T_ep)     # at most 1s per frame if few steps.
+
+    frames_out: list[np.ndarray] = []
+    for t_idx in range(T_ep):
+        img = img_rows[t_idx]                                   # (H, W, 3) uint8
+        att = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
+
+        att_min, att_max = att.min(), att.max()
+        if att_max - att_min > 1e-8:
+            norm_att = (att - att_min) / (att_max - att_min)
+        else:
+            norm_att = np.zeros_like(att)
+
+        H, W = img.shape[:2]
+        fig, ax = plt.subplots(figsize=(W / 100, H / 100), dpi=100)
+        ax.imshow(img)
+        ax.imshow(
+            norm_att, cmap="hot", alpha=0.5, interpolation="bilinear",
+            extent=(0, W, H, 0),
+        )
+        ax.text(
+            5, H - 15, f"t={t_idx}", fontsize=14, color="white",
+            ha="left", va="top", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.6),
+        )
+        ax.axis("off")
+
+        fig.canvas.draw()
+        # buffer_rgba is the cross-version replacement for deprecated tostring_rgb
+        rgba = np.asarray(fig.canvas.buffer_rgba())  # (H, W, 4)
+        frames_out.append(rgba[:, :, :3])            # drop alpha → (H, W, 3) RGB
+        plt.close(fig)
+
+    if has_moviepy and len(frames_out):
+        clip = ImageSequenceClip(frames_out, fps=fps)
+        vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
+        clip.write_videofile(vid_path, codec="libx264", logger=None)
+        print(f"  Saved attention video → {vid_path}")
+    else:
+        # Fallback: save each frame as an individual numbered PNG (useful for manual stitching).
+        for t_idx, frame_b in enumerate(frames_out):
+            p = os.path.join(out_dir, f"attn_frame_cam{cam_idx}_t{t_idx}.png")
+            plt.imsave(p, frame_b)
+        print(f"  (no moviepy – saved {len(frames_out)} individual PNG frames)")
 
 
 def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
