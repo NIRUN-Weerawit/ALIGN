@@ -511,21 +511,13 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
         plt.close(fig)
 
     if len(frames_out):
-        # Grab dimensions from the first frame to avoid scoping issues with H/W from above
-        sample_frame = frames_out[0]
-        F_H, F_W = sample_frame.shape[:2]
-
         import subprocess
         import tempfile
-        # Save each frame as a temporary PNG for ffmpeg to read.
         tmp_dir = tempfile.mkdtemp()
         try:
+            # Save raw numpy array bypasses DPI/inch scaling and tight_layout bugs.
             for i, frame_b in enumerate(frames_out):
-                plt.figure(figsize=(F_W / 100, F_H / 100), dpi=100)
-                plt.imshow(frame_b); plt.axis('off')
-                plt.tight_layout(pad=0)
-                plt.savefig(f"{tmp_dir}/frame_{i:04d}.png", format='png')
-                plt.close()
+                plt.imsave(f"{tmp_dir}/frame_{i:04d}.png", frame_b)
 
             vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
             subprocess.run(
