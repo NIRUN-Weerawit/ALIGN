@@ -477,58 +477,47 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
     """Render an MP4 video of individual frames overlaid with attention heatmaps."""
     import matplotlib; matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import subprocess
+    import tempfile
 
-    fps = max(1, T_ep)     # 1 second per frame if few time steps.
+    fps = max(1, T_ep)
 
-    frames_out: list[np.ndarray] = []
-    for t_idx in range(T_ep):
-        img = img_rows[t_idx]                                   # (H, W, 3) uint8
-        att = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        for t_idx in range(T_ep):
+            img = img_rows[t_idx]                           # (H, W, 3) uint8
+            att = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
 
-        att_min, att_max = att.min(), att.max()
-        if att_max - att_min > 1e-8:
-            norm_att = (att - att_min) / (att_max - att_min)
-        else:
-            norm_att = np.zeros_like(att)
+            H, W = img.shape[:2]
+            amax, amin = att.max(), att.min()
+            n_att = (att - amin) / (amax - amin + 1e-8) if amax > amin else np.zeros_like(att)
 
-        H, W = img.shape[:2]
-        fig, ax = plt.subplots(figsize=(W / 100, H / 100), dpi=100)
-        ax.imshow(img)
-        ax.imshow(
-            norm_att, cmap="hot", alpha=0.5, interpolation="bilinear",
-            extent=(0, W, H, 0),
-        )
-        ax.text(
-            5, H - 15, f"t={t_idx}", fontsize=14, color="white",
-            ha="left", va="top", fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.6),
-        )
-        ax.axis("off")
-
-        fig.canvas.draw()
-        rgba = np.asarray(fig.canvas.buffer_rgba())  # (H, W, 4)
-        frames_out.append(rgba[:, :, :3])            # drop alpha → (H, W, 3) RGB
-        plt.close(fig)
-
-    if len(frames_out):
-        import subprocess
-        import tempfile
-        tmp_dir = tempfile.mkdtemp()
-        try:
-            # Save raw numpy array bypasses DPI/inch scaling and tight_layout bugs.
-            for i, frame_b in enumerate(frames_out):
-                plt.imsave(f"{tmp_dir}/frame_{i:04d}.png", frame_b)
-
-            vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
-            subprocess.run(
-                f"ffmpeg -y -framerate {fps} -i {tmp_dir}/frame_%04d.png "
-                "-c:v libx264 -pix_fmt yuv420p {vid_path}".format(tmp_dir=tmp_dir, fps=fps, vid_path=vid_path),
-                shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            # figsize must be in inches; dpi=100 -> 1 inch == 100 pixels exactly.
+            fig, ax = plt.subplots(figsize=(W / 100.0, H / 100.0), dpi=100)
+            ax.set_position([0, 0, 1, 1])   # remove all padding
+            ax.imshow(img)
+            ax.imshow(
+                n_att, cmap="hot", alpha=0.5, interpolation="bilinear",
+                extent=(0, W, H, 0), aspect='auto'
             )
-            print(f"  Saved attention video (via ffmpeg) → {vid_path}")
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            print(f"  Failed to generate MP4 via ffmpeg ({e}); keeping individual frames.")
+            ax.text(W - 10, H - 15, f"t={t_idx}", fontsize=max(10, H // 40), color="white",
+                    ha="right", va="top", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.6))
+            ax.axis("off")
+
+            fig.savefig(f"{tmp_dir}/frame_{t_idx:04d}.png", dpi=100, bbox_inches='tight', pad_inches=0)
+            plt.close(fig)
+
+        vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
+        subprocess.run(
+            f"ffmpeg -y -framerate {fps} -i {tmp_dir}/frame_%04d.png "
+            "-c:v libx264 -pix_fmt yuv420p {vid_path}".format(tmp_dir=tmp_dir, fps=fps, vid_path=vid_path),
+            shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        print(f"  Saved attention video (via ffmpeg) → {vid_path}")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        print(f"  Failed to generate MP4 via ffmpeg ({e}); keeping individual frames.")
 
 
 def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
@@ -630,7 +619,7 @@ def main():
                         help="Cameras to use (>=2 to test cross-camera)")
     parser.add_argument("--n-samples", type=int, default=3,
                         help="Number of samples to test")
-    parser.add_argument("--n-frames", type=int, default=5,
+    parser.add_argument("--n-frames", type=int, default=50,
                         help="Number of frames per sample")
     parser.add_argument("--device", default=None)
     parser.add_argument("--out-dir", default=None,
