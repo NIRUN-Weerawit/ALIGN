@@ -422,34 +422,31 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
             os.makedirs(out_dir, exist_ok=True)
 
             for cam_idx in range(num_cams_cfg):
-                # Correctly extract per-camera frames regardless of stacking.
-                if frames.ndim == 5:        # (T, V, H, W, 3)
+                if frames.ndim == 5:       # Multi-cam: (T, V, H, W, 3)
                     img_rows = np.array([frames[t, cam_idx] for t in range(T_ep)])
-                else:                       # (T, H, W, 3)
+                else:                       # Single-cam: (T, H, W, 3)
                     img_rows = np.array([frames[t] for t in range(T_ep)])
 
                 fig, axes = plt.subplots(1, T_ep, figsize=(4 * T_ep, 4))
                 if T_ep == 1:
                     axes = np.array([axes])
 
-                for t_idx in range(T_ep):
-                    ax   = axes[t_idx] if T_ep > 1 else axes[0]
-                    img  = img_rows[t_idx]
-                    att  = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
-
-                    att_min, att_max = att.min(), att.max()
-                    norm_att = (att - att_min)/(att_max - att_min + 1e-8) if att_max > att_min else np.zeros_like(att)
-
+                for t in range(T_ep):
+                    ax = axes[t] if T_ep > 1 else axes[0]
+                    img = img_rows[t]
+                    att = timeline_weights[t][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
+                    a_min, a_max = att.min(), att.max()
+                    norm_att = (att - a_min) / (a_max - a_min + 1e-8) if a_max > a_min else np.zeros_like(att)
                     ax.imshow(img)
                     ax.imshow(norm_att, cmap="hot", alpha=0.5, interpolation="bilinear", extent=(0, img.shape[1], img.shape[0], 0))
-                    ax.set_title(f"t={t_idx}"); ax.axis("off")
+                    ax.set_title(f"t={t}"); ax.axis("off")
 
                 fig.suptitle(f"Camera {cam_idx}: attention over timeline")
                 fig.tight_layout()
                 fig.savefig(os.path.join(out_dir, f"attention_timeline_cam{cam_idx}.png"), dpi=80)
                 plt.close(fig)
 
-                # Also stitch frames into an MP4 video.
+                # Stitch overlay frames into an MP4 video.
                 _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim)
 
         except Exception as e:
@@ -490,8 +487,9 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
         # Stitch individual overlayed frames into a single MP4 
         vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
         if len(os.listdir(tmp_dir)) > 0:
+            fps = 2  # Slow down to 2fps so each frame stays visible for half a second.
             subprocess.run(
-                f"ffmpeg -y -framerate {max(1, T_ep)} "
+                f"ffmpeg -y -framerate {fps} "
                 f"-i {tmp_dir}/f_%04d.png -c:v mpeg4 -pix_fmt yuv420p -qscale 0 {vid_path}",
                 shell=True, capture_output=True
             )
