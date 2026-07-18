@@ -421,6 +421,7 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
 
             os.makedirs(out_dir, exist_ok=True)
 
+            # --- A. Per-camera timeline grids + MP4 videos -----------------
             for cam_idx in range(num_cams_cfg):
                 if frames.ndim == 5:       # Multi-cam: (T, V, H, W, 3)
                     img_rows = np.array([frames[t, cam_idx] for t in range(T_ep)])
@@ -431,28 +432,71 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
                 if T_ep == 1:
                     axes = np.array([axes])
 
-                for t in range(T_ep):
-                    ax = axes[t] if T_ep > 1 else axes[0]
-                    img = img_rows[t]
-                    att = timeline_weights[t][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
-                    a_min, a_max = att.min(), att.max()
-                    norm_att = (att - a_min) / (a_max - a_min + 1e-8) if a_max > a_min else np.zeros_like(att)
+                for t_idx in range(T_ep):
+                    ax   = axes[t_idx] if T_ep > 1 else axes[0]
+                    img  = img_rows[t_idx]
+                    att  = timeline_weights[t_idx][cam_idx].reshape(grid_dim, grid_dim).astype(np.float64)
+
+                    att_min, att_max = att.min(), att.max()
+                    norm_att = (att - att_min)/(att_max - att_min + 1e-8) if att_max > att_min else np.zeros_like(att)
+
                     ax.imshow(img)
                     ax.imshow(norm_att, cmap="hot", alpha=0.5, interpolation="bilinear", extent=(0, img.shape[1], img.shape[0], 0))
-                    ax.set_title(f"t={t}"); ax.axis("off")
+                    ax.set_title(f"t={t_idx}"); ax.axis("off")
 
                 fig.suptitle(f"Camera {cam_idx}: attention over timeline")
                 fig.tight_layout()
                 fig.savefig(os.path.join(out_dir, f"attention_timeline_cam{cam_idx}.png"), dpi=80)
                 plt.close(fig)
 
-                # Stitch overlay frames into an MP4 video.
                 _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim)
+
+            # --- B. Per-camera attention comparison (original/zero/perturbed z_t on frame 0) ---
+            if frames.ndim == 5 and num_cams_cfg >= 2:
+                pt_0 = patches_seq[0, 0].detach()
+                st_0 = states_enc[0, 0].detach()
+
+                comparison_weights = {}   # label -> list of per-cam weights (P,)
+                for label, z_t_v in [
+                    ("original", st_0),
+                    ("zero", torch.zeros_like(st_0)),
+                    ("perturbed", st_0 + torch.randn_like(st_0) * 0.3),
+                ]:
+                    comparison_weights[label] = _extract_weights_for_step(pt_0, z_t_v)
+
+                n_cams = num_cams_cfg
+                n_labels = len(comparison_weights)
+                fig, axes = plt.subplots(n_cams, n_labels, figsize=(5 * n_labels, 4 * n_cams))
+                if n_cams == 1 and n_labels == 1:
+                    axes = np.array([[axes]])
+                elif n_cams == 1:
+                    axes = axes.reshape(1, -1)
+                elif n_labels == 1:
+                    axes = axes.reshape(-1, 1)
+
+                orig_frame = frames[0]   # (V, H, W, 3)
+                for cam_idx in range(n_cams):
+                    img = orig_frame[cam_idx]
+                    for label_idx, label in enumerate(comparison_weights):
+                        ax = axes[cam_idx, label_idx]
+                        w  = comparison_weights[label][cam_idx]
+
+                        attn_grid = w.reshape(grid_dim, grid_dim)
+                        a_min, a_max = attn_grid.min(), attn_grid.max()
+                        norm_g = (attn_grid - a_min)/(a_max - a_min + 1e-8) if a_max > a_min else np.zeros_like(attn_grid)
+
+                        ax.imshow(img, alpha=0.6)
+                        ax.imshow(norm_g, cmap="hot", alpha=0.5, interpolation="bilinear", extent=(0, img.shape[1], img.shape[0], 0))
+                        ax.set_title(f"cam {cam_idx}, z_t={label}"); ax.axis("off")
+
+                fig.suptitle("Per-camera state-conditioned attention: rows=cams, cols=z_t variants")
+                fig.tight_layout()
+                fig.savefig(os.path.join(out_dir, "attention_comparison.png"), dpi=80, bbox_inches="tight")
+                plt.close(fig)
 
         except Exception as e:
             import traceback; traceback.print_exc()
             print(f"  Failed to save visualisations: {e}")
-
 
 def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim):
     """Render an MP4 video where each frame is a full-size image with a heatmap overlay."""
@@ -487,9 +531,8 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
         # Stitch individual overlayed frames into a single MP4 
         vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
         if len(os.listdir(tmp_dir)) > 0:
-            fps = 2  # Slow down to 2fps so each frame stays visible for half a second.
             subprocess.run(
-                f"ffmpeg -y -framerate {fps} "
+                f"ffmpeg -y -framerate {max(1, T_ep)} "
                 f"-i {tmp_dir}/f_%04d.png -c:v mpeg4 -pix_fmt yuv420p -qscale 0 {vid_path}",
                 shell=True, capture_output=True
             )
