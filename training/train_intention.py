@@ -797,7 +797,9 @@ def main():
     if model.intention_head is None:
         print("  Building head via dummy forward...")
         V = num_cameras
-        dummy_frames = torch.zeros(1, args.history_size, V, 224, 224, 3, device=device)
+        # Use the actual image size from the dataset
+        img_h, img_w = full_ds.image_size if hasattr(full_ds, 'image_size') else (224, 224)
+        dummy_frames = torch.zeros(1, args.history_size, V, img_h, img_w, 3, device=device)
         dummy_states = torch.zeros(1, args.history_size, 7, device=device)
         with torch.no_grad():
             model(dummy_frames, dummy_states)
