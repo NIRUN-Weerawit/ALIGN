@@ -456,13 +456,16 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
                 fig.savefig(os.path.join(out_dir, f"attention_timeline_cam{cam_idx}.png"), dpi=80)
                 plt.close(fig)
 
-                _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim)
+                # _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim)
+                # Per-camera videos disabled — using the combined side-by-side video below instead.
 
-            # After all per-camera videos: also produce a side-by-side combined video
+            # Side-by-side combined video for multi-cam (single output, all cameras)
             if frames.ndim == 5 and num_cams_cfg >= 2:
-                # img_rows_per_cam is a list of lists, so convert each
                 all_cam_imgs = [np.array(per_cam) for per_cam in img_rows_per_cam]
                 _save_combined_video(out_dir, num_cams_cfg, all_cam_imgs, timeline_weights, T_ep, grid_dim)
+            elif frames.ndim == 4:
+                # Single-cam fallback: use the per-camera video path
+                _save_timeline_video(out_dir, 0, img_rows, timeline_weights, T_ep, grid_dim)
 
             # --- B. Per-camera attention comparison (original/zero/perturbed z_t on frame 0) ---
             if frames.ndim == 5 and num_cams_cfg >= 2:
