@@ -815,9 +815,9 @@ def main():
                     img_h, img_w = img_shape[1], img_shape[2]
                 cam_frames.append(ds[0:1])  # (1, H, W, C)
             if len(cam_frames) == 1:
-                dummy_np = cam_frames[0].astype(np.uint8)
+                dummy_np = cam_frames[0].astype(np.uint8)  # (1, H, W, C)
             else:
-                dummy_np = np.stack(cam_frames, axis=0).astype(np.uint8)  # (V, 1, H, W, C) -> squeeze batch
+                dummy_np = np.stack(cam_frames, axis=1).astype(np.uint8)  # (1, V, H, W, C)
         dummy = torch.from_numpy(dummy_np).to(device)
         z_v_dummy = model._vision_forward(dummy)  # (VP_tokens, raw_dim) or (1, VP, raw_dim)
         if z_v_dummy.ndim == 2:
