@@ -793,17 +793,15 @@ def main():
     print("  Trainable: vision projection + state encoder + intention encoder + head"
           + (" + text projection" if model.text_encoder is not None else ""))
     # Collect trainable params
-    # Trigger a dummy forward to build lazy head/bank before counting params
+    # Build lazy head/bank before counting params.
+    # Compute pool_out_dim from DINOv2 patch formula: P = (H/14) * (W/14)
     if model.intention_head is None:
-        print("  Building head via dummy forward...")
-        V = num_cameras
-        # Use the actual image size from the dataset
+        print("  Building head...")
         img_h, img_w = full_ds.image_size if hasattr(full_ds, 'image_size') else (224, 224)
-        dummy_frames = torch.zeros(1, args.history_size, V, img_h, img_w, 3, device=device)
-        dummy_states = torch.zeros(1, args.history_size, 7, device=device)
-        with torch.no_grad():
-            model(dummy_frames, dummy_states)
-        print(f"  Head built: pool_out_dim={model.pool_out_dim}")
+        num_patches = (img_h // 14) * (img_w // 14)
+        pool_out_dim = num_cameras * num_patches * args.compressed_dim
+        model._build_head_and_bank(pool_out_dim)
+        print(f"  Head built: pool_out_dim={pool_out_dim} (img={img_h}x{img_w}, patches={num_patches})")
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in model.parameters())
