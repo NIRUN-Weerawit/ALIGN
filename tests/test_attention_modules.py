@@ -422,11 +422,18 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
             os.makedirs(out_dir, exist_ok=True)
 
             # --- A. Per-camera timeline grids + MP4 videos -----------------
+            # First, build per-camera frame lists (one entry per timestep)
+            # img_rows_per_cam[cam_idx] is a list of (H, W, 3) images for that camera
+            if frames.ndim == 5:       # Multi-cam: (T, V, H, W, 3)
+                img_rows_per_cam = [
+                    [frames[t, cam_idx] for t in range(T_ep)]
+                    for cam_idx in range(num_cams_cfg)
+                ]
+            else:                       # Single-cam: (T, H, W, 3)
+                img_rows_per_cam = [[frames[t] for t in range(T_ep)]]
+
             for cam_idx in range(num_cams_cfg):
-                if frames.ndim == 5:       # Multi-cam: (T, V, H, W, 3)
-                    img_rows = np.array([frames[t, cam_idx] for t in range(T_ep)])
-                else:                       # Single-cam: (T, H, W, 3)
-                    img_rows = np.array([frames[t] for t in range(T_ep)])
+                img_rows = np.array(img_rows_per_cam[cam_idx])
 
                 fig, axes = plt.subplots(1, T_ep, figsize=(4 * T_ep, 4))
                 if T_ep == 1:
@@ -450,6 +457,12 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
                 plt.close(fig)
 
                 _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, grid_dim)
+
+            # After all per-camera videos: also produce a side-by-side combined video
+            if frames.ndim == 5 and num_cams_cfg >= 2:
+                # img_rows_per_cam is a list of lists, so convert each
+                all_cam_imgs = [np.array(per_cam) for per_cam in img_rows_per_cam]
+                _save_combined_video(out_dir, num_cams_cfg, all_cam_imgs, timeline_weights, T_ep, grid_dim)
 
             # --- B. Per-camera attention comparison (original/zero/perturbed z_t on frame 0) ---
             if frames.ndim == 5 and num_cams_cfg >= 2:
@@ -551,6 +564,76 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
                 print(completed.stderr.strip() or completed.stdout.strip())
             elif os.path.exists(vid_path):
                 print(f"  Saved attention video -> {vid_path}")
+    finally:
+        shutil.rmtree(tmp_dir)
+
+
+def _save_combined_video(out_dir, num_cams, all_cam_imgs, timeline_weights, T_ep, grid_dim):
+    """Render a side-by-side MP4 video of all cameras' attention heatmaps.
+
+    Each frame shows all cameras stacked horizontally, with their attention
+    heatmap overlay. Useful for visually comparing attention across cameras.
+
+    Args:
+        all_cam_imgs: list of (T_ep, H, W, 3) arrays, one per camera.
+        timeline_weights: list of (num_cams, P) arrays, one per timestep.
+    """
+    import os, tempfile, shutil, subprocess
+    from PIL import Image
+    import numpy as np
+
+    import matplotlib; matplotlib.use('Agg')
+    from matplotlib import cm
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        for t in range(T_ep):
+            # Build per-camera frame
+            cam_frames = []
+            for cam_idx in range(num_cams):
+                img = all_cam_imgs[cam_idx][t]                  # (H, W, 3) uint8
+                att = timeline_weights[t][cam_idx].reshape(grid_dim, grid_dim)
+                H, W = img.shape[:2]
+
+                att_resized = np.array(
+                    Image.fromarray(att, 'F').resize((W, H), Image.BILINEAR)
+                )
+                min_v, max_v = att_resized.min(), att_resized.max()
+                norm_att = (att_resized - min_v) / (max_v - min_v + 1e-8)
+                heat_rgb = cm.hot(norm_att)[:, :, :3] * 255.0
+                alpha = np.stack([norm_att] * 3, axis=-1)
+                cam_frame = np.clip(
+                    img.astype(np.float32) * (1.0 - alpha * 0.6)
+                    + heat_rgb * (alpha * 0.6),
+                    0, 255,
+                ).astype(np.uint8)
+                cam_frames.append(cam_frame)
+
+            # Stack horizontally: (H, W * num_cams, 3)
+            combined = np.concatenate(cam_frames, axis=1)
+            Image.fromarray(combined).save(f"{tmp_dir}/f_{t:04d}.png")
+
+        vid_path = os.path.join(out_dir, "attention_video_combined.mp4")
+        if len(os.listdir(tmp_dir)) > 0:
+            fps = 2
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", os.path.join(tmp_dir, "f_%04d.png"),
+                "-r", str(fps),
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-an",
+                vid_path,
+            ]
+            completed = subprocess.run(cmd, capture_output=True, text=True)
+            if completed.returncode != 0:
+                print("  Failed to save combined attention video")
+                print(completed.stderr.strip() or completed.stdout.strip())
+            elif os.path.exists(vid_path):
+                print(f"  Saved combined attention video -> {vid_path}")
     finally:
         shutil.rmtree(tmp_dir)
 
