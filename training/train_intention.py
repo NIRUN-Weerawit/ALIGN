@@ -794,10 +794,16 @@ def main():
           + (" + text projection" if model.text_encoder is not None else ""))
     # Collect trainable params
     # Build lazy head/bank before counting params.
-    # Compute pool_out_dim from DINOv2 patch formula: P = (H/14) * (W/14)
+    # Read actual image size from HDF5 to compute pool_out_dim correctly.
     if model.intention_head is None:
         print("  Building head...")
-        img_h, img_w = full_ds.image_size if hasattr(full_ds, 'image_size') else (224, 224)
+        # Read the actual image size from the HDF5 file
+        import h5py
+        with h5py.File(args.data[0], "r") as _h5:
+            ep_key = sorted([k for k in _h5.keys() if k.startswith("ep_")])[0]
+            cam_name = args.cameras[0]
+            img_shape = _h5[f"{ep_key}/{cam_name}"].shape
+            img_h, img_w = img_shape[1], img_shape[2]
         num_patches = (img_h // 14) * (img_w // 14)
         pool_out_dim = num_cameras * num_patches * args.compressed_dim
         model._build_head_and_bank(pool_out_dim)
