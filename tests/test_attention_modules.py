@@ -548,7 +548,7 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
         # Use H.264 so VS Code/browser-based viewers can open the file.
         vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
         if len(os.listdir(tmp_dir)) > 0:
-            fps = 2  # Slow down so each frame holds for half a second.
+            fps = 10  # Slow down so each frame holds for half a second.
             cmd = [
                 "ffmpeg", "-y",
                 "-framerate", str(fps),
@@ -618,7 +618,7 @@ def _save_combined_video(out_dir, num_cams, all_cam_imgs, timeline_weights, T_ep
 
         vid_path = os.path.join(out_dir, "attention_video_combined.mp4")
         if len(os.listdir(tmp_dir)) > 0:
-            fps = 2
+            fps = 10
             cmd = [
                 "ffmpeg", "-y",
                 "-framerate", str(fps),
