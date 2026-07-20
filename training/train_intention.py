@@ -293,37 +293,40 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             # Current time = last frame in the window
             current_t = win_end - 1
 
-            # Forward through model
+            # Forward through model (uses model's internal z_v_pooled_seq for consistency)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
                 out = model(f_win, s_win)
                 intent_emb = out.get("intent_emb", None)
                 h_current = out["h_seq"][:, -1]
+                # Use model's own outputs to guarantee dim consistency
+                z_v_win_model = out["z_v_pooled_seq"]  # (B, H, pool_out_dim)
+                z_t_win_model = out["z_t_seq"]          # (B, H, state_dim)
 
                 # Memory bank: store every step (warmup), retrieve + fuse in active phase
                 if model.use_memory_bank:
-                    z_v_current = z_v_win[:, -1]  # (B, pool_out_dim)
+                    z_v_current = z_v_win_model[:, -1]  # (B, pool_out_dim)
 
                     if t >= H - 1 and intent_emb is not None:
                         # Active phase: retrieve + fuse + store
                         z_v_fused, intent_fused = model.memory_module(
                             z_v_current, intent_emb,
                         )
-                        z_v_win_for_head = z_v_win.clone()
+                        z_v_win_for_head = z_v_win_model.clone()
                         z_v_win_for_head[:, -1] = z_v_fused
                         h_for_head = intent_fused
                     else:
                         # Warmup: store perceptual only, no retrieval
                         model.memory_module.store_perceptual_only(z_v_current)
-                        z_v_win_for_head = z_v_win
+                        z_v_win_for_head = z_v_win_model
                         h_for_head = h_current
                 else:
-                    z_v_win_for_head = z_v_win
+                    z_v_win_for_head = z_v_win_model
                     h_for_head = h_current
 
-                # Predict actions
+                # Predict actions (use model's own outputs for dim consistency)
                 actions_pred = model.predict_actions(
-                    z_v_win_for_head, z_t_win, h_for_head,
+                    z_v_win_for_head, z_t_win_model, h_for_head,
                 )
 
                 # Target: C future actions from current time
