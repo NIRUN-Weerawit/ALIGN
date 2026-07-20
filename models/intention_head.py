@@ -494,36 +494,38 @@ class DiffusionActionHead(nn.Module):
         return x.float()
 
     def _step(self, x: torch.Tensor, t: int, cond: torch.Tensor) -> torch.Tensor:
-        """One denoising step: x_t → x_{t-1} (deterministic)."""
+        """One denoising step: x_t → x_{t-1} (DDIM deterministic, eta=0).
+
+        Standard DDIM (Song et al. 2020):
+            x_0_pred   = (x_t - σ_t * ε_θ) / √ᾱ_t         # predicted clean sample
+            x_{t-1}    = √ᾱ_{t-1} * x_0_pred + √(1-ᾱ_{t-1}) * ε_θ
+
+        This is the deterministic DDIM step (eta=0). No stochastic noise is added
+        between steps; the only randomness is the initial noise x_T.
+
+        Note: The previous version had a buggy formula that mixed the
+        DDIM step with an incorrect variance term. The fixed version uses
+        the standard DDIM eta=0 update.
+        """
         predicted_noise = self._predict_noise_with_index(
             x,
-            # Single timestep repeated for whole batch — shape (B,)
             torch.full((x.shape[0],), t, dtype=torch.long, device=x.device),
             cond,
         )
 
-        sigma_t     = self.sigma[t].float()                          # (1,)
-        sigma_prev  = self.sigma[max(t - 1, 0)].float()
+        a_bar_t    = self.alpha_bar[t].float()
+        a_bar_prev = (self.alpha_bar[max(t - 1, 0)].float()
+                      if t > 0
+                      else torch.tensor(1.0, dtype=torch.float32, device=x.device))
+        sigma_t    = self.sigma[t].float()
 
-        a_bar_t      = self.alpha_bar[t].float()
-        if t > 0:
-            a_bar_prev = self.alpha_bar[t - 1].float()
-        else:
-            a_bar_prev = torch.tensor(1.0, dtype=torch.float32, device=x.device)
+        # Step 1: predict x_0 from x_t and predicted noise
+        # (x - σ_t * noise) / √ᾱ_t  — note the parentheses!
+        x_0_pred = (x - sigma_t * predicted_noise) / a_bar_t.sqrt()
 
-        # Mean prediction (DDPM/DDIM common term):
-        x_hat = ((x - sigma_t * predicted_noise / a_bar_t.sqrt()) /
-                  sigma_t * (a_bar_prev.sqrt() - a_bar_t.sqrt()))
-
-        # Add variance term: σ_{t-1}·(σ_t^2 - (ᾱ_t - ᾱ_{t-1})²)^(1/2) for diversity
-        if t > 1:
-            var_coeff = sigma_prev * torch.sqrt(
-                sigma_t.pow(2) - (a_bar_t - a_bar_prev).pow(2) + 1e-8,
-            )
-        else:
-            var_coeff = sigma_prev
-
-        return x_hat + predicted_noise * var_coeff[:, None, None]
+        # Step 2: compute x_{t-1} (DDIM eta=0)
+        x_prev = a_bar_prev.sqrt() * x_0_pred + (1.0 - a_bar_prev).sqrt() * predicted_noise
+        return x_prev
 
 
 # ================================================================
