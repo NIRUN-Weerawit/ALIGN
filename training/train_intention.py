@@ -181,6 +181,7 @@ def build_model(args, num_cameras, device):
         head_dim_ff=args.head_dim_ff,
         use_text=args.use_text,
         text_dim=args.text_dim,
+        pool_num_queries=args.pool_num_queries,
     )
     model = model.to(device)
     return model
@@ -245,7 +246,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 actions_pred_for_loss = actions_pred
 
             # Loss depends on head type
-            if args.head_type in ("flow", "diffusion"):
+            if args.head_type in ("flow", "diffusion", "diffusion_policy"):
                 loss = model.intention_head.loss(target, actions_pred)
             else:
                 # Direct regression: MSE on actions (use padded for fair comparison)
@@ -321,7 +322,7 @@ def validate(model, loader, device, args):
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]
-            if args.head_type in ("flow", "diffusion"):
+            if args.head_type in ("flow", "diffusion", "diffusion_policy"):
                 # For flow/diffusion heads, sample actions via generator's method
                 actions_pred = model.sample_actions(
                     out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
@@ -453,7 +454,7 @@ def parse_args():
     # NOTE: --action-dim hardcoded to 6 (OSC pose deltas).
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
-    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion", "flow"],
+    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion", "diffusion_policy", "flow"],
                         default="mamba",
                         help="Which head architecture: transformer, mamba, hybrid, diffusion, or flow")
     parser.add_argument("--use-history", action="store_true", default=True,
@@ -475,6 +476,11 @@ def parse_args():
                         help="Mamba block expansion factor (default 2).")
     parser.add_argument("--action-dim", type=int, default=6,
                         help="Action output dim (default 6 for OSC).")
+    # N-query pool config
+    parser.add_argument("--pool-num-queries", type=int, default=8,
+                        help="Number of independent queries per camera in state-conditioned pool "
+                             "(default 8). Increases pool_out_dim from V*D_viz → V*NQ*D_viz.")
+    # Patch tokens
     parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
                         action="store_false", default=True,
                         help="Use CLS token instead of patch tokens from DINOv2.")

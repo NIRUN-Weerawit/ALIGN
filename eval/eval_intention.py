@@ -268,7 +268,7 @@ def evaluate(
                                     enabled=device.type == "cuda"):
                 out = model(frames, state)
                 h_current = out["h_seq"][:, -1]
-                if model.head_type == "flow":
+                if model.head_type in ("flow", "diffusion_policy"):
                     # Flow head: use sample_actions (ODE integration)
                     actions_pred = model.sample_actions(
                         out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,

@@ -596,7 +596,7 @@ def run_model_in_sim(
                 with sdpa_kernel(backends=[SDPBackend.MATH]):
                     out = model(f_t, s_t)
                     h_current = out["h_seq"][:, -1]
-                    if model.head_type == "flow":
+                    if model.head_type in ("flow", "diffusion_policy"):
                         a_model_full = model.sample_actions(
                             out["z_v_pooled_seq"], out["z_t_seq"],
                             h_current, z_text=z_text,

@@ -711,7 +711,418 @@ class FlowMatchingActionHead(nn.Module):
 
 
 # ================================================================
-# Sinusoidal time embedding (used by FlowMatchingActionHead)
+# Diffusion Policy Head (Chi et al. 2023)
+# ================================================================
+# Real Diffusion Policy: 1D Conditional U-Net with temporal convolutions
+# for action sequence prediction. Unlike the legacy DiffusionActionHead
+# (which used an MLP backbone), this implementation:
+#   1. Uses 1D Conv1d to couple K timesteps (key for non-oversmoothed outputs)
+#   2. Has a U-Net architecture with downsampling/upsampling
+#   3. Uses FiLM conditioning at every block (time + per-step cond)
+#   4. Has skip connections between encoder and decoder
+#
+# Reference: Chi et al. "Diffusion Policy: Visuomotor Policy Learning via
+# Action Diffusion" (RSS 2023). https://diffusion-policy.cs.columbia.edu/
+
+
+class _FiLM1d(nn.Module):
+    """Feature-wise Linear Modulation for 1D conv outputs.
+
+    Given per-step cond (B, K, cond_dim) and time embedding (B, time_dim),
+    produce (gamma, beta) of shape (B, channels) and apply:
+        out = gamma * features + beta
+
+    Used at every block of the U-Net for time + cond conditioning.
+    """
+
+    def __init__(self, channels: int, cond_dim: int, time_dim: int):
+        super().__init__()
+        # MLP that maps (cond + time) -> (gamma, beta) for each channel
+        self.proj = nn.Sequential(
+            nn.Linear(cond_dim + time_dim, channels * 2),
+        )
+        # Initialize gamma=1, beta=0 so FiLM is identity at init
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.ones_(self.proj[-1].bias[:channels])    # gamma=1
+        nn.init.zeros_(self.proj[-1].bias[channels:])   # beta=0
+
+    def forward(self, x: torch.Tensor, cond_global: torch.Tensor,
+                t_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, K) — conv output to modulate
+            cond_global: (B, cond_dim) — global cond per sample
+                          (mean-pooled from per-step cond)
+            t_emb: (B, time_dim) — time embedding per sample
+
+        Returns:
+            (B, C, K) — modulated features
+        """
+        B, C, K = x.shape
+        # Concatenate cond and time → predict FiLM params
+        h = torch.cat([cond_global, t_emb], dim=-1)             # (B, cond+time)
+        film = self.proj(h)                                     # (B, 2C)
+        gamma, beta = film.chunk(2, dim=-1)                     # each (B, C)
+        # Reshape for broadcasting over K: (B, C, 1)
+        gamma = gamma.unsqueeze(-1)
+        beta = beta.unsqueeze(-1)
+        return gamma * x + beta
+
+
+class _Conv1dBlock(nn.Module):
+    """Conv1d block with GroupNorm, SiLU, and FiLM conditioning.
+
+    Architecture:
+        Conv1d(in -> out, kernel=3, padding=1) → GroupNorm → FiLM → SiLU
+    Optional residual: 1x1 Conv1d if in != out or stride != 1.
+    """
+
+    def __init__(self, in_channels: int, out_channels: int,
+                 cond_dim: int, time_dim: int, n_groups: int = 8):
+        super().__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=3,
+                              padding=1)
+        self.norm = nn.GroupNorm(n_groups, out_channels)
+        self.film = _FiLM1d(out_channels, cond_dim, time_dim)
+        self.act = nn.SiLU()
+        # Residual projection if channels change
+        if in_channels != out_channels:
+            self.residual = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual = nn.Identity()
+
+    def forward(self, x: torch.Tensor, cond_global: torch.Tensor,
+                t_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C_in, K)
+            cond_global: (B, cond_dim)
+            t_emb: (B, time_dim)
+        Returns:
+            (B, C_out, K)
+        """
+        residual = self.residual(x)
+        h = self.conv(x)
+        h = self.norm(h)
+        h = self.film(h, cond_global, t_emb)
+        h = self.act(h)
+        return h + residual
+
+
+class _Downsample1d(nn.Module):
+    """Downsample by 2x using Conv1d stride=2."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv1d(channels, channels, kernel_size=3, stride=2, padding=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+class _Upsample1d(nn.Module):
+    """Upsample by 2x using nearest-neighbor + Conv1d."""
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+
+    def forward(self, x, target_len=None):
+        # Nearest-neighbor upsample
+        x = nn.functional.interpolate(x, scale_factor=2, mode="nearest")
+        out = self.conv(x)
+        if target_len is not None:
+            # Pad or crop to target length
+            if out.shape[-1] < target_len:
+                out = nn.functional.pad(out, (0, target_len - out.shape[-1]))
+            elif out.shape[-1] > target_len:
+                out = out[..., :target_len]
+        return out
+
+
+class DiffusionPolicyUNet1D(nn.Module):
+    """1D Conditional U-Net for Diffusion Policy (Chi et al. 2023).
+
+    Architecture:
+        Input:  x_t (B, K, action_dim) + cond (B, K, cond_dim) → concat
+                → (B, K, action_dim + cond_dim) → permute to (B, C, K)
+        Encoder: Conv1dBlock(in, h) → Down → Conv1dBlock(h, 2h) → Down → Conv1dBlock(2h, 4h)
+        Bottleneck: Conv1dBlock(4h, 4h)
+        Decoder: Upsample + Conv1dBlock(4h + 4h, 2h)
+                  + Upsample + Conv1dBlock(2h + 2h, h)
+                  + Conv1dBlock(h + h, h)  (no upsample, just refine)
+        Output: Conv1d(h, action_dim)  →  permute back to (B, K, action_dim)
+
+    All conv blocks are FiLM-conditioned on (cond_global, t_emb).
+
+    For K=10 (default), we use 2 downsamples (10 → 5 → 2) which works fine.
+    For longer K, more downsamples may be needed.
+    """
+
+    def __init__(self, action_dim: int, cond_dim: int, time_dim: int = 64,
+                 hidden_dim: int = 128, n_groups: int = 8):
+        super().__init__()
+        self.action_dim = action_dim
+        self.cond_dim = cond_dim
+        self.time_dim = time_dim
+        self.hidden_dim = hidden_dim
+
+        # Input projection: concat(x_t, cond) → hidden
+        self.input_proj = nn.Conv1d(action_dim + cond_dim, hidden_dim,
+                                    kernel_size=3, padding=1)
+
+        # Encoder: hidden -> 2*hidden -> 4*hidden
+        self.down1 = _Downsample1d(hidden_dim)
+        self.enc1 = _Conv1dBlock(hidden_dim, hidden_dim, cond_dim, time_dim, n_groups)
+        self.enc2 = _Conv1dBlock(hidden_dim, hidden_dim * 2, cond_dim, time_dim, n_groups)
+
+        self.down2 = _Downsample1d(hidden_dim * 2)
+        self.enc3 = _Conv1dBlock(hidden_dim * 2, hidden_dim * 2, cond_dim, time_dim, n_groups)
+        self.enc4 = _Conv1dBlock(hidden_dim * 2, hidden_dim * 4, cond_dim, time_dim, n_groups)
+
+        # Bottleneck
+        self.bottleneck = _Conv1dBlock(hidden_dim * 4, hidden_dim * 4,
+                                        cond_dim, time_dim, n_groups)
+
+        # Decoder with skip connections
+        self.up2 = _Upsample1d(hidden_dim * 4)
+        self.dec2 = _Conv1dBlock(hidden_dim * 4 + hidden_dim * 2,
+                                hidden_dim * 2, cond_dim, time_dim, n_groups)
+
+        self.up1 = _Upsample1d(hidden_dim * 2)
+        self.dec1 = _Conv1dBlock(hidden_dim * 2 + hidden_dim,
+                                hidden_dim, cond_dim, time_dim, n_groups)
+
+        # Final refinement (no upsample, just smooth)
+        self.dec0 = _Conv1dBlock(hidden_dim + hidden_dim,
+                                hidden_dim, cond_dim, time_dim, n_groups)
+
+        # Output projection: noise prediction
+        self.output_proj = nn.Conv1d(hidden_dim, action_dim, kernel_size=1)
+        # Zero-init output for stable early training
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, x_t: torch.Tensor, cond: torch.Tensor,
+                t_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_t: (B, K, action_dim) — noisy actions
+            cond: (B, K, cond_dim) — per-step condition
+            t_emb: (B, time_dim) — time embedding (per-sample)
+
+        Returns:
+            predicted_noise: (B, K, action_dim)
+        """
+        B, K, _ = x_t.shape
+        # Build global cond (per-sample, used for FiLM)
+        # Mean-pool cond over K to get a (B, cond_dim) global representation
+        cond_global = cond.mean(dim=1)  # (B, cond_dim)
+
+        # Concat x_t and cond along feature dim, permute to (B, C, K)
+        x = torch.cat([x_t, cond], dim=-1)              # (B, K, action+cond)
+        x = x.permute(0, 2, 1)                          # (B, C, K)
+        x = self.input_proj(x)                          # (B, hidden, K)
+
+        # Encoder path with skip connections
+        # Store skips at each encoder level (before downsample)
+        skip0 = x                                         # (B, hidden, K)
+
+        # Down 1: K -> K/2
+        x = self.down1(x)                                # (B, hidden, K/2)
+        x = self.enc1(x, cond_global, t_emb)             # (B, hidden, K/2)
+        skip1 = x                                         # (B, hidden, K/2)
+
+        x = self.enc2(x, cond_global, t_emb)             # (B, 2h, K/2)
+
+        # Down 2: K/2 -> K/4
+        x = self.down2(x)                                # (B, 2h, K/4)
+        x = self.enc3(x, cond_global, t_emb)             # (B, 2h, K/4)
+        skip2 = x                                         # (B, 2h, K/4)
+
+        x = self.enc4(x, cond_global, t_emb)             # (B, 4h, K/4)
+
+        # Bottleneck at lowest resolution
+        x = self.bottleneck(x, cond_global, t_emb)       # (B, 4h, K/4)
+
+        # Decoder path with skip connections
+        # Up 2: K/4 -> K/2
+        x = self.up2(x, target_len=skip2.shape[-1])      # (B, 4h, K/4) → (B, 4h, K/4)
+        x = torch.cat([x, skip2], dim=1)                 # (B, 4h+2h, K/4)
+        x = self.dec2(x, cond_global, t_emb)             # (B, 2h, K/4)
+
+        # Up 1: K/4 -> K/2
+        x = self.up1(x, target_len=skip1.shape[-1])      # (B, 2h, K/4) → (B, 2h, K/2)
+        x = torch.cat([x, skip1], dim=1)                 # (B, 2h+h, K/2)
+        x = self.dec1(x, cond_global, t_emb)             # (B, h, K/2)
+
+        # Final refinement: match K to skip0's K
+        if x.shape[-1] != skip0.shape[-1]:
+            x = nn.functional.interpolate(x, size=skip0.shape[-1], mode="linear")
+        x = torch.cat([x, skip0], dim=1)                 # (B, h+h, K)
+        x = self.dec0(x, cond_global, t_emb)             # (B, h, K)
+
+        # Output projection
+        x = self.output_proj(x)                          # (B, action_dim, K)
+        x = x.permute(0, 2, 1)                          # (B, K, action_dim)
+        return x
+
+
+class DiffusionPolicyHead(nn.Module):
+    """True Diffusion Policy head (Chi et al. 2023) with 1D Conditional U-Net.
+
+    Key differences from legacy DiffusionActionHead (which used MLP):
+      - Backbone: 1D U-Net with Conv1d (vs MLP)
+      - Temporal coupling: Conv1d layers mix K timesteps (vs per-timestep)
+      - Skip connections: encoder → decoder (vs none)
+      - FiLM conditioning: at every block (vs single global)
+
+    Args:
+        cond_dim:          per-step condition dim (z_v + z_t + text + h)
+        action_dim:        output dim (default 6, or 7 with gripper)
+        hidden_dim:        U-Net base channels (default 128)
+        num_inference_steps: DDIM denoising steps (default 10)
+        time_dim:          sinusoidal time embedding dim (default 64)
+        chunk_size:        K — number of past steps / future actions
+        use_history:       whether to use_history (controls FiLM input dim)
+
+    Training: standard DDPM noise prediction (Ho et al. 2020) with cosine schedule.
+    Inference: deterministic DDIM (Song et al. 2020) with eta=0.
+    """
+
+    def __init__(self, cond_dim: int = 768, action_dim: int = 6,
+                 hidden_dim: int = 128, num_inference_steps: int = 10,
+                 time_dim: int = 64, chunk_size: int = 10,
+                 use_history: bool = True):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_inference_steps = num_inference_steps
+        self.time_dim = time_dim
+        self.chunk_size = chunk_size
+        self.use_history = use_history
+        self.cond_dim = cond_dim
+
+        # Sinusoidal time embedding
+        self.time_emb = nn.Sequential(
+            SinusoidalPositionalEncoding(time_dim),
+            nn.Linear(time_dim, time_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_dim * 2, time_dim),
+        )
+
+        # DDPM noise schedule (cosine, Lin et al. 2023)
+        import math as _math
+        T_steps = num_inference_steps
+        s = 0.008
+        t_vals = torch.arange(T_steps + 1, dtype=torch.float64)
+        theta = torch.tensor(_math.pi / 2, dtype=torch.float64) * (
+            t_vals / T_steps + s) / (1 + s)
+        alpha_bar = torch.cos(theta).pow(2)
+        sigma = torch.sqrt(1 - alpha_bar)
+        self.register_buffer("alpha_bar", alpha_bar.float())
+        self.register_buffer("sigma", sigma.float())
+
+        # The U-Net noise predictor
+        self.unet = DiffusionPolicyUNet1D(
+            action_dim=action_dim,
+            cond_dim=cond_dim,
+            time_dim=time_dim,
+            hidden_dim=hidden_dim,
+        )
+
+    def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
+                              z_t_window: torch.Tensor,
+                              h_current: torch.Tensor = None,
+                              z_text: torch.Tensor = None) -> torch.Tensor:
+        """Build per-step condition (B, K, cond_dim)."""
+        B, K = z_v_pooled_window.shape[:2]
+        per_step_parts = [z_v_pooled_window, z_t_window]
+        if z_text is not None:
+            z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
+            per_step_parts.append(z_text_expanded)
+        per_step_in = torch.cat(per_step_parts, dim=-1)
+        if self.use_history and h_current is not None:
+            h_repeated = h_current.unsqueeze(1).expand(-1, K, -1)
+            per_step_in = torch.cat([per_step_in, h_repeated], dim=-1)
+        return per_step_in
+
+    def forward(self, z_v_pooled_window: torch.Tensor,
+                z_t_window: torch.Tensor,
+                h_current: torch.Tensor = None,
+                z_text: torch.Tensor = None) -> torch.Tensor:
+        """Build per-step condition. Returns cond for loss/sample."""
+        return self._build_per_step_cond(
+            z_v_pooled_window, z_t_window, h_current, z_text
+        )
+
+    def predict_noise(self, x_t: torch.Tensor, t: torch.Tensor,
+                      cond: torch.Tensor) -> torch.Tensor:
+        """Predict noise given noisy actions and timestep.
+
+        Args:
+            x_t: (B, K, action_dim) — noisy actions
+            t:   (B,) integer timestep in [0, num_inference_steps]
+            cond: (B, K, cond_dim) — per-step condition
+        Returns:
+            (B, K, action_dim) — predicted noise
+        """
+        t_emb = self.time_emb(t.float() / self.num_inference_steps)  # (B, time_dim)
+        return self.unet(x_t, cond, t_emb)
+
+    def loss(self, actions_target: torch.Tensor,
+             cond: torch.Tensor) -> torch.Tensor:
+        """DDPM noise-prediction training loss (Ho et al. 2020).
+
+        Sample t uniformly per sample, add Gaussian noise, predict the noise.
+        """
+        B, K = actions_target.shape[:2]
+        device = actions_target.device
+
+        # Sample t per sample (shared across K)
+        t_indices = torch.randint(0, self.num_inference_steps + 1,
+                                  (B,), device=device).long()
+        alpha_bar_t = self.alpha_bar[t_indices][:, None, None]   # (B, 1, 1)
+        sigma_t = self.sigma[t_indices][:, None, None]
+
+        noise = torch.randn_like(actions_target, dtype=torch.float32)
+        x_t = alpha_bar_t.sqrt() * actions_target.float() + sigma_t * noise
+
+        predicted_noise = self.predict_noise(x_t, t_indices, cond)
+        return F.mse_loss(predicted_noise.float(), noise.float())
+
+    @torch.no_grad()
+    def sample(self, cond: torch.Tensor, num_steps: int = None) -> torch.Tensor:
+        """DDIM deterministic sampling (eta=0) from noise to actions.
+
+        Standard DDIM update:
+            x_0_pred   = (x_t - sigma_t * eps_theta) / sqrt(alpha_bar_t)
+            x_{t-1}    = sqrt(alpha_bar_{t-1}) * x_0_pred + sqrt(1 - alpha_bar_{t-1}) * eps_theta
+        """
+        if num_steps is None:
+            num_steps = self.num_inference_steps
+        B, K, D = cond.shape[0], cond.shape[1], self.action_dim
+        device = cond.device
+
+        # Start from pure noise
+        x = torch.randn(B, K, D, device=device)
+
+        # Iterate from T-1 to 0
+        for i in range(num_steps - 1, -1, -1):
+            t = torch.full((B,), i, device=device, dtype=torch.long)
+            eps = self.predict_noise(x, t, cond)
+
+            a_bar_t = self.alpha_bar[i]
+            a_bar_prev = (self.alpha_bar[max(i - 1, 0)]
+                          if i > 0
+                          else torch.tensor(1.0, dtype=torch.float32, device=device))
+            sigma_t = self.sigma[i]
+
+            # DDIM eta=0 step
+            x_0_pred = (x - sigma_t * eps) / a_bar_t.sqrt()
+            x = a_bar_prev.sqrt() * x_0_pred + (1.0 - a_bar_prev).sqrt() * eps
+        return x
+
+
+# ================================================================
+# Sinusoidal time embedding (used by FlowMatchingActionHead and DiffusionPolicyHead)
 # ================================================================
 
 class SinusoidalPositionalEncoding(nn.Module):

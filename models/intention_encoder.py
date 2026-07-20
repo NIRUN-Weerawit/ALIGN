@@ -34,41 +34,44 @@ except ImportError:
 # ================================================================
 
 class StateConditionedAttentionPool(nn.Module):
-    """Cross-attention where z_t (robot state) is the query and z_v patches
-    are the keys/values.
+    """N-query cross-attention where robot state z_t generates N independent queries.
 
-    The output is a single vector that summarizes the patches, weighted by
-    their relevance to the current robot state. This is "task-aware pooling":
-    the attention adapts per-timestep based on where the gripper is.
+    Instead of a single pooled token, each query learns to attend to a different
+    spatial region of the patches — effectively a state-conditioned spatial summary
+    with N diverse foci per timestep. The queries are produced by an independent
+    linear projection per query (no parameter sharing between queries), so they
+    naturally diverge to cover different visual regions.
 
     Args:
         vision_dim: patch feature dim (e.g., 256)
         state_dim:  robot state dim (e.g., 256)
-        num_heads:  attention heads (default 4)
-        dropout:    attention dropout
+        num_queries: number of independent queries per camera (default 8)
+        num_heads:   attention heads within each query (default 4)
+        dropout:     attention dropout
 
     Input:
-        z_v_patches: (B, P, vision_dim)  — P patch tokens (P=16 for 224x224)
+        z_v_patches: (B, P, vision_dim)  — P patch tokens
         z_t:         (B, state_dim)      — current robot state
 
     Output:
-        (B, vision_dim) — state-aware visual summary, with residual from z_t
+        (B, num_queries * vision_dim) — concatenated N pooled tokens
     """
     def __init__(self, vision_dim: int = 256, state_dim: int = 256,
-                 num_heads: int = 4, dropout: float = 0.0):
+                 num_queries: int = 8, num_heads: int = 4, dropout: float = 0.0):
         super().__init__()
         self.vision_dim = vision_dim
         self.state_dim = state_dim
-        # Project state to vision_dim for cross-attention
-        self.state_proj = nn.Linear(state_dim, vision_dim)
-        # Cross-attention: 1 query (state) attends to P keys/values (patches)
+        self.num_queries = num_queries
+
+        # N independent queries from z_t — each learns a different spatial focus
+        # Output: (B, N*vision_dim) → reshape to (B, N, vision_dim)
+        self.query_proj = nn.Linear(state_dim, num_queries * vision_dim)
+        # Cross-attention: N queries attend to P patches each
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=vision_dim, num_heads=num_heads,
             dropout=dropout, batch_first=True,
         )
         self.norm = nn.LayerNorm(vision_dim)
-        # Learnable scale for the attention output (starts at 1.0)
-        self.attn_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, z_v_patches: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
         """
@@ -76,19 +79,17 @@ class StateConditionedAttentionPool(nn.Module):
             z_v_patches: (B, P, vision_dim)
             z_t:         (B, state_dim)
         Returns:
-            (B, vision_dim) — pooled, state-conditioned visual summary
+            (B, num_queries * vision_dim) — N pooled tokens, concatenated
         """
-        # z_t as query (1 token, projected to vision_dim)
-        z_t_proj = self.state_proj(z_t)  # (B, vision_dim)
-        q = z_t_proj.unsqueeze(1)        # (B, 1, vision_dim)
-        # z_v patches as keys and values
-        k = v = z_v_patches              # (B, P, vision_dim)
-        # Cross-attention
-        attn_out, _ = self.cross_attn(q, k, v)  # (B, 1, vision_dim)
-        # Residual + LayerNorm: use PROJECTED z_t so shapes match
-        # (vision_dim may differ from state_dim, e.g. vision=512, state=256)
-        out = self.norm(attn_out.squeeze(1) + z_t_proj)  # (B, vision_dim)
-        return out
+        B = z_t.shape[0]
+        # N independent queries from state — each is a separate linear projection
+        q = self.query_proj(z_t).reshape(B, self.num_queries, self.vision_dim)  # (B, N, D_viz)
+        k = v = z_v_patches  # (B, P, D_viz)
+        # Cross-attention: each of N queries attends to all P patches
+        attn_out, _ = self.cross_attn(q, k, v)  # (B, N, D_viz)
+        # Residual + LayerNorm
+        out = self.norm(attn_out + q)            # (B, N, D_viz)
+        return out.reshape(B, -1)                # (B, N*D_viz)
 
 
 # ================================================================
@@ -96,29 +97,29 @@ class StateConditionedAttentionPool(nn.Module):
 # ================================================================
 
 class PerCameraStateConditionedPool(nn.Module):
-    """Apply StateConditionedAttentionPool to each camera separately, then
-    concatenate the results.
+    """Apply N-query state-conditioned pool to each camera, then concatenate.
 
-    For num_cameras=1, this is equivalent to a single StateConditionedAttentionPool.
-    For num_cameras>1, each camera gets its own pool; outputs are concatenated
-    along the feature dim.
+    For num_cameras=1: output (B, num_queries * vision_dim).
+    For num_cameras>1: output (B, V * num_queries * vision_dim) — per-cam results concatenated.
 
     Args:
         vision_dim: per-patch dim
-        state_dim:  robot state dim
+        state_dim:  state embedding dim
         num_cameras: number of cameras
-        num_heads:  attention heads
+        num_queries: independent queries per camera (N-query pool)
+        num_heads:   attention heads
     """
     def __init__(self, vision_dim: int = 256, state_dim: int = 256,
-                 num_cameras: int = 1, num_heads: int = 4, dropout: float = 0.0):
+                 num_cameras: int = 1, num_queries: int = 8,
+                 num_heads: int = 4, dropout: float = 0.0):
         super().__init__()
         self.num_cameras = num_cameras
+        self.num_queries = num_queries
         self.vision_dim = vision_dim
-        # One pool per camera (shared weights if num_cameras=1)
         self.pools = nn.ModuleList([
             StateConditionedAttentionPool(
                 vision_dim=vision_dim, state_dim=state_dim,
-                num_heads=num_heads, dropout=dropout,
+                num_queries=num_queries, num_heads=num_heads, dropout=dropout,
             )
             for _ in range(num_cameras)
         ])
@@ -129,19 +130,15 @@ class PerCameraStateConditionedPool(nn.Module):
             z_v_patches_multi: (B, V, P, vision_dim) — V cameras × P patches
             z_t: (B, state_dim)
         Returns:
-            (B, V * vision_dim) — concatenated per-camera pools
+            (B, V * num_queries * vision_dim) — concatenated per-camera N-query pools
         """
         if self.num_cameras == 1:
-            # Squeeze the V dim, single pool
             return self.pools[0](z_v_patches_multi.squeeze(1), z_t)
-        # Apply per-camera pool
         outs = []
         for v in range(self.num_cameras):
-            # z_v_patches_multi: (B, V, P, vision_dim) — extract one camera
-            z_v_v = z_v_patches_multi[:, v]  # (B, P, vision_dim) — NOT z_v_patches_multi[:,:, v]
-            #                                     which would be (B, V, vision_dim) — wrong dim
+            z_v_v = z_v_patches_multi[:, v]  # (B, P, vision_dim)
             outs.append(self.pools[v](z_v_v, z_t))
-        return torch.cat(outs, dim=-1)  # (B, V * vision_dim)
+        return torch.cat(outs, dim=-1)  # (B, V * num_queries * vision_dim)
 
 
 # ================================================================
@@ -149,30 +146,32 @@ class PerCameraStateConditionedPool(nn.Module):
 # ================================================================
 
 class IntentionEncoder(nn.Module):
-    """Mamba-based intention encoder.
+    """Mamba-based intention encoder with N-query visual pooling.
 
     Combines:
-      - State-Conditioned Attention Pool (per-camera, then concat)
+      - N-query State-Conditioned Attention Pool (per-camera, then concat)
       - Mamba recurrence (single hidden state h(t))
 
     Per timestep:
-      z_v_patches(t) = (B, [V,] P, vision_dim)    from VisionEncoder
-      z_t(t)         = (B, state_dim)              from StateEncoder
-      z_v_pooled(t)  = PerCameraPool(z_v_patches, z_t)  (B, V*vision_dim)
-      mamba_in(t)    = concat[z_v_pooled, z_t]    (B, V*vision_dim + state_dim)
-      h(t)           = Mamba(h(t-1), mamba_in)    (B, mamba_output_dim)
+      z_v_patches(t) = (B, [V,] P, vision_dim)              from VisionEncoder
+      z_t(t)         = (B, state_dim)                        from StateEncoder
+      z_v_pooled(t)  = N-Query-Pool(z_v_patches, z_t)        (B, V*NQ*vision_dim)
+      mamba_in(t)    = concat[z_v_pooled, z_t]               (B, V*NQ*vision_dim + state_dim)
+      h(t)           = Mamba(h(t-1), mamba_in)               (B, mamba_output_dim)
 
     Args:
-        vision_dim: per-patch dim (e.g., 256)
-        state_dim:  robot state dim (e.g., 256)
+        vision_dim:       per-patch dim (e.g., 256)
+        state_dim:        robot state dim (e.g., 256)
         mamba_output_dim: output dim of Mamba hidden state (e.g., 512)
-        num_cameras: number of cameras (default 1)
-        mamba_d_state: SSM state dim (default 16)
-        mamba_d_conv:  local conv width (default 4)
-        mamba_expand:  Mamba block expand (default 2)
+        num_cameras:      number of cameras (default 1)
+        num_queries:      N-query pool size per camera (default 8)
+        mamba_d_state:    SSM state dim (default 16)
+        mamba_d_conv:     local conv width (default 4)
+        mamba_expand:     Mamba block expand (default 2)
     """
     def __init__(self, vision_dim: int = 256, state_dim: int = 256,
                  mamba_output_dim: int = 512, num_cameras: int = 1,
+                 num_queries: int = 8,
                  mamba_d_state: int = 16, mamba_d_conv: int = 4,
                  mamba_expand: int = 2):
         super().__init__()
@@ -186,14 +185,15 @@ class IntentionEncoder(nn.Module):
         self.state_dim = state_dim
         self.mamba_output_dim = mamba_output_dim
         self.num_cameras = num_cameras
+        self.num_queries = num_queries
 
-        # Per-camera state-conditioned pool
+        # Per-camera N-query state-conditioned attention pool
         self.pool = PerCameraStateConditionedPool(
             vision_dim=vision_dim, state_dim=state_dim,
-            num_cameras=num_cameras,
+            num_cameras=num_cameras, num_queries=num_queries,
         )
-        # Pool output dim = num_cameras * vision_dim
-        self.pool_out_dim = num_cameras * vision_dim
+        # Pool output dim = V * NQ * D_viz
+        self.pool_out_dim = num_cameras * num_queries * vision_dim
 
         # Mamba input dim = pool_out_dim + state_dim
         self.mamba_in_dim = self.pool_out_dim + state_dim
@@ -210,13 +210,13 @@ class IntentionEncoder(nn.Module):
         self.mamba_to_hidden = nn.Linear(self.mamba_in_dim, mamba_output_dim)
 
     def pool_patches(self, z_v_patches: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
-        """Apply state-conditioned attention pool.
+        """Apply N-query state-conditioned attention pool.
 
         Args:
             z_v_patches: (B, P, vision_dim) or (B, V, P, vision_dim)
             z_t: (B, state_dim)
         Returns:
-            (B, V*vision_dim) — pooled vector
+            (B, V * num_queries * vision_dim) — N pooled tokens per camera
         """
         if z_v_patches.ndim == 3:
             # (B, P, vision_dim) — single camera

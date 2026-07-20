@@ -41,7 +41,7 @@ from models.align_model import VisionEncoder, RobotStateEncoder
 from models.intention_encoder import IntentionEncoder, PerCameraStateConditionedPool
 from models.intention_head import (
     IntentionTransformerHead, MambaActionHead,
-    DiffusionActionHead, FlowMatchingActionHead,
+    DiffusionActionHead, FlowMatchingActionHead, DiffusionPolicyHead,
 )
 
 
@@ -86,6 +86,7 @@ class ALIGNIntentionModel(nn.Module):
         head_dim_ff: int = 1024,
         use_text: bool = False,
         text_dim: int = 256,
+        pool_num_queries: int = 8,
     ):
         super().__init__()
         self.vision_dim = vision_dim
@@ -97,8 +98,9 @@ class ALIGNIntentionModel(nn.Module):
         self.use_patch_tokens = use_patch_tokens
         self.use_text = use_text
         self.text_dim = text_dim
-        # Pool output dim: num_cameras * vision_dim (per-camera pools concatenated)
-        self.pool_out_dim = num_cameras * vision_dim
+        self.pool_num_queries = pool_num_queries
+        # Pool output dim: V * NQ * vision_dim (per-cam N-query pools concatenated)
+        self.pool_out_dim = num_cameras * pool_num_queries * vision_dim
 
         # Vision encoder (DINOv2 with patch tokens)
         self.vision_encoder = VisionEncoder(
@@ -114,10 +116,10 @@ class ALIGNIntentionModel(nn.Module):
         # Intention encoder (state-conditioned pool + Mamba)
         # If mamba_output_dim=0, skip the Mamba history component entirely.
         self.use_history = mamba_output_dim > 0
-        # Pool is always present (per-camera state-conditioned attention pool)
+        # Pool is always present (per-camera N-query state-conditioned attention pool)
         self.pool = PerCameraStateConditionedPool(
             vision_dim=vision_dim, state_dim=state_dim,
-            num_cameras=num_cameras,
+            num_cameras=num_cameras, num_queries=pool_num_queries,
         )
         if self.use_history:
             self.intention_encoder = IntentionEncoder(
@@ -125,6 +127,7 @@ class ALIGNIntentionModel(nn.Module):
                 state_dim=state_dim,
                 mamba_output_dim=mamba_output_dim,
                 num_cameras=num_cameras,
+                num_queries=pool_num_queries,
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
@@ -187,6 +190,24 @@ class ALIGNIntentionModel(nn.Module):
                 num_inference_steps=20,   # diffusion needs more steps than FM
                 time_dim=128,
                 chunk_size=chunk_size,
+            )
+        elif head_type == "diffusion_policy":
+            # True Diffusion Policy (Chi et al. 2023) with 1D U-Net
+            # This is a separate branch from "diffusion" (which uses MLP backbone)
+            cond_dim = (
+                self.pool_out_dim
+                + state_dim
+                + (text_dim if use_text else 0)
+                + (mamba_output_dim if mamba_output_dim > 0 else 0)
+            )
+            self.intention_head = DiffusionPolicyHead(
+                cond_dim=cond_dim,
+                action_dim=action_dim,
+                hidden_dim=head_d_model,  # reuse head_d_model as U-Net base channels
+                num_inference_steps=10,   # DDIM steps (10 is enough for quality)
+                time_dim=64,
+                chunk_size=chunk_size,
+                use_history=mamba_output_dim > 0,
             )
         elif head_type == "flow":
             # Flow-matching head: cond_dim = pool + state + text + h
@@ -399,7 +420,7 @@ class ALIGNIntentionModel(nn.Module):
         Returns:
             actions: (B, K, action_dim)
         """
-        if isinstance(self.intention_head, (DiffusionActionHead, FlowMatchingActionHead)):
+        if isinstance(self.intention_head, (DiffusionActionHead, FlowMatchingActionHead, DiffusionPolicyHead)):
             cond = self.intention_head(
                 z_v_pooled_window, z_t_window, h_current, z_text=z_text,
             )
