@@ -120,12 +120,12 @@ class ALIGNIntentionModel(nn.Module):
         self.memory_bank_len = memory_bank_len
 
         # Pool output dim: total VP tokens * compressed_dim
-        # New architecture: pool_out_dim = mean across all patches (B, compressed_dim).
-        # This keeps the head's per-step input small (16 default) instead of
-        # the huge 8192 (2 cams * 256 patches * 16) we'd get with full patches.
-        # Per-patch information is preserved in the Mamba state (h_seq) which
-        # is built from the full (B, T, V*P, compressed_dim) sequence.
-        self.pool_out_dim = compressed_dim
+        # New architecture: pool_out_dim = V * P * compressed_dim (all patches).
+        # For 2 cameras, 256 patches, 16 dim: pool_out_dim = 2*256*16 = 8192.
+        # The head receives ALL per-step patch features (not pooled), so it
+        # can attend across patches within each step. The z_v_pooled_seq
+        # has shape (B, T, V*P*compressed_dim) = (B, T, 8192) for 2 cams.
+        self.pool_out_dim = num_cameras * 256 * compressed_dim
 
         # Vision encoder (DINOv2 with patch tokens)
         self.vision_encoder = VisionEncoder(
@@ -291,12 +291,11 @@ class ALIGNIntentionModel(nn.Module):
         z_v_patches: (B, V*P, 768) -- raw 768-D features from VisionEncoder
                     after cross-camera attention. V*P is treated as N_tokens.
         z_t: (B, state_dim)
-        Returns: (B, compressed_dim) — mean-pooled across all VP positions.
-                The per-patch info is preserved in the Mamba state (h_seq);
-                here we just need a compact per-step summary for the head.
+        Returns: (B, V*P, compressed_dim) — all per-patch features preserved.
+                The head receives the full patch sequence, not a mean-pooled
+                summary, so it can attend across patches within each step.
         """
-        out = self.pool(z_v_patches, z_t)           # (B, V*P, compressed_dim)
-        return out.mean(dim=1)                       # (B, compressed_dim)
+        return self.pool(z_v_patches, z_t)          # (B, V*P, compressed_dim)
 
     # ----------------------------------------------------------------
     # Batched training forward
@@ -353,18 +352,22 @@ class ALIGNIntentionModel(nn.Module):
         else:
             h_seq = torch.zeros(z_t_seq.shape[0], z_t_seq.shape[1], 1, device=z_t_seq.device)
 
-        # Get pooled vision per timestep
+        # Get per-step per-patch features for the head.
         # z_v_patches_seq is (B, T, V*P, 768) — raw DINOv2 patches
         # We apply _pool_patches (VisionPatchEncoder) to each timestep:
         #   (B, V*P, 768) -> SE compress (16) -> state modulate -> (B, V*P, 16)
-        # Then flatten to (B, V*P*16) = (B, pool_out_dim) for the head.
+        # Reshape to (B, V*P*16) = (B, 8192) so the head sees ALL
+        # 256 patches × 16 dim per step (per camera, V=2 cams total).
         z_v_pooled_seq = []
         for t in range(T):
             z_v_t = z_v_patches_seq[:, t]
             z_t_t = z_t_seq[:, t]
-            z_v_pooled_t = self._pool_patches(z_v_t, z_t_t)
+            z_v_pooled_t = self._pool_patches(z_v_t, z_t_t)  # (B, V*P, 16)
             z_v_pooled_seq.append(z_v_pooled_t)
-        z_v_pooled_seq = torch.stack(z_v_pooled_seq, dim=1)  # (B, T, pool_out_dim)
+        # Stack: (B, T, V*P, 16) -> flatten to (B, T, V*P*16) = (B, T, 8192)
+        z_v_pooled_seq = torch.stack(z_v_pooled_seq, dim=1)              # (B, T, V*P, 16)
+        B, T, N_tok, D = z_v_pooled_seq.shape
+        z_v_pooled_seq = z_v_pooled_seq.reshape(B, T, N_tok * D)          # (B, T, 8192)
 
         return {
             "z_v_pooled_seq": z_v_pooled_seq,
