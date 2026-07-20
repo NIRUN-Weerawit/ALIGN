@@ -106,7 +106,7 @@ class IntentionTransformerHead(nn.Module):
         Args:
             z_v_pooled_window: (B, K, pool_out_dim) — K past pooled visions
             z_t_window:        (B, K, state_dim)    — K past states
-            h_current:         (B, mamba_output_dim) — current Mamba state (or None)
+            h_current:         (B, mamba_output_dim) or (B, N, intent_dim)
             z_text:            (B, text_dim) — task text embedding (or None)
         Returns:
             actions: (B, K, action_dim) — K future actions
@@ -119,22 +119,23 @@ class IntentionTransformerHead(nn.Module):
         # Per-timestep input: concat[z_v_pooled, z_t, z_text?]
         per_step_parts = [z_v_pooled_window, z_t_window]
         if self.use_text and z_text is not None:
-            # Expand z_text to per-step: (B, 1, text_dim) → (B, K, text_dim)
             z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
             per_step_parts.append(z_text_expanded)
         per_step_in = torch.cat(per_step_parts, dim=-1)
-        # (B, K, pool_out_dim + state_dim + text_dim?)
         x = self.input_proj(per_step_in)  # (B, K, d_model)
 
-        # h as a context token (prepended) — only if use_history
+        # h as context token(s) — only if use_history
         if self.use_history and h_current is not None:
-            h_token = self.h_proj(h_current).unsqueeze(1)  # (B, 1, d_model)
-            x = torch.cat([h_token, x], dim=1)  # (B, K+1, d_model)
-        # else: no h token, x stays (B, K, d_model)
+            if h_current.ndim == 3:
+                # V4: (B, N, intent_dim) — multiple intent tokens
+                h_tokens = self.h_proj(h_current)  # (B, N, d_model)
+                x = torch.cat([h_tokens, x], dim=1)  # (B, K+N, d_model)
+            else:
+                # V3: (B, mamba_output_dim) — single h vector
+                h_token = self.h_proj(h_current).unsqueeze(1)  # (B, 1, d_model)
+                x = torch.cat([h_token, x], dim=1)  # (B, K+1, d_model)
 
         # Add positional encoding (size matches x)
-        # Note: pos_emb was sized chunk_size+1 (for K + 1 h token). With text
-        # added per-step (not as a separate token), no size change needed.
         x = x + self.pos_emb[:x.size(1)].unsqueeze(0)
 
         # Transformer (use math backend to avoid cuDNN issues with Mamba)
@@ -143,14 +144,12 @@ class IntentionTransformerHead(nn.Module):
             with sdpa_kernel(backends=[SDPBackend.MATH]):
                 x = self.transformer(x)
         except ImportError:
-            x = self.transformer(x)  # fallback if SDPA API not available
+            x = self.transformer(x)
 
-        # If h was prepended, drop it; otherwise keep all K
+        # Drop h context token(s); keep K timestep tokens
         if self.use_history and h_current is not None:
-            x = x[:, 1:]  # (B, K, d_model) — drop h context token
-
-        # Drop the h context token, keep K timestep tokens
-        # (already done above if use_history; if not, x is already (B, K, d_model))
+            n_h = h_current.shape[1] if h_current.ndim == 3 else 1
+            x = x[:, n_h:]  # (B, K, d_model)
 
         # Output: K actions
         actions = self.output_proj(x)  # (B, K, action_dim)
@@ -227,7 +226,7 @@ class MambaActionHead(nn.Module):
         Args:
             z_v_pooled_window: (B, K, pool_out_dim) — K past pooled visions
             z_t_window:        (B, K, state_dim)    — K past states
-            h_current:         (B, mamba_output_dim) — current Mamba state (or None)
+            h_current:         (B, mamba_output_dim) or (B, N, intent_dim)
             z_text:            (B, text_dim) — task text embedding (or None)
         Returns:
             actions: (B, K, action_dim) — K future actions
@@ -240,15 +239,19 @@ class MambaActionHead(nn.Module):
         # Per-timestep input: concat[z_v_pooled, z_t, z_text?]
         per_step_parts = [z_v_pooled_window, z_t_window]
         if self.use_text and z_text is not None:
-            # Expand z_text to per-step: (B, 1, text_dim) → (B, K, text_dim)
             z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
             per_step_parts.append(z_text_expanded)
         per_step_in = torch.cat(per_step_parts, dim=-1)
-        # (B, K, pool_out_dim + state_dim + text_dim?)
+
         if self.use_history and h_current is not None:
-            h_repeated = h_current.unsqueeze(1).expand(-1, K, -1)  # (B, K, mamba_output_dim)
+            if h_current.ndim == 3:
+                # V4: (B, N, intent_dim) — pool to single vector, then repeat
+                h_pooled = h_current.mean(dim=1)  # (B, intent_dim)
+            else:
+                # V3: (B, mamba_output_dim)
+                h_pooled = h_current
+            h_repeated = h_pooled.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
             per_step_in = torch.cat([per_step_in, h_repeated], dim=-1)
-        # (B, K, input_dim)
 
         # Mamba: (B, K, input_dim) -> (B, K, input_dim)
         out = self.mamba(per_step_in)
@@ -375,7 +378,11 @@ class DiffusionActionHead(nn.Module):
         if z_text is not None:
             parts.append(z_text.unsqueeze(1).expand(-1, K, -1))
         if h_current is not None:
-            parts.append(h_current.unsqueeze(1).expand(-1, K, -1))
+            if h_current.ndim == 3:
+                h_pooled = h_current.mean(dim=1)  # (B, D)
+            else:
+                h_pooled = h_current
+            parts.append(h_pooled.unsqueeze(1).expand(-1, K, -1))
         return torch.cat(parts, dim=-1)
 
     def forward(self, z_v_pooled_window: torch.Tensor,
@@ -615,7 +622,11 @@ class FlowMatchingActionHead(nn.Module):
             per_step_parts.append(z_text_expanded)
         per_step_in = torch.cat(per_step_parts, dim=-1)
         if self.use_history and h_current is not None:
-            h_repeated = h_current.unsqueeze(1).expand(-1, K, -1)
+            if h_current.ndim == 3:
+                h_pooled = h_current.mean(dim=1)  # (B, D)
+            else:
+                h_pooled = h_current
+            h_repeated = h_pooled.unsqueeze(1).expand(-1, K, -1)
             per_step_in = torch.cat([per_step_in, h_repeated], dim=-1)
         return per_step_in
 
@@ -1040,7 +1051,11 @@ class DiffusionPolicyHead(nn.Module):
             per_step_parts.append(z_text_expanded)
         per_step_in = torch.cat(per_step_parts, dim=-1)
         if self.use_history and h_current is not None:
-            h_repeated = h_current.unsqueeze(1).expand(-1, K, -1)
+            if h_current.ndim == 3:
+                h_pooled = h_current.mean(dim=1)  # (B, D)
+            else:
+                h_pooled = h_current
+            h_repeated = h_pooled.unsqueeze(1).expand(-1, K, -1)
             per_step_in = torch.cat([per_step_in, h_repeated], dim=-1)
         return per_step_in
 

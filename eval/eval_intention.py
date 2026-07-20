@@ -121,6 +121,7 @@ def load_intention_model(
         mamba_output_dim=cfg["mamba_output_dim"],
         action_dim=cfg.get("action_dim", 6),
         chunk_size=cfg["chunk_size"],
+        history_size=cfg.get("history_size", cfg["chunk_size"]),
         num_cameras=cfg["num_cameras"],
         use_patch_tokens=cfg["use_patch_tokens"],
         mamba_d_state=cfg["mamba_d_state"],
@@ -133,6 +134,14 @@ def load_intention_model(
         head_type=cfg.get("head_type", "mamba"),
         use_text=cfg.get("use_text", False),
         text_dim=cfg.get("text_dim", 256),
+        compressed_dim=cfg.get("compressed_dim", 16),
+        pool_num_queries=cfg.get("pool_num_queries", 8),
+        # V4 args (default to False/0 for backward compat with V3 checkpoints)
+        use_intent_tokens=cfg.get("use_intent_tokens", False),
+        num_intent_tokens=cfg.get("num_intent_tokens", 2),
+        intent_dim=cfg.get("intent_dim", 512),
+        use_memory_bank=cfg.get("use_memory_bank", False),
+        memory_bank_len=cfg.get("memory_bank_len", 16),
     ).to(device)
 
     # Load the state dict. We try a strict load first; if that fails

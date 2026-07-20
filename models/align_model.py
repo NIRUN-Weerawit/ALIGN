@@ -236,25 +236,29 @@ class SEChannelProject(nn.Module):
 # ================================================================
 
 class VisionEncoder(nn.Module):
-    """Frozen DINOv2 ViT-B + trainable projection head.
+    """Frozen DINOv2 ViT-B (raw features) + cross-camera attention.
 
     Supports single-camera (4D: (B, H, W, 3)) and multi-camera (5D:
     (B, V, H, W, 3)) inputs.
 
-    v2 (default): uses DINOv2 patch tokens — 256 patches per image,
-    projected to ``embed_dim``. Returns:
-        single camera: (B, num_patches, embed_dim)
-        multi camera:  (B, V * num_patches, embed_dim)
-    The per-patch features preserve spatial information that the older
-    CLS-only head collapsed away. When ``num_cameras>1`` and
-    ``fusion_type="transformer"`` (default in v2), a small
-    ``CrossCameraTransformer`` is applied to the concatenated
-    (B, V*P, embed_dim) tensor so patches from different views attend
-    to each other (see :class:`CrossCameraTransformer`).
+    NEW ARCHITECTURE (v3+):
+        DINOv2 [P=256, 768] → CrossCameraXform (768×VP) →
+        (downstream SEVisualCompressor 768→16, then state-modulator) →
+        all patches to Mamba/Head.
+
+    v2 (default with use_patch_tokens=True):
+        Uses DINOv2 patch tokens — 256 patches per image, raw 768-D.
+        Returns:
+            single camera: (B, num_patches, 768)
+            multi camera:  (B, V * num_patches, 768)
+        When num_cameras>1 and fusion_type="transformer" (default in v2),
+        a small CrossCameraTransformer is applied to the concatenated
+        (B, V*P, 768) tensor so patches from different views attend
+        to each other BEFORE channel compression downstream.
 
     v1 (use_patch_tokens=False): keeps the original CLS-token behavior.
-    Returns (B, embed_dim) regardless of camera count (multi-camera
-    views are fused via a learnable linear layer back to embed_dim).
+        Returns (B, embed_dim) regardless of camera count (multi-camera
+        views are fused via a learnable linear layer back to embed_dim).
     """
 
     def __init__(self, backbone: str = "dinov2_vitb14", embed_dim: int = 256,
@@ -279,22 +283,28 @@ class VisionEncoder(nn.Module):
         # v2: use patch tokens by default; v1 falls back to CLS
         self.use_patch_tokens = use_patch_tokens
 
-        # Per-camera projection: SE-gated compression — DINOv2 feature (768) → embed_dim (256)
-        # SE bottleneck learns adaptive channel weights BEFORE projection,
-        # suppressing noisy DINOv2 dimensions per-image.
-        self.projection = SEChannelProject(768, embed_dim)
+        # NEW ARCHITECTURE (v3+):
+        #   DINOv2 [P=256, 768] → CrossCameraXform (768×VP) →
+        #   SE-compress(→16) → State-modulate → ALL patches to Mamba/Head
+        # No per-camera projection here — downstream SEVisualCompressor
+        # in intention_encoder.py handles the channel compression from
+        # raw 768-D to compact 16-D per patch.
+        # The `embed_dim` parameter is kept for API compatibility (used by
+        # v1/CLS-mode fusion below).
+        self.projection = nn.Identity()
         # Multi-camera fusion (v1 only): concatenate V * embed_dim → embed_dim
         if num_cameras > 1 and not use_patch_tokens:
             self.fusion = nn.Sequential(
                 nn.Linear(num_cameras * embed_dim, embed_dim),
                 nn.LayerNorm(embed_dim),
             )
-        # v2 multi-camera: optional cross-camera attention transformer.
-        # Only added when v2 is used AND num_cameras>1 AND the caller
-        # requested it. This keeps v1, single-cam, and "linear" fallback
-        # checkpoints free of any new parameters.
+        # v2 multi-camera: cross-camera attention transformer.
+        # Operates on RAW 768-D DINOv2 features (per new architecture), so
+        # patches from different views can attend to each other before
+        # channel compression in the downstream SEVisualCompressor.
         if num_cameras > 1 and use_patch_tokens and fusion_type == "transformer":
-            self.cross_cam_attn = CrossCameraTransformer(embed_dim=embed_dim)
+            # Use 768 (DINOv2 raw dim) for the cross-camera attention
+            self.cross_cam_attn = CrossCameraTransformer(embed_dim=768)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode camera frame(s).
@@ -340,19 +350,25 @@ class VisionEncoder(nn.Module):
                 # v2: get all patch tokens (no CLS) — preserves spatial info
                 features_dict = self.backbone.forward_features(x)
                 patch_features = features_dict["x_norm_patchtokens"]
-                # (B*V, num_patches, 768)
-                features = self.projection(patch_features)  # (B*V, num_patches, embed_dim)
-                # Reshape to (B, V * num_patches, embed_dim) — multi-cam stacks
+                # (B*V, num_patches, 768) — raw DINOv2 features
+                # In new architecture, we DON'T project to embed_dim here.
+                # The cross-camera attention runs on raw 768-D features,
+                # then downstream SEVisualCompressor does the channel
+                # compression (768 → 16) per patch position.
+                features = self.projection(patch_features)  # (B*V, num_patches, 768)
+                # Reshape to (B, V * num_patches, 768) — multi-cam stacks
                 # patches along the sequence dim; single-cam is unchanged.
                 P = features.size(1)
-                features = features.reshape(B, V * P, self.embed_dim)
-                # Phase 3: cross-camera attention over the V*P patch tokens.
+                features = features.reshape(B, V * P, 768)
+                # Cross-camera attention over the V*P patch tokens (768-D).
                 # Only present when v2 is used AND num_cameras>1 AND the
                 # caller requested the transformer fusion. With
                 # ``fusion_type="linear"`` or v1, the reshape above is
                 # the only multi-cam fusion.
                 if V > 1 and hasattr(self, "cross_cam_attn"):
                     features = self.cross_cam_attn(features)
+                # Note: output is now (B, V*P, 768) — NOT embed_dim.
+                # Downstream must handle the 768-D features.
             else:
                 # v1: CLS token only — collapses spatial info
                 features = self.backbone(x)  # (B*V, 768)

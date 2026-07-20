@@ -92,7 +92,7 @@ torch.backends.cudnn.enabled = False
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from data.align_dataset import ALIGNDataset, MultiALIGNDataset, head_collate
+from data.align_dataset import ALIGNDataset, MultiALIGNDataset, head_collate, v4_segment_collate
 from models.align_intention import ALIGNIntentionModel
 from training.wandb_utils import init_wandb
 
@@ -126,9 +126,17 @@ def build_datasets(args):
 
 def build_loaders(train_ds, val_ds, args):
     """Build train and val dataloaders."""
-    collate_fn = lambda b: head_collate(
-        b, chunk_size=args.chunk_size, vision_window_size=args.chunk_size,
-    )
+    is_v4 = args.use_intent_tokens or args.use_memory_bank
+    if is_v4:
+        collate_fn = lambda b: v4_segment_collate(
+            b, history_size=args.history_size, chunk_size=args.chunk_size,
+            segment_min_mult=args.segment_min_mult,
+            segment_max_mult=args.segment_max_mult,
+        )
+    else:
+        collate_fn = lambda b: head_collate(
+            b, chunk_size=args.chunk_size, vision_window_size=args.chunk_size,
+        )
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         drop_last=True, collate_fn=collate_fn,
@@ -169,6 +177,7 @@ def build_model(args, num_cameras, device):
         mamba_output_dim=args.mamba_output_dim if args.use_history else 0,
         action_dim=args.action_dim,
         chunk_size=args.chunk_size,
+        history_size=args.history_size,
         num_cameras=num_cameras,
         use_patch_tokens=args.use_patch_tokens,
         mamba_d_state=args.mamba_d_state,
@@ -182,14 +191,188 @@ def build_model(args, num_cameras, device):
         use_text=args.use_text,
         text_dim=args.text_dim,
         pool_num_queries=args.pool_num_queries,
+        compressed_dim=args.compressed_dim,
+        # V4 args
+        use_intent_tokens=args.use_intent_tokens,
+        num_intent_tokens=args.num_intent_tokens,
+        intent_dim=args.intent_dim,
+        use_memory_bank=args.use_memory_bank,
+        memory_bank_len=args.memory_bank_len,
     )
     model = model.to(device)
     return model
 
 
 # ================================================================
-# Training / Validation
+# V4 Training — Sequential T-loop with persistent memory bank
 # ================================================================
+
+def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
+    """V4 training epoch with sequential T-loop and persistent memory bank.
+
+    Each batch contains variable-length segments. The model processes
+    each segment step by step, maintaining a persistent memory bank
+    that accumulates across the segment.
+
+    Returns (avg_loss, avg_action_mean).
+    """
+    model.train()
+    losses, actions_pred_list = [], []
+    n_steps = min(max_steps, len(loader)) if max_steps else len(loader)
+    pbar = tqdm(range(n_steps), total=n_steps, desc="  [train V4]", unit="batch", leave=False)
+    step_iter = iter(loader)
+
+    for _ in pbar:
+        try:
+            batch = next(step_iter)
+        except StopIteration:
+            break
+
+        H = args.history_size
+        C = args.chunk_size
+        B = len(batch["segment_len"])
+        max_seg_len = batch["frames_segment"].shape[1]
+
+        frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
+        states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
+        actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
+        seg_lens = batch["segment_len"]  # (B,)
+
+        # Text encoding
+        z_text = None
+        if args.use_text:
+            texts = batch.get("texts", ["default task"] * B)
+            z_text = model.text_encoder(texts)
+
+        # Reset memory bank at start of segment
+        if model.use_memory_bank:
+            model.memory_module.reset(batch_size=B, device=device)
+
+        # Pre-encode vision for the entire segment (vision is the bottleneck)
+        # We process each timestep's frames through vision encoder
+        z_v_pooled_all = []
+        z_t_all = []
+        for t in range(max_seg_len):
+            f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
+            s_t = states_seg[:, t]  # (B, 7)
+            z_v_t = model._vision_forward(f_t)
+            if z_v_t.ndim == 3:
+                z_v_t = z_v_t.unsqueeze(1)
+            z_v_pooled_t = model._pool_patches(z_v_t, model.state_encoder(s_t))
+            z_v_pooled_all.append(z_v_pooled_t)
+            z_t_all.append(model.state_encoder(s_t))
+        # Stack: (B, S, pool_out_dim) and (B, S, state_dim)
+        z_v_pooled_all = torch.stack(z_v_pooled_all, dim=1)
+        z_t_all = torch.stack(z_t_all, dim=1)
+
+        total_loss = torch.tensor(0.0, device=device)
+        optimizer.zero_grad()
+
+        # Sequential T-loop
+        last_actions_pred = None
+        loss_accum = []
+        for t in range(max_seg_len - C):
+            # Build H-window ending at t+H-1
+            win_start = max(0, t + H - max_seg_len)
+            win_end = min(t + H, max_seg_len)
+            z_v_win = z_v_pooled_all[:, win_start:win_end]  # (B, H_actual, pool_out_dim)
+            z_t_win = z_t_all[:, win_start:win_end]          # (B, H_actual, state_dim)
+            f_win = frames_seg[:, win_start:win_end]
+            s_win = states_seg[:, win_start:win_end]
+
+            # Pad window to H if needed (end of segment)
+            if z_v_win.shape[1] < H:
+                pad_len = H - z_v_win.shape[1]
+                z_v_win = torch.cat([z_v_win[:, :1].expand(-1, pad_len, -1), z_v_win], dim=1)
+                z_t_win = torch.cat([z_t_win[:, :1].expand(-1, pad_len, -1), z_t_win], dim=1)
+
+            # Current time = last frame in the window
+            current_t = win_end - 1
+
+            # Forward through model
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                    enabled=device.type == "cuda"):
+                out = model(f_win, s_win)
+                intent_emb = out.get("intent_emb", None)
+                h_current = out["h_seq"][:, -1]
+
+                # Memory bank: store every step (warmup), retrieve + fuse in active phase
+                if model.use_memory_bank:
+                    z_v_current = z_v_win[:, -1]  # (B, pool_out_dim)
+
+                    if t >= H - 1 and intent_emb is not None:
+                        # Active phase: retrieve + fuse + store
+                        z_v_fused, intent_fused = model.memory_module(
+                            z_v_current, intent_emb,
+                        )
+                        z_v_win_for_head = z_v_win.clone()
+                        z_v_win_for_head[:, -1] = z_v_fused
+                        h_for_head = intent_fused
+                    else:
+                        # Warmup: store perceptual only, no retrieval
+                        model.memory_module.store_perceptual_only(z_v_current)
+                        z_v_win_for_head = z_v_win
+                        h_for_head = h_current
+                else:
+                    z_v_win_for_head = z_v_win
+                    h_for_head = h_current
+
+                # Predict actions
+                actions_pred = model.predict_actions(
+                    z_v_win_for_head, z_t_win, h_for_head, z_text=z_text,
+                )
+
+                # Target: C future actions from current time
+                target_end = min(current_t + C, max_seg_len)
+                target = actions_seg[:, current_t:target_end]
+                if target.shape[1] < C:
+                    pad = target[:, -1:].expand(-1, C - target.shape[1], -1)
+                    target = torch.cat([target, pad], dim=1)
+
+                # Pad model output with target's gripper if needed
+                if actions_pred.shape[-1] < target.shape[-1]:
+                    pad = target[..., actions_pred.shape[-1]:]
+                    actions_pred_loss = torch.cat([actions_pred, pad], dim=-1)
+                else:
+                    actions_pred_loss = actions_pred
+
+                # Loss
+                if args.head_type in ("flow", "diffusion", "diffusion_policy"):
+                    loss = model.intention_head.loss(target, actions_pred)
+                else:
+                    loss = F.mse_loss(actions_pred_loss, target)
+
+                # Optional semantic anchoring
+                if args.use_intent_tokens and args.anchor_weight > 0 and z_text is not None and intent_emb is not None:
+                    intent_pooled = intent_emb.mean(dim=1)  # (B, intent_dim)
+                    anchor_loss = 1.0 - F.cosine_similarity(intent_pooled, z_text, dim=-1).mean()
+                    loss = loss + args.anchor_weight * anchor_loss
+
+            if args.skip_nan and not torch.isfinite(loss):
+                continue
+
+            loss_accum.append(loss)
+            last_actions_pred = actions_pred
+
+        # One optimizer step per segment: sum all losses and backward
+        if loss_accum:
+            total_loss = torch.stack(loss_accum).sum()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                args.grad_clip,
+            )
+            optimizer.step()
+
+        avg_step_loss = float(total_loss.item() / max(len(loss_accum), 1)) if loss_accum else 0.0
+        losses.append(avg_step_loss)
+        actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
+
+        pbar.set_postfix(mse=f"{avg_step_loss:.5f}")
+
+    avg_loss = float(np.mean(losses)) if losses else float("inf")
+    avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
+    return avg_loss, avg_action
 
 def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
     """Train for one epoch. Returns (avg_loss, avg_action_mean)."""
@@ -485,6 +668,34 @@ def parse_args():
                         action="store_false", default=True,
                         help="Use CLS token instead of patch tokens from DINOv2.")
     parser.set_defaults(use_patch_tokens=True)
+    # NEW architecture: per-patch compressed dim (16 default)
+    parser.add_argument("--compressed-dim", type=int, default=16,
+                        help="Per-patch dim after SEVisualCompressor (default 16). "
+                             "Used by new vision architecture: "
+                             "DINOv2 -> CrossCameraXform (768) -> SE-compress (16) -> "
+                             "state-modulate -> all patches to Mamba/Head.")
+    # V4: Intent tokens
+    parser.add_argument("--use-intent-tokens", action="store_true", default=False,
+                        help="Enable learnable intent tokens (V4).")
+    parser.add_argument("--num-intent-tokens", type=int, default=2,
+                        help="Number of intent tokens (default 2).")
+    parser.add_argument("--intent-dim", type=int, default=512,
+                        help="Intent token output dim (default 512).")
+    # V4: Memory bank
+    parser.add_argument("--use-memory-bank", action="store_true", default=False,
+                        help="Enable Perceptual-Cognitive Memory Bank (V4).")
+    parser.add_argument("--memory-bank-len", type=int, default=16,
+                        help="Max paired entries in bank (default 16).")
+    # V4: Segment training
+    parser.add_argument("--history-size", type=int, default=20,
+                        help="Past frames for Mamba window (default 20).")
+    parser.add_argument("--segment-min-mult", type=int, default=2,
+                        help="Min segment length = history_size * this (default 2).")
+    parser.add_argument("--segment-max-mult", type=int, default=5,
+                        help="Max segment length = history_size * this (default 5).")
+    # V4: Semantic anchoring
+    parser.add_argument("--anchor-weight", type=float, default=0.0,
+                        help="Weight for semantic anchoring loss (0 = disabled).")
     # Text modality (optional)
     parser.add_argument("--use-text", action="store_true", default=True,
                         help="Enable text encoder + text-conditioned head.")
@@ -675,11 +886,13 @@ def main():
     log_fp = open(log_path, "w")
 
     # Training loop
-    print(f"\n  Training for {args.epochs} epochs...")
+    is_v4 = args.use_intent_tokens or args.use_memory_bank
+    train_fn = train_v4_epoch if is_v4 else train_one_epoch
+    print(f"  Training for {args.epochs} epochs..." + (" (V4 mode)" if is_v4 else " (V3 mode)"))
     best_val_loss = float("inf")
     for epoch in range(1, args.epochs + 1):
         t_start = time.time()
-        train_loss, train_action = train_one_epoch(
+        train_loss, train_action = train_fn(
             model, train_loader, optimizer, device, args,
             max_steps=args.max_steps_per_epoch,
         )

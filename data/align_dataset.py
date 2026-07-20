@@ -1053,6 +1053,163 @@ def head_collate(batch: list, chunk_size: int = 5,
 
 
 # ================================================================
+# V4 Segment Collate — Variable-length segments with persistent bank
+# ================================================================
+
+def v4_segment_collate(batch: list, history_size: int = 20,
+                       chunk_size: int = 10,
+                       segment_min_mult: int = 2,
+                       segment_max_mult: int = 5) -> dict:
+    """Collate batch for V4 training with variable-length segments.
+
+    Samples a contiguous segment of length segment_len from each episode,
+    where segment_len is randomly chosen per sample in [2*H, min(5*H, ep_len)].
+    The segment is processed step by step during training with a persistent
+    memory bank.
+
+    Args:
+        batch: list of items from ALIGNDataset (mode="head").
+        history_size: H — Mamba window size (past frames).
+        chunk_size: C — future action prediction length.
+        segment_min_mult: min segment length = H * this value.
+        segment_max_mult: max segment length = H * this value.
+
+    Returns:
+        dict with keys:
+            frames_segment: (B, S, V, H, W, 3) uint8 — full segment frames
+            states_segment: (B, S, 7) float32 — full segment states
+            actions_segment: (B, S, 7) float32 — full segment actions
+            texts: list of strings (B,)
+            segment_len: (B,) int — actual length of each segment
+            history_size: int — H
+            chunk_size: int — C
+    """
+    rng = np.random.default_rng()
+    all_frames = []
+    all_states = []
+    all_actions = []
+    all_texts = []
+    all_lens = []
+
+    for item in batch:
+        frames = item["frames"]       # (N, V, H, W, 3) or (N, H, W, 3)
+        poses = item["poses"]         # (N, 6)
+        actions = item.get("actions", None)  # (N, 7) or None
+        text = item["text"]
+        item_grippers = item.get("grippers", None)
+
+        N = len(frames)
+        H = history_size
+        C = chunk_size
+
+        # Need at least H + C frames for one valid training step
+        min_len = H + C
+        if N < min_len:
+            continue
+
+        # Random segment length: [min_mult*H, max_mult*H], capped by episode
+        seg_min = min(segment_min_mult * H, N)
+        seg_max = min(segment_max_mult * H, N)
+        if seg_min >= seg_max:
+            seg_len = seg_max
+        else:
+            seg_len = int(rng.integers(seg_min, seg_max + 1))
+
+        # Random start position
+        max_start = N - seg_len
+        seg_start = rng.integers(0, max_start + 1) if max_start > 0 else 0
+
+        # Extract segment
+        seg_frames = frames[seg_start:seg_start + seg_len]
+        seg_poses = poses[seg_start:seg_start + seg_len]
+
+        # Build states: [pos(3), euler(3), gripper(1)] for each timestep
+        seg_states = []
+        for k_t in range(seg_len):
+            abs_t = seg_start + k_t
+            if item_grippers is not None and abs_t < len(item_grippers):
+                gk_t = float(item_grippers[abs_t])
+            elif actions is not None and abs_t < len(actions) and actions.shape[1] >= 7:
+                gk_t = float(actions[abs_t, 6])
+            else:
+                gk_t = 0.0
+            state_t = np.concatenate([
+                seg_poses[k_t, :6].astype(np.float32), [gk_t],
+            ], axis=0).astype(np.float32)
+            seg_states.append(state_t)
+        seg_states = np.stack(seg_states, axis=0)  # (S, 7)
+
+        # Actions segment
+        if actions is not None:
+            seg_actions = actions[seg_start:seg_start + seg_len].astype(np.float32)
+        else:
+            seg_actions = np.zeros((seg_len, 7), dtype=np.float32)
+
+        # Text
+        if isinstance(text, list):
+            text_pick = text[rng.integers(0, len(text))]
+        else:
+            text_pick = text
+
+        all_frames.append(seg_frames)
+        all_states.append(seg_states)
+        all_actions.append(seg_actions)
+        all_texts.append(text_pick)
+        all_lens.append(seg_len)
+
+    if not all_frames:
+        raise ValueError("No valid segments found in batch")
+
+    # Stack to (B, S, ...) — segments may have different lengths
+    # We pad to max_len in the batch
+    max_len = max(all_lens)
+    B = len(all_frames)
+
+    padded_frames = []
+    padded_states = []
+    padded_actions = []
+    for b in range(B):
+        S = all_lens[b]
+        # Pad frames
+        f = all_frames[b]
+        if f.ndim == 4:
+            # (S, H, W, 3) — single camera
+            pad_f = np.zeros((max_len, *f.shape[1:]), dtype=f.dtype)
+            pad_f[:S] = f
+            pad_f[S:] = f[-1:]  # replicate last frame
+        else:
+            # (S, V, H, W, 3) — multi camera
+            pad_f = np.zeros((max_len, *f.shape[1:]), dtype=f.dtype)
+            pad_f[:S] = f
+            pad_f[S:] = f[-1:]
+        padded_frames.append(pad_f)
+
+        # Pad states
+        s = all_states[b]
+        pad_s = np.zeros((max_len, 7), dtype=np.float32)
+        pad_s[:S] = s
+        pad_s[S:] = s[-1:]  # replicate last state
+        padded_states.append(pad_s)
+
+        # Pad actions
+        a = all_actions[b]
+        pad_a = np.zeros((max_len, 7), dtype=np.float32)
+        pad_a[:S] = a
+        pad_a[S:] = a[-1:]
+        padded_actions.append(pad_a)
+
+    return {
+        "frames_segment": np.stack(padded_frames, axis=0).astype(np.uint8),
+        "states_segment": np.stack(padded_states, axis=0).astype(np.float32),
+        "actions_segment": np.stack(padded_actions, axis=0).astype(np.float32),
+        "texts": all_texts,
+        "segment_len": np.array(all_lens, dtype=np.int32),
+        "history_size": history_size,
+        "chunk_size": chunk_size,
+    }
+
+
+# ================================================================
 # Converter: raw recordings → HDF5
 # ================================================================
 
