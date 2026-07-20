@@ -265,8 +265,6 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
             s_t = states_seg[:, t]  # (B, 7)
             z_v_t = model._vision_forward(f_t)
-            if z_v_t.ndim == 3:
-                z_v_t = z_v_t.unsqueeze(1)
             z_v_pooled_t = model._pool_patches(z_v_t, model.state_encoder(s_t))
             z_v_pooled_all.append(z_v_pooled_t)
             z_t_all.append(model.state_encoder(s_t))
