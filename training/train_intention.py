@@ -795,38 +795,38 @@ def main():
     # Collect trainable params
     # Build lazy head/bank before counting params.
     # Probe actual vision output dim by running one real frame through VisionEncoder.
-    # This catches camera count & resolution mismatches that formulaic guesses miss.
+    # Use the dataset's __getitem__ to get the actual resized frame.
     print("  Building head (probing actual vision output shape)...")
-    import h5py
     with torch.no_grad():
-        with h5py.File(args.data[0], "r") as _h5:
-            ep_key = sorted([k for k in _h5.keys() if k.startswith("ep_")])[0]
-            # Read one frame from ALL cameras to get the real multi-cam shape
-            cam_frames = []
-            for cam_name in args.cameras:
-                # HDF5 structure: ep_XXX/frames/{camera_name}
-                frames_grp = _h5[f"{ep_key}/frames"]
-                if isinstance(frames_grp, h5py.Dataset):
-                    ds = frames_grp
-                else:
-                    ds = frames_grp[cam_name]
-                img_shape = ds.shape  # (N, H, W, C)
-                if len(cam_frames) == 0:
-                    img_h, img_w = img_shape[1], img_shape[2]
-                cam_frames.append(ds[0:1])  # (1, H, W, C)
-            if len(cam_frames) == 1:
-                dummy_np = cam_frames[0].astype(np.uint8)  # (1, H, W, C)
-            else:
-                dummy_np = np.stack(cam_frames, axis=1).astype(np.uint8)  # (1, V, H, W, C)
-        dummy = torch.from_numpy(dummy_np).to(device)
-        z_v_dummy = model._vision_forward(dummy)  # (VP_tokens, raw_dim) or (1, VP, raw_dim)
+        # Get one sample from the dataset to see the actual resized frame
+        sample = full_ds[0]
+        # sample is a dict from v4_segment_collate or head_collate
+        # For V4: sample has 'frames' key with shape (S, V, H, W, 3)
+        # For V3: sample has 'frames' key with shape (K, V, H, W, 3)
+        if isinstance(sample, dict) and 'frames' in sample:
+            frames_sample = sample['frames']
+        elif isinstance(sample, (list, tuple)):
+            # V3 collate returns (frames, states, actions, ...)
+            frames_sample = sample[0]
+        else:
+            frames_sample = sample
+        # Take first timestep, add batch dim
+        if frames_sample.ndim == 5:
+            # (T, V, H, W, 3) -> (1, V, H, W, 3)
+            dummy = frames_sample[0:1].to(device)
+        elif frames_sample.ndim == 4:
+            # (T, H, W, 3) -> (1, H, W, 3)
+            dummy = frames_sample[0:1].to(device)
+        else:
+            raise ValueError(f"Unexpected frame shape: {frames_sample.shape}")
+        z_v_dummy = model._vision_forward(dummy)
         if z_v_dummy.ndim == 2:
             N_tok_actual = z_v_dummy.shape[0]
         else:
             N_tok_actual = z_v_dummy.shape[1]
     pool_out_dim = N_tok_actual * args.compressed_dim
     model._build_head_and_bank(pool_out_dim)
-    print(f"  Head built: pool_out_dim={pool_out_dim} (cameras={num_cameras}, img={img_h}x{img_w}, VP_tokens={N_tok_actual})")
+    print(f"  Head built: pool_out_dim={pool_out_dim} (VP_tokens={N_tok_actual})")
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in model.parameters())
