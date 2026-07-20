@@ -103,15 +103,26 @@ from training.wandb_utils import init_wandb
 
 def build_datasets(args):
     """Build train and val datasets from one or more HDF5 files."""
+    is_v4 = getattr(args, 'use_intent_tokens', False) or getattr(args, 'use_memory_bank', False)
+    if is_v4:
+        # V4 collate needs at least H*segment_max_mult frames (default: 20*5=100).
+        # __getitem__ returns frames_per_ep + traj_window, so we need enough runway.
+        traj_window = max(
+            args.history_size * getattr(args, 'segment_max_mult', 5),
+            args.chunk_size,
+        )
+    else:
+        traj_window = args.chunk_size
+
     if len(args.data) == 1:
         ds = ALIGNDataset(
             args.data[0], mode="head",
-            traj_window=args.chunk_size, cameras=args.cameras,
+            traj_window=traj_window, cameras=args.cameras,
         )
     else:
         ds = MultiALIGNDataset(
             args.data, mode="head",
-            traj_window=args.chunk_size, cameras=args.cameras,
+            traj_window=traj_window, cameras=args.cameras,
         )
     n_total = len(ds)
     n_val = max(1, int(n_total * args.val_split))
