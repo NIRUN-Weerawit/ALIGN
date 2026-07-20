@@ -776,8 +776,14 @@ def main():
     if model.intention_encoder is not None:
         for p in model.intention_encoder.parameters():
             p.requires_grad = True
-    for p in model.intention_head.parameters():
-        p.requires_grad = True
+    # Head is lazily built on first forward pass; skip if not yet built
+    if model.intention_head is not None:
+        for p in model.intention_head.parameters():
+            p.requires_grad = True
+    # Memory bank is lazily built on first forward pass
+    if model.memory_module is not None:
+        for p in model.memory_module.parameters():
+            p.requires_grad = True
     # If text encoder exists, train the projection (frozen CLIP under it)
     if model.text_encoder is not None:
         for p in model.text_encoder.projection.parameters():
@@ -787,6 +793,15 @@ def main():
     print("  Trainable: vision projection + state encoder + intention encoder + head"
           + (" + text projection" if model.text_encoder is not None else ""))
     # Collect trainable params
+    # Trigger a dummy forward to build lazy head/bank before counting params
+    if model.intention_head is None:
+        print("  Building head via dummy forward...")
+        V = num_cameras
+        dummy_frames = torch.zeros(1, args.history_size, V, 224, 224, 3, device=device)
+        dummy_states = torch.zeros(1, args.history_size, 7, device=device)
+        with torch.no_grad():
+            model(dummy_frames, dummy_states)
+        print(f"  Head built: pool_out_dim={model.pool_out_dim}")
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in model.parameters())
