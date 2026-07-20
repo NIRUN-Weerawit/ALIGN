@@ -804,7 +804,12 @@ def main():
             # Read one frame from ALL cameras to get the real multi-cam shape
             cam_frames = []
             for cam_name in args.cameras:
-                ds = _h5[f"{ep_key}/{cam_name}"]
+                # HDF5 structure: ep_XXX/frames/{camera_name}
+                frames_grp = _h5[f"{ep_key}/frames"]
+                if isinstance(frames_grp, h5py.Dataset):
+                    ds = frames_grp
+                else:
+                    ds = frames_grp[cam_name]
                 img_shape = ds.shape  # (N, H, W, C)
                 if len(cam_frames) == 0:
                     img_h, img_w = img_shape[1], img_shape[2]
