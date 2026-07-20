@@ -262,9 +262,12 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             z_v_pooled_t = model._pool_patches(z_v_t, model.state_encoder(s_t))
             z_v_pooled_all.append(z_v_pooled_t)
             z_t_all.append(model.state_encoder(s_t))
-        # Stack: (B, S, pool_out_dim) and (B, S, state_dim)
-        z_v_pooled_all = torch.stack(z_v_pooled_all, dim=1)
+        # Stack: (B, S, V*P, comp_dim) and (B, S, state_dim)
+        z_v_pooled_all = torch.stack(z_v_pooled_all, dim=1)  # (B, S, V*P, comp_dim)
         z_t_all = torch.stack(z_t_all, dim=1)
+        # Flatten patch axis into feature dim for head consumption (3D expected)
+        B_seg, S, N_tok, D_comp = z_v_pooled_all.shape
+        z_v_pooled_all = z_v_pooled_all.reshape(B_seg, S, N_tok * D_comp)  # (B, S, V*P*comp_dim)
 
         total_loss = torch.tensor(0.0, device=device)
         optimizer.zero_grad()
