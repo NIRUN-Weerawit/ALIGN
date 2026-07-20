@@ -342,7 +342,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
                 # Loss
                 if args.head_type == "diffusion_policy":
-                    loss = model.intention_head.loss(target, actions_pred)
+                    # Slice actions_pred to target length K for diffusion loss (cond/action K must match)
+                    pred_for_loss = actions_pred[:, :target.shape[1]]  # (B, C, cond_dim)
+                    loss = model.intention_head.loss(target, pred_for_loss)
                 else:
                     loss = F.mse_loss(actions_pred_loss, target)
 
@@ -415,7 +417,9 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
 
             # Loss depends on head type
             if args.head_type == "diffusion_policy":
-                loss = model.intention_head.loss(target, actions_pred)
+                # Slice actions_pred to target length K for diffusion loss (cond/action K must match)
+                pred_for_loss = actions_pred[:, :target.shape[1]]  # (B, C, cond_dim)
+                loss = model.intention_head.loss(target, pred_for_loss)
             else:
                 # Direct regression: MSE on actions (use padded for fair comparison)
                 loss = F.mse_loss(actions_pred_for_loss, target)
