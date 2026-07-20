@@ -180,6 +180,7 @@ def evaluate(
     device_str: Optional[str] = None,
     override_chunk_size: Optional[int] = None,
     override_num_cameras: Optional[int] = None,
+    cameras: Optional[List[str]] = None,
     task_text: Optional[str] = None,
 ):
     device = torch.device(device_str or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -194,19 +195,20 @@ def evaluate(
         override_num_cameras=override_num_cameras,
     )
     chunk_size = cfg["chunk_size"]
-    cameras = ["wrist_image"] if cfg["num_cameras"] == 1 else None  # let dataset auto-detect
+    # Use --cameras if provided, else let dataset auto-detect
+    dataset_cameras = cameras  # rename to avoid shadowing the loop var
 
     # -- Dataset (held-out split)
     if len(data_paths) == 1:
         ds = ALIGNDataset(
             data_paths[0], mode="head",
-            traj_window=traj_window, cameras=cameras,
+            traj_window=traj_window, cameras=dataset_cameras,
         )
     else:
         from data.align_dataset import MultiALIGNDataset
         ds = MultiALIGNDataset(
             data_paths, mode="head",
-            traj_window=traj_window, cameras=cameras,
+            traj_window=traj_window, cameras=dataset_cameras,
         )
     n_total = len(ds)
     n_val = max(1, int(n_total * val_split))
@@ -228,8 +230,10 @@ def evaluate(
     n_samples = 0
     sum_se = 0.0   # sum of squared errors (overall)
     sum_ae = 0.0   # sum of absolute errors (overall)
-    per_dim_se = np.zeros(6, dtype=np.float64)  # per-output-dim squared errors
-    per_dim_ae = np.zeros(6, dtype=np.float64)  # per-output-dim absolute errors
+    # Use the model's action_dim (may be 6 or 7 depending on training config)
+    action_dim = cfg.get("action_dim", 6)
+    per_dim_se = np.zeros(action_dim, dtype=np.float64)  # per-output-dim squared errors
+    per_dim_ae = np.zeros(action_dim, dtype=np.float64)  # per-output-dim absolute errors
     per_step_mse: List[List[float]] = [[] for _ in range(chunk_size)]
     per_step_cos: List[List[float]] = [[] for _ in range(chunk_size)]
     per_step_mag_pred: List[List[float]] = [[] for _ in range(chunk_size)]
@@ -246,7 +250,7 @@ def evaluate(
             frames = torch.from_numpy(batch["frames_window"]).to(device)  # (B, K, H, W, 3) or (B, K, V, H, W, 3)
             state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
             # Always use 'actions_window' (target) for error computation
-            target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 6)
+            target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, action_dim)
 
             # Optional text encoding (only if model has text encoder)
             z_text = None
@@ -274,15 +278,21 @@ def evaluate(
                     actions_pred = model.predict_actions(
                         out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
                     )
-                # (B, K, 6)
+                # (B, K, action_dim)
 
             actions_pred_f = actions_pred.float()
             target_f = target.float()
 
+            # Pad model output with target's gripper if needed so shapes match
+            # (only when model action_dim < target action_dim)
+            if actions_pred_f.shape[-1] < target_f.shape[-1]:
+                pad = target_f[..., actions_pred_f.shape[-1]:]
+                actions_pred_f = torch.cat([actions_pred_f, pad], dim=-1)
+
             # ---- Aggregate errors ----
             B = actions_pred_f.shape[0]
             n_samples += B
-            err = actions_pred_f - target_f        # (B, K, 6)
+            err = actions_pred_f - target_f        # (B, K, action_dim)
             sum_se += (err ** 2).sum().item()
             sum_ae += err.abs().sum().item()
             # per-dim (collapsed over B and K)
@@ -319,7 +329,7 @@ def evaluate(
         return
 
     # ---- Aggregate metrics ----
-    total_elements = n_samples * chunk_size * 6
+    total_elements = n_samples * chunk_size * action_dim
     overall_mse = sum_se / total_elements
     overall_mae = sum_ae / total_elements
     overall_rmse = float(np.sqrt(overall_mse))
@@ -330,7 +340,7 @@ def evaluate(
 
     # ---- Print results ----
     print(f"\n{'='*68}")
-    print(f"=== Results ({n_samples} samples, K={chunk_size} steps, 6 dims) ===")
+    print(f"=== Results ({n_samples} samples, K={chunk_size} steps, {action_dim} dims) ===")
     print(f"{'='*68}")
     print(f"\nLoss mode: action (only)")
     print(f"\nOverall metrics (flattened over K and 6 dims):")
@@ -338,16 +348,18 @@ def evaluate(
     print(f"  RMSE: {overall_rmse:.6f}")
     print(f"  MAE:  {overall_mae:.6f}")
 
-    dim_names = ["x", "y", "z", "roll", "pitch", "yaw"]
+    # Default dim names: 6 OSC deltas + 1 gripper
+    dim_names = ["x", "y", "z", "roll", "pitch", "yaw", "gripper"]
     print(f"\nPer-dimension metrics (averaged over K steps):")
-    print(f"  {'dim':<6}{'MSE':<14}{'RMSE':<14}{'MAE':<14}")
-    for d in range(6):
-        print(f"  {dim_names[d]:<6}"
+    print(f"  {'dim':<8}{'MSE':<14}{'RMSE':<14}{'MAE':<14}")
+    for d in range(action_dim):
+        name = dim_names[d] if d < len(dim_names) else f"d{d}"
+        print(f"  {name:<8}"
               f"{per_dim_mse[d]:<14.6f}"
               f"{per_dim_rmse[d]:<14.6f}"
               f"{per_dim_mae[d]:<14.6f}")
 
-    print(f"\nPer-step metrics (averaged over 6 dims):")
+    print(f"\nPer-step metrics (averaged over {action_dim} dims):")
     print(f"  {'step':<6}{'MSE':<14}{'cos':<10}{'|pred|':<12}{'|target|':<12}")
     for k in range(chunk_size):
         step_mse = float(np.mean(per_step_mse[k]))
@@ -424,6 +436,10 @@ def main():
                         help="Override chunk_size (default: read from ckpt).")
     parser.add_argument("--num-cameras", type=int, default=None,
                         help="Override num_cameras (default: read from ckpt).")
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera names to load from HDF5 "
+                             "(default: auto-detect, e.g. ['wrist_image']). "
+                             "MUST match the cameras the model was trained with.")
     parser.add_argument("--task-text", type=str, default=None,
                         help="Task text for text-conditioned models "
                              "(default: 'default task' if model uses text).")
@@ -439,6 +455,7 @@ def main():
         device_str=args.device,
         override_chunk_size=args.chunk_size,
         override_num_cameras=args.num_cameras,
+        cameras=args.cameras,
         task_text=args.task_text,
     )
     # Optional: dump a JSON summary next to the checkpoint

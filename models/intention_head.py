@@ -20,6 +20,8 @@ Architecture:
   - Transformer encoder over the (K+1) tokens
   - Output projection to K actions
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -254,6 +256,274 @@ class MambaActionHead(nn.Module):
         # Output projection: per-timestep action
         actions = self.output_proj(out)  # (B, K, action_dim)
         return actions
+
+
+# ================================================================
+# Diffusion Action Head (DDPM baseline)
+# ================================================================
+
+
+class DiffusionActionHead(nn.Module):
+    """DDPM-style diffusion head for action prediction.
+
+    Baseline for comparing against flow-matching: trains a noise predictor
+    ε_θ(x_T, t, c) and denoises iteratively back to x_0 ≈ actions.
+
+    Architecture (same conditioning backbone as flow-matching head):
+      - Per-step condition: concat[z_v_pooled[t], z_t[t], z_text?, h_current]
+      - Noise predictor: MLP with sinusoidal time emb + FiLM gating
+      - Training: noise prediction objective  (DDPM)
+      - Inference: deterministic denoising (no variance scheduling)
+
+    Compared to flow-matching:
+      + Proven baseline — Diffusion Policy paper, widely adopted
+      - ~20 inference steps needed (vs ~10 for FM at similar quality)
+      - More training samples per forward than direct regression
+
+    Args:
+        cond_dim:          condition dim = pool_out + state + text + h
+        action_dim:        output dim (default 6)
+        hidden_dim:        MLP hidden (default 256, maps via --head-d-model)
+        num_inference_steps: denoising steps (default 20)
+        time_dim:          sinusoidal time emb dim (default 64)
+        chunk_size:        K — number of past steps / future actions
+    """
+
+    def __init__(self, cond_dim: int = 768, action_dim: int = 6,
+                 hidden_dim: int = 256, num_inference_steps: int = 20,
+                 time_dim: int = 64, chunk_size: int = 10):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_inference_steps = num_inference_steps
+        self.time_dim = time_dim
+        self.chunk_size = chunk_size
+        self.cond_dim = cond_dim
+
+        # Cosine noise schedule (Lin et al. 2023): ᾱ_t = cos^2(π/2 · (t/T + s)/(1+s))
+        # σ_t = sqrt(1 - ᾱ_t) controls signal-to-noise ratio at step t
+        T_steps = num_inference_steps
+        s = 0.008
+        t_vals = torch.arange(T_steps + 1, dtype=torch.float64)         # 0…T
+        theta = torch.tensor(math.pi / 2, dtype=torch.float64) * \
+                (t_vals / T_steps + s) / (1 + s)
+        alpha_bar = torch.cos(theta).pow(2)                             # ᾱ_t
+        sigma = torch.sqrt(1 - alpha_bar)                               # √(1-ᾱ)
+        self.register_buffer("alpha_bar", alpha_bar.float())            # (T+1,) 0→~1
+        self.register_buffer("sigma", sigma.float())                    # (T+1,)  0→~1
+
+        # Per-sample cosine-squared values θ(t) for time embedding:
+        # cos_s_value[i] = cos²((i + 0.5)*π / (2*T)) for i in [0, T-1]
+        self.register_buffer("cos_s_values", torch.tensor(
+            [math.cos(math.pi * (i + 0.5) / (2 * T_steps)) ** 2
+             for i in range(T_steps)], dtype=torch.float32))
+
+        # Time embedding: cosine² → sinusoidal scaling → MLP
+        self.time_emb_mlp = nn.Sequential(
+            nn.Linear(time_dim, time_dim),
+            nn.SiLU(),
+        )
+
+        # Input: cat(action_t, cond)
+        self.input_proj = nn.Linear(action_dim + cond_dim, hidden_dim)
+        self.cond_scale = nn.Parameter(torch.ones(hidden_dim))
+        self.cond_shift = nn.Parameter(torch.zeros(hidden_dim))
+
+        # Noise predictor body (shared across timesteps, conditioned on c and t_emb)
+        self.body = nn.Sequential(
+            nn.Linear(hidden_dim + time_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+
+        # Output: hidden → noise prediction (ε̂)
+        self.output_proj = nn.Linear(hidden_dim, action_dim)
+        # Small init for stable early-step training (avoids blowing up ᾱ=0 regime)
+        nn.init.normal_(self.output_proj.weight, std=1e-3)
+        nn.init.zeros_(self.output_proj.bias)
+
+    # ---------------------------------------------------------------
+    # Noise predictor: ε_θ(x_t , t, c)  →  (B, K, action_dim)
+    # ---------------------------------------------------------------
+    def _cosine_s_emb(self, t_indices: torch.Tensor) -> torch.Tensor:
+        """Cosine-squared time embedding (Lin et al. 2023).
+
+        t_indices: integer step indices, any shape (e.g. (B,), (B,K))
+        Returns:   scaled sinusoidal embedding of shape (*t.shape, time_dim)
+
+        Uses cos²(θ_t) to scale the sinusoidal frequencies so nearby timesteps
+        get similar embeddings — smoother than raw sin/cos of t.
+        """
+        clamped = torch.clamp(t_indices.long(), 0, len(self.cos_s_values) - 1)
+        cos2_t = self.cos_s_values[clamped]                              # (*t.shape,)
+        half_dim = self.time_dim // 2
+        exponents = torch.arange(half_dim, device=cos2_t.device, dtype=torch.float32)
+        freqs = torch.exp(exponents * (-math.log(10000.0) / max(half_dim - 1, 1)))
+        scaled = cos2_t.unsqueeze(-1) * freqs                            # (*t.shape, half_dim)
+        raw_emb = torch.cat([torch.cos(scaled), torch.sin(scaled)], dim=-1)  # (*, time_dim)
+        return self.time_emb_mlp(raw_emb)
+
+    def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
+                              z_t_window: torch.Tensor,
+                              h_current: torch.Tensor = None,
+                              z_text: torch.Tensor = None) -> torch.Tensor:
+        """Build per-step condition (B, K, cond_dim)."""
+        B, K = z_v_pooled_window.shape[:2]
+        parts = [z_v_pooled_window, z_t_window]
+        if z_text is not None:
+            parts.append(z_text.unsqueeze(1).expand(-1, K, -1))
+        if h_current is not None:
+            parts.append(h_current.unsqueeze(1).expand(-1, K, -1))
+        return torch.cat(parts, dim=-1)
+
+    def forward(self, z_v_pooled_window: torch.Tensor,
+                z_t_window: torch.Tensor,
+                h_current: torch.Tensor = None,
+                z_text: torch.Tensor = None) -> torch.Tensor:
+        """Build per-step condition for training loss.
+
+        Returns cond tensor; caller passes it to .loss() (see FlowMatchingActionHead).
+        """
+        return self._build_per_step_cond(
+            z_v_pooled_window, z_t_window, h_current, z_text,
+        )
+
+    def predict_noise(self, noisy_actions: torch.Tensor,
+                      timesteps: int, cond: torch.Tensor) -> torch.Tensor:
+        """Predict noise given action observation at discrete step *timesteps* (0…T).
+
+        Unlike the flow head where *t* is continuous [0,1], diffusion works in
+        integer steps here for simplicity and to match DDPM/DDIM convention.
+        For batched training with per-sample timesteps use .loss() directly.
+
+        Args:
+            noisy_actions: (B, K, action_dim) — x_current
+            timesteps:     step index 0…T  (scalar, same for entire batch+chunk)
+            cond:          (B, K, cond_dim)  — per-step condition
+        Returns:
+            predicted_noise: (B, K, action_dim) — ε̂
+        """
+        B, K = noisy_actions.shape[:2]
+
+        # Time embedding: scalar t → (time_dim,) → (K, time_dim) broadcast
+        t_tensor = torch.full((K,), float(timesteps), device=cond.device)   # (K,)
+        emb = self._cosine_s_emb(t_tensor).unsqueeze(0)                      # (1, K, time_dim)
+
+        h_base = self.input_proj(torch.cat([noisy_actions, cond], -1))     # (B, K, hidden)
+        h_gate = h_base * self.cond_scale + self.cond_shift                # FiLM gating on cond path
+
+        body_in = torch.cat([h_gate.expand_as(h_base), emb.expand(B, -1, -1).expand_as(h_base)], -1)  # (B, K, hidden+time)
+        h_body = self.body(body_in)                                        # (B, K, hidden)
+        return self.output_proj(h_body).float()                           # (B, K, action_dim)
+
+    def loss(self, actions_target: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        """DDPM noise-prediction training loss.
+
+        Sample t uniformly from 0…T, add Gaussian noise scaled by sigma_t,
+        ask the model to predict that noise back given x_t.
+
+        Args:
+            actions_target: (B, K, action_dim) — ground truth actions
+            cond:           (B, K, cond_dim)   — per-step condition
+        Returns:
+            scalar MSE between predicted noise and actual injected Gaussian noise
+        """
+        B, K = actions_target.shape[:2]
+        device = actions_target.device
+
+        # Sample t ~ Uniform(0, T) for each sample in the batch (share across chunk dim)
+        t_indices = torch.randint(0, self.num_inference_steps + 1,
+                                  (B,), device=device).long()             # (B,)
+
+        alpha_bar_t = self.alpha_bar[t_indices][:, None, None]            # (B, 1, 1)
+        sigma_t     = self.sigma[t_indices][:, None, None]
+
+        noise = torch.randn_like(actions_target, dtype=torch.float32)      # ε ~ N(0,I)
+        x_t = alpha_bar_t.sqrt() * actions_target.float() + sigma_t * noise
+
+        predicted_noise = self._predict_noise_with_index(x_t, t_indices, cond)
+        return F.mse_loss(predicted_noise.float(), noise.float())
+
+    def _predict_noise_with_index(self, x_t: torch.Tensor,
+                                   t_indices: torch.Tensor,
+                                   cond: torch.Tensor) -> torch.Tensor:
+        """Core forward inside loss() — handles per-sample (batch-level) timestep indices."""
+        B = x_t.shape[0]
+        K = x_t.shape[1]
+
+        # Time embedding from integer t → float in [0, T_steps] scaled to [0, 1]
+        t_float = (t_indices.to(cond.dtype).unsqueeze(1)) \
+                  .expand(-1, K)                                     # (B, K)
+        emb = self._cosine_s_emb(t_float)                             # (B, K, time_dim)
+
+        h_base = self.input_proj(torch.cat([x_t, cond], -1))          # (B, K, hidden)
+        h_gate = h_base * self.cond_scale + self.cond_shift           # FiLM gating on cond path
+
+        body_in = torch.cat([h_gate, emb], -1)                         # (B, K, hidden+time)
+        h_body = self.body(body_in)                                   # (B, K, hidden)
+        return self.output_proj(h_body).float()                        # (B, K, action_dim)
+
+    @torch.no_grad()
+    def sample(self, cond: torch.Tensor, num_steps: Optional[int] = None) -> torch.Tensor:
+        """Deterministic DDIM-style denoising from noise to actions.
+
+        Runs in reverse: x_T → x_{T-1} → … → x_0 ≈ actions.
+
+        Args:
+            cond:     (B, K, cond_dim) — per-step condition
+            num_steps: override default inference step count
+        Returns:
+            actions:  (B, K, action_dim)
+        """
+        if num_steps is None:
+            num_steps = self.num_inference_steps
+
+        B, K = cond.shape[:2]
+        device = cond.device
+
+        # Start from pure noise at step T (the end of the schedule)
+        x = torch.randn(B, K, self.action_dim, dtype=torch.float32, device=device)
+
+        for i in range(num_steps - 1, -1, -1):   # t = T-1 → 0
+            t = torch.tensor([i], dtype=torch.long, device=device)
+            x_next = self._step(x, i, cond)
+            x = x_next
+
+        return x.float()
+
+    def _step(self, x: torch.Tensor, t: int, cond: torch.Tensor) -> torch.Tensor:
+        """One denoising step: x_t → x_{t-1} (deterministic)."""
+        predicted_noise = self._predict_noise_with_index(
+            x,
+            # Single timestep repeated for whole batch — shape (B,)
+            torch.full((x.shape[0],), t, dtype=torch.long, device=x.device),
+            cond,
+        )
+
+        sigma_t     = self.sigma[t].float()                          # (1,)
+        sigma_prev  = self.sigma[max(t - 1, 0)].float()
+
+        a_bar_t      = self.alpha_bar[t].float()
+        if t > 0:
+            a_bar_prev = self.alpha_bar[t - 1].float()
+        else:
+            a_bar_prev = torch.tensor(1.0, dtype=torch.float32, device=x.device)
+
+        # Mean prediction (DDPM/DDIM common term):
+        x_hat = ((x - sigma_t * predicted_noise / a_bar_t.sqrt()) /
+                  sigma_t * (a_bar_prev.sqrt() - a_bar_t.sqrt()))
+
+        # Add variance term: σ_{t-1}·(σ_t^2 - (ᾱ_t - ᾱ_{t-1})²)^(1/2) for diversity
+        if t > 1:
+            var_coeff = sigma_prev * torch.sqrt(
+                sigma_t.pow(2) - (a_bar_t - a_bar_prev).pow(2) + 1e-8,
+            )
+        else:
+            var_coeff = sigma_prev
+
+        return x_hat + predicted_noise * var_coeff[:, None, None]
 
 
 # ================================================================

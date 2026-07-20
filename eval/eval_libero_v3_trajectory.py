@@ -532,12 +532,12 @@ def run_model_in_sim(
     sim_positions = []
     errors = []
     stored_actions = []
-    init_frames = []
 
-    # State buffer (K-window)
+    # State buffer (K-window) — each entry is a (7,) state vector
     pose_buffer = []
-    frame_buffers = []
-    
+    # Frame buffer (K-window) — each entry is (V, H, W, 3) uint8, V = num cameras
+    frame_buffer = []
+
     def _normalize_frame(f):
         """Make sure frame is (H, W, 3) uint8."""
         if f is None:
@@ -546,51 +546,50 @@ def run_model_in_sim(
             f = f[0]
         return f.astype(np.uint8)
 
+    def _render_all_cameras():
+        """Render all cameras and return (V, H, W, 3) uint8 stack."""
+        per_cam = []
+        for camera_view in use_camera:
+            f = _normalize_frame(get_sim_frame(env, key=camera_view,
+                                              render_size=render_size,
+                                              flip_vertical=flip_vertical,
+                                              flip_horizontal=flip_horizontal))
+            per_cam.append(f)
+        return np.stack(per_cam, axis=0)  # (V, H, W, 3)
+
     # Get initial sim state to populate buffer
     init_eef = get_sim_eef_pose(obs)
     init_state = np.concatenate([init_eef, [0.0]]).astype(np.float32)  # (7,)
-    for camera_view in use_camera:
-        init_frame = _normalize_frame(get_sim_frame(env, key=camera_view,
-                                                    render_size=render_size,
-                                                    flip_vertical=flip_vertical,
-                                                    flip_horizontal=flip_horizontal))
-        init_frames.append(init_frame.copy())
-        
-    # Pad initial buffers
+    init_frame_stack = _render_all_cameras()  # (V, H, W, 3)
+
+    # Pad initial buffers with K copies of the initial state/frame
     for k in range(chunk_size):
         pose_buffer.append(init_state.copy())
-        frame_buffers.append([])
-        for cam_id,frame in enumerate(init_frames):
-            frame_buffers[k].append([])
-            if frame is not None:
-                frame_buffers[k][cam_id].append(frame.copy()) 
-    
+        frame_buffer.append(init_frame_stack.copy())
+
     for step in range(min(len(actions), max_steps)):
-        # 1. Render current sim frame BEFORE step\
-        for cam_id, camera_view in enumerate(use_camera):
-            sim_frame = _normalize_frame(get_sim_frame(env, key=camera_view,
-                                                        render_size=render_size,
-                                                        flip_vertical=flip_vertical,
-                                                        flip_horizontal=flip_horizontal))
-            if len(frame_buffers) > chunk_size:
-                frame_buffers.pop(0)
-        if sim_frame is not None:
-            frames.append(sim_frame.copy())
+        # 1. Render current sim frame BEFORE step
+        current_frame_stack = _render_all_cameras()  # (V, H, W, 3)
+        # Record the first camera's view for video output
+        frames.append(current_frame_stack[0].copy())
+
         sim_eef = get_sim_eef_pose(obs)
         sim_positions.append(sim_eef)
 
-        # Update buffers
+        # 2. Update sliding windows: pop oldest, push newest
         sim_state = np.concatenate([sim_eef, [0.0]]).astype(np.float32)
         pose_buffer.append(sim_state)
-        if len(pose_buffer) > chunk_size:
-            pose_buffer.pop(0)
-        # 2. Build K-window tensors
+        pose_buffer.pop(0)
+        frame_buffer.append(current_frame_stack)
+        frame_buffer.pop(0)
+
+        # 3. Build K-window tensors
         win_states = np.stack(pose_buffer, axis=0).astype(np.float32)  # (K, 7)
-        win_frames = np.stack(frame_buffers, axis=0).squeeze(2)  # (K, V, H, W, 3) uint8
-        f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device) # (1, K, V, H, W, 3) uint8
+        win_frames = np.stack(frame_buffer, axis=0)  # (K, V, H, W, 3) uint8
+        f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)  # (1, K, V, H, W, 3)
         s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
-        # print(f"shape of f_t: {f_t.shape}, shape of s_t: {s_t.shape}")
-        # 3. Run v3 model
+
+        # 4. Run v3 model
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                      enabled=device.type == "cuda"):
@@ -607,26 +606,30 @@ def run_model_in_sim(
                             out["z_v_pooled_seq"], out["z_t_seq"],
                             h_current, z_text=z_text,
                         )
-        a_model = a_model_full[0, 0, :].float().cpu().numpy()  # (6,)
+        a_model = a_model_full[0, 0, :].float().cpu().numpy()  # (6,) or (7,)
 
-        # 4. Build the final action
-        # Apply action_scale to model output (useful if model output scale doesn't match sim)
+        # 5. Build the final action
         a_model_scaled = a_model * action_scale
         base_action = actions[step].copy()  # (7,)
         final_action = (1.0 - alpha) * base_action.copy()
-        final_action[:6] = final_action[:6] + alpha * a_model_scaled
-        if final_action.shape[0] >= 7:
-            # final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
-            final_action[6] = -1.0
+        final_action[:6] = final_action[:6] + alpha * a_model_scaled[:6]
+        # Gripper: use model's gripper prediction if available, else keep base
+        if a_model.shape[0] >= 7 and final_action.shape[0] >= 7:
+            final_action[6] = 1.0 if a_model_scaled[6] >= 0.5 else -1.0
+            
+        elif final_action.shape[0] >= 7:
+            final_action[6] = -1.0  # fallback: close gripper
+        
         if debug:
             print(f"Model action: {a_model}")
+            
         stored_actions.append(a_model_scaled.copy())
 
-        # 5. Step sim
+        # 6. Step sim
         obs, reward, done, info = env.step(final_action)
         sim_eef_after = get_sim_eef_pose(obs)
         sim_positions[-1] = sim_eef_after
-        # 6. Compute EEF error vs dataset expert
+        # 7. Compute EEF error vs dataset expert
         if expert_poses is not None and step < len(expert_poses):
             expert_eef = expert_poses[step]
             err = float(np.linalg.norm(sim_eef_after[:3] - expert_eef[:3]))

@@ -245,10 +245,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 actions_pred_for_loss = actions_pred
 
             # Loss depends on head type
-            if args.head_type == "flow":
-                # Flow-matching: cond → velocity field loss
-                # Flow head uses cond, not actions, so we pass the
-                # un-padded actions_pred (which is cond for flow head)
+            if args.head_type in ("flow", "diffusion"):
                 loss = model.intention_head.loss(target, actions_pred)
             else:
                 # Direct regression: MSE on actions (use padded for fair comparison)
@@ -324,12 +321,12 @@ def validate(model, loader, device, args):
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]
-            if args.head_type == "flow":
-                # For flow head, sample actions via ODE integration
+            if args.head_type in ("flow", "diffusion"):
+                # For flow/diffusion heads, sample actions via generator's method
                 actions_pred = model.sample_actions(
                     out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
                 )
-                # For loss reporting, also compute the flow-matching loss
+                # For loss reporting, also compute the generative head's loss
                 cond = model.intention_head(
                     out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
                 )
@@ -456,9 +453,9 @@ def parse_args():
     # NOTE: --action-dim hardcoded to 6 (OSC pose deltas).
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
-    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "flow"],
+    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion", "flow"],
                         default="mamba",
-                        help="Which head architecture: transformer, mamba, hybrid, or flow")
+                        help="Which head architecture: transformer, mamba, hybrid, diffusion, or flow")
     parser.add_argument("--use-history", action="store_true", default=True,
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",

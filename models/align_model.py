@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ALIGN model architecture — shared backbone + dual heads.
-
-Architecture:
-    DINOv2 ViT-B (frozen) → projection → z_v (256d)
-    Transformer (trained) → projection → z_t (256d)
-    CLIP text (frozen) → projection → z_text (256d)
-        │                              │
-        └────────── CrossAttnMixer ─────┘
-                   │          │
-         ┌─────────┴─────────┐
-         │                   │
-    Decision Head (α)   Assistant Head (Δposes)
-
-Usage:
-    from models.align_model import ALIGNModel
-    model = ALIGNModel()
-    vision = model.encode_raw_vision(frames)        # (B, 256) — no mixer
-    z_v, z_t, z_text = model.encode_mixed(...)      # through mixer
-    alpha = model.decision_head(z_v, z_t, z_text)
-    delta = model.assistant_head(z_v, z_t, z_text, noisy_pose)
-"""
 
 from typing import Optional, Tuple, Dict, List
 
@@ -167,6 +146,92 @@ class LanguageConditionedVisualAttention(nn.Module):
 
 
 # ================================================================
+# SE-Gated Channel Projection (v2.1 — adaptive channel compression)
+# Inspired by MemoryVLA's perceptual compression module (ICLR 2026).
+# Learnable per-image gating on DINOv2 channels BEFORE linear projection.
+# Suppresses noisy dimensions based on scene content, improving signal-to-noise
+# in downstream patches compared to a static Linear projection.
+# ================================================================
+
+class SEChannelProject(nn.Module):
+    """SE-bottleneck + channel projection: x(C_in) → (C_in ⊙ SE) ⊗ W → x'(C_out).
+
+    Steps:
+      1. Squeeze: global mean over patch dimension → (B, C_in) importance map
+      2. Excitation: MLP(C_in → C_in//reduction → C_in) + sigmoid
+      3. Scale: multiply original features by channel weights BEFORE projection
+      4. Project: Linear(C_in → C_out) + LayerNorm
+
+    This ensures the network can dynamically suppress irrelevant DINOv2 channels
+    (e.g., high-frequency texture, background noise) per-image before compression,
+    rather than learning a single fixed linear basis averaged over all training data.
+
+    Args:
+        in_dim: input channel dim (default 768 for DINOv2-ViT-B patch tokens)
+        out_dim: output embed dim (e.g., 256)
+        reduction: SE reduction ratio (default 16, matching ResNet-SE convention)
+
+    Input:
+        x: (B, P, in_dim) — per-patch DINOv2 features
+
+    Output:
+        y: (B, P, out_dim) — adaptively reweighted + projected patches
+    """
+    def __init__(self, in_dim: int = 768, out_dim: int = 256, reduction: int = 16):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+
+        # SE bottleneck: learn which DINOv2 channels matter per-image
+        # Reduction ratio 16 matches ResNet-SE convention (768 → 48)
+        se_hidden = max(1, in_dim // reduction)
+        self.se_squeeze = nn.AdaptiveAvgPool1d(1)  # reduces P patches to global average
+        self.se_excitation = nn.Sequential(
+            nn.Linear(in_dim, se_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(se_hidden, in_dim),
+            nn.Sigmoid(),
+        )
+
+        # Channel projection: 768 → out_dim (e.g., 256) + normalization
+        self.projection = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.LayerNorm(out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """SE-gated channel projection.
+
+        Args:
+            x: (B, P, in_dim) — per-patch DINOv2 features (e.g., 768).
+               For v1 CLS mode: (B, in_dim) also works via squeeze/unsqueeze.
+
+        Returns:
+            y: (B, P, out_dim) or (B, out_dim) matching input shape.
+        """
+        is_2d = x.ndim == 2  # v1 CLS mode: (B, C_in) — no patch dim to pool over
+        if is_2d:
+            x = x.unsqueeze(1)  # treat as a single "patch": (B, 1, C_in)
+
+        # Squeeze: global mean across patches → per-channel statistics
+        squeezed = self.se_squeeze(x.transpose(1, 2))  # (B, P, C_in) as (B, C_in, P) → pool → (B, C_in, 1)
+        squeezed = squeezed.squeeze(-1)  # (B, C_in)
+
+        # Excitation: learn per-channel importance in [0, 1]
+        weights = self.se_excitation(squeezed)  # (B, C_in) → (B, C_in), sigmoided
+
+        # Scale: suppress noisy DINOv2 channels based on scene content
+        x_se = x * weights.unsqueeze(1)  # (B, P, C_in) — broadcast per-channel weights
+
+        # Project down to embed_dim
+        y = self.projection(x_se)  # (B, P, out_dim) or (B, 1, out_dim)
+
+        if is_2d:
+            return y.squeeze(1)  # back to (B, out_dim)
+        return y
+
+
+# ================================================================
 # Vision Encoder
 # ================================================================
 
@@ -214,11 +279,10 @@ class VisionEncoder(nn.Module):
         # v2: use patch tokens by default; v1 falls back to CLS
         self.use_patch_tokens = use_patch_tokens
 
-        # Per-camera projection: DINOv2 feature (768) → embed_dim (256)
-        self.projection = nn.Sequential(
-            nn.Linear(768, embed_dim),
-            nn.LayerNorm(embed_dim),
-        )
+        # Per-camera projection: SE-gated compression — DINOv2 feature (768) → embed_dim (256)
+        # SE bottleneck learns adaptive channel weights BEFORE projection,
+        # suppressing noisy DINOv2 dimensions per-image.
+        self.projection = SEChannelProject(768, embed_dim)
         # Multi-camera fusion (v1 only): concatenate V * embed_dim → embed_dim
         if num_cameras > 1 and not use_patch_tokens:
             self.fusion = nn.Sequential(

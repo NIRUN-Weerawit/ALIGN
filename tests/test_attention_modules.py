@@ -528,15 +528,28 @@ def _save_timeline_video(out_dir, cam_idx, img_rows, timeline_weights, T_ep, gri
             
             Image.fromarray(frame_out).save(f"{tmp_dir}/f_{t:04d}.png")
 
-        # Stitch individual overlayed frames into a single MP4 
+        # Stitch individual overlayed frames into a single MP4.
+        # Use H.264 so VS Code/browser-based viewers can open the file.
         vid_path = os.path.join(out_dir, f"attention_video_cam{cam_idx}.mp4")
         if len(os.listdir(tmp_dir)) > 0:
-            subprocess.run(
-                f"ffmpeg -y -framerate {max(1, T_ep)} "
-                f"-i {tmp_dir}/f_%04d.png -c:v mpeg4 -pix_fmt yuv420p -qscale 0 {vid_path}",
-                shell=True, capture_output=True
-            )
-            if os.path.exists(vid_path):
+            fps = 2  # Slow down so each frame holds for half a second.
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", os.path.join(tmp_dir, "f_%04d.png"),
+                "-r", str(fps),
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-an",
+                vid_path,
+            ]
+            completed = subprocess.run(cmd, capture_output=True, text=True)
+            if completed.returncode != 0:
+                print("  Failed to save attention video")
+                print(completed.stderr.strip() or completed.stdout.strip())
+            elif os.path.exists(vid_path):
                 print(f"  Saved attention video -> {vid_path}")
     finally:
         shutil.rmtree(tmp_dir)

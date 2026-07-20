@@ -39,7 +39,10 @@ from typing import Optional, Tuple, List
 
 from models.align_model import VisionEncoder, RobotStateEncoder
 from models.intention_encoder import IntentionEncoder, PerCameraStateConditionedPool
-from models.intention_head import IntentionTransformerHead, MambaActionHead, FlowMatchingActionHead
+from models.intention_head import (
+    IntentionTransformerHead, MambaActionHead,
+    DiffusionActionHead, FlowMatchingActionHead,
+)
 
 
 class ALIGNIntentionModel(nn.Module):
@@ -168,6 +171,22 @@ class ALIGNIntentionModel(nn.Module):
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
+            )
+        elif head_type == "diffusion":
+            # Diffusion (DDPM) head: cond_dim = pool + state + text + h
+            cond_dim = (
+                self.pool_out_dim
+                + state_dim
+                + (text_dim if use_text else 0)
+                + (mamba_output_dim if mamba_output_dim > 0 else 0)
+            )
+            self.intention_head = DiffusionActionHead(
+                cond_dim=cond_dim,
+                action_dim=action_dim,
+                hidden_dim=head_d_model,  # reuse head_d_model as hidden_dim
+                num_inference_steps=20,   # diffusion needs more steps than FM
+                time_dim=128,
+                chunk_size=chunk_size,
             )
         elif head_type == "flow":
             # Flow-matching head: cond_dim = pool + state + text + h
@@ -380,7 +399,7 @@ class ALIGNIntentionModel(nn.Module):
         Returns:
             actions: (B, K, action_dim)
         """
-        if isinstance(self.intention_head, FlowMatchingActionHead):
+        if isinstance(self.intention_head, (DiffusionActionHead, FlowMatchingActionHead)):
             cond = self.intention_head(
                 z_v_pooled_window, z_t_window, h_current, z_text=z_text,
             )
