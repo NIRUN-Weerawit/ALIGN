@@ -794,20 +794,34 @@ def main():
           + (" + text projection" if model.text_encoder is not None else ""))
     # Collect trainable params
     # Build lazy head/bank before counting params.
-    # Read actual image size from HDF5 to compute pool_out_dim correctly.
-    if model.intention_head is None:
-        print("  Building head...")
-        # Read the actual image size from the HDF5 file
-        import h5py
+    # Probe actual vision output dim by running one real frame through VisionEncoder.
+    # This catches camera count & resolution mismatches that formulaic guesses miss.
+    print("  Building head (probing actual vision output shape)...")
+    import h5py
+    with torch.no_grad():
         with h5py.File(args.data[0], "r") as _h5:
             ep_key = sorted([k for k in _h5.keys() if k.startswith("ep_")])[0]
-            cam_name = args.cameras[0]
-            img_shape = _h5[f"{ep_key}/{cam_name}"].shape
-            img_h, img_w = img_shape[1], img_shape[2]
-        num_patches = (img_h // 14) * (img_w // 14)
-        pool_out_dim = num_cameras * num_patches * args.compressed_dim
-        model._build_head_and_bank(pool_out_dim)
-        print(f"  Head built: pool_out_dim={pool_out_dim} (img={img_h}x{img_w}, patches={num_patches})")
+            # Read one frame from ALL cameras to get the real multi-cam shape
+            cam_frames = []
+            for cam_name in args.cameras:
+                ds = _h5[f"{ep_key}/{cam_name}"]
+                img_shape = ds.shape  # (N, H, W, C)
+                if len(cam_frames) == 0:
+                    img_h, img_w = img_shape[1], img_shape[2]
+                cam_frames.append(ds[0:1])  # (1, H, W, C)
+            if len(cam_frames) == 1:
+                dummy_np = cam_frames[0].astype(np.uint8)
+            else:
+                dummy_np = np.stack(cam_frames, axis=0).astype(np.uint8)  # (V, 1, H, W, C) -> squeeze batch
+        dummy = torch.from_numpy(dummy_np).to(device)
+        z_v_dummy = model._vision_forward(dummy)  # (VP_tokens, raw_dim) or (1, VP, raw_dim)
+        if z_v_dummy.ndim == 2:
+            N_tok_actual = z_v_dummy.shape[0]
+        else:
+            N_tok_actual = z_v_dummy.shape[1]
+    pool_out_dim = N_tok_actual * args.compressed_dim
+    model._build_head_and_bank(pool_out_dim)
+    print(f"  Head built: pool_out_dim={pool_out_dim} (cameras={num_cameras}, img={img_h}x{img_w}, VP_tokens={N_tok_actual})")
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in model.parameters())
