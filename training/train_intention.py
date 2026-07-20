@@ -247,12 +247,6 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
         seg_lens = batch["segment_len"]  # (B,)
 
-        # Text encoding
-        z_text = None
-        if args.use_text:
-            texts = batch.get("texts", ["default task"] * B)
-            z_text = model.text_encoder(texts)
-
         # Reset memory bank at start of segment
         if model.use_memory_bank:
             model.memory_module.reset(batch_size=B, device=device)
@@ -326,7 +320,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
                 # Predict actions
                 actions_pred = model.predict_actions(
-                    z_v_win_for_head, z_t_win, h_for_head, z_text=z_text,
+                    z_v_win_for_head, z_t_win, h_for_head,
                 )
 
                 # Target: C future actions from current time
@@ -348,12 +342,6 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     loss = model.intention_head.loss(target, actions_pred)
                 else:
                     loss = F.mse_loss(actions_pred_loss, target)
-
-                # Optional semantic anchoring
-                if args.use_intent_tokens and args.anchor_weight > 0 and z_text is not None and intent_emb is not None:
-                    intent_pooled = intent_emb.mean(dim=1)  # (B, intent_dim)
-                    anchor_loss = 1.0 - F.cosine_similarity(intent_pooled, z_text, dim=-1).mean()
-                    loss = loss + args.anchor_weight * anchor_loss
 
             if args.skip_nan and not torch.isfinite(loss):
                 continue
@@ -401,19 +389,6 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
         target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 7)
 
-        # Optional text encoding (only if --use-text was set)
-        z_text = None
-        if args.use_text:
-            # Build text list: use --task-text for all items, or pull from batch if present
-            B = frames.shape[0]
-            if "texts" in batch and batch["texts"]:
-                texts = batch["texts"]
-            elif args.task_text:
-                texts = [args.task_text] * B
-            else:
-                texts = ["default task"] * B
-            z_text = model.text_encoder(texts)  # (B, text_dim)
-
         # Forward (BF16 always on for speed; disabled automatically on CPU)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
@@ -421,7 +396,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
             h_current = out["h_seq"][:, -1]  # (B, mamba_output_dim) — latest
             # predict_actions returns actions (direct regression) or cond (flow head)
             actions_pred = model.predict_actions(
-                out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                out["z_v_pooled_seq"], out["z_t_seq"], h_current,
             )  # (B, K, action_dim) — may be < target.shape[-1] if model
                 #   doesn't predict gripper
 
@@ -496,18 +471,6 @@ def validate(model, loader, device, args):
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)
         target = torch.from_numpy(batch["actions_window"]).float().to(device)
 
-        # Optional text encoding (only if --use-text was set)
-        z_text = None
-        if args.use_text:
-            B = frames.shape[0]
-            if "texts" in batch and batch["texts"]:
-                texts = batch["texts"]
-            elif args.task_text:
-                texts = [args.task_text] * B
-            else:
-                texts = ["default task"] * B
-            z_text = model.text_encoder(texts)
-
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
@@ -515,16 +478,16 @@ def validate(model, loader, device, args):
             if args.head_type == "diffusion_policy":
                 # For flow/diffusion heads, sample actions via generator's method
                 actions_pred = model.sample_actions(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
                 )
                 # For loss reporting, also compute the generative head's loss
                 cond = model.intention_head(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
                 )
                 loss = model.intention_head.loss(target, cond)
             else:
                 actions_pred = model.predict_actions(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
                 )
                 # Pad with target's gripper if needed
                 if actions_pred.shape[-1] < target.shape[-1]:
