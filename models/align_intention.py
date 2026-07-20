@@ -159,6 +159,9 @@ class ALIGNIntentionModel(nn.Module):
         self.pool_out_dim = pool_out_dim
         self._built = True
 
+        # Determine device from existing parameters
+        device = next(self.vision_encoder.parameters()).device
+
         # Build head
         if self.head_type == "transformer":
             self.intention_head = IntentionTransformerHead(
@@ -198,6 +201,9 @@ class ALIGNIntentionModel(nn.Module):
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
 
+        # Move head to the same device as the rest of the model
+        self.intention_head = self.intention_head.to(device)
+
         # Build memory bank
         if self.use_memory_bank:
             self.memory_module = PerceptualCognitiveMemoryModule(
@@ -205,7 +211,7 @@ class ALIGNIntentionModel(nn.Module):
                 cognitive_dim=self.intent_dim if self.use_intent_tokens else self.mamba_output_dim,
                 bank_len=self.memory_bank_len,
                 num_heads=4,
-            )
+            ).to(device)
 
     # ----------------------------------------------------------------
     # Vision helpers
