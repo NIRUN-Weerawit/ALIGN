@@ -172,7 +172,6 @@ def build_loaders(train_ds, val_ds, args):
 def build_model(args, num_cameras, device):
     """Build ALIGNIntentionModel. All dimensions come from `args`."""
     model = ALIGNIntentionModel(
-        vision_dim=args.vision_dim,
         state_dim=args.state_dim,
         mamba_output_dim=args.mamba_output_dim if args.use_history else 0,
         action_dim=args.action_dim,
@@ -190,7 +189,6 @@ def build_model(args, num_cameras, device):
         head_dim_ff=args.head_dim_ff,
         use_text=args.use_text,
         text_dim=args.text_dim,
-        pool_num_queries=args.pool_num_queries,
         compressed_dim=args.compressed_dim,
         # V4 args
         use_intent_tokens=args.use_intent_tokens,
@@ -628,13 +626,6 @@ def parse_args():
     # NOTE: --num-cameras removed; auto-derived from --cameras.
     parser.add_argument("--val-split", type=float, default=0.1)
     # Model
-    # NOTE: --pretrained removed; warm-starting is rare and complicates the CLI.
-    # NOTE: --vision-dim, --state-dim, --mamba-output-dim hardcoded to v3 defaults.
-    # NOTE: --mamba-d-state, --mamba-d-conv, --mamba-expand are Mamba internals; hardcoded.
-    # NOTE: --use-patch-tokens / --no-patch-tokens removed; always on for v3.
-    # NOTE: DINOv2 is always frozen (no flag). State encoder is always
-    # trainable (no flag) since we don't have pretrained weights for it.
-    # NOTE: --action-dim hardcoded to 6 (OSC pose deltas).
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
     parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion_policy"],
@@ -644,9 +635,7 @@ def parse_args():
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
                         help="Disable Mamba history component.")
-    # V3 architecture dimensions (configurable, no longer hardcoded)
-    parser.add_argument("--vision-dim", type=int, default=256,
-                        help="Per-patch vision dim after projection (default 256).")
+    # Architecture dimensions
     parser.add_argument("--state-dim", type=int, default=256,
                         help="Robot state encoder output dim (default 256).")
     parser.add_argument("--mamba-output-dim", type=int, default=512,
@@ -659,21 +648,14 @@ def parse_args():
                         help="Mamba block expansion factor (default 2).")
     parser.add_argument("--action-dim", type=int, default=6,
                         help="Action output dim (default 6 for OSC).")
-    # N-query pool config
-    parser.add_argument("--pool-num-queries", type=int, default=8,
-                        help="Number of independent queries per camera in state-conditioned pool "
-                             "(default 8). Increases pool_out_dim from V*D_viz → V*NQ*D_viz.")
     # Patch tokens
     parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
                         action="store_false", default=True,
                         help="Use CLS token instead of patch tokens from DINOv2.")
     parser.set_defaults(use_patch_tokens=True)
-    # NEW architecture: per-patch compressed dim (16 default)
+    # Per-patch compressed dim (SEVisualCompressor output)
     parser.add_argument("--compressed-dim", type=int, default=16,
-                        help="Per-patch dim after SEVisualCompressor (default 16). "
-                             "Used by new vision architecture: "
-                             "DINOv2 -> CrossCameraXform (768) -> SE-compress (16) -> "
-                             "state-modulate -> all patches to Mamba/Head.")
+                        help="Per-patch dim after SEVisualCompressor (default 16).")
     # V4: Intent tokens
     parser.add_argument("--use-intent-tokens", action="store_true", default=False,
                         help="Enable learnable intent tokens (V4).")
@@ -704,14 +686,14 @@ def parse_args():
     parser.add_argument("--task-text", type=str, default=None,
                         help="Task description for text conditioning (default: auto from dataset).")
     # IntentionTransformerHead params
-    parser.add_argument("--head-d-model", type=int, default=384,
-                        help="IntentionTransformerHead model dimension (default: 384)")
-    parser.add_argument("--head-nhead", type=int, default=4,
-                        help="IntentionTransformerHead number of head (default: 4)")
-    parser.add_argument("--head-num-layers", type=int, default=2,
-                        help="IntentionTransformerHead number of layer (default: 2)")
+    parser.add_argument("--head-d-model", type=int, default=512,
+                        help="IntentionTransformerHead model dimension (default: 512)")
+    parser.add_argument("--head-nhead", type=int, default=8,
+                        help="IntentionTransformerHead number of head (default: 8)")
+    parser.add_argument("--head-num-layers", type=int, default=6,
+                        help="IntentionTransformerHead number of layer (default: 6)")
     parser.add_argument("--head-dim-ff", type=int, default=1024,
-                        help="IntentionTransformerHead fead-forward dimension (default: 1024)")
+                        help="IntentionTransformerHead feed-forward dimension (default: 1024)")
     # Training
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-name", default=None,
@@ -726,7 +708,7 @@ def parse_args():
                         help="Skip batches with NaN/Inf loss (default on).")
     parser.add_argument("--no-skip-nan", dest="skip_nan", action="store_false",
                         help="Disable NaN skipping (will NaN out the run).")
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=1)
     # NOTE: --loss-mode removed; always 'action' for v3.
     # NOTE: --bf16 / --no-bf16 removed; BF16 is always on for speed.
     parser.add_argument("--max-steps-per-epoch", type=int, default=0,

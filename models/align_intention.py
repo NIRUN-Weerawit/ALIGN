@@ -72,7 +72,6 @@ class ALIGNIntentionModel(nn.Module):
     """
     def __init__(
         self,
-        vision_dim: int = 256,
         state_dim: int = 256,
         mamba_output_dim: int = 512,
         action_dim: int = 6,
@@ -91,7 +90,6 @@ class ALIGNIntentionModel(nn.Module):
         use_text: bool = False,
         text_dim: int = 256,
         compressed_dim: int = 16,
-        pool_num_queries: int = 8,
         # V4 args
         use_intent_tokens: bool = False,
         num_intent_tokens: int = 2,
@@ -100,7 +98,6 @@ class ALIGNIntentionModel(nn.Module):
         memory_bank_len: int = 16,
     ):
         super().__init__()
-        self.vision_dim = vision_dim
         self.state_dim = state_dim
         self.mamba_output_dim = mamba_output_dim
         self.action_dim = action_dim
@@ -119,16 +116,13 @@ class ALIGNIntentionModel(nn.Module):
         self.memory_bank_len = memory_bank_len
 
         # Pool output dim: total VP tokens * compressed_dim
-        # New architecture: pool_out_dim = V * P * compressed_dim (all patches).
-        # For 2 cameras, 256 patches, 16 dim: pool_out_dim = 2*256*16 = 8192.
-        # The head receives ALL per-step patch features (not pooled), so it
-        # can attend across patches within each step. The z_v_pooled_seq
-        # has shape (B, T, V*P*compressed_dim) = (B, T, 8192) for 2 cams.
+        # pool_out_dim = V * P * compressed_dim (all patches preserved)
+        # For 2 cameras, 256 patches, 16 dim: pool_out_dim = 2*256*16 = 8192
         self.pool_out_dim = num_cameras * 256 * compressed_dim
 
-        # Vision encoder (DINOv2 with patch tokens)
+        # Vision encoder (DINOv2 with patch tokens, outputs raw 768-D features)
         self.vision_encoder = VisionEncoder(
-            embed_dim=vision_dim,
+            embed_dim=768,  # DINOv2 ViT-B/14 output dim, hardcoded
             num_cameras=num_cameras,
             use_patch_tokens=use_patch_tokens,
         )

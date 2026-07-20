@@ -49,7 +49,6 @@ from data.align_dataset import ALIGNDataset, head_collate
 # Used when the checkpoint's `config` field is missing or incomplete.
 DEFAULT_CONFIG: Dict[str, object] = dict(
     chunk_size=5,
-    vision_dim=256,
     state_dim=256,
     mamba_output_dim=512,
     mamba_d_state=16,
@@ -64,6 +63,7 @@ DEFAULT_CONFIG: Dict[str, object] = dict(
     head_type="mamba",
     use_text=False,
     text_dim=256,
+    compressed_dim=16,
 )
 
 
@@ -116,7 +116,6 @@ def load_intention_model(
         print(f"  Text:       enabled (dim={cfg.get('text_dim', 256)})")
 
     model = ALIGNIntentionModel(
-        vision_dim=cfg["vision_dim"],
         state_dim=cfg["state_dim"],
         mamba_output_dim=cfg["mamba_output_dim"],
         action_dim=cfg.get("action_dim", 6),
@@ -135,7 +134,6 @@ def load_intention_model(
         use_text=cfg.get("use_text", False),
         text_dim=cfg.get("text_dim", 256),
         compressed_dim=cfg.get("compressed_dim", 16),
-        pool_num_queries=cfg.get("pool_num_queries", 8),
         # V4 args (default to False/0 for backward compat with V3 checkpoints)
         use_intent_tokens=cfg.get("use_intent_tokens", False),
         num_intent_tokens=cfg.get("num_intent_tokens", 2),

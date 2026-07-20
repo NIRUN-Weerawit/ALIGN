@@ -55,25 +55,24 @@ class ALIGNIntentionInference:
 
         # Extract model config
         self.chunk_size = cfg.get("chunk_size", 10)
-        self.vision_dim = cfg.get("vision_dim", 256)
         self.state_dim = cfg.get("state_dim", 256)
         self.mamba_output_dim = cfg.get("mamba_output_dim", 512)
         self.action_dim = cfg.get("action_dim", 6)
         self.num_cameras = cfg.get("num_cameras", 1)
-        self.loss_mode = cfg.get("loss_mode", "action")
+        self.compressed_dim = cfg.get("compressed_dim", 16)
         print(f"[ALIGN] Loaded config: chunk={self.chunk_size}, "
-              f"vision={self.vision_dim}, state={self.state_dim}, "
+              f"state={self.state_dim}, "
               f"mamba={self.mamba_output_dim}, action={self.action_dim}, "
-              f"cams={self.num_cameras}, loss={self.loss_mode}")
+              f"cams={self.num_cameras}")
 
         # Build model
         self.model = ALIGNIntentionModel(
-            vision_dim=self.vision_dim,
             state_dim=self.state_dim,
             mamba_output_dim=self.mamba_output_dim,
             action_dim=self.action_dim,
             chunk_size=self.chunk_size,
             num_cameras=self.num_cameras,
+            compressed_dim=self.compressed_dim,
         ).to(self.device)
 
         # Load weights
