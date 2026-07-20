@@ -337,7 +337,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     actions_pred_loss = actions_pred
 
                 # Loss
-                if args.head_type in ("flow", "diffusion", "diffusion_policy"):
+                if args.head_type == "diffusion_policy":
                     loss = model.intention_head.loss(target, actions_pred)
                 else:
                     loss = F.mse_loss(actions_pred_loss, target)
@@ -429,7 +429,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 actions_pred_for_loss = actions_pred
 
             # Loss depends on head type
-            if args.head_type in ("flow", "diffusion", "diffusion_policy"):
+            if args.head_type == "diffusion_policy":
                 loss = model.intention_head.loss(target, actions_pred)
             else:
                 # Direct regression: MSE on actions (use padded for fair comparison)
@@ -505,7 +505,7 @@ def validate(model, loader, device, args):
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]
-            if args.head_type in ("flow", "diffusion", "diffusion_policy"):
+            if args.head_type == "diffusion_policy":
                 # For flow/diffusion heads, sample actions via generator's method
                 actions_pred = model.sample_actions(
                     out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
@@ -637,9 +637,9 @@ def parse_args():
     # NOTE: --action-dim hardcoded to 6 (OSC pose deltas).
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
-    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion", "diffusion_policy", "flow"],
+    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion_policy"],
                         default="mamba",
-                        help="Which head architecture: transformer, mamba, hybrid, diffusion, or flow")
+                        help="Which head architecture: transformer, mamba, hybrid, or diffusion_policy")
     parser.add_argument("--use-history", action="store_true", default=True,
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
