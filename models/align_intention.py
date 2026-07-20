@@ -31,8 +31,7 @@ from typing import Optional, Tuple, List
 from models.align_model import VisionEncoder, RobotStateEncoder
 from models.intention_encoder import IntentionEncoder, PerCameraStateConditionedPool
 from models.intention_head import (
-    IntentionTransformerHead, MambaActionHead,
-    DiffusionActionHead, FlowMatchingActionHead, DiffusionPolicyHead,
+    IntentionTransformerHead, MambaActionHead, DiffusionPolicyHead,
 )
 from models.memory_bank import PerceptualCognitiveMemoryModule
 
@@ -166,11 +165,10 @@ class ALIGNIntentionModel(nn.Module):
             self.intention_head = IntentionTransformerHead(
                 pool_out_dim=self.pool_out_dim,
                 state_dim=state_dim,
-                mamba_output_dim=mamba_output_dim if use_intent_tokens else mamba_output_dim,
-                text_dim=text_dim if use_text else 0,
+                intent_dim=intent_dim if use_intent_tokens else 0,
                 action_dim=action_dim,
                 chunk_size=chunk_size,
-                vision_dim=vision_dim,
+                num_intent_tokens=num_intent_tokens,
                 d_model=head_d_model,
                 nhead=head_nhead,
                 num_layers=head_num_layers,
@@ -180,48 +178,28 @@ class ALIGNIntentionModel(nn.Module):
             self.intention_head = MambaActionHead(
                 pool_out_dim=self.pool_out_dim,
                 state_dim=state_dim,
-                mamba_output_dim=mamba_output_dim if use_intent_tokens else mamba_output_dim,
-                text_dim=text_dim if use_text else 0,
+                intent_dim=intent_dim if use_intent_tokens else 0,
                 action_dim=action_dim,
                 chunk_size=chunk_size,
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
+                use_intent=use_intent_tokens,
             )
         elif head_type == "hybrid":
             self.intention_head = MambaActionHead(
                 pool_out_dim=self.pool_out_dim,
                 state_dim=state_dim,
-                mamba_output_dim=mamba_output_dim if use_intent_tokens else mamba_output_dim,
-                text_dim=text_dim if use_text else 0,
+                intent_dim=intent_dim if use_intent_tokens else 0,
                 action_dim=action_dim,
                 chunk_size=chunk_size,
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
-            )
-        elif head_type == "diffusion":
-            cond_dim = (
-                self.pool_out_dim
-                + state_dim
-                + (text_dim if use_text else 0)
-                + (mamba_output_dim if mamba_output_dim > 0 else 0)
-            )
-            self.intention_head = DiffusionActionHead(
-                cond_dim=cond_dim,
-                action_dim=action_dim,
-                hidden_dim=head_d_model,
-                num_inference_steps=20,
-                time_dim=128,
-                chunk_size=chunk_size,
+                use_intent=use_intent_tokens,
             )
         elif head_type == "diffusion_policy":
-            cond_dim = (
-                self.pool_out_dim
-                + state_dim
-                + (text_dim if use_text else 0)
-                + (mamba_output_dim if mamba_output_dim > 0 else 0)
-            )
+            cond_dim = self.pool_out_dim + state_dim + (intent_dim if use_intent_tokens else 0)
             self.intention_head = DiffusionPolicyHead(
                 cond_dim=cond_dim,
                 action_dim=action_dim,
@@ -229,23 +207,6 @@ class ALIGNIntentionModel(nn.Module):
                 num_inference_steps=10,
                 time_dim=64,
                 chunk_size=chunk_size,
-                use_history=mamba_output_dim > 0,
-            )
-        elif head_type == "flow":
-            cond_dim = (
-                self.pool_out_dim
-                + state_dim
-                + (text_dim if use_text else 0)
-                + (mamba_output_dim if mamba_output_dim > 0 else 0)
-            )
-            self.intention_head = FlowMatchingActionHead(
-                cond_dim=cond_dim,
-                action_dim=action_dim,
-                hidden_dim=head_d_model,
-                num_inference_steps=10,
-                time_dim=64,
-                chunk_size=chunk_size,
-                use_history=mamba_output_dim > 0,
             )
         else:
             raise ValueError(f"Unknown head_type: {head_type}")
@@ -423,39 +384,33 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     def predict_actions(self, z_v_pooled_window: torch.Tensor,
                         z_t_window: torch.Tensor,
-                        h_current: torch.Tensor,
-                        z_text: torch.Tensor = None) -> torch.Tensor:
-        """Predict K future actions from K past states + conditioning.
-
-        For V4 with intent tokens, h_current is (B, N, intent_dim).
-        For V3, h_current is (B, mamba_output_dim).
+                        intent_emb: torch.Tensor = None) -> torch.Tensor:
+        """Predict K future actions from K past states + intent tokens.
 
         Args:
             z_v_pooled_window: (B, K, pool_out_dim)
             z_t_window:        (B, K, state_dim)
-            h_current:         (B, mamba_output_dim) or (B, N, intent_dim)
-            z_text:            (B, text_dim) or None
+            intent_emb:        (B, N, intent_dim) or None
         Returns:
             actions: (B, K, action_dim)
         """
         return self.intention_head(
-            z_v_pooled_window, z_t_window, h_current, z_text=z_text,
+            z_v_pooled_window, z_t_window, intent_emb=intent_emb,
         )
 
     @torch.no_grad()
     def sample_actions(self, z_v_pooled_window: torch.Tensor,
                        z_t_window: torch.Tensor,
-                       h_current: torch.Tensor,
-                       z_text: torch.Tensor = None,
+                       intent_emb: torch.Tensor = None,
                        num_steps: int = None) -> torch.Tensor:
-        if isinstance(self.intention_head, (DiffusionActionHead, FlowMatchingActionHead, DiffusionPolicyHead)):
+        if isinstance(self.intention_head, DiffusionPolicyHead):
             cond = self.intention_head(
-                z_v_pooled_window, z_t_window, h_current, z_text=z_text,
+                z_v_pooled_window, z_t_window, intent_emb=intent_emb,
             )
             return self.intention_head.sample(cond, num_steps=num_steps)
         else:
             return self.intention_head(
-                z_v_pooled_window, z_t_window, h_current, z_text=z_text,
+                z_v_pooled_window, z_t_window, intent_emb=intent_emb,
             )
 
     # ----------------------------------------------------------------
