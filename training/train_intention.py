@@ -825,19 +825,30 @@ def main():
             "n_params": n_total,
             "n_trainable_params": n_trainable,
         })
-        # Explicitly log v3 architecture dimensions (in case args rename)
+        # Log architecture dimensions under clean namespaces
         wandb_trainer.run.config.update({
-            "v3/vision_dim": args.vision_dim,
-            "v3/state_dim": args.state_dim,
-            "v3/mamba_output_dim": args.mamba_output_dim,
-            "v3/mamba_d_state": args.mamba_d_state,
-            "v3/mamba_d_conv": args.mamba_d_conv,
-            "v3/mamba_expand": args.mamba_expand,
-            "v3/action_dim": args.action_dim,
-            "v3/use_patch_tokens": args.use_patch_tokens,
-            "v3/use_history": args.use_history,
-            "v3/use_text": args.use_text,
-            "v3/text_dim": args.text_dim,
+            "arch/state_dim": args.state_dim,
+            "arch/mamba_output_dim": args.mamba_output_dim,
+            "arch/mamba_d_state": args.mamba_d_state,
+            "arch/mamba_d_conv": args.mamba_d_conv,
+            "arch/mamba_expand": args.mamba_expand,
+            "arch/action_dim": args.action_dim,
+            "arch/compressed_dim": args.compressed_dim,
+            "arch/use_patch_tokens": args.use_patch_tokens,
+            "arch/use_history": args.use_history,
+            "arch/use_text": args.use_text,
+            "arch/text_dim": args.text_dim,
+            "arch/head_type": args.head_type,
+            "arch/history_size": args.history_size,
+            "arch/chunk_size": args.chunk_size,
+            "v4/use_intent_tokens": args.use_intent_tokens,
+            "v4/num_intent_tokens": args.num_intent_tokens,
+            "v4/intent_dim": args.intent_dim,
+            "v4/use_memory_bank": args.use_memory_bank,
+            "v4/memory_bank_len": args.memory_bank_len,
+            "v4/anchor_weight": args.anchor_weight,
+            "v4/segment_min_mult": args.segment_min_mult,
+            "v4/segment_max_mult": args.segment_max_mult,
         })
         # Watch gradients (for monitoring)
         wandb_trainer.watch(model, log="gradients", log_freq=200, log_graph=False)
