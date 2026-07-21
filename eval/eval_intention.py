@@ -260,7 +260,7 @@ def evaluate(
             target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, action_dim)
 
             # Optional text encoding (only if model has text encoder)
-            z_text = None
+            z_sext = None
             if getattr(model, "text_encoder", None) is not None:
                 B_size = frames.shape[0]
                 if "texts" in batch and batch["texts"]:
@@ -269,7 +269,7 @@ def evaluate(
                     texts = [task_text] * B_size
                 else:
                     texts = ["default task"] * B_size
-                z_text = model.text_encoder(texts)
+                z_sext = model.text_encoder(texts)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
@@ -278,12 +278,12 @@ def evaluate(
                 if model.head_type in ("flow", "diffusion_policy"):
                     # Flow head: use sample_actions (ODE integration)
                     actions_pred = model.sample_actions(
-                        out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                        out["z_v_pooled_seq"], out["z_s_seq"], h_current, z_sext=z_sext,
                     )
                 else:
                     # Direct regression head
                     actions_pred = model.predict_actions(
-                        out["z_v_pooled_seq"], out["z_t_seq"], h_current, z_text=z_text,
+                        out["z_v_pooled_seq"], out["z_s_seq"], h_current, z_sext=z_sext,
                     )
                 # (B, K, action_dim)
 
