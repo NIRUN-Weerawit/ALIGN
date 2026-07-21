@@ -254,21 +254,23 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         # Pre-encode vision for the entire segment (vision is the bottleneck)
         # We process each timestep's frames through vision encoder
-        # z_v_pooled_all = []
-        # z_s_all = []
-        # for t in range(max_seg_len):
-        #     f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
-        #     s_t = states_seg[:, t]  # (B, 7)
-        #     z_v_t = model._vision_forward(f_t)
-        #     z_v_pooled_t = model._pool_patches(z_v_t, model.state_encoder(s_t))
-        #     z_v_pooled_all.append(z_v_pooled_t)
-        #     z_s_all.append(model.state_encoder(s_t))
-        # # Stack: (B, S, V*P, comp_dim) and (B, S, state_dim)
-        # z_v_pooled_all = torch.stack(z_v_pooled_all, dim=1)  # (B, S, V*P, comp_dim)
-        # z_s_all = torch.stack(z_s_all, dim=1)
-        # # Flatten patch axis into feature dim for head consumption (3D expected)
-        # B_seg, S, N_tok, D_comp = z_v_pooled_all.shape
-        # z_v_pooled_all = z_v_pooled_all.reshape(B_seg, S, N_tok * D_comp)  # (B, S, V*P*comp_dim)
+        z_v_pooled_all = []
+        z_s_all = []
+        for t in range(max_seg_len):
+            f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
+            s_t = states_seg[:, t]  # (B, 7)
+            z_v_t = model._vision_forward(f_t)
+            assert z_v_t.ndim == 3, f"Expected 3D tensor, got {z_v_t.ndim}D" 
+            z_v_pooled_all.append(z_v_t)
+            z_s_all.append(model.state_encoder(s_t))
+            
+        # Stack: (B, S, V*P, 768) and (B, S, state_dim)
+        z_v_all = torch.stack(z_v_pooled_all, dim=1)  # (B, S, V*P, 768)
+        z_s_all = torch.stack(z_s_all, dim=1)
+        
+        # Keep raw patches for intention encoder; flatten for head later
+        B_seg, S, N_tok, raw_dim = z_v_all.shape
+        z_v_pooled_all = z_v_all.reshape(B_seg, S, N_tok * raw_dim)  # (B, S, V*P*768)
 
         total_loss = torch.tensor(0.0, device=device)
         optimizer.zero_grad()
@@ -287,8 +289,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             history_start = current_t - H + 1
             history_end = current_t + 1
 
-            # z_v_win = z_v_pooled_all[:, history_start:history_end]  # (B, H_actual, pool_out_dim)
-            # z_s_win = z_s_all[:, history_start:history_end]         # (B, H_actual, state_dim)
+            z_v_win = z_v_all[:, history_start:history_end]  # (B, H_actual, V*P, 768)
+            z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
+            z_v_win_pooled = z_v_pooled_all[:, history_start:history_end]  # (B, H_actual, pool_out_dim)
 
             frames_window = frames_seg[:, history_start:history_end]
             state_window = states_seg[:, history_start:history_end]
@@ -298,19 +301,21 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             # Forward through model (uses model's internal z_v_pooled_seq for consistency)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                out = model(frames_window, state_window)
+                out = model.forward_intent(z_v_win, z_s_win)
                 # print(f"out keys: {list(out.keys())}, z_v_pooled_seq shape: {out['z_v_pooled_seq'].shape}, z_s_seq shape: {out['z_s_seq'].shape}, h_seq shape: {out['h_seq'].shape}, intent_emb shape: {out.get('intent_emb', None).shape if out.get('intent_emb', None) is not None else None}")
+                
                 intent_emb = out.get("intent_emb", None)
-                # print(f"Intent emb shape: {intent_emb.shape if intent_emb is not None else None}")
                 h_current = out["h_seq"][:, -1]
+                
+                # print(f"Intent emb shape: {intent_emb.shape if intent_emb is not None else None}")
                 # Use model's own outputs to guarantee dim consistency
-                z_v_win_model = out["z_v_pooled_seq"]  # (B, H, pool_out_dim)
-                z_s_win_model = out["z_s_seq"]          # (B, H, state_dim)
+                # z_v_win_model = out["z_v_pooled_seq"]  # (B, H, pool_out_dim)
+                # z_s_win_model = out["z_s_seq"]          # (B, H, state_dim)
 
                 # Memory bank (3-stream: perceptual, cognitive, state)
                 if model.use_memory_bank:
-                    z_v_current = z_v_win_model[:, -1]  # (B, pool_out_dim)
-                    z_s_current = z_s_win_model[:, -1]  # (B, state_dim)
+                    z_v_current = z_v_win_pooled[:, -1]  # (B, pool_out_dim)
+                    z_s_current = z_s_win[:, -1]  # (B, state_dim)
 
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
@@ -326,13 +331,13 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     else:
                         # Warmup: store perceptual + state, no retrieval
                         model.memory_module.store_perceptual_only(z_v_current, z_s_current)
-                        z_v_win_for_head = z_v_win_model
-                        z_s_win_for_head = z_s_win_model
+                        z_v_win_for_head = z_v_win_pooled
+                        z_s_win_for_head = z_s_win
                         h_for_head = intent_emb
                     # print(f"Memory bank: h_forhead shape: {h_for_head.shape}, h_current shape: {h_current.shape},intention_fused shape: {intent_fused.shape if n >= H - 1 and intent_emb is not None else None}, z_v_win_for_head shape: {z_v_win_for_head.shape}, z_v_win_model shape: {z_v_win_model.shape}")
                 else:
-                    z_v_win_for_head = z_v_win_model
-                    z_s_win_for_head = z_s_win_model
+                    z_v_win_for_head = z_v_win_pooled
+                    z_s_win_for_head = z_s_win
                     h_for_head = h_current
                     # print(f"h_forhead shape: {h_for_head.shape}, z_v_win_for_head shape: {z_v_win_for_head.shape}")
 
