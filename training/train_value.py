@@ -370,12 +370,12 @@ def train_value(
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed_t = model.encode_mixed(frame_t, traj_t, texts)
             z_v_t = mixed_t["z_v"].float()
-            z_t_t = mixed_t["z_t"].float()
-            z_text_t = mixed_t["z_text"].float()
+            z_s_t = mixed_t["z_s"].float()
+            z_sext_t = mixed_t["z_sext"].float()
 
             # 2. Compute reward r_t from GAIL
             with torch.no_grad():
-                gail_logits = gail_disc(z_v_t, z_t_t, z_text_t, action)
+                gail_logits = gail_disc(z_v_t, z_s_t, z_sext_t, action)
                 r_t = compute_reward(gail_logits)  # (B,)
 
             # 3. Encode next state s_{t+1} (for TD target)
@@ -389,10 +389,10 @@ def train_value(
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed_next = model.encode_mixed(frame_next, traj_next, texts)
             z_v_next = mixed_next["z_v"].float()
-            z_t_next = mixed_next["z_t"].float()
+            z_s_next = mixed_next["z_s"].float()
 
             # 4. Compute V(s_t) and the bootstrap V at the look-ahead state
-            v_t = value_head(z_v_t, z_t_t, z_text_t)
+            v_t = value_head(z_v_t, z_s_t, z_sext_t)
 
             # 5. Build the TD target.
             #    - n_steps=1 (default): TD(0) target = r_t + gamma * V(s_{t+1})
@@ -411,9 +411,9 @@ def train_value(
             # Phase 9: use target network for bootstrap (DDPG/DQN trick)
             with torch.no_grad():
                 if use_target_net:
-                    v_next = v_target(z_v_next, z_t_next, z_text_t)
+                    v_next = v_target(z_v_next, z_s_next, z_sext_t)
                 else:
-                    v_next = value_head(z_v_next, z_t_next, z_text_t)
+                    v_next = value_head(z_v_next, z_s_next, z_sext_t)
             v_target_td = r_t + gamma * v_next
 
             # 6. Loss — Phase 9: Huber loss (DQN trick) for outlier robustness
@@ -467,22 +467,22 @@ def train_value(
                     vmixed_t = model.encode_mixed(vframe_t, vtraj_t, vtexts)
                     vmixed_next = model.encode_mixed(vframe_next, vtraj_next, vtexts)
                 vz_v_t = vmixed_t["z_v"].float()
-                vz_t_t = vmixed_t["z_t"].float()
-                vz_text_t = vmixed_t["z_text"].float()
+                vz_s_t = vmixed_t["z_s"].float()
+                vz_sext_t = vmixed_t["z_sext"].float()
                 vz_v_next = vmixed_next["z_v"].float()
-                vz_t_next = vmixed_next["z_t"].float()
+                vz_s_next = vmixed_next["z_s"].float()
 
                 # GAIL reward
-                vgail_logits = gail_disc(vz_v_t, vz_t_t, vz_text_t, vaction)
+                vgail_logits = gail_disc(vz_v_t, vz_s_t, vz_sext_t, vaction)
                 vr_t = compute_reward(vgail_logits)
                 vr_t = torch.clamp(vr_t, min=-reward_clip, max=reward_clip)
 
                 # V(s_t) and TD target
-                vv_t = value_head(vz_v_t, vz_t_t, vz_text_t)
+                vv_t = value_head(vz_v_t, vz_s_t, vz_sext_t)
                 if use_target_net:
-                    vv_next = v_target(vz_v_next, vz_t_next, vz_text_t)
+                    vv_next = v_target(vz_v_next, vz_s_next, vz_sext_t)
                 else:
-                    vv_next = value_head(vz_v_next, vz_t_next, vz_text_t).detach()
+                    vv_next = value_head(vz_v_next, vz_s_next, vz_sext_t).detach()
                 vv_target = vr_t + gamma * vv_next
                 if use_huber_loss:
                     vloss = torch.nn.functional.smooth_l1_loss(vv_t, vv_target.detach())
