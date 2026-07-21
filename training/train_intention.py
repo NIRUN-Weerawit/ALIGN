@@ -522,11 +522,31 @@ def validate(model, loader, device, args):
         if model.use_memory_bank:
             model.memory_module.reset(batch_size=B, device=device)
 
+        # Pre-encode vision for the entire segment (vision is the bottleneck)
+        max_seg_len = batch["frames_segment"].shape[1]
+        z_v_pooled_all = []
+        z_s_all = []
+        for t in range(max_seg_len):
+            f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
+            s_t = states_seg[:, t]  # (B, 7)
+            z_v_t = model._vision_forward(f_t)
+            z_v_pooled_all.append(z_v_t)
+            z_s_all.append(model.state_encoder(s_t))
+            
+        # Stack: (B, S, V*P, 768) and (B, S, state_dim)
+        z_v_all = torch.stack(z_v_pooled_all, dim=1)  # (B, S, V*P, 768)
+        z_s_all = torch.stack(z_s_all, dim=1)
+        
+        z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
+        
+        # Flatten patch axis into feature dim for head consumption (3D expected)
+        B_seg, S, N_tok, comp_dim = z_v_mod_all.shape
+        z_v_all_stacked = z_v_mod_all.reshape(B_seg, S, N_tok * comp_dim)  # (B, S, V*P*comp_dim)
+
         # Sequential T-loop
         last_actions_pred = None
         actions_pred = None
         loss_accum = []
-        max_seg_len = batch["frames_segment"].shape[1]
         num_windows = max_seg_len - H - C + 1
 
         for n in range(num_windows):
@@ -537,58 +557,48 @@ def validate(model, loader, device, args):
             history_start = current_t - H + 1
             history_end = current_t + 1
 
-            # z_v_win = z_v_pooled_all[:, history_start:history_end]  # (B, H_actual, pool_out_dim)
-            # z_s_win = z_s_all[:, history_start:history_end]         # (B, H_actual, state_dim)
+            z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
+            z_v_win_stacked = z_v_all_stacked[:, history_start:history_end]  # (B, H_actual, pool_out_dim)
+            z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
 
-            frames_window = frames_seg[:, history_start:history_end]
-            state_window = states_seg[:, history_start:history_end]
-            
             valid_mask = seg_lens >= (current_t + C)
-        
+
+            # Forward through model
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                out = model(frames_window, state_window)
-                # print(f"out keys: {list(out.keys())}, z_v_pooled_seq shape: {out['z_v_pooled_seq'].shape}, z_s_seq shape: {out['z_s_seq'].shape}, h_seq shape: {out['h_seq'].shape}, intent_emb shape: {out.get('intent_emb', None).shape if out.get('intent_emb', None) is not None else None}")
-                intent_emb = out.get("intent_emb", None)
-                # print(f"Intent emb shape: {intent_emb.shape if intent_emb is not None else None}")
-                h_current = out["h_seq"][:, -1]
-                # Use model's own outputs to guarantee dim consistency
-                z_v_win_model = out["z_v_pooled_seq"]  # (B, H, pool_out_dim)
-                z_s_win_model = out["z_s_seq"]          # (B, H, state_dim)
+                out = model.forward_intent(z_v_win, z_s_win)
                 
+                intent_emb = out.get("intent_emb", None)
+                h_current = out["h_seq"][:, -1]
+
                 # Memory bank (3-stream: perceptual, cognitive, state)
                 if model.use_memory_bank:
-                    z_v_current = z_v_win_model[:, -1]  # (B, pool_out_dim)
-                    z_s_current = z_s_win_model[:, -1]  # (B, state_dim)
-
+                    z_v_current = z_v_win_stacked[:, -1]  # (B, pool_out_dim)
+                    z_s_current = z_s_win[:, -1]  # (B, state_dim)
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
                             z_v_current, z_s_current, intent_emb
                         )
-                        # print(f"Memory bank: z_v_fused shape: {z_v_fused.shape}, z_s_fused shape: {z_s_fused.shape}, intent_fused shape: {intent_fused.shape}")
-                        # z_v_win_for_head = z_v_win_model.clone()
                         z_v_win_for_head = z_v_fused
                         z_s_win_for_head = z_s_fused
-                        # z_v_win_for_head[:, -1] = z_v_fused
                         h_for_head = intent_fused
                     else:
                         # Warmup: store perceptual + state, no retrieval
                         model.memory_module.store_perceptual_only(z_v_current, z_s_current)
-                        z_v_win_for_head = z_v_win_model
-                        z_s_win_for_head = z_s_win_model
+                        z_v_win_for_head = z_v_win_stacked
+                        z_s_win_for_head = z_s_win
                         h_for_head = intent_emb
-                    # print(f"Memory bank: h_forhead shape: {h_for_head.shape}, h_current shape: {h_current.shape},intention_fused shape: {intent_fused.shape if n >= H - 1 and intent_emb is not None else None}, z_v_win_for_head shape: {z_v_win_for_head.shape}, z_v_win_model shape: {z_v_win_model.shape}")
                 else:
-                    z_v_win_for_head = z_v_win_model
-                    z_s_win_for_head = z_s_win_model
+                    z_v_win_for_head = z_v_win_stacked
+                    z_s_win_for_head = z_s_win
                     h_for_head = h_current
-                
+
                 # Target: C future actions from current time
                 target_end = min(current_t + C, max_seg_len)
-                # print(f"t={n}, current_t={current_t}, target_end={target_end}, actions_seg shape: {actions_seg.shape}")
                 target = target_seg[:, current_t:target_end]
-                
+
+                # Loss
                 if args.head_type == "diffusion":
                     cond = model.intention_head(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
@@ -598,58 +608,60 @@ def validate(model, loader, device, args):
                     )
                     loss = model.intention_head.loss(target, cond)
                 else:
-                    z_v_0 = out["z_v_pooled_seq"][:, 0:1]  # (B, 1, pool_out_dim)
-                    z_s_0 = out["z_s_seq"][:, 0:1]          # (B, 1, state_dim)
                     actions_pred = model.predict_actions(
-                        z_v_0, z_s_0, h_current,
+                        z_v_win_for_head, z_s_win_for_head, h_for_head,
                     )
-                    # Pad with target's gripper if needed
-                    if actions_pred.shape[-1] < target.shape[-1]:
-                        pad = target[..., actions_pred.shape[-1]:]
-                        actions_pred_loss = torch.cat([actions_pred, pad], dim=-1)
-                    else:
-                        actions_pred_loss = actions_pred
-                    loss = F.mse_loss(actions_pred_loss, target)
+                    if valid_mask.any():
+                        loss = F.mse_loss(
+                            actions_pred[valid_mask],
+                            target[valid_mask]
+                        )
 
-        # Per-dim error accumulation (across batch and time)
-        # Pad model output with target's gripper if needed so shapes match
-        if actions_pred.shape[-1] < target.shape[-1]:
-            pad = target[..., actions_pred.shape[-1]:].detach().float().cpu().numpy()
-            actions_pred_for_metric = np.concatenate(
-                [actions_pred.detach().float().cpu().numpy(), pad], axis=-1,
-            )
-            # Mark this batch as using padded gripper (grip_mse is uninformative)
-            padded_gripper_batches += 1
-        else:
-            actions_pred_for_metric = actions_pred.detach().float().cpu().numpy()
-        target_np = target.detach().float().cpu().numpy()
-        diff = actions_pred_for_metric - target_np  # (B, T, D)
-        B, T, D = diff.shape
-        if per_dim_squared is None:
-            per_dim_squared = np.zeros(D, dtype=np.float64)
-            per_dim_abs = np.zeros(D, dtype=np.float64)
-        per_dim_squared += (diff ** 2).sum(axis=(0, 1))  # (D,)
-        per_dim_abs += np.abs(diff).sum(axis=(0, 1))      # (D,)
-        n_samples += B * T
+            if args.skip_nan and not torch.isfinite(loss):
+                continue
 
-        # Gripper accuracy (only meaningful if model output has >=7 dims
-        # AND the model is actually predicting gripper, not just padded).
-        # We track this only when the model's gripper prediction is genuine.
-        if actions_pred.shape[-1] >= 7 and target.shape[-1] >= 7:
-            genuine_gripper_batches += 1
-            grip_pred = actions_pred[..., 6]  # model's gripper prediction
-            grip_target = target[..., 6]
-            # Convert continuous values to binary open/close
-            grip_pred_binary = (grip_pred > 0).float()
-            grip_target_binary = (grip_target > 0).float()
-            grip_correct = (grip_pred_binary == grip_target_binary).float().sum().item()
-            grip_total = B * T
-            grip_correct_total += grip_correct
-            grip_total_total += grip_total
+            loss_accum.append(loss)
+            last_actions_pred = actions_pred
 
-        losses.append(loss.item())
-        actions_pred_list.append(actions_pred.detach().abs().mean().item())
-        pbar.set_postfix(mse=f"{loss.item():.5f}")
+        # Accumulate metrics across all windows in this segment
+        if loss_accum:
+            avg_window_loss = torch.stack(loss_accum).mean().item()
+            losses.append(avg_window_loss)
+            actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
+            pbar.set_postfix(mse=f"{avg_window_loss:.5f}")
+
+            # Per-dim error accumulation (across batch and time)
+            # Use the last window's predictions for per-dim metrics
+            if actions_pred.shape[-1] < target.shape[-1]:
+                pad = target[..., actions_pred.shape[-1]:].detach().float().cpu().numpy()
+                actions_pred_for_metric = np.concatenate(
+                    [actions_pred.detach().float().cpu().numpy(), pad], axis=-1,
+                )
+                padded_gripper_batches += 1
+            else:
+                actions_pred_for_metric = actions_pred.detach().float().cpu().numpy()
+            target_np = target.detach().float().cpu().numpy()
+            diff = actions_pred_for_metric - target_np  # (B, T, D)
+            B_win, T, D = diff.shape
+            if per_dim_squared is None:
+                per_dim_squared = np.zeros(D, dtype=np.float64)
+                per_dim_abs = np.zeros(D, dtype=np.float64)
+            per_dim_squared += (diff ** 2).sum(axis=(0, 1))  # (D,)
+            per_dim_abs += np.abs(diff).sum(axis=(0, 1))      # (D,)
+            n_samples += B_win * T
+
+            # Gripper accuracy (only meaningful if model output has >=7 dims
+            # AND the model is actually predicting gripper, not just padded).
+            if actions_pred.shape[-1] >= 7 and target.shape[-1] >= 7:
+                genuine_gripper_batches += 1
+                grip_pred = actions_pred[..., 6]  # model's gripper prediction
+                grip_target = target[..., 6]
+                grip_pred_binary = (grip_pred > 0).float()
+                grip_target_binary = (grip_target > 0).float()
+                grip_correct = (grip_pred_binary == grip_target_binary).float().sum().item()
+                grip_total = B_win * T
+                grip_correct_total += grip_correct
+                grip_total_total += grip_total
 
     avg_loss = float(np.mean(losses)) if losses else float("inf")
     avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
