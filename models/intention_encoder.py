@@ -198,18 +198,6 @@ class VisionPatchEncoder(nn.Module):
 
 
 # ================================================================
-# Backward-compat alias: old code imports PerCameraStateConditionedPool
-# for pooling. Remap here to patch encoder while keeping API shape.
-# ================================================================
-
-class PerCameraStateConditionedPool(VisionPatchEncoder):
-    """Backward-compatible alias for VisionPatchEncoder. Old code that does
-    `pool(z_v_patches, z_s)` still works -- it just gets patch-level outputs.
-    """
-    pass
-
-
-# ================================================================
 # Intention Encoder (Mamba-based) -- full patch sequence to Mamba
 # ================================================================
 
@@ -306,8 +294,27 @@ class IntentionEncoder(nn.Module):
         """
         out = self.vision_patch_encoder(z_v_patches, z_s)  # (B, VP, comp_dim)
         return out.mean(dim=1)                               # (B, comp_dim) — mean pool
-
-    def forward(self, z_v_patches_seq: torch.Tensor, z_s_seq: torch.Tensor
+    
+    def encode_patches(self, z_v_patches: torch.Tensor, z_s: torch.Tensor
+                       ) -> torch.Tensor:
+        """Encode patches via VisionPatchEncoder without pooling.
+        
+        Args:
+            z_v_patches: (B, P_or_VP_tokens, raw_dim=768)
+            z_s:         (B, state_dim)
+        Returns:
+            (B, VP_tokens, compressed_dim) -- all VP positions preserved
+        """
+        B, T = z_v_patches.shape[:2]
+        # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
+        z_v_mod_seq = []
+        for t in range(T):
+            out_t = self.vision_patch_encoder(z_v_patches[:, t], z_s[:, t])
+            z_v_mod_seq.append(out_t)
+        
+        return torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
+        
+    def forward(self, z_v_mod_seq: torch.Tensor, z_s_seq: torch.Tensor
                 ) -> torch.Tensor:
         """Batched T-step Mamba forward.
 
@@ -317,20 +324,22 @@ class IntentionEncoder(nn.Module):
             intent_emb: (B, N, intent_dim) — intent token outputs
 
         Args:
-            z_v_patches_seq: (B, T, tokens, raw_dim=768)
+            z_v_mod_seq: (B, T, VP, comp_dim)
             z_s_seq:         (B, T, state_dim)
         Returns:
             h_seq or (h_seq, intent_emb)
         """
-        B, T = z_v_patches_seq.shape[:2]
+        # B, T = z_v_patches_seq.shape[:2]
 
-        # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
-        z_v_mod_seq = []
-        for t in range(T):
-            out_t = self.vision_patch_encoder(z_v_patches_seq[:, t], z_s_seq[:, t])
-            z_v_mod_seq.append(out_t)
-        z_v_mod_seq = torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
+        # # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
+        # z_v_mod_seq = []
+        # for t in range(T):
+        #     out_t = self.vision_patch_encoder(z_v_patches_seq[:, t], z_s_seq[:, t])
+        #     z_v_mod_seq.append(out_t)
+        # z_v_mod_seq = torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
 
+        # z_v_mod_seq = self.encode_patches(z_v_patches_seq, z_s_seq)  # (B, T, VP, comp_dim)
+        
         # Flatten token positions into feature dimension -> Mamba input
         B, T, N_tok, D_comp = z_v_mod_seq.shape
         mamba_in = torch.cat([

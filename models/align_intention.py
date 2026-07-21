@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, List
 
 from models.align_model import VisionEncoder, RobotStateEncoder
-from models.intention_encoder import IntentionEncoder, PerCameraStateConditionedPool
+from models.intention_encoder import IntentionEncoder
 from models.intention_head import (
     IntentionTransformerHead, MambaActionHead, DiffusionPolicyHead,
 )
@@ -113,10 +113,7 @@ class ALIGNIntentionModel(nn.Module):
         )
         # Intention encoder (patch encoder + Mamba)
         self.use_history = mamba_output_dim > 0
-        self.pool = PerCameraStateConditionedPool(
-            compressed_dim=compressed_dim, state_dim=state_dim,
-            num_cameras=num_cameras,
-        )
+
         if self.use_history:
             self.intention_encoder = IntentionEncoder(
                 state_dim=state_dim,
@@ -223,18 +220,41 @@ class ALIGNIntentionModel(nn.Module):
     def _vision_forward(self, frames: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(frames)
 
-    def _pool_patches(self, z_v_patches: torch.Tensor, z_s: torch.Tensor) -> torch.Tensor:
-        """Encode raw DINOv2 patches via VisionPatchEncoder.
-
-        z_v_patches: (B, V*P, 768) -- raw 768-D features from VisionEncoder
-        z_s: (B, state_dim)
-        Returns: (B, V*P, compressed_dim) — all per-patch features preserved.
-        """
-        return self.pool(z_v_patches, z_s)
-
     # ----------------------------------------------------------------
     # Batched training forward
     # ----------------------------------------------------------------
+    def forward_intent(self, z_v_patches_seq: torch.Tensor, z_s_seq: torch.Tensor) -> dict:
+        """Batched T-step encoding (training) with intent tokens.
+
+        Args:
+            z_v_patches_seq: (B, T, V*P, comp_dim)
+            z_s_seq:         (B, T, state_dim)
+        Returns:
+            dict with:
+              z_v_pooled_seq: (B, T, pool_out_dim)
+              z_s_seq:         (B, T, state_dim)
+              h_seq:           (B, T, mamba_output_dim) or (B, T, mamba_in_dim)
+              intent_emb:      (B, N, intent_dim)
+        """
+        # B, T = z_v_patches_seq.shape[:2]
+        
+        # Forward through intention encoder
+        intent_emb = None
+        if self.use_history:
+            # z_v_mod_seq = self.intention_encoder.encode_patches(z_v_patches_seq, z_s_seq)  # (B, T, VP, comp_dim)
+            result = self.intention_encoder(z_v_patches_seq, z_s_seq)
+            if self.use_intent_tokens:
+                h_seq, intent_emb = result
+            else:
+                h_seq = result
+        else:
+            h_seq = torch.zeros(z_s_seq.shape[0], z_s_seq.shape[1], 1, device=z_s_seq.device)
+
+        return {
+            "h_seq": h_seq,
+            "intent_emb": intent_emb,
+        }
+        
     def forward(self, frames_seq: torch.Tensor, state_seq: torch.Tensor
                 ) -> dict:
         """Batched T-step encoding (training).
@@ -257,36 +277,28 @@ class ALIGNIntentionModel(nn.Module):
         # Encode each frame
         z_v_patches_seq = []
         for t in range(T):
-            z_v_t = self._vision_forward(frames_seq[:, t])
-            if z_v_t.ndim == 3:
-                pass  # shape already (B, V*P, 768)
+            z_v_t = self._vision_forward(frames_seq[:, t]) # shape already (B, V*P, comp_dim) or (B, P, comp_dim)
+            assert z_v_t.ndim == 3, f"Expected 3D tensor, got {z_v_t.ndim}D" 
             z_v_patches_seq.append(z_v_t)
-        z_v_patches_seq = torch.stack(z_v_patches_seq, dim=1)  # (B, T, V*P, 768)
+        z_v_patches_seq = torch.stack(z_v_patches_seq, dim=1)  # (B, T, V*P, comp_dim)
 
         # Encode states (batched)
         z_s_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
 
         # Forward through intention encoder
-        intent_emb = None
-        if self.use_history:
-            result = self.intention_encoder(z_v_patches_seq, z_s_seq)
-            if self.use_intent_tokens:
-                h_seq, intent_emb = result
-            else:
-                h_seq = result
-        else:
-            h_seq = torch.zeros(z_s_seq.shape[0], z_s_seq.shape[1], 1, device=z_s_seq.device)
+        intent = self.forward_intent(z_v_patches_seq, z_s_seq)
+        h_seq = intent["h_seq"]
+        intent_emb = intent.get("intent_emb", None)
 
         # Get per-step per-patch features for the head
         z_v_pooled_seq = []
         for t in range(T):
             z_v_t = z_v_patches_seq[:, t]
             z_s_t = z_s_seq[:, t]
-            z_v_pooled_t = self._pool_patches(z_v_t, z_s_t)  # (B, V*P, comp_dim)
-            z_v_pooled_seq.append(z_v_pooled_t)
+            z_v_pooled_seq.append(z_v_t)    # (B, V*P, comp_dim)
         z_v_pooled_seq = torch.stack(z_v_pooled_seq, dim=1)  # (B, T, V*P, comp_dim)
-        B, T, N_tok, D_comp = z_v_pooled_seq.shape
-        pool_out_dim = N_tok * D_comp
+        B, T, N_tok, comp_dim = z_v_pooled_seq.shape
+        pool_out_dim = N_tok * comp_dim
         z_v_pooled_seq = z_v_pooled_seq.reshape(B, T, pool_out_dim)  # (B, T, pool_out_dim)
 
         # Build head and bank on first forward (now we know pool_out_dim)
@@ -298,7 +310,7 @@ class ALIGNIntentionModel(nn.Module):
             "h_seq": h_seq,
             "intent_emb": intent_emb,
         }
-
+        
     # ----------------------------------------------------------------
     # Single-step inference forward
     # ----------------------------------------------------------------
@@ -323,12 +335,12 @@ class ALIGNIntentionModel(nn.Module):
         """
         z_v_patches = self._vision_forward(frames)
         z_s = self.state_encoder(robot_state)
-        z_v_pooled = self._pool_patches(z_v_patches, z_s)
+        z_v_pooled = z_v_patches
 
         # Build head on first call
         if not self._built:
-            B, N_tok, D_comp = z_v_pooled.shape
-            self._build_head_and_bank(N_tok * D_comp)
+            B, N_tok, comp_dim = z_v_pooled.shape
+            self._build_head_and_bank(N_tok * comp_dim)
 
         if self.use_history:
             result = self.intention_encoder.forward_step(
