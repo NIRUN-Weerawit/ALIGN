@@ -270,12 +270,12 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         z_s_all = torch.stack(z_s_all, dim=1)
         
         z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
-        print(f"shapes: z_v_all: {z_v_mod_all.shape}")
+        # print(f"shapes: z_v_all: {z_v_mod_all.shape}")
         
         # Flatten patch axis into feature dim for head consumption (3D expected)
         B_seg, S, N_tok, comp_dim = z_v_mod_all.shape
         z_v_all_stacked = z_v_mod_all.reshape(B_seg, S, N_tok * comp_dim)  # (B, S, V*P*comp_dim)
-        print(f"reshapedshapes: z_v_all: {z_v_all_stacked.shape}")
+        # print(f"reshapedshapes: z_v_all: {z_v_all_stacked.shape}")
 
         total_loss = torch.tensor(0.0, device=device)
         optimizer.zero_grad()
@@ -297,7 +297,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
             z_v_win_stacked = z_v_all_stacked[:, history_start:history_end]  # (B, H_actual, pool_out_dim= V*P*comp_dim)
             z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
-            print(f"z_v_win shape: {z_v_win.shape}, z_s_all shape: {z_s_all.shape}, history_start: {history_start}, history_end: {history_end}")
+            # print(f"z_v_win shape: {z_v_win.shape}, z_s_all shape: {z_s_all.shape}, history_start: {history_start}, history_end: {history_end}")
 
             frames_window = frames_seg[:, history_start:history_end]
             state_window = states_seg[:, history_start:history_end]
@@ -322,7 +322,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 if model.use_memory_bank:
                     z_v_current = z_v_win_stacked[:, -1]  # (B, pool_out_dim)
                     z_s_current = z_s_win[:, -1]  # (B, state_dim)
-                    print(f"Memory bank: z_v_current shape: {z_v_current.shape}, z_s_current shape: {z_s_current.shape}, intent_emb shape: {intent_emb.shape if intent_emb is not None else None}")
+                    # print(f"Memory bank: z_v_current shape: {z_v_current.shape}, z_s_current shape: {z_s_current.shape}, intent_emb shape: {intent_emb.shape if intent_emb is not None else None}")
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
