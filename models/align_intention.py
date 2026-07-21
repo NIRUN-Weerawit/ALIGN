@@ -8,7 +8,7 @@ V4 (opt-in):  Intent tokens + Perceptual-Cognitive Memory Bank
 Per timestep t:
   frames(t) (B, [V,] H, W, 3)     robot_state(t) (B, 7)
     ↓ VisionEncoder                ↓ StateEncoder
-  z_v_patches (B, [V,] P, D)        z_t (B, state_dim)
+  z_v_patches (B, [V,] P, D)        z_s (B, state_dim)
     ↓                                ↓
     └─ VisionPatchEncoder ──────────┘
        SE compress + state modulate
@@ -167,7 +167,7 @@ class ALIGNIntentionModel(nn.Module):
             self.intention_head = IntentionTransformerHead(
                 pool_out_dim=pool_out_dim,
                 state_dim=self.state_dim,
-                intent_dim=self.intent_dim if self.use_intent_tokens else 0,
+                intent_dim=self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0,
                 action_dim=self.action_dim,
                 chunk_size=self.chunk_size,
                 num_intent_tokens=self.num_intent_tokens,
@@ -180,7 +180,7 @@ class ALIGNIntentionModel(nn.Module):
             self.intention_head = MambaActionHead(
                 pool_out_dim=pool_out_dim,
                 state_dim=self.state_dim,
-                intent_dim=self.intent_dim if self.use_intent_tokens else 0,
+                intent_dim=self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0,
                 action_dim=self.action_dim,
                 chunk_size=self.chunk_size,
                 mamba_d_state=self.mamba_d_state,
@@ -188,8 +188,8 @@ class ALIGNIntentionModel(nn.Module):
                 mamba_expand=self.mamba_expand,
                 use_intent=self.use_intent_tokens,
             )
-        elif self.head_type == "diffusion_policy":
-            cond_dim = pool_out_dim + self.state_dim + (self.intent_dim if self.use_intent_tokens else 0)
+        elif self.head_type == "diffusion":
+            cond_dim = pool_out_dim + self.state_dim + (self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0)
             self.intention_head = DiffusionPolicyHead(
                 cond_dim=cond_dim,
                 action_dim=self.action_dim,
@@ -204,11 +204,12 @@ class ALIGNIntentionModel(nn.Module):
         # Move head to the same device as the rest of the model
         self.intention_head = self.intention_head.to(device)
 
-        # Build memory bank
+        # Build memory bank (3-stream: perceptual, cognitive, state)
         if self.use_memory_bank:
             self.memory_module = PerceptualCognitiveMemoryModule(
                 perceptual_dim=pool_out_dim,
-                cognitive_dim=self.intent_dim if self.use_intent_tokens else self.mamba_output_dim,
+                cognitive_dim=self.intent_dim*self.num_intent_tokens if self.use_intent_tokens else self.mamba_output_dim,
+                state_dim=self.state_dim,
                 bank_len=self.memory_bank_len,
                 num_heads=4,
             ).to(device)
@@ -222,14 +223,14 @@ class ALIGNIntentionModel(nn.Module):
     def _vision_forward(self, frames: torch.Tensor) -> torch.Tensor:
         return self.vision_encoder(frames)
 
-    def _pool_patches(self, z_v_patches: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
+    def _pool_patches(self, z_v_patches: torch.Tensor, z_s: torch.Tensor) -> torch.Tensor:
         """Encode raw DINOv2 patches via VisionPatchEncoder.
 
         z_v_patches: (B, V*P, 768) -- raw 768-D features from VisionEncoder
-        z_t: (B, state_dim)
+        z_s: (B, state_dim)
         Returns: (B, V*P, compressed_dim) — all per-patch features preserved.
         """
-        return self.pool(z_v_patches, z_t)
+        return self.pool(z_v_patches, z_s)
 
     # ----------------------------------------------------------------
     # Batched training forward
@@ -238,7 +239,7 @@ class ALIGNIntentionModel(nn.Module):
                 ) -> dict:
         """Batched T-step encoding (training).
 
-        V3: returns {z_v_pooled_seq, z_t_seq, h_seq}
+        V3: returns {z_v_pooled_seq, z_s_seq, h_seq}
         V4 (use_intent_tokens): also returns intent_emb
 
         Args:
@@ -247,7 +248,7 @@ class ALIGNIntentionModel(nn.Module):
         Returns:
             dict with:
               z_v_pooled_seq: (B, T, pool_out_dim)
-              z_t_seq:         (B, T, state_dim)
+              z_s_seq:         (B, T, state_dim)
               h_seq:           (B, T, mamba_output_dim) or (B, T, mamba_in_dim)
               intent_emb:      (B, N, intent_dim) or None
         """
@@ -263,25 +264,25 @@ class ALIGNIntentionModel(nn.Module):
         z_v_patches_seq = torch.stack(z_v_patches_seq, dim=1)  # (B, T, V*P, 768)
 
         # Encode states (batched)
-        z_t_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
+        z_s_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
 
         # Forward through intention encoder
         intent_emb = None
         if self.use_history:
-            result = self.intention_encoder(z_v_patches_seq, z_t_seq)
+            result = self.intention_encoder(z_v_patches_seq, z_s_seq)
             if self.use_intent_tokens:
                 h_seq, intent_emb = result
             else:
                 h_seq = result
         else:
-            h_seq = torch.zeros(z_t_seq.shape[0], z_t_seq.shape[1], 1, device=z_t_seq.device)
+            h_seq = torch.zeros(z_s_seq.shape[0], z_s_seq.shape[1], 1, device=z_s_seq.device)
 
         # Get per-step per-patch features for the head
         z_v_pooled_seq = []
         for t in range(T):
             z_v_t = z_v_patches_seq[:, t]
-            z_t_t = z_t_seq[:, t]
-            z_v_pooled_t = self._pool_patches(z_v_t, z_t_t)  # (B, V*P, comp_dim)
+            z_s_t = z_s_seq[:, t]
+            z_v_pooled_t = self._pool_patches(z_v_t, z_s_t)  # (B, V*P, comp_dim)
             z_v_pooled_seq.append(z_v_pooled_t)
         z_v_pooled_seq = torch.stack(z_v_pooled_seq, dim=1)  # (B, T, V*P, comp_dim)
         B, T, N_tok, D_comp = z_v_pooled_seq.shape
@@ -293,7 +294,7 @@ class ALIGNIntentionModel(nn.Module):
 
         return {
             "z_v_pooled_seq": z_v_pooled_seq,
-            "z_t_seq": z_t_seq,
+            "z_s_seq": z_s_seq,
             "h_seq": h_seq,
             "intent_emb": intent_emb,
         }
@@ -307,7 +308,7 @@ class ALIGNIntentionModel(nn.Module):
                     ):
         """One step of encoding (inference).
 
-        V3: returns (z_v_pooled, z_t, h_new, h_states_new)
+        V3: returns (z_v_pooled, z_s, h_new, h_states_new)
         V4 (use_intent_tokens and produce_intent): also returns intent_emb
 
         Args:
@@ -317,12 +318,12 @@ class ALIGNIntentionModel(nn.Module):
             produce_intent: if True, run intent tokens after history step
 
         Returns:
-            (z_v_pooled, z_t, h_new, h_states_new) or
-            (z_v_pooled, z_t, h_new, h_states_new, intent_emb)
+            (z_v_pooled, z_s, h_new, h_states_new) or
+            (z_v_pooled, z_s, h_new, h_states_new, intent_emb)
         """
         z_v_patches = self._vision_forward(frames)
-        z_t = self.state_encoder(robot_state)
-        z_v_pooled = self._pool_patches(z_v_patches, z_t)
+        z_s = self.state_encoder(robot_state)
+        z_v_pooled = self._pool_patches(z_v_patches, z_s)
 
         # Build head on first call
         if not self._built:
@@ -331,51 +332,51 @@ class ALIGNIntentionModel(nn.Module):
 
         if self.use_history:
             result = self.intention_encoder.forward_step(
-                z_v_patches, z_t, h_states, produce_intent=produce_intent,
+                z_v_patches, z_s, h_states, produce_intent=produce_intent,
             )
             if self.use_intent_tokens and produce_intent:
                 h_new, h_states_new, intent_emb = result
-                return z_v_pooled, z_t, h_new, h_states_new, intent_emb
+                return z_v_pooled, z_s, h_new, h_states_new, intent_emb
             else:
                 h_new, h_states_new = result
         else:
-            h_new = torch.zeros(z_t.shape[0], 1, device=z_t.device)
+            h_new = torch.zeros(z_s.shape[0], 1, device=z_s.device)
             h_states_new = h_states
 
-        return z_v_pooled, z_t, h_new, h_states_new
+        return z_v_pooled, z_s, h_new, h_states_new
 
     # ----------------------------------------------------------------
     # Predict actions from window
     # ----------------------------------------------------------------
     def predict_actions(self, z_v_pooled_window: torch.Tensor,
-                        z_t_window: torch.Tensor,
+                        z_s_window: torch.Tensor,
                         intent_emb: torch.Tensor = None) -> torch.Tensor:
         """Predict K future actions from K past states + intent tokens.
 
         Args:
             z_v_pooled_window: (B, K, pool_out_dim)
-            z_t_window:        (B, K, state_dim)
+            z_s_window:        (B, K, state_dim)
             intent_emb:        (B, N, intent_dim) or None
         Returns:
             actions: (B, K, action_dim)
         """
         return self.intention_head(
-            z_v_pooled_window, z_t_window, intent_emb=intent_emb,
+            z_v_pooled_window, z_s_window, intent_emb=intent_emb,
         )
 
     @torch.no_grad()
     def sample_actions(self, z_v_pooled_window: torch.Tensor,
-                       z_t_window: torch.Tensor,
+                       z_s_window: torch.Tensor,
                        intent_emb: torch.Tensor = None,
                        num_steps: int = None) -> torch.Tensor:
         if isinstance(self.intention_head, DiffusionPolicyHead):
             cond = self.intention_head(
-                z_v_pooled_window, z_t_window, intent_emb=intent_emb,
+                z_v_pooled_window, z_s_window, intent_emb=intent_emb,
             )
             return self.intention_head.sample(cond, num_steps=num_steps)
         else:
             return self.intention_head(
-                z_v_pooled_window, z_t_window, intent_emb=intent_emb,
+                z_v_pooled_window, z_s_window, intent_emb=intent_emb,
             )
 
     # ----------------------------------------------------------------

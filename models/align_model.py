@@ -118,15 +118,15 @@ class LanguageConditionedVisualAttention(nn.Module):
         self.gate_scale = nn.Parameter(torch.tensor(1.0))  # learnable scale
 
     def forward(self, patch_features: torch.Tensor,
-                z_text: torch.Tensor) -> torch.Tensor:
+                z_sext: torch.Tensor) -> torch.Tensor:
         """Args:
             patch_features: (B, P, vision_dim) — patch tokens
-            z_text: (B, text_dim) — text embedding (single vector per sample)
+            z_sext: (B, text_dim) — text embedding (single vector per sample)
         Returns:
             (B, P, vision_dim) — gated patch features
         """
         # Compute text-derived gate (B, 1, vision_dim)
-        gate = torch.sigmoid(self.text_to_gate(z_text)).unsqueeze(1)
+        gate = torch.sigmoid(self.text_to_gate(z_sext)).unsqueeze(1)
         # Gated patches: text-relevant patches are emphasized
         gated = patch_features * gate
         # Cross-attention: patches attend to text (text as a single key/value).
@@ -137,7 +137,7 @@ class LanguageConditionedVisualAttention(nn.Module):
         # own projection, we use a minimal adaptation: apply the same linear
         # used for the gate (a no-op when text_dim == vision_dim) to lift
         # text to vision_dim for K/V.
-        text_for_kv = self.text_to_gate[0](z_text).unsqueeze(1)  # (B, 1, vision_dim)
+        text_for_kv = self.text_to_gate[0](z_sext).unsqueeze(1)  # (B, 1, vision_dim)
         attn_out, _ = self.cross_attn(
             query=gated, key=text_for_kv, value=text_for_kv,
         )
@@ -540,10 +540,10 @@ class FuturePredictionHeadMLP(nn.Module):
     Input:
         z_v_window: (B, K, embed_dim) — per-step vision embeddings
                     (in the simple case, all K are the same current frame)
-        z_t_window: (B, K, embed_dim) — per-step trajectory tokens
-        z_text:    (B, embed_dim) — broadcasted
+        z_s_window: (B, K, embed_dim) — per-step trajectory tokens
+        z_sext:    (B, embed_dim) — broadcasted
     Output:
-        (predicted_z_v, predicted_z_t) — each (B, K, embed_dim)
+        (predicted_z_v, predicted_z_s) — each (B, K, embed_dim)
     """
 
     def __init__(
@@ -556,8 +556,8 @@ class FuturePredictionHeadMLP(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.K = K
-        # Input: K * (3 * embed_dim) — flattened (z_v, z_t, z_text) at K timesteps
-        # Output: K * (2 * embed_dim) — predicted (z_v, z_t) at K timesteps
+        # Input: K * (3 * embed_dim) — flattened (z_v, z_s, z_sext) at K timesteps
+        # Output: K * (2 * embed_dim) — predicted (z_v, z_s) at K timesteps
         input_dim = K * 3 * embed_dim
         output_dim = K * 2 * embed_dim
 
@@ -573,36 +573,36 @@ class FuturePredictionHeadMLP(nn.Module):
     def forward(
         self,
         z_v_window: torch.Tensor,  # (B, K, embed_dim)
-        z_t_window: torch.Tensor,  # (B, K, embed_dim)
-        z_text: torch.Tensor,      # (B, embed_dim) — broadcast over K
+        z_s_window: torch.Tensor,  # (B, K, embed_dim)
+        z_sext: torch.Tensor,      # (B, embed_dim) — broadcast over K
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict K future (z_v, z_t) embeddings from K past ones.
+        """Predict K future (z_v, z_s) embeddings from K past ones.
 
         Returns:
-            (predicted_z_v, predicted_z_t), each of shape (B, K, embed_dim)
+            (predicted_z_v, predicted_z_s), each of shape (B, K, embed_dim)
         """
         B, K, D = z_v_window.shape
-        # Concatenate z_v and z_text at each timestep, z_t and z_text likewise
-        z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
-        # Concatenate features: (B, K, 3*D) — (z_v, z_t, z_text) at each step
-        features = torch.cat([z_v_window, z_t_window, z_text_expanded], dim=-1)
+        # Concatenate z_v and z_sext at each timestep, z_s and z_sext likewise
+        z_sext_expanded = z_sext.unsqueeze(1).expand(-1, K, -1)  # (B, K, D)
+        # Concatenate features: (B, K, 3*D) — (z_v, z_s, z_sext) at each step
+        features = torch.cat([z_v_window, z_s_window, z_sext_expanded], dim=-1)
         # Flatten: (B, K * 3 * D)
         flat = features.reshape(B, -1)
         # Predict: (B, K * 2 * D)
         out = self.mlp(flat)
-        # Reshape to (B, K, 2, D) and split into z_v, z_t
+        # Reshape to (B, K, 2, D) and split into z_v, z_s
         out = out.reshape(B, K, 2, D)
         predicted_z_v = out[:, :, 0, :]  # (B, K, D)
-        predicted_z_t = out[:, :, 1, :]  # (B, K, D)
-        return predicted_z_v, predicted_z_t
+        predicted_z_s = out[:, :, 1, :]  # (B, K, D)
+        return predicted_z_v, predicted_z_s
 
 
 class FuturePredictionHeadTransformer(nn.Module):
     """Transformer-based future prediction head.
 
-    Input: (B, K, 3*D) — concatenated (z_v, z_t, z_text) at K past timesteps
+    Input: (B, K, 3*D) — concatenated (z_v, z_s, z_sext) at K past timesteps
            plus learned positional encoding
-    Output: (B, K, 2*D) — predicted (z_v, z_t) at K future timesteps
+    Output: (B, K, 2*D) — predicted (z_v, z_s) at K future timesteps
 
     Uses self-attention to capture temporal dependencies in the input
     window. The output for each position is a parallel prediction of
@@ -643,18 +643,18 @@ class FuturePredictionHeadTransformer(nn.Module):
     def forward(
         self,
         z_v_window: torch.Tensor,  # (B, K, embed_dim)
-        z_t_window: torch.Tensor,  # (B, K, embed_dim)
-        z_text: torch.Tensor,      # (B, embed_dim) — broadcast over K
+        z_s_window: torch.Tensor,  # (B, K, embed_dim)
+        z_sext: torch.Tensor,      # (B, embed_dim) — broadcast over K
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict K future (z_v, z_t) embeddings from K past ones.
+        """Predict K future (z_v, z_s) embeddings from K past ones.
 
         Returns:
-            (predicted_z_v, predicted_z_t), each of shape (B, K, embed_dim)
+            (predicted_z_v, predicted_z_s), each of shape (B, K, embed_dim)
         """
         B, K, D = z_v_window.shape
         # Concatenate features per timestep
-        z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)
-        features = torch.cat([z_v_window, z_t_window, z_text_expanded], dim=-1)
+        z_sext_expanded = z_sext.unsqueeze(1).expand(-1, K, -1)
+        features = torch.cat([z_v_window, z_s_window, z_sext_expanded], dim=-1)
         # Project to d_model and add positional encoding
         x = self.input_proj(features)  # (B, K, d_model)
         x = x + self.pos_encoding[:K].unsqueeze(0)  # (1, K, d_model) broadcasts
@@ -662,10 +662,10 @@ class FuturePredictionHeadTransformer(nn.Module):
         x = self.transformer(x)  # (B, K, d_model)
         # Project to output embeddings
         out = self.output_proj(x)  # (B, K, 2*embed_dim)
-        # Split into z_v, z_t predictions
+        # Split into z_v, z_s predictions
         predicted_z_v = out[:, :, :D]
-        predicted_z_t = out[:, :, D:]
-        return predicted_z_v, predicted_z_t
+        predicted_z_s = out[:, :, D:]
+        return predicted_z_v, predicted_z_s
 
 
 
@@ -676,10 +676,10 @@ class FuturePredictionHeadTransformer(nn.Module):
 class AssistantHead(nn.Module):
     """MLP predicting chunk of K pose-relative GOALS from shared embeddings.
 
-    Input layout: cat([z_v, z_t, z_text, current_action], dim=-1)
+    Input layout: cat([z_v, z_s, z_sext, current_action], dim=-1)
       - z_v: vision embedding (256D)
-      - z_t: pose trajectory embedding (256D) — past K poses
-      - z_text: text embedding (256D)
+      - z_s: pose trajectory embedding (256D) — past K poses
+      - z_sext: text embedding (256D)
 
     Output: (B, K, 6) — K POSE-RELATIVE GOALS (delta from current noisy pose).
       goal[k] = (where the EEF should be at step k+1) - (current noisy pose)
@@ -717,10 +717,10 @@ class AssistantHead(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,
-        z_t: torch.Tensor,
-        z_text: torch.Tensor,
+        z_s: torch.Tensor,
+        z_sext: torch.Tensor,
     ) -> torch.Tensor:
-        x = torch.cat([z_v, z_t, z_text], dim=-1)
+        x = torch.cat([z_v, z_s, z_sext], dim=-1)
         out = self.mlp(x)
         return out.reshape(-1, self.chunk_size, self.action_dim)
 
@@ -728,10 +728,10 @@ class AssistantHead(nn.Module):
 class AssistantHeadTransformer(nn.Module):
     """Transformer predicting a single next action from a window of K past embeddings.
 
-    Input layout (per timestep): cat([z_v_k, z_t_k, z_text_broadcast], dim=-1)
+    Input layout (per timestep): cat([z_v_k, z_s_k, z_sext_broadcast], dim=-1)
       - z_v_window:    (B, K, embed_dim)  — vision embeddings for K past timesteps
-      - z_t_window:    (B, K, embed_dim)  — pose trajectory embeddings for K past timesteps
-      - z_text:        (B, embed_dim)     — text embedding (broadcast over K)
+      - z_s_window:    (B, K, embed_dim)  — pose trajectory embeddings for K past timesteps
+      - z_sext:        (B, embed_dim)     — text embedding (broadcast over K)
 
     Output: (B, action_dim) — single next ACTION in OSC units (m, rad → OSC scale).
             The transformer attends over the K past timesteps and emits one
@@ -783,14 +783,14 @@ class AssistantHeadTransformer(nn.Module):
     def forward(
         self,
         z_v_window: torch.Tensor,  # (B, K, embed_dim)
-        z_t_window: torch.Tensor,  # (B, K, embed_dim)
-        z_text: torch.Tensor,       # (B, embed_dim)
+        z_s_window: torch.Tensor,  # (B, K, embed_dim)
+        z_sext: torch.Tensor,       # (B, embed_dim)
     ) -> torch.Tensor:
         B, K = z_v_window.shape[:2]
         # Broadcast text over the K window
-        z_text_expanded = z_text.unsqueeze(1).expand(-1, K, -1)  # (B, K, embed_dim)
+        z_sext_expanded = z_sext.unsqueeze(1).expand(-1, K, -1)  # (B, K, embed_dim)
         # Concatenate per-timestep features
-        features = torch.cat([z_v_window, z_t_window, z_text_expanded], dim=-1)  # (B, K, 3D)
+        features = torch.cat([z_v_window, z_s_window, z_sext_expanded], dim=-1)  # (B, K, 3D)
         # Project to d_model + add positional encoding
         x = self.input_proj(features) + self.pos_encoding[:K].unsqueeze(0)  # (B, K, d_model)
         # Self-attention over the K timesteps
@@ -1220,13 +1220,13 @@ class ALIGNModel(nn.Module):
         Phase 1a uses this: InfoNCE on raw encoder outputs with mixer frozen.
         """
         z_v = self.encode_raw_vision(frames)
-        z_t = self.encode_raw_trajectory_tokens(traj)
-        z_text = self.encode_raw_text(texts)
-        if z_text is None:
+        z_s = self.encode_raw_trajectory_tokens(traj)
+        z_sext = self.encode_raw_text(texts)
+        if z_sext is None:
             # Match the modality dim of z_v (vision is the largest in v2)
-            z_text = torch.zeros(z_v.shape[0], self.text_dim, device=z_v.device,
+            z_sext = torch.zeros(z_v.shape[0], self.text_dim, device=z_v.device,
                                   dtype=z_v.dtype)
-        return {"z_v": z_v, "z_t": z_t, "z_text": z_text}
+        return {"z_v": z_v, "z_s": z_s, "z_sext": z_sext}
 
     # ── Phase 1b helper: full encode-through-mixer ─────────────
 
@@ -1247,17 +1247,17 @@ class ALIGNModel(nn.Module):
               'z_v'        — (B, P, vision_dim) v2 patch tokens, or
                               (B, vision_dim) v1 CLS token.
               'z_v_pooled' — (B, vision_dim) v2 mean of patches (for back-compat).
-              'z_t'        — (B, state_dim) state embedding (one-step).
-              'z_text'     — (B, text_dim) text embedding.
-              'z_t_tokens' — (B, 1, state_dim) state token in mixer format
+              'z_s'        — (B, state_dim) state embedding (one-step).
+              'z_sext'     — (B, text_dim) text embedding.
+              'z_s_tokens' — (B, 1, state_dim) state token in mixer format
                               (kept for back-compat with v1 callers that
                               expect a K-dim window).
         """
         z_v_raw = self.encode_raw_vision(frames)       # v2: (B, P, vision_dim)
         z_state = self.encode_raw_trajectory_tokens(traj)  # v2: (B, state_dim)
-        z_text = self.encode_raw_text(texts)
-        if z_text is None:
-            z_text = torch.zeros(z_v_raw.shape[0], self.text_dim,
+        z_sext = self.encode_raw_text(texts)
+        if z_sext is None:
+            z_sext = torch.zeros(z_v_raw.shape[0], self.text_dim,
                                  device=z_v_raw.device, dtype=z_v_raw.dtype)
 
         # Phase 4: language-conditioned visual attention (v2 only).
@@ -1265,7 +1265,7 @@ class ALIGNModel(nn.Module):
         # cross-modal mixing. v1 (CLS-only) and `lang_as_prior=False`
         # fall back to the un-gated raw patches.
         if self.lang_visual_attn is not None and z_v_raw.ndim == 3:
-            z_v = self.lang_visual_attn(z_v_raw, z_text)
+            z_v = self.lang_visual_attn(z_v_raw, z_sext)
         else:
             z_v = z_v_raw
 
@@ -1276,15 +1276,15 @@ class ALIGNModel(nn.Module):
         else:
             z_v_pooled = z_v
 
-        # The mixer expects z_t as (B, K, D). We have a one-step state
+        # The mixer expects z_s as (B, K, D). We have a one-step state
         # (B, state_dim). Add a K=1 dim — the position encoding slot for
         # the current frame is well-defined (position 0 = now).
         z_state_for_mixer = z_state.unsqueeze(1)  # (B, 1, state_dim)
 
         # Through mixer. The mixer's per-modality input/output projections
         # handle the (possibly different) per-modality dims.
-        z_v_out, z_state_out, z_text_out = self.cross_attention_mixer(
-            z_v, z_state_for_mixer, z_text
+        z_v_out, z_state_out, z_sext_out = self.cross_attention_mixer(
+            z_v, z_state_for_mixer, z_sext
         )
 
         # Squeeze back to (B, state_dim) for the one-step state output.
@@ -1299,10 +1299,10 @@ class ALIGNModel(nn.Module):
         return {
             "z_v": z_v_out,
             "z_v_pooled": z_v_pooled_out,
-            "z_t": z_state_out,
-            "z_text": z_text_out,
+            "z_s": z_state_out,
+            "z_sext": z_sext_out,
             # K=1 window form, kept for back-compat with old training code
-            "z_t_tokens": z_state_out.unsqueeze(1),
+            "z_s_tokens": z_state_out.unsqueeze(1),
             # Also keep the original raw pooled vision for downstream use
             "z_v_pooled_pre_mixer": z_v_pooled,
         }
@@ -1334,22 +1334,22 @@ class ALIGNModel(nn.Module):
     def predict_future(
         self,
         z_v_window: torch.Tensor,  # (B, K, embed_dim)
-        z_t_window: torch.Tensor,  # (B, K, embed_dim)
-        z_text: torch.Tensor,      # (B, embed_dim)
+        z_s_window: torch.Tensor,  # (B, K, embed_dim)
+        z_sext: torch.Tensor,      # (B, embed_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run the Decision (Future Prediction) head.
 
         Returns:
-            (predicted_z_v, predicted_z_t) — each (B, K, embed_dim)
+            (predicted_z_v, predicted_z_s) — each (B, K, embed_dim)
         """
-        return self.decision_head(z_v_window, z_t_window, z_text)
+        return self.decision_head(z_v_window, z_s_window, z_sext)
 
     @staticmethod
     def compute_alpha_from_predictions(
         predicted_z_v: torch.Tensor,  # (B, K, embed_dim)
-        predicted_z_t: torch.Tensor,  # (B, K, embed_dim)
+        predicted_z_s: torch.Tensor,  # (B, K, embed_dim)
         actual_z_v: torch.Tensor,     # (B, K, embed_dim)
-        actual_z_t: torch.Tensor,     # (B, K, embed_dim)
+        actual_z_s: torch.Tensor,     # (B, K, embed_dim)
         aggregation: str = "weighted_mean",
         decay: float = 0.7,
     ) -> torch.Tensor:
@@ -1360,8 +1360,8 @@ class ALIGNModel(nn.Module):
         lays low when it doesn't (α ≈ 0).
 
         Args:
-            predicted_z_v, predicted_z_t: (B, K, embed_dim) — model predictions
-            actual_z_v, actual_z_t: (B, K, embed_dim) — ground truth embeddings
+            predicted_z_v, predicted_z_s: (B, K, embed_dim) — model predictions
+            actual_z_v, actual_z_s: (B, K, embed_dim) — ground truth embeddings
             aggregation: "weighted_mean", "last_step_only", or "mean"
             decay: weight decay for "weighted_mean" (most recent has highest weight)
 
@@ -1370,7 +1370,7 @@ class ALIGNModel(nn.Module):
         """
         # Cosine similarity along the last dim, then convert to "error"
         cos_v = F.cosine_similarity(predicted_z_v, actual_z_v, dim=-1)  # (B, K)
-        cos_t = F.cosine_similarity(predicted_z_t, actual_z_t, dim=-1)  # (B, K)
+        cos_t = F.cosine_similarity(predicted_z_s, actual_z_s, dim=-1)  # (B, K)
         cos_error = ((1 - cos_v) + (1 - cos_t)) / 2  # (B, K), in [0, 2]
 
         if aggregation == "last_step_only":
@@ -1396,9 +1396,9 @@ class ALIGNModel(nn.Module):
     @staticmethod
     def future_prediction_loss(
         predicted_z_v: torch.Tensor,  # (B, K, embed_dim)
-        predicted_z_t: torch.Tensor,  # (B, K, embed_dim)
+        predicted_z_s: torch.Tensor,  # (B, K, embed_dim)
         target_z_v: torch.Tensor,     # (B, K, embed_dim) — detached
-        target_z_t: torch.Tensor,     # (B, K, embed_dim) — detached
+        target_z_s: torch.Tensor,     # (B, K, embed_dim) — detached
         decay: float = 1.0,           # exponential decay weight on older steps
     ) -> torch.Tensor:
         """Cosine-similarity loss for future prediction.
@@ -1413,7 +1413,7 @@ class ALIGNModel(nn.Module):
         reshape the encoder.
         """
         cos_v = F.cosine_similarity(predicted_z_v, target_z_v.detach(), dim=-1)  # (B, K)
-        cos_t = F.cosine_similarity(predicted_z_t, target_z_t.detach(), dim=-1)  # (B, K)
+        cos_t = F.cosine_similarity(predicted_z_s, target_z_s.detach(), dim=-1)  # (B, K)
         per_step = ((1 - cos_v) + (1 - cos_t)) / 2  # (B, K) in [0, 1]
         if decay < 1.0:
             K = per_step.shape[1]
@@ -1451,11 +1451,11 @@ class ALIGNModel(nn.Module):
         """
         mixed = self.encode_mixed(frames, traj, texts)
         # v2: z_v is (B, P, vision_dim); z_v_pooled is (B, vision_dim).
-        #     z_t is (B, state_dim); z_t_tokens is (B, 1, state_dim).
+        #     z_s is (B, state_dim); z_s_tokens is (B, 1, state_dim).
         z_v_pooled = mixed["z_v_pooled"]
-        z_t = mixed["z_t"]  # (B, state_dim)
-        z_text = mixed["z_text"]
-        z_t_tokens = mixed["z_t_tokens"]  # (B, 1, head_dim)
+        z_s = mixed["z_s"]  # (B, state_dim)
+        z_sext = mixed["z_sext"]
+        z_s_tokens = mixed["z_s_tokens"]  # (B, 1, head_dim)
 
         # Project state and text to the head's common dim if needed.
         # For the v2 default (state_dim=256, text_dim=256, head_dim=vision_dim=512)
@@ -1463,15 +1463,15 @@ class ALIGNModel(nn.Module):
         # (e.g. embed_dim=256 path), the projections are skipped and the
         # tensors are used as-is.
         if self._head_state_proj is not None:
-            z_t_for_head = self._head_state_proj(z_t)
-            z_t_tokens_for_head = self._head_state_proj(z_t_tokens) if z_t_tokens.ndim == 2 else self._head_state_proj(z_t_tokens.view(-1, self.state_dim)).view(z_t_tokens.shape[0], z_t_tokens.shape[1], -1)
+            z_s_for_head = self._head_state_proj(z_s)
+            z_s_tokens_for_head = self._head_state_proj(z_s_tokens) if z_s_tokens.ndim == 2 else self._head_state_proj(z_s_tokens.view(-1, self.state_dim)).view(z_s_tokens.shape[0], z_s_tokens.shape[1], -1)
         else:
-            z_t_for_head = z_t
-            z_t_tokens_for_head = z_t_tokens
+            z_s_for_head = z_s
+            z_s_tokens_for_head = z_s_tokens
         if self._head_text_proj is not None:
-            z_text_for_head = self._head_text_proj(z_text)
+            z_sext_for_head = self._head_text_proj(z_sext)
         else:
-            z_text_for_head = z_text
+            z_sext_for_head = z_sext
 
         result: Dict[str, torch.Tensor] = {}
         if compute_decision:
@@ -1479,13 +1479,13 @@ class ALIGNModel(nn.Module):
             # K future ones. In v2 the window is K=1 (the current one-step
             # state), and the head still predicts K=decision_K future states.
             B = z_v_pooled.shape[0]
-            K_input = z_t_tokens_for_head.shape[1]
+            K_input = z_s_tokens_for_head.shape[1]
             z_v_window = z_v_pooled.unsqueeze(1).expand(-1, K_input, -1)  # (B, K, head_dim)
-            predicted_z_v, predicted_z_t = self.decision_head(
-                z_v_window, z_t_tokens_for_head, z_text_for_head
+            predicted_z_v, predicted_z_s = self.decision_head(
+                z_v_window, z_s_tokens_for_head, z_sext_for_head
             )
             result["predicted_z_v"] = predicted_z_v
-            result["predicted_z_t"] = predicted_z_t
+            result["predicted_z_s"] = predicted_z_s
             # For backward-compat: also compute a per-batch "alpha" estimate
             # assuming the predictions match the inputs (degenerate case).
             # In practice, callers should use compute_alpha_from_predictions()
@@ -1493,7 +1493,7 @@ class ALIGNModel(nn.Module):
             result["alpha"] = torch.ones(B, 1, device=z_v_pooled.device)
         if compute_assistant:
             # Call the appropriate assistant head based on architecture.
-            # Both MLP and transformer heads take (z_v, z_t, z_text).
+            # Both MLP and transformer heads take (z_v, z_s, z_sext).
             if self.assistant_arch == "transformer":
                 # Transformer needs (B, K, D) windows. Replicate the current
                 # embeddings K times to form a fake "window" of K identical
@@ -1501,13 +1501,13 @@ class ALIGNModel(nn.Module):
                 # (see encode_mixed_windowed for the proper API).
                 K = self.assistant_head.chunk_size
                 z_v_window = z_v_pooled.unsqueeze(1).expand(-1, K, -1)
-                z_t_window = z_t_for_head.unsqueeze(1).expand(-1, K, -1)
+                z_s_window = z_s_for_head.unsqueeze(1).expand(-1, K, -1)
                 result["delta"] = self.assistant_head(
-                    z_v_window, z_t_window, z_text_for_head
+                    z_v_window, z_s_window, z_sext_for_head
                 )
             else:
                 result["delta"] = self.assistant_head(
-                    z_v_pooled, z_t_for_head, z_text_for_head
+                    z_v_pooled, z_s_for_head, z_sext_for_head
                 )
         return result
 

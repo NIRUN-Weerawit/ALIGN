@@ -707,7 +707,7 @@ def world_model_collate(batch: list, traj_window: int = 5) -> dict:
         }
 
     The encoder (frozen) is applied at training time to produce the
-    actual (z_v, z_t, z_text) embeddings. The collate function only
+    actual (z_v, z_s, z_sext) embeddings. The collate function only
     provides the raw inputs.
     """
     all_frame_t = []
@@ -1108,8 +1108,10 @@ def v4_segment_collate(batch: list, history_size: int = 20,
             continue
 
         # Random segment length: [min_mult*H, max_mult*H], capped by episode
-        seg_min = min(segment_min_mult * H, N)
-        seg_max = min(segment_max_mult * H, N)
+        # seg_min = min(segment_min_mult * H, N)
+        seg_min = max(H + C, segment_min_mult * H)
+        # seg_max = min(segment_max_mult * H, N)
+        seg_max = min(max(segment_max_mult * H, H + C), N)
         if seg_min >= seg_max:
             seg_len = seg_max
         else:
@@ -1193,9 +1195,11 @@ def v4_segment_collate(batch: list, history_size: int = 20,
 
         # Pad actions
         a = all_actions[b]
+        # print(f"actions shape: {a.shape}, max_len: {max_len}, S: {S}")
         pad_a = np.zeros((max_len, 7), dtype=np.float32)
         pad_a[:S] = a
         pad_a[S:] = a[-1:]
+        # print(f"padded_actions shape: {pad_a.shape}, max_len: {max_len}, S: {S}")
         padded_actions.append(pad_a)
 
     return {

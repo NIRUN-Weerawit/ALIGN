@@ -5,8 +5,8 @@
 Per timestep t:
   VisionEncoder -> raw DINOv2 patches      (B, VP_tokens, 768)
     | SEVisualCompressor                   (B, VP_tokens, comp_dim=16)
-    | StateConditionalCrossAttn + z_t     (B, VP_tokens, comp_dim=16)
-    | concat with z_t                      (B, VP*comp_dim + state_dim) -> Mamba
+    | StateConditionalCrossAttn + z_s     (B, VP_tokens, comp_dim=16)
+    | concat with z_s                      (B, VP*comp_dim + state_dim) -> Mamba
     | Mamba recurrence                     (B, mamba_output_dim)
 
 All VP token positions preserved -- no spatial averaging.
@@ -96,17 +96,17 @@ class SEVisualCompressor(nn.Module):
 
 
 # ================================================================
-# State-Conditional Cross-Attn Modulator -- z_t modulates patches per position
+# State-Conditional Cross-Attn Modulator -- z_s modulates patches per position
 # NOT pooling. Each patch token gets its own modulation from state context.
 # ================================================================
 
 class StateConditionalCrossAttn(nn.Module):
     """Per-patch cross-attention where VP token positions each get a query
-    derived from z_t robot state, attending to the actual patch KV features.
+    derived from z_s robot state, attending to the actual patch KV features.
 
     Unlike pooling (which collapses P->1 by averaging), this modulates each
     position independently through unique per-position queries while all
-    derive from the same underlying z_t embedding via learned projections.
+    derive from the same underlying z_s embedding via learned projections.
 
     Args:
         compressed_dim:  per-token dim after SE compression (default 16)
@@ -115,7 +115,7 @@ class StateConditionalCrossAttn(nn.Module):
 
     Input:
         z_v_comp: (B, N_tokens, compressed_dim)  -- from SEVisualCompressor
-        z_t:      (B, state_dim)                   -- robot state embedding
+        z_s:      (B, state_dim)                   -- robot state embedding
 
     Output:
         (B, N_tokens, compressed_dim)  -- same position count, values modulated
@@ -123,7 +123,7 @@ class StateConditionalCrossAttn(nn.Module):
 
     def __init__(self, compressed_dim: int = 16, state_dim: int = 256, num_heads: int = 4):
         super().__init__()
-        # Per-position query from z_t. Different random weights per position -> queries
+        # Per-position query from z_s. Different random weights per position -> queries
         # diverge during training and attend to distinct spatial regions.
         self.q_proj = nn.Linear(state_dim, compressed_dim)
         self.cross_attn = nn.MultiheadAttention(
@@ -133,11 +133,11 @@ class StateConditionalCrossAttn(nn.Module):
         # Start at identity so modulator learns adaptively from gradient signals
         self.attn_scale = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, z_v_comp: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_v_comp: torch.Tensor, z_s: torch.Tensor) -> torch.Tensor:
         B, N_pos, D = z_v_comp.shape
 
-        # One query per position, all derived from same z_t via projection weights
-        q = self.q_proj(z_t).unsqueeze(1).expand(-1, N_pos, -1)  # (B, N_pos, D)
+        # One query per position, all derived from same z_s via projection weights
+        q = self.q_proj(z_s).unsqueeze(1).expand(-1, N_pos, -1)  # (B, N_pos, D)
         k = v = z_v_comp                                         # patches as KV
 
         attn_out, _ = self.cross_attn(q, k, v)                   # (B, N_pos, D)
@@ -157,7 +157,7 @@ class VisionPatchEncoder(nn.Module):
     Pipeline:
       Raw DINOv2 patches (B, VP, 768)
         -> SEVisualCompressor   (B, VP, compressed_dim)
-        -> StateConditionalCrossAttn + z_t  (B, VP, compressed_dim)
+        -> StateConditionalCrossAttn + z_s  (B, VP, compressed_dim)
 
     Args:
         compressed_dim:  per-patch dim after compression (default 16)
@@ -183,17 +183,17 @@ class VisionPatchEncoder(nn.Module):
         self.state_modulator = StateConditionalCrossAttn(
             compressed_dim=compressed_dim, state_dim=state_dim, num_heads=num_heads)
 
-    def forward(self, v_patches_raw: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
+    def forward(self, v_patches_raw: torch.Tensor, z_s: torch.Tensor) -> torch.Tensor:
         """Compress channels then modulate via state. All VP positions preserved.
 
         Args:
             v_patches_raw: (B, VP_tokens, raw_dim=768) -- from VisionEncoder
-            z_t:           (B, state_dim)               -- robot state embedding
+            z_s:           (B, state_dim)               -- robot state embedding
         Returns:
             (B, VP_tokens, compressed_dim) -- modulated patches, positions preserved
         """
         z_v_comp = self.se_compressor(v_patches_raw)         # (B, VP, comp_dim)
-        z_v_mod  = self.state_modulator(z_v_comp, z_t)       # (B, VP, comp_dim)
+        z_v_mod  = self.state_modulator(z_v_comp, z_s)       # (B, VP, comp_dim)
         return z_v_mod
 
 
@@ -204,7 +204,7 @@ class VisionPatchEncoder(nn.Module):
 
 class PerCameraStateConditionedPool(VisionPatchEncoder):
     """Backward-compatible alias for VisionPatchEncoder. Old code that does
-    `pool(z_v_patches, z_t)` still works -- it just gets patch-level outputs.
+    `pool(z_v_patches, z_s)` still works -- it just gets patch-level outputs.
     """
     pass
 
@@ -218,9 +218,9 @@ class IntentionEncoder(nn.Module):
 
     Per timestep:
       v_patches(t) = VisionEncoder output  (B, VP_tokens, raw_dim=768)
-      z_t(t)       = StateEncoder state     (B, state_dim=256)
-          -> VisionPatchEncoder(v_patches, z_t) -> modulated patches  (B, VP, comp_dim)
-          -> concat with z_t -> mamba_in    (B, VP*comp_dim + state_dim)
+      z_s(t)       = StateEncoder state     (B, state_dim=256)
+          -> VisionPatchEncoder(v_patches, z_s) -> modulated patches  (B, VP, comp_dim)
+          -> concat with z_s -> mamba_in    (B, VP*comp_dim + state_dim)
           -> Mamba recurrence                (B, mamba_output_dim=512)
 
     V4: When use_intent_tokens=True, learnable intent tokens are appended
@@ -294,20 +294,20 @@ class IntentionEncoder(nn.Module):
             )
             self.intent_proj = nn.Linear(self.mamba_in_dim, intent_dim)
 
-    def pool_patches(self, z_v_patches: torch.Tensor, z_t: torch.Tensor
+    def pool_patches(self, z_v_patches: torch.Tensor, z_s: torch.Tensor
                      ) -> torch.Tensor:
         """Legacy interface -- encode patches via VisionPatchEncoder.
 
         Args:
             z_v_patches: (B, P_or_VP_tokens, raw_dim=768)
-            z_t:         (B, state_dim)
+            z_s:         (B, state_dim)
         Returns:
             (B, compressed_dim) -- mean-pooled across VP positions
         """
-        out = self.vision_patch_encoder(z_v_patches, z_t)  # (B, VP, comp_dim)
+        out = self.vision_patch_encoder(z_v_patches, z_s)  # (B, VP, comp_dim)
         return out.mean(dim=1)                               # (B, comp_dim) — mean pool
 
-    def forward(self, z_v_patches_seq: torch.Tensor, z_t_seq: torch.Tensor
+    def forward(self, z_v_patches_seq: torch.Tensor, z_s_seq: torch.Tensor
                 ) -> torch.Tensor:
         """Batched T-step Mamba forward.
 
@@ -318,7 +318,7 @@ class IntentionEncoder(nn.Module):
 
         Args:
             z_v_patches_seq: (B, T, tokens, raw_dim=768)
-            z_t_seq:         (B, T, state_dim)
+            z_s_seq:         (B, T, state_dim)
         Returns:
             h_seq or (h_seq, intent_emb)
         """
@@ -327,7 +327,7 @@ class IntentionEncoder(nn.Module):
         # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
         z_v_mod_seq = []
         for t in range(T):
-            out_t = self.vision_patch_encoder(z_v_patches_seq[:, t], z_t_seq[:, t])
+            out_t = self.vision_patch_encoder(z_v_patches_seq[:, t], z_s_seq[:, t])
             z_v_mod_seq.append(out_t)
         z_v_mod_seq = torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
 
@@ -335,7 +335,7 @@ class IntentionEncoder(nn.Module):
         B, T, N_tok, D_comp = z_v_mod_seq.shape
         mamba_in = torch.cat([
             z_v_mod_seq.reshape(B, T, N_tok * D_comp),
-            z_t_seq,
+            z_s_seq,
         ], dim=-1)  # (B, T, mamba_in_dim)
 
         if self.use_intent_tokens:
@@ -357,7 +357,7 @@ class IntentionEncoder(nn.Module):
             h_seq = self.mamba_to_hidden(h_seq)                # (B, T, mamba_output_dim)
             return h_seq
 
-    def forward_step(self, z_v_patches: torch.Tensor, z_t: torch.Tensor,
+    def forward_step(self, z_v_patches: torch.Tensor, z_s: torch.Tensor,
                      h_states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      produce_intent: bool = False
                      ):
@@ -368,7 +368,7 @@ class IntentionEncoder(nn.Module):
 
         Args:
             z_v_patches: (B, tokens, raw_dim=768)
-            z_t:         (B, state_dim)
+            z_s:         (B, state_dim)
             h_states:    (conv_state, ssm_state) from prev step, or None
             produce_intent: if True, run intent tokens through Mamba after history step
 
@@ -383,9 +383,9 @@ class IntentionEncoder(nn.Module):
         conv_state, ssm_state = h_states
 
         # Encode patches: SE compress + state modulate
-        z_v_mod = self.vision_patch_encoder(z_v_patches, z_t)  # (B, VP, comp_dim)
+        z_v_mod = self.vision_patch_encoder(z_v_patches, z_s)  # (B, VP, comp_dim)
         B_tok, N_tok, D_comp = z_v_mod.shape
-        mamba_in = torch.cat([z_v_mod.reshape(B_tok, N_tok * D_comp), z_t], dim=-1)
+        mamba_in = torch.cat([z_v_mod.reshape(B_tok, N_tok * D_comp), z_s], dim=-1)
 
         mamba_out, conv_state, ssm_state = self.mamba.step(
             mamba_in.unsqueeze(1),  # (B, 1, mamba_in_dim)

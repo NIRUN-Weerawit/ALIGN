@@ -12,7 +12,7 @@ Two head architectures:
 
 All consume:
   - z_v_pooled_window: (B, K, pool_out_dim) — K past pooled visions
-  - z_t_window:        (B, K, state_dim)    — K past states
+  - z_s_window:        (B, K, state_dim)    — K past states
   - intent_emb:        (B, N, intent_dim)   — N intent tokens (V4)
 
 Output:
@@ -35,7 +35,7 @@ class IntentionTransformerHead(nn.Module):
     """Transformer head for action prediction from intention state.
 
     Prepends N intent tokens as context tokens, then K per-timestep
-    tokens from concat[z_v_pooled, z_t]. Transformer encoder over
+    tokens from concat[z_v_pooled, z_s]. Transformer encoder over
     (K+N) tokens. Output K actions.
 
     Args:
@@ -67,7 +67,7 @@ class IntentionTransformerHead(nn.Module):
         self.num_intent_tokens = num_intent_tokens
         self.intent_dim = intent_dim
 
-        # Per-timestep projection: concat[z_v_pooled, z_t] → d_model
+        # Per-timestep projection: concat[z_v_pooled, z_s] → d_model
         per_step_in_dim = pool_out_dim + state_dim
         self.input_proj = nn.Linear(per_step_in_dim, d_model)
 
@@ -100,12 +100,12 @@ class IntentionTransformerHead(nn.Module):
         nn.init.zeros_(self.output_proj.bias)
 
     def forward(self, z_v_pooled_window: torch.Tensor,
-                z_t_window: torch.Tensor,
+                z_s_window: torch.Tensor,
                 intent_emb: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             z_v_pooled_window: (B, K, pool_out_dim) — K past pooled visions
-            z_t_window:        (B, K, state_dim)    — K past states
+            z_s_window:        (B, K, state_dim)    — K past states
             intent_emb:        (B, N, intent_dim)   — N intent tokens (or None)
         Returns:
             actions: (B, K, action_dim) — K future actions
@@ -115,8 +115,8 @@ class IntentionTransformerHead(nn.Module):
             f"Window size {K} doesn't match chunk_size {self.chunk_size}"
         )
 
-        # Per-timestep input: concat[z_v_pooled, z_t]
-        per_step_in = torch.cat([z_v_pooled_window, z_t_window], dim=-1)
+        # Per-timestep input: concat[z_v_pooled, z_s]
+        per_step_in = torch.cat([z_v_pooled_window, z_s_window], dim=-1)
         x = self.input_proj(per_step_in)  # (B, K, d_model)
 
         # Prepend intent tokens as context
@@ -157,10 +157,10 @@ except ImportError:
 
 
 class MambaActionHead(nn.Module):
-    """Mamba-based action head: K past (z_v_pooled, z_t) + intent → K future actions.
+    """Mamba-based action head: K past (z_v_pooled, z_s) + intent → K future actions.
 
     Architecture:
-      input[t] = concat[z_v_pooled[t], z_t[t], intent_pooled]
+      input[t] = concat[z_v_pooled[t], z_s[t], intent_pooled]
       mamba_seq = Mamba(input_seq)               # (B, K, hidden_dim)
       actions = output_proj(mamba_seq)            # (B, K, action_dim)
 
@@ -202,12 +202,12 @@ class MambaActionHead(nn.Module):
         nn.init.zeros_(self.output_proj.bias)
 
     def forward(self, z_v_pooled_window: torch.Tensor,
-                z_t_window: torch.Tensor,
+                z_s_window: torch.Tensor,
                 intent_emb: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             z_v_pooled_window: (B, K, pool_out_dim) — K past pooled visions
-            z_t_window:        (B, K, state_dim)    — K past states
+            z_s_window:        (B, K, state_dim)    — K past states
             intent_emb:        (B, N, intent_dim)   — N intent tokens (or None)
         Returns:
             actions: (B, K, action_dim) — K future actions
@@ -217,8 +217,8 @@ class MambaActionHead(nn.Module):
             f"Window size {K} doesn't match chunk_size {self.chunk_size}"
         )
 
-        # Per-timestep input: concat[z_v_pooled, z_t]
-        per_step_in = torch.cat([z_v_pooled_window, z_t_window], dim=-1)
+        # Per-timestep input: concat[z_v_pooled, z_s]
+        per_step_in = torch.cat([z_v_pooled_window, z_s_window], dim=-1)
         # (B, K, per_step_in_dim) where per_step_in_dim = pool_out_dim + state_dim
 
         # For V4: prepend N intent tokens as context (similar to transformer head).
@@ -272,7 +272,7 @@ class DiffusionPolicyUNet1D(nn.Module):
         self.time_dim = time_dim
         self.hidden_dim = hidden_dim
 
-        self.input_proj = nn.Conv1d(action_dim + cond_dim, hidden_dim,
+        self.input_proj = nn.Conv1d(action_dim, hidden_dim,
                                     kernel_size=3, padding=1)
 
         # Encoder
@@ -307,11 +307,18 @@ class DiffusionPolicyUNet1D(nn.Module):
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor,
                 t_emb: torch.Tensor) -> torch.Tensor:
         B, K, _ = x_t.shape
-        cond_global = cond.mean(dim=1)  # (B, cond_dim)
-
-        x = torch.cat([x_t, cond], dim=-1)              # (B, K, action+cond)
-        x = x.permute(0, 2, 1)                          # (B, C, K)
+        
+        # cond: [B, C]
+        if cond.ndim == 3:
+            cond_global = cond.squeeze(1) if cond.shape[1] == 1 else cond.mean(dim=1)
+        else:
+            cond_global = cond
+        
+        # x = torch.cat([x_t, cond], dim=-1)              # (B, K, action+cond)
+        x = x_t.permute(0, 2, 1)                          # (B, C, K)
+        # print(f"DiffusionPolicyUNet1D: input x shape: {x.shape}, cond shape: {cond.shape}, t_emb shape: {t_emb.shape}")
         x = self.input_proj(x)                          # (B, hidden, K)
+        # print(f"DiffusionPolicyUNet1D: projected x shape: {x.shape}")
 
         skip0 = x
 
@@ -395,18 +402,18 @@ class _Upsample1d(nn.Module):
 class DiffusionPolicyHead(nn.Module):
     """Diffusion Policy head (Chi et al. 2023) with 1D Conditional U-Net.
 
-    Conditioned on intent tokens (pooled) + z_v_pooled + z_t.
+    Conditioned on intent tokens (pooled) + z_v_pooled + z_s.
     No text conditioning.
 
     Args:
-        cond_dim:          per-step condition dim (z_v + z_t + intent)
+        cond_dim:          per-step condition dim (z_v + z_s + intent)
         action_dim:        output dim (default 6)
         hidden_dim:        U-Net base channels (default 128)
         num_inference_steps: DDIM denoising steps (default 10)
         time_dim:          sinusoidal time embedding dim (default 64)
         chunk_size:        K — number of past steps / future actions
     """
-    def __init__(self, cond_dim: int = 768, action_dim: int = 6,
+    def __init__(self, cond_dim: int = 768, action_dim: int = 7,
                  hidden_dim: int = 128, num_inference_steps: int = 10,
                  time_dim: int = 64, chunk_size: int = 10):
         super().__init__()
@@ -444,30 +451,31 @@ class DiffusionPolicyHead(nn.Module):
         )
 
     def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
-                              z_t_window: torch.Tensor,
+                              z_s_window: torch.Tensor,
                               intent_emb: torch.Tensor = None) -> torch.Tensor:
         """Build per-step condition (B, K, cond_dim).
 
-        Condition = concat[z_v_pooled, z_t, intent_pooled] per step.
+        Condition = concat[z_v_pooled, z_s, intent_pooled] per step.
         Intent tokens are pooled to a single vector and repeated per-step.
         """
-        B, K = z_v_pooled_window.shape[:2]
-        parts = [z_v_pooled_window, z_t_window]
+        K = z_v_pooled_window.shape[1]
+        parts = [z_v_pooled_window, z_s_window]
+
         if intent_emb is not None:
             if intent_emb.ndim == 3:
-                intent_pooled = intent_emb.mean(dim=1)  # (B, intent_dim)
+                intent_stacked = intent_emb.reshape(intent_emb.shape[0], -1)   # [B, intent_dim * N]
             else:
-                intent_pooled = intent_emb
-            intent_repeated = intent_pooled.unsqueeze(1).expand(-1, K, -1)
-            parts.append(intent_repeated)
-        return torch.cat(parts, dim=-1)
+                intent_stacked = intent_emb
+            parts.append(intent_stacked)
+        cond = torch.cat(parts, dim=-1)  # (B, K, cond_dim)
+        return cond
 
     def forward(self, z_v_pooled_window: torch.Tensor,
-                z_t_window: torch.Tensor,
+                z_s_window: torch.Tensor,
                 intent_emb: torch.Tensor = None) -> torch.Tensor:
         """Build per-step condition. Returns cond for loss/sample."""
         return self._build_per_step_cond(
-            z_v_pooled_window, z_t_window, intent_emb,
+            z_v_pooled_window, z_s_window, intent_emb,
         )
 
     def predict_noise(self, x_t: torch.Tensor, t: torch.Tensor,
@@ -498,7 +506,7 @@ class DiffusionPolicyHead(nn.Module):
         """DDIM deterministic sampling (eta=0) from noise to actions."""
         if num_steps is None:
             num_steps = self.num_inference_steps
-        B, K, D = cond.shape[0], cond.shape[1], self.action_dim
+        B, K, D = cond.shape[0], self.chunk_size, self.action_dim
         device = cond.device
 
         x = torch.randn(B, K, D, device=device)
