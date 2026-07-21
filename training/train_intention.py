@@ -491,6 +491,10 @@ def validate(model, loader, device, args):
         # Use only the first observation (index 0) — matches training
         # where current observation predicts next C actions
         target_0 = target[:, :args.chunk_size]  # (B, C, 7)
+        # Pad if segment is shorter than chunk_size
+        if target_0.shape[1] < args.chunk_size:
+            pad = target_0[:, -1:].expand(-1, args.chunk_size - target_0.shape[1], -1)
+            target_0 = torch.cat([target_0, pad], dim=1)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
