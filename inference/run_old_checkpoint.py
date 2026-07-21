@@ -247,10 +247,10 @@ def run_inference(input_path: str, data_path: str, cameras: list,
         states = states.to(device)        # (1, K, 7) float32
 
         # Encode text if model uses it (provides default if not in batch)
-        z_text = None
+        z_sext = None
         if model.use_text and model.text_encoder is not None:
             texts = ["default task"] * frames.shape[0]
-            z_text = model.text_encoder(texts)
+            z_sext = model.text_encoder(texts)
 
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
@@ -258,8 +258,8 @@ def run_inference(input_path: str, data_path: str, cameras: list,
                 out = model(frames, states)
                 h_current = out["h_seq"][:, -1]
                 actions_pred = model.predict_actions(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
-                    z_text=z_text,
+                    out["z_v_pooled_seq"], out["z_s_seq"], h_current,
+                    z_sext=z_sext,
                 )
         print(f"  frames: {tuple(frames.shape)}, states: {tuple(states.shape)}")
         print(f"  model output: actions_pred {tuple(actions_pred.shape)}")

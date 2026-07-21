@@ -217,9 +217,9 @@ def main():
                                      enabled=device.type == "cuda"):
                 mixed = model.encode_mixed(frames, traj_view, texts)
                 z_v = mixed["z_v"].float()
-                z_t = mixed["z_t"].float()
-                z_text = mixed["z_text"].float()
-                action_pred = model.assistant_head(z_v, z_t, z_text)
+                z_s = mixed["z_s"].float()
+                z_sext = mixed["z_sext"].float()
+                action_pred = model.assistant_head(z_v, z_s, z_sext)
 
             all_preds.append(action_pred.float().cpu().numpy())
             all_targets.append(current_action.float().cpu().numpy())

@@ -37,7 +37,7 @@ class ALIGNIntentionInference:
         2. Read current robot state (7-D) → encode via StateEncoder
         3. State-Conditioned Attention Pool → z_v_pooled
         4. Mamba step (with persistent state) → h(t)
-        5. Buffer K past (z_v_pooled, z_t) for the head
+        5. Buffer K past (z_v_pooled, z_s) for the head
         6. IntentionTransformerHead → K future actions
         7. Use first predicted action as the next command
     """
@@ -87,14 +87,14 @@ class ALIGNIntentionInference:
 
         # Buffers
         self.z_v_pooled_buffer: List[torch.Tensor] = []  # K past pooled visions
-        self.z_t_buffer: List[torch.Tensor] = []         # K past states
+        self.z_s_buffer: List[torch.Tensor] = []         # K past states
         self.h_states: Optional[tuple] = None            # (conv_state, ssm_state)
         self.step_count = 0
 
     def reset(self):
         """Reset for a new episode."""
         self.z_v_pooled_buffer = []
-        self.z_t_buffer = []
+        self.z_s_buffer = []
         self.h_states = None
         self.step_count = 0
 
@@ -111,7 +111,7 @@ class ALIGNIntentionInference:
               - action: (action_dim,) — predicted current action
               - chunk: (K, action_dim) — predicted K future actions
               - z_v_pooled: (vision_dim,) — current pooled visual
-              - z_t: (state_dim,) — current state
+              - z_s: (state_dim,) — current state
               - h: (mamba_output_dim,) — current mamba state
         """
         # Preprocess
@@ -130,17 +130,17 @@ class ALIGNIntentionInference:
         )  # (1, 7)
 
         # One step encoding
-        z_v_pooled, z_t, h_new, h_states_new = self.model.encode_step(
+        z_v_pooled, z_s, h_new, h_states_new = self.model.encode_step(
             frames_t, state_t, self.h_states,
         )
         self.h_states = h_states_new
 
         # Update buffers (rolling window)
         self.z_v_pooled_buffer.append(z_v_pooled)
-        self.z_t_buffer.append(z_t)
+        self.z_s_buffer.append(z_s)
         if len(self.z_v_pooled_buffer) > self.chunk_size:
             self.z_v_pooled_buffer.pop(0)
-            self.z_t_buffer.pop(0)
+            self.z_s_buffer.pop(0)
 
         # First step: not enough history for head, return zero action
         if len(self.z_v_pooled_buffer) < self.chunk_size:
@@ -149,22 +149,22 @@ class ALIGNIntentionInference:
                 "action": np.zeros(self.action_dim, dtype=np.float32),
                 "chunk": np.zeros((self.chunk_size, self.action_dim), dtype=np.float32),
                 "z_v_pooled": z_v_pooled.squeeze(0).cpu().numpy(),
-                "z_t": z_t.squeeze(0).cpu().numpy(),
+                "z_s": z_s.squeeze(0).cpu().numpy(),
                 "h": h_new.squeeze(0).cpu().numpy(),
             }
 
-        # Build head input: K past (z_v_pooled, z_t) + 1 latest h
+        # Build head input: K past (z_v_pooled, z_s) + 1 latest h
         z_v_pooled_window = torch.stack(
             self.z_v_pooled_buffer[-self.chunk_size:], dim=1
         )  # (1, K, vision_dim * num_cameras)
-        z_t_window = torch.stack(
-            self.z_t_buffer[-self.chunk_size:], dim=1
+        z_s_window = torch.stack(
+            self.z_s_buffer[-self.chunk_size:], dim=1
         )  # (1, K, state_dim)
         h_current = h_new  # (1, mamba_output_dim)
 
         # Predict actions
         chunk = self.model.predict_actions(
-            z_v_pooled_window, z_t_window, h_current
+            z_v_pooled_window, z_s_window, h_current
         )  # (1, K, action_dim)
         chunk_np = chunk.squeeze(0).cpu().numpy()  # (K, action_dim)
         action = chunk_np[0]  # use first action
@@ -174,7 +174,7 @@ class ALIGNIntentionInference:
             "action": action,
             "chunk": chunk_np,
             "z_v_pooled": z_v_pooled.squeeze(0).cpu().numpy(),
-            "z_t": z_t.squeeze(0).cpu().numpy(),
+            "z_s": z_s.squeeze(0).cpu().numpy(),
             "h": h_new.squeeze(0).cpu().numpy(),
         }
 

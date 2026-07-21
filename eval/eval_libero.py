@@ -111,7 +111,7 @@ def record_episode_video(
     model: ALIGNModel,
     device: torch.device,
     task_description: str,
-    z_text: torch.Tensor,
+    z_sext: torch.Tensor,
     output_path: str,
     chunk_size: int = 10,
     traj_window: int = 20,
@@ -127,7 +127,7 @@ def record_episode_video(
         import imageio
     except ImportError:
         print("  imageio not installed. Install: pip install imageio[ffmpeg]")
-        return run_episode(env, model, device, task_description, z_text,
+        return run_episode(env, model, device, task_description, z_sext,
                           chunk_size, traj_window, max_steps, use_bf16)
 
     obs = env.reset()
@@ -209,7 +209,7 @@ def record_episode_video(
                 mixed = model.encode_mixed(frame_t, traj_t, [""])
 
             z_v = mixed["z_v"]
-            z_t = mixed["z_t"]
+            z_s = mixed["z_s"]
 
             # NOTE: The Decision head is now a future prediction head.
             # At inference, we don't have access to the future (the sim
@@ -221,7 +221,7 @@ def record_episode_video(
             alpha_val = 1.0
 
             # Assistant head: predicts current action from K past frames.
-            action_pred = model.assistant_head(z_v, z_t, z_text)
+            action_pred = model.assistant_head(z_v, z_s, z_sext)
             action_pred_np = action_pred.squeeze(0).cpu().numpy()
 
             if chunk_cache is not None:
@@ -271,7 +271,7 @@ def run_episode(
     model: ALIGNModel,
     device: torch.device,
     task_description: str,
-    z_text: torch.Tensor,
+    z_sext: torch.Tensor,
     chunk_size: int = 10,
     traj_window: int = 20,
     max_steps: int = 500,
@@ -351,7 +351,7 @@ def run_episode(
                 mixed = model.encode_mixed(frame_t, traj_t, [""])
 
             z_v = mixed["z_v"]
-            z_t = mixed["z_t"]
+            z_s = mixed["z_s"]
 
             # See note in the first loop: at inference, we don't have
             # access to the future, so we use a fixed α = 1.0. The
@@ -360,7 +360,7 @@ def run_episode(
             alpha_val = 1.0
 
             # Assistant head: predicts current action from K past frames.
-            action_pred = model.assistant_head(z_v, z_t, z_text)
+            action_pred = model.assistant_head(z_v, z_s, z_sext)
             action_pred_np = action_pred.squeeze(0).cpu().numpy()
 
             if chunk_cache is not None:
@@ -444,7 +444,7 @@ def evaluate_suite(
             print(f"  [{task_idx+1}/{len(task_list)}] {task_name[:60]}  ep {ep+1}/{n_episodes}")
 
             try:
-                z_text = model.encode_text([task_name])
+                z_sext = model.encode_text([task_name])
 
                 bddl_path = get_bddl_path(suite_name, task_name)
                 if not os.path.exists(bddl_path):
@@ -465,14 +465,14 @@ def evaluate_suite(
                     video_path = str(out_dir / f"task_{task_idx:03d}_ep{ep}.mp4")
                     result = record_episode_video(
                         env=env, model=model, device=device,
-                        task_description=task_name, z_text=z_text,
+                        task_description=task_name, z_sext=z_sext,
                         output_path=video_path,
                         chunk_size=chunk_size, max_steps=max_steps,
                     )
                 else:
                     result = run_episode(
                         env=env, model=model, device=device,
-                        task_description=task_name, z_text=z_text,
+                        task_description=task_name, z_sext=z_sext,
                         chunk_size=chunk_size, max_steps=max_steps,
                     )
 

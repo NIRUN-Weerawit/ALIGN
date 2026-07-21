@@ -15,7 +15,7 @@ V is trained with TD(λ) return on real expert trajectories:
 
 Loss: MSE(V(s_t), G_t^lambda.detach())
 
-This is intentionally simple: just a small MLP that maps (z_v, z_t, z_text)
+This is intentionally simple: just a small MLP that maps (z_v, z_s, z_sext)
 to a scalar. The complexity is in the training (TD(λ) returns), not the
 architecture.
 """
@@ -28,7 +28,7 @@ import torch.nn.functional as F
 class ValueHeadMLP(nn.Module):
     """Estimates V(s) = expected cumulative reward from state s.
 
-    Input:  (z_v, z_t, z_text) shape (B, 3*D) — concatenated
+    Input:  (z_v, z_s, z_sext) shape (B, 3*D) — concatenated
     Output: scalar V(s) shape (B,)
 
     The head is intentionally simple: a small MLP. The value function
@@ -68,15 +68,15 @@ class ValueHeadMLP(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,    # (B, embed_dim)
-        z_t: torch.Tensor,    # (B, embed_dim)
-        z_text: torch.Tensor, # (B, embed_dim)
+        z_s: torch.Tensor,    # (B, embed_dim)
+        z_sext: torch.Tensor, # (B, embed_dim)
     ) -> torch.Tensor:
         """Compute V(s) for each state.
 
         Returns:
             V: (B,) scalar value per state
         """
-        x = torch.cat([z_v, z_t, z_text], dim=-1)
+        x = torch.cat([z_v, z_s, z_sext], dim=-1)
         out = self.mlp(x)  # (B, 1)
         return out.squeeze(-1)  # (B,)
 
@@ -168,9 +168,9 @@ if __name__ == "__main__":
     B, D = 4, 256
     vh = ValueHeadMLP(embed_dim=D)
     z_v = torch.randn(B, D)
-    z_t = torch.randn(B, D)
-    z_text = torch.randn(B, D)
-    v = vh(z_v, z_t, z_text)
+    z_s = torch.randn(B, D)
+    z_sext = torch.randn(B, D)
+    v = vh(z_v, z_s, z_sext)
     assert v.shape == (B,), f"v shape: {v.shape}"
     print(f"  V shape: {v.shape}")
     print(f"  V values: {v.tolist()}")

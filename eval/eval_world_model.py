@@ -144,9 +144,9 @@ def _percentiles(x: np.ndarray, ps=(5, 25, 50, 75, 95)) -> dict:
     return {f"p{p}": float(np.percentile(x, p)) for p in ps}
 
 
-def _joint_norm(z_v: torch.Tensor, z_t: torch.Tensor) -> torch.Tensor:
-    """Concatenated (z_v, z_t) along the embedding dim → (B, 2D)."""
-    return torch.cat([z_v, z_t], dim=-1)
+def _joint_norm(z_v: torch.Tensor, z_s: torch.Tensor) -> torch.Tensor:
+    """Concatenated (z_v, z_s) along the embedding dim → (B, 2D)."""
+    return torch.cat([z_v, z_s], dim=-1)
 
 
 # ================================================================
@@ -343,7 +343,7 @@ def evaluate(
     # =============================================================
 
     # Test 1: real (s, a, s') — cosine sim to predicted s'
-    test1_cos_joint: List[float] = []   # cos on (z_v', z_t') concatenated
+    test1_cos_joint: List[float] = []   # cos on (z_v', z_s') concatenated
     test1_cos_v: List[float] = []
     test1_cos_t: List[float] = []
     test1_pred_norm: List[float] = []   # ||predicted s'||
@@ -371,7 +371,7 @@ def evaluate(
                              window_size: int = 5) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode state with K-frame window for world model input.
 
-        Returns (z_v_window, z_t_window, z_text) all (B, W, D) except z_text (B, D).
+        Returns (z_v_window, z_s_window, z_sext) all (B, W, D) except z_sext (B, D).
         Handles both single-cam (B, K, H, W, 3) and multi-cam (B, K, V, H, W, 3).
         """
         with torch.no_grad(), torch.amp.autocast(
@@ -384,19 +384,19 @@ def evaluate(
             # Use encode_raw_vision_window which handles both 5D and 6D
             z_v = align.encode_raw_vision_window(frames)  # (B, K, D)
 
-            z_t_tokens = align.encode_raw_trajectory_tokens(traj)
-            z_text = align.encode_raw_text(texts)
-            if z_text is None:
-                z_text = torch.zeros_like(z_v[:, 0])
+            z_s_tokens = align.encode_raw_trajectory_tokens(traj)
+            z_sext = align.encode_raw_text(texts)
+            if z_sext is None:
+                z_sext = torch.zeros_like(z_v[:, 0])
 
-            z_v, z_t_tokens, z_text = align.cross_attention_mixer(
-                z_v, z_t_tokens, z_text
+            z_v, z_s_tokens, z_sext = align.cross_attention_mixer(
+                z_v, z_s_tokens, z_sext
             )
 
             z_v = z_v[:, -window_size:]
-            z_t_tokens = z_t_tokens[:, -window_size:]
+            z_s_tokens = z_s_tokens[:, -window_size:]
 
-        return z_v, z_t_tokens, z_text
+        return z_v, z_s_tokens, z_sext
 
     def _encode_state_target(frames: torch.Tensor,
                               traj: torch.Tensor,
@@ -406,7 +406,7 @@ def evaluate(
             "cuda", dtype=torch.bfloat16, enabled=use_bf16
         ):
             mixed = align.encode_mixed(frames, traj, texts)
-        return mixed["z_v"].float(), mixed["z_t"].float()
+        return mixed["z_v"].float(), mixed["z_s"].float()
 
     def _batch_to_tensors(batch: dict) -> dict:
         """Normalize batch keys (frame_t vs frames_t) and to-device.
@@ -474,19 +474,19 @@ def evaluate(
             # -- Encode state_t and state_t+1 --
             if _is_old_arch:
                 # Old architecture: single embeddings (B, D)
-                z_v, z_t, z_text = _encode_state_target(frames_t, state_t, texts)
-                z_v_next, z_t_next = _encode_state_target(frames_next, state_next, texts)
+                z_v, z_s, z_sext = _encode_state_target(frames_t, state_t, texts)
+                z_v_next, z_s_next = _encode_state_target(frames_next, state_next, texts)
             else:
-                z_v, z_t, z_text = _encode_state_window(frames_t, state_t, texts, window_size=cfg.get("window_size", 5))
-                z_v_next, z_t_next = _encode_state_target(frames_next, state_next, texts)
+                z_v, z_s, z_sext = _encode_state_window(frames_t, state_t, texts, window_size=cfg.get("window_size", 5))
+                z_v_next, z_s_next = _encode_state_target(frames_next, state_next, texts)
 
             # ============== TEST 1: real (s, a) -> predicted s' ====
-            z_v_pred, z_t_pred = world_model(z_v, z_t, z_text, action)
-            pred_joint = _joint_norm(z_v_pred, z_t_pred)
-            real_joint = _joint_norm(z_v_next, z_t_next)
+            z_v_pred, z_s_pred = world_model(z_v, z_s, z_sext, action)
+            pred_joint = _joint_norm(z_v_pred, z_s_pred)
+            real_joint = _joint_norm(z_v_next, z_s_next)
             cos_joint = F.cosine_similarity(pred_joint, real_joint, dim=-1)
             cos_v = F.cosine_similarity(z_v_pred, z_v_next, dim=-1)
-            cos_t = F.cosine_similarity(z_t_pred, z_t_next, dim=-1)
+            cos_t = F.cosine_similarity(z_s_pred, z_s_next, dim=-1)
             test1_cos_joint.extend(cos_joint.cpu().tolist())
             test1_cos_v.extend(cos_v.cpu().tolist())
             test1_cos_t.extend(cos_t.cpu().tolist())
@@ -500,16 +500,16 @@ def evaluate(
             # and cos(pred, target) HIGH.
             if _is_old_arch:
                 z_v_last_input = z_v  # (B, D)
-                z_t_last_input = z_t
+                z_s_last_input = z_s
             else:
                 z_v_last_input = z_v[:, -1]  # (B, D) — last frame in window
-                z_t_last_input = z_t[:, -1]  # (B, D) — last traj token
+                z_s_last_input = z_s[:, -1]  # (B, D) — last traj token
             cos_v_copy = F.cosine_similarity(z_v_pred, z_v_last_input, dim=-1)
-            cos_t_copy = F.cosine_similarity(z_t_pred, z_t_last_input, dim=-1)
+            cos_t_copy = F.cosine_similarity(z_s_pred, z_s_last_input, dim=-1)
             # Also measure: how similar is the target to the last input?
             # If target ≈ last_input, the task is trivially easy (copying works)
             cos_v_target_vs_input = F.cosine_similarity(z_v_next, z_v_last_input, dim=-1)
-            cos_t_target_vs_input = F.cosine_similarity(z_t_next, z_t_last_input, dim=-1)
+            cos_t_target_vs_input = F.cosine_similarity(z_s_next, z_s_last_input, dim=-1)
             test1b_cos_v_copy.extend(cos_v_copy.cpu().tolist())
             test1b_cos_t_copy.extend(cos_t_copy.cpu().tolist())
             test1b_cos_v_target_vs_input.extend(cos_v_target_vs_input.cpu().tolist())
@@ -520,14 +520,14 @@ def evaluate(
             action_mean = action.mean(dim=0, keepdim=True).expand_as(action)
             action_std = action.std(dim=0, keepdim=True).clamp_min(1e-3)
             rand_action = action_mean + action_std * torch.randn_like(action)
-            z_v_rand, z_t_rand = world_model(z_v, z_t, z_text, rand_action)
-            pred_rand = _joint_norm(z_v_rand, z_t_rand)
+            z_v_rand, z_s_rand = world_model(z_v, z_s, z_sext, rand_action)
+            pred_rand = _joint_norm(z_v_rand, z_s_rand)
             test2_random_norm.extend(pred_rand.norm(dim=-1).cpu().tolist())
 
             # ============== TEST 3: multi-step rollout =============
             # We re-use the dataset directly (NOT the batch's collated items)
             # to get a clean episode window. For each batch item we already
-            # have (z_v, z_t, z_text) at the anchor t, and the corresponding
+            # have (z_v, z_s, z_sext) at the anchor t, and the corresponding
             # `action` for stepping forward. We need:
             #   - the source episode (frames, poses, actions)
             #   - the anchor t chosen by the collate
@@ -613,11 +613,11 @@ def evaluate(
                 if _is_old_arch:
                     # Old: single embedding (1, D) — unsqueeze to (1, 1, D)
                     z_v_cur = z_v[i:i + 1].unsqueeze(1).clone()
-                    z_t_cur = z_t[i:i + 1].unsqueeze(1).clone()
+                    z_s_cur = z_s[i:i + 1].unsqueeze(1).clone()
                 else:
                     z_v_cur = z_v[i:i + 1].clone()       # (1, W, D)
-                    z_t_cur = z_t[i:i + 1].clone()       # (1, W, D)
-                z_text_cur = z_text[i:i + 1].clone()  # (1, D)
+                    z_s_cur = z_s[i:i + 1].clone()       # (1, W, D)
+                z_sext_cur = z_sext[i:i + 1].clone()  # (1, D)
                 text_i = [texts[i]] if isinstance(texts, list) else [texts]
                 for k in range(K):
                     if chosen_t + k + 1 >= len(frames_i):
@@ -626,12 +626,12 @@ def evaluate(
                     a_real = torch.from_numpy(
                         actions_i[chosen_t + k, :6].astype(np.float32)
                     ).to(device).unsqueeze(0)
-                    z_v_pred, z_t_pred = world_model(
-                        z_v_cur, z_t_cur, z_text_cur, a_real
+                    z_v_pred, z_s_pred = world_model(
+                        z_v_cur, z_s_cur, z_sext_cur, a_real
                     )
                     # Slide window: drop oldest, append predicted
                     z_v_cur = torch.cat([z_v_cur[:, 1:], z_v_pred.unsqueeze(1)], dim=1)
-                    z_t_cur = torch.cat([z_t_cur[:, 1:], z_t_pred.unsqueeze(1)], dim=1)
+                    z_s_cur = torch.cat([z_s_cur[:, 1:], z_s_pred.unsqueeze(1)], dim=1)
                     # Encode the real next state (k+1 steps ahead)
                     f_real = torch.from_numpy(
                         frames_i[chosen_t + k + 1]
@@ -648,11 +648,11 @@ def evaluate(
                             device=device,
                         )
                         p_real = torch.cat([pad, p_real], dim=1)
-                    z_v_real_next, z_t_real_next = _encode_state_target(
+                    z_v_real_next, z_s_real_next = _encode_state_target(
                         f_real, p_real, text_i
                     )
-                    real_joint_k = _joint_norm(z_v_real_next, z_t_real_next)
-                    pred_joint_k = _joint_norm(z_v_pred, z_t_pred)
+                    real_joint_k = _joint_norm(z_v_real_next, z_s_real_next)
+                    pred_joint_k = _joint_norm(z_v_pred, z_s_pred)
                     cos_k = F.cosine_similarity(
                         pred_joint_k, real_joint_k, dim=-1
                     ).item()

@@ -32,8 +32,8 @@ INPUT  (per sample, B = batch):
 
 OUTPUT (per sample, B = batch):
   - z_v:     (B, 256) — single visual embedding (frozen DINOv2 + proj)
-  - z_t:     (B, 256) — mean-pooled trajectory embedding
-  - z_text:  (B, 256) — text embedding
+  - z_s:     (B, 256) — mean-pooled trajectory embedding
+  - z_sext:  (B, 256) — text embedding
   All passed through the cross-attention mixer in Phase 1b.
 
 TARGET:
@@ -41,7 +41,7 @@ TARGET:
   - Negatives = all other samples in the same batch
 
 LOSS:
-  - compute_contrastive_loss(z_v, z_t, z_text, temperature=0.07)
+  - compute_contrastive_loss(z_v, z_s, z_sext, temperature=0.07)
     For each pair (v,t), (v,l), (t,l):
       - L2-normalize both embeddings
       - Compute (B, B) cosine similarity matrix
@@ -50,9 +50,9 @@ LOSS:
 
 METRICS (per step / per epoch, logged to wandb + JSONL):
   - loss       (float, lower=better):  mean of 3 InfoNCE losses
-  - cos_vt     (float, in [-1, 1]):     mean cosine sim of z_v vs z_t (positive pairs, target=1)
-  - cos_vl     (float, in [-1, 1]):     mean cosine sim of z_v vs z_text (target=1)
-  - cos_tl     (float, in [-1, 1]):     mean cosine sim of z_t vs z_text (target=1)
+  - cos_vt     (float, in [-1, 1]):     mean cosine sim of z_v vs z_s (positive pairs, target=1)
+  - cos_vl     (float, in [-1, 1]):     mean cosine sim of z_v vs z_sext (target=1)
+  - cos_tl     (float, in [-1, 1]):     mean cosine sim of z_s vs z_sext (target=1)
   - lr         (float):                 current learning rate
 
 BEST CHECKPOINT:
@@ -344,7 +344,7 @@ def pretrain_hdf5(
                 # Raw encoder outputs (no mixer), BF16 autocast
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     raw = model.encode_raw_all(frames, trajs, texts)
-                stats = criterion(raw["z_v"], raw["z_t"], raw["z_text"])
+                stats = criterion(raw["z_v"], raw["z_s"], raw["z_sext"])
                 loss = stats["loss"]
 
                 optimizer.zero_grad()
@@ -432,7 +432,7 @@ def pretrain_hdf5(
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                             raw = model.encode_raw_all(frames, trajs, texts)
                         raw = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
-                        stats = criterion(raw["z_v"], raw["z_t"], raw["z_text"])
+                        stats = criterion(raw["z_v"], raw["z_s"], raw["z_sext"])
                         val_losses.append(stats["loss"].item())
                         val_vt.append(stats["avg_cos_vt"].item())
                         val_vl.append(stats["avg_cos_vl"].item())
@@ -509,7 +509,7 @@ def pretrain_hdf5(
                 # Mixer outputs, BF16 autocast
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     mixed = model.encode_mixed(frames, trajs, texts)
-                stats = criterion(mixed["z_v"], mixed["z_t"], mixed["z_text"])
+                stats = criterion(mixed["z_v"], mixed["z_s"], mixed["z_sext"])
                 loss = stats["loss"]
 
                 optimizer.zero_grad()
@@ -567,7 +567,7 @@ def pretrain_hdf5(
                             trajs = torch.cat([trajs, pad], dim=-1)
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                             mixed = model.encode_mixed(frames, trajs, texts)
-                        stats_val = criterion(mixed["z_v"], mixed["z_t"], mixed["z_text"])
+                        stats_val = criterion(mixed["z_v"], mixed["z_s"], mixed["z_sext"])
                         val_losses_1b.append(stats_val["loss"].item())
                         val_vt_1b.append(stats_val["avg_cos_vt"].item())
                         val_vl_1b.append(stats_val["avg_cos_vl"].item())

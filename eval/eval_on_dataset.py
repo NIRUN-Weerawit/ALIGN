@@ -187,7 +187,7 @@ def evaluate_on_dataset(
         n = len(frames)
 
         # Precompute text embedding
-        z_text = model.encode_text([text])
+        z_sext = model.encode_text([text])
 
         # Inject noise if requested
         if noise_std > 0:
@@ -248,35 +248,35 @@ def evaluate_on_dataset(
                     # Encode current (noised) trajectory
                     mixed = model.encode_mixed(frame_t, traj_t, [""])
                     z_v = mixed["z_v"]
-                    z_t_tokens = mixed["z_t_tokens"]
-                    z_text = mixed["z_text"]
+                    z_s_tokens = mixed["z_s_tokens"]
+                    z_sext = mixed["z_sext"]
                     # Encode the actual future (clean) trajectory
                     mixed_future = model.encode_mixed(frame_t, traj_future_t, [""])
-                    z_t_future_tokens = mixed_future["z_t_tokens"]
+                    z_s_future_tokens = mixed_future["z_s_tokens"]
 
             # Decision head: predict K future embeddings from K past
             z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)
             z_v_target = z_v.unsqueeze(1).expand(-1, K, -1)
-            predicted_z_v, predicted_z_t = model.decision_head(
-                z_v_window, z_t_tokens, z_text
+            predicted_z_v, predicted_z_s = model.decision_head(
+                z_v_window, z_s_tokens, z_sext
             )
 
             # α from prediction error
             alpha = ALIGNModel.compute_alpha_from_predictions(
-                predicted_z_v, predicted_z_t,
-                z_v_target, z_t_future_tokens,
+                predicted_z_v, predicted_z_s,
+                z_v_target, z_s_future_tokens,
                 aggregation="weighted_mean", decay=0.7,
             )
             alpha_val = float(alpha.squeeze().cpu())
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                # Assistant head needs mean-pooled z_t
-                z_t = z_t_tokens.mean(dim=1)
+                # Assistant head needs mean-pooled z_s
+                z_s = z_s_tokens.mean(dim=1)
 
                 # Assistant head: predicts current action from K past frames.
                 # No need to pass current_action as input — the model just
                 # predicts it as output.
-                action_pred = model.assistant_head(z_v, z_t, z_text)
+                action_pred = model.assistant_head(z_v, z_s, z_sext)
                 action_pred_np = action_pred.squeeze(0).cpu().numpy()
 
                 if chunk_cache is not None:

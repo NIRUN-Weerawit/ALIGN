@@ -527,15 +527,15 @@ def train_gail(
             ):
                 mixed_t = align.encode_mixed(frame_t, traj_t, texts)
                 z_v = mixed_t["z_v"].float()        # (B, D)
-                z_t = mixed_t["z_t"].float()        # (B, D)
-                z_text = mixed_t["z_text"].float()  # (B, D)
+                z_s = mixed_t["z_s"].float()        # (B, D)
+                z_sext = mixed_t["z_sext"].float()  # (B, D)
 
             # -- Sample rollout actions (same states, different a) --
             action_rol = sample_rollout_actions(B)
 
             # -- Discriminator logits --
-            expert_logits = discriminator(z_v, z_t, z_text, action_exp)
-            rollout_logits = discriminator(z_v, z_t, z_text, action_rol)
+            expert_logits = discriminator(z_v, z_s, z_sext, action_exp)
+            rollout_logits = discriminator(z_v, z_s, z_sext, action_rol)
 
             # -- BCE loss (expert -> 1, rollout -> 0) --
             loss, exp_acc, rol_acc = gail_loss(expert_logits, rollout_logits)
@@ -599,14 +599,14 @@ def train_gail(
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     vmixed = align.encode_mixed(vframes, vtrajs, vtexts)
                     vz_v = vmixed["z_v"].float()
-                    vz_t = vmixed["z_t"].float()
-                    vz_text = vmixed["z_text"].float()
+                    vz_s = vmixed["z_s"].float()
+                    vz_sext = vmixed["z_sext"].float()
 
                 v_action_exp = vactions[:, -1, :6] if vactions.ndim == 3 else vactions[:, :6]
                 v_action_rol = sample_rollout_actions(B)
 
-                vexpert_logits = discriminator(vz_v, vz_t, vz_text, v_action_exp)
-                vrollout_logits = discriminator(vz_v, vz_t, vz_text, v_action_rol)
+                vexpert_logits = discriminator(vz_v, vz_s, vz_sext, v_action_exp)
+                vrollout_logits = discriminator(vz_v, vz_s, vz_sext, v_action_rol)
                 vloss, vexp_acc, vrol_acc = gail_loss(vexpert_logits, vrollout_logits)
                 val_losses.append(vloss.item())
                 val_exp_accs.append(vexp_acc.item())

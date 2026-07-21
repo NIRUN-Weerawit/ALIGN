@@ -496,7 +496,7 @@ def run_model_in_sim(
     max_steps: int = 200,
     alpha: float = 1.0,
     action_scale: float = 1.0,
-    z_text: Optional[torch.Tensor] = None,
+    z_sext: Optional[torch.Tensor] = None,
     render_size: int = 256,
     use_camera: str = "agentview_image",
     flip_vertical: bool = True,
@@ -598,13 +598,13 @@ def run_model_in_sim(
                     h_current = out["h_seq"][:, -1]
                     if model.head_type in ("flow", "diffusion_policy"):
                         a_model_full = model.sample_actions(
-                            out["z_v_pooled_seq"], out["z_t_seq"],
-                            h_current, z_text=z_text,
+                            out["z_v_pooled_seq"], out["z_s_seq"],
+                            h_current, z_sext=z_sext,
                         )
                     else:
                         a_model_full = model.predict_actions(
-                            out["z_v_pooled_seq"], out["z_t_seq"],
-                            h_current, z_text=z_text,
+                            out["z_v_pooled_seq"], out["z_s_seq"],
+                            h_current, z_sext=z_sext,
                         )
         a_model = a_model_full[0, 0, :].float().cpu().numpy()  # (6,) or (7,)
 
@@ -902,9 +902,9 @@ def main():
         print(f"    BDDL: {bddl_path}")
 
         # Encode text (if model uses text)
-        z_text_eval = None
+        z_sext_eval = None
         if getattr(model, "text_encoder", None) is not None:
-            z_text_eval = model.text_encoder([task_name] * 1)
+            z_sext_eval = model.text_encoder([task_name] * 1)
 
         try:
             if OffScreenRenderEnv is None:
@@ -949,7 +949,7 @@ def main():
             max_steps=args.max_steps,
             alpha=args.alpha,
             action_scale=args.action_scale if args.action_scale is not None else 1.0,
-            z_text=z_text_eval,
+            z_sext=z_sext_eval,
             render_size=args.render_size,
             use_camera=args.cameras,
             flip_vertical=flip_vertical,

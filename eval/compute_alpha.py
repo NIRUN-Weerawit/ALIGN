@@ -105,8 +105,8 @@ def compute_alpha(
     world_model,
     value_head,
     z_v: torch.Tensor,      # (D,)
-    z_t: torch.Tensor,      # (D,)
-    z_text: torch.Tensor,   # (D,)
+    z_s: torch.Tensor,      # (D,)
+    z_sext: torch.Tensor,   # (D,)
     a_human: torch.Tensor,  # (6,)
     a_model: torch.Tensor,  # (6,)
     tau: float = 1.0,
@@ -119,8 +119,8 @@ def compute_alpha(
       - v_m: V(s'_m) where s'_m = world_model(s, a_model)
 
     Implements:
-      s'_h = world_model(z_v, z_t, z_text, a_human)
-      s'_m = world_model(z_v, z_t, z_text, a_model)
+      s'_h = world_model(z_v, z_s, z_sext, a_human)
+      s'_m = world_model(z_v, z_s, z_sext, a_model)
       v_h = value_head(s'_h)
       v_m = value_head(s'_m)
       alpha = sigmoid((v_m - v_h) / tau)
@@ -130,11 +130,11 @@ def compute_alpha(
     """
     with torch.no_grad():
         # Imagine counterfactuals
-        z_v_h, z_t_h = world_model(z_v.unsqueeze(0), z_t.unsqueeze(0), z_text.unsqueeze(0), a_human.unsqueeze(0))
-        z_v_m, z_t_m = world_model(z_v.unsqueeze(0), z_t.unsqueeze(0), z_text.unsqueeze(0), a_model.unsqueeze(0))
+        z_v_h, z_s_h = world_model(z_v.unsqueeze(0), z_s.unsqueeze(0), z_sext.unsqueeze(0), a_human.unsqueeze(0))
+        z_v_m, z_s_m = world_model(z_v.unsqueeze(0), z_s.unsqueeze(0), z_sext.unsqueeze(0), a_model.unsqueeze(0))
         # Compute values
-        v_h = value_head(z_v_h.squeeze(0), z_t_h.squeeze(0), z_text)
-        v_m = value_head(z_v_m.squeeze(0), z_t_m.squeeze(0), z_text)
+        v_h = value_head(z_v_h.squeeze(0), z_s_h.squeeze(0), z_sext)
+        v_m = value_head(z_v_m.squeeze(0), z_s_m.squeeze(0), z_sext)
         # Sigmoid alpha
         diff = (v_m - v_h) / tau
         alpha = torch.sigmoid(diff)
@@ -150,8 +150,8 @@ def compute_alpha_batch(
     world_model,
     value_head,
     z_v: torch.Tensor,      # (B, D)
-    z_t: torch.Tensor,      # (B, D)
-    z_text: torch.Tensor,   # (B, D)
+    z_s: torch.Tensor,      # (B, D)
+    z_sext: torch.Tensor,   # (B, D)
     a_human: torch.Tensor,  # (B, 6)
     a_model: torch.Tensor,  # (B, 6)
     tau: float = 1.0,
@@ -162,11 +162,11 @@ def compute_alpha_batch(
     """
     with torch.no_grad():
         # Imagine counterfactuals
-        z_v_h, z_t_h = world_model(z_v, z_t, z_text, a_human)
-        z_v_m, z_t_m = world_model(z_v, z_t, z_text, a_model)
+        z_v_h, z_s_h = world_model(z_v, z_s, z_sext, a_human)
+        z_v_m, z_s_m = world_model(z_v, z_s, z_sext, a_model)
         # Compute values
-        v_h = value_head(z_v_h, z_t_h, z_text)
-        v_m = value_head(z_v_m, z_t_m, z_text)
+        v_h = value_head(z_v_h, z_s_h, z_sext)
+        v_m = value_head(z_v_m, z_s_m, z_sext)
         # Sigmoid alpha
         diff = (v_m - v_h) / tau
         alpha = torch.sigmoid(diff)
@@ -189,12 +189,12 @@ if __name__ == "__main__":
     vh = create_value_head(embed_dim=D)
 
     z_v = torch.randn(B, D)
-    z_t = torch.randn(B, D)
-    z_text = torch.randn(B, D)
+    z_s = torch.randn(B, D)
+    z_sext = torch.randn(B, D)
     a_human = torch.randn(B, A) * 0.05
     a_model = torch.randn(B, A) * 0.05
 
-    alpha, v_h, v_m = compute_alpha_batch(wm, vh, z_v, z_t, z_text, a_human, a_model, tau=1.0)
+    alpha, v_h, v_m = compute_alpha_batch(wm, vh, z_v, z_s, z_sext, a_human, a_model, tau=1.0)
     print(f"  alpha: {alpha}")
     print(f"  alpha range: [{alpha.min().item():.4f}, {alpha.max().item():.4f}]")
     print(f"  v_h: {v_h.tolist()}")
@@ -206,14 +206,14 @@ if __name__ == "__main__":
     # Test with different temperatures
     print("\nTesting tau effect:")
     for tau in [0.1, 1.0, 5.0]:
-        alpha_test, _, _ = compute_alpha_batch(wm, vh, z_v, z_t, z_text, a_human, a_model, tau=tau)
+        alpha_test, _, _ = compute_alpha_batch(wm, vh, z_v, z_s, z_sext, a_human, a_model, tau=tau)
         print(f"  tau={tau}: alpha range [{alpha_test.min().item():.4f}, {alpha_test.max().item():.4f}]")
 
     # Test with equal V_m and V_h (tie-breaking)
     print("\nTesting tie-breaking (V_m == V_h should give alpha=0.5):")
-    z_v_m_test, z_t_m_test = wm(z_v, z_t, z_text, a_human)  # same action
+    z_v_m_test, z_s_m_test = wm(z_v, z_s, z_sext, a_human)  # same action
     # Manually compute alpha for this case
-    v = vh(z_v_m_test, z_t_m_test, z_text)
+    v = vh(z_v_m_test, z_s_m_test, z_sext)
     alpha_tie = torch.sigmoid((v - v) / 1.0)  # v_m == v_h
     print(f"  alpha when v_m == v_h: {alpha_tie.tolist()}")
     print(f"  (Expected: all 0.5 — Decision 6)")

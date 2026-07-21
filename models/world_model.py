@@ -18,8 +18,8 @@ foundation for the new counterfactual alpha computation.
 
 Implementation mirrors FuturePredictionHeadMLP / FuturePredictionHeadTransformer
 but with:
-  - Action input (6D OSC_POSE delta) concatenated to (z_v, z_t, z_text)
-  - Single-step output (z_v', z_t') instead of K parallel
+  - Action input (6D OSC_POSE delta) concatenated to (z_v, z_s, z_sext)
+  - Single-step output (z_v', z_s') instead of K parallel
   - MSE loss on real embedding values (not cosine) for accurate dynamics
 """
 
@@ -39,13 +39,13 @@ class WorldModelMLP(nn.Module):
 
     Input layout (per sample):
       - z_v_window: (B, K, embed_dim) K past vision embeddings
-      - z_t_window: (B, K, embed_dim) K past trajectory embeddings
-      - z_text:     (B, embed_dim) text embedding (constant for the task)
+      - z_s_window: (B, K, embed_dim) K past trajectory embeddings
+      - z_sext:     (B, embed_dim) text embedding (constant for the task)
       - action:     (B, action_dim) the action to apply (6D OSC_POSE delta)
 
     Output:
       - z_v_prime: (B, embed_dim) predicted next vision embedding
-      - z_t_prime: (B, embed_dim) predicted next trajectory embedding
+      - z_s_prime: (B, embed_dim) predicted next trajectory embedding
 
     Args:
         embed_dim: per-modality embedding dim (default 256).
@@ -69,7 +69,7 @@ class WorldModelMLP(nn.Module):
         self.embed_dim = embed_dim
         self.action_dim = action_dim
         self.window_size = window_size
-        # Input: K * (z_v + z_t) + z_text + action  (new arch)
+        # Input: K * (z_v + z_s) + z_sext + action  (new arch)
         # or: 3*embed_dim + action_dim (old arch, window_size=0)
         if window_size > 0:
             input_dim = window_size * 2 * embed_dim + embed_dim + action_dim
@@ -94,27 +94,27 @@ class WorldModelMLP(nn.Module):
     def forward(
         self,
         z_v_window: torch.Tensor,  # (B, K, embed_dim) or (B, embed_dim) for old arch
-        z_t_window: torch.Tensor,  # (B, K, embed_dim) or (B, embed_dim) for old arch
-        z_text: torch.Tensor,      # (B, embed_dim)
+        z_s_window: torch.Tensor,  # (B, K, embed_dim) or (B, embed_dim) for old arch
+        z_sext: torch.Tensor,      # (B, embed_dim)
         action: torch.Tensor,      # (B, action_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predict next state embeddings from a window of past states + action.
 
         Returns:
-            (z_v_prime, z_t_prime), each of shape (B, embed_dim)
+            (z_v_prime, z_s_prime), each of shape (B, embed_dim)
         """
         if self.window_size > 0:
             # New architecture: (B, K, D) window
             B, K, D = z_v_window.shape
-            window_flat = torch.cat([z_v_window, z_t_window], dim=-1).reshape(B, -1)
-            x = torch.cat([window_flat, z_text, action], dim=-1)
+            window_flat = torch.cat([z_v_window, z_s_window], dim=-1).reshape(B, -1)
+            x = torch.cat([window_flat, z_sext, action], dim=-1)
         else:
             # Old architecture: (B, D) single embeddings
-            x = torch.cat([z_v_window, z_t_window, z_text, action], dim=-1)
+            x = torch.cat([z_v_window, z_s_window, z_sext, action], dim=-1)
         out = self.mlp(x)
         z_v_prime = out[:, :self.embed_dim]
-        z_t_prime = out[:, self.embed_dim:]
-        return z_v_prime, z_t_prime
+        z_s_prime = out[:, self.embed_dim:]
+        return z_v_prime, z_s_prime
 
 
 class WorldModelRNN(nn.Module):
@@ -129,13 +129,13 @@ class WorldModelRNN(nn.Module):
 
     Input layout (per sample):
       - z_v_window: (B, K, embed_dim) K past vision embeddings
-      - z_t_window: (B, K, embed_dim) K past trajectory embeddings
-      - z_text:     (B, embed_dim) text embedding (constant for the task)
+      - z_s_window: (B, K, embed_dim) K past trajectory embeddings
+      - z_sext:     (B, embed_dim) text embedding (constant for the task)
       - action:     (B, action_dim) the action to apply (6D OSC_POSE delta)
 
     Output:
       - z_v_prime: (B, embed_dim) predicted next vision embedding
-      - z_t_prime: (B, embed_dim) predicted next trajectory embedding
+      - z_s_prime: (B, embed_dim) predicted next trajectory embedding
 
     Args:
         embed_dim: per-modality embedding dim (default 256).
@@ -158,7 +158,7 @@ class WorldModelRNN(nn.Module):
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
 
-        # Per-timestep input: cat(z_v, z_t) = 2*embed_dim
+        # Per-timestep input: cat(z_v, z_s) = 2*embed_dim
         rnn_input_dim = 2 * embed_dim
         self.gru = nn.GRU(
             input_size=rnn_input_dim,
@@ -182,28 +182,28 @@ class WorldModelRNN(nn.Module):
     def forward(
         self,
         z_v_window: torch.Tensor,  # (B, K, embed_dim)
-        z_t_window: torch.Tensor,  # (B, K, embed_dim)
-        z_text: torch.Tensor,      # (B, embed_dim)
+        z_s_window: torch.Tensor,  # (B, K, embed_dim)
+        z_sext: torch.Tensor,      # (B, embed_dim)
         action: torch.Tensor,      # (B, action_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predict next state embeddings from a sequence of past states + action.
 
         Returns:
-            (z_v_prime, z_t_prime), each of shape (B, embed_dim)
+            (z_v_prime, z_s_prime), each of shape (B, embed_dim)
         """
         # Concatenate vision and trajectory at each timestep: (B, K, 2*D)
-        rnn_input = torch.cat([z_v_window, z_t_window], dim=-1)
+        rnn_input = torch.cat([z_v_window, z_s_window], dim=-1)
         # GRU: (B, K, 2*D) -> (B, K, hidden_dim), final hidden (num_layers, B, hidden_dim)
         _, h_n = self.gru(rnn_input)
         # Take the last layer's final hidden state: (B, hidden_dim)
         h_last = h_n[-1]  # (B, hidden_dim)
 
         # Concatenate with text and action: (B, hidden_dim + D + A)
-        x = torch.cat([h_last, z_text, action], dim=-1)
+        x = torch.cat([h_last, z_sext, action], dim=-1)
         out = self.output_mlp(x)
         z_v_prime = out[:, :self.embed_dim]
-        z_t_prime = out[:, self.embed_dim:]
-        return z_v_prime, z_t_prime
+        z_s_prime = out[:, self.embed_dim:]
+        return z_v_prime, z_s_prime
 
 
 class WorldModelTransformer(nn.Module):
@@ -248,20 +248,20 @@ class WorldModelTransformer(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,    # (B, embed_dim)
-        z_t: torch.Tensor,    # (B, embed_dim)
-        z_text: torch.Tensor, # (B, embed_dim)
+        z_s: torch.Tensor,    # (B, embed_dim)
+        z_sext: torch.Tensor, # (B, embed_dim)
         action: torch.Tensor, # (B, action_dim)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predict next state embeddings.
 
         Returns:
-            (z_v_prime, z_t_prime), each of shape (B, embed_dim)
+            (z_v_prime, z_s_prime), each of shape (B, embed_dim)
         """
         B, D = z_v.shape
         # Stack the three state vectors + action into a sequence of 1 token
         # (single-step: one "transition" token, but we can also think of
         # this as a sequence of length 1)
-        x = torch.cat([z_v, z_t, z_text, action], dim=-1)  # (B, 3D + A)
+        x = torch.cat([z_v, z_s, z_sext, action], dim=-1)  # (B, 3D + A)
         x = x.unsqueeze(1)  # (B, 1, 3D + A)
         # Project
         x = self.input_proj(x)  # (B, 1, d_model)
@@ -272,8 +272,8 @@ class WorldModelTransformer(nn.Module):
         out = out.squeeze(1)  # (B, 2*embed_dim)
         # Split
         z_v_prime = out[:, :D]
-        z_t_prime = out[:, D:]
-        return z_v_prime, z_t_prime
+        z_s_prime = out[:, D:]
+        return z_v_prime, z_s_prime
 
 
 def create_world_model(
@@ -321,12 +321,12 @@ def create_world_model(
 def world_model_loss(
     z_v_pred: torch.Tensor,
     z_v_true: torch.Tensor,
-    z_t_pred: torch.Tensor,
-    z_t_true: torch.Tensor,
+    z_s_pred: torch.Tensor,
+    z_s_true: torch.Tensor,
 ) -> torch.Tensor:
     """MSE on actual embedding values (not cosine).
 
-    Returns scalar loss = mean(MSE(z_v) + MSE(z_t)).
+    Returns scalar loss = mean(MSE(z_v) + MSE(z_s)).
 
     Why MSE not cosine: we need imagined states to have the right scale.
     V(s) is meaningless if imagined s' is in a different scale than
@@ -336,7 +336,7 @@ def world_model_loss(
     reshape the encoder.
     """
     loss_v = F.mse_loss(z_v_pred, z_v_true.detach())
-    loss_t = F.mse_loss(z_t_pred, z_t_true.detach())
+    loss_t = F.mse_loss(z_s_pred, z_s_true.detach())
     return (loss_v + loss_t) / 2
 
 
@@ -352,32 +352,32 @@ if __name__ == "__main__":
     B, D, A, K = 4, 256, 6, 5
     wm_mlp = WorldModelMLP(embed_dim=D, action_dim=A, window_size=K)
     z_v_window = torch.randn(B, K, D)
-    z_t_window = torch.randn(B, K, D)
-    z_text = torch.randn(B, D)
+    z_s_window = torch.randn(B, K, D)
+    z_sext = torch.randn(B, D)
     action = torch.randn(B, A)
-    z_v_p, z_t_p = wm_mlp(z_v_window, z_t_window, z_text, action)
+    z_v_p, z_s_p = wm_mlp(z_v_window, z_s_window, z_sext, action)
     assert z_v_p.shape == (B, D), f"z_v_p shape: {z_v_p.shape}"
-    assert z_t_p.shape == (B, D), f"z_t_p shape: {z_t_p.shape}"
-    print(f"  Output shapes OK: {z_v_p.shape}, {z_t_p.shape}")
-    loss = world_model_loss(z_v_p, z_v_window[:, -1], z_t_p, z_t_window[:, -1])
+    assert z_s_p.shape == (B, D), f"z_s_p shape: {z_s_p.shape}"
+    print(f"  Output shapes OK: {z_v_p.shape}, {z_s_p.shape}")
+    loss = world_model_loss(z_v_p, z_v_window[:, -1], z_s_p, z_s_window[:, -1])
     print(f"  Loss: {loss.item():.4f}")
     loss.backward()
     print(f"  Backward OK, params have gradients")
 
     print("\nTesting WorldModelTransformer...")
     wm_tx = WorldModelTransformer(embed_dim=D, action_dim=A)
-    z_v_p, z_t_p = wm_tx(z_v_window[:, -1], z_t_window[:, -1], z_text, action)
+    z_v_p, z_s_p = wm_tx(z_v_window[:, -1], z_s_window[:, -1], z_sext, action)
     assert z_v_p.shape == (B, D)
-    assert z_t_p.shape == (B, D)
-    print(f"  Output shapes OK: {z_v_p.shape}, {z_t_p.shape}")
-    loss = world_model_loss(z_v_p, z_v_window[:, -1], z_t_p, z_t_window[:, -1])
+    assert z_s_p.shape == (B, D)
+    print(f"  Output shapes OK: {z_v_p.shape}, {z_s_p.shape}")
+    loss = world_model_loss(z_v_p, z_v_window[:, -1], z_s_p, z_s_window[:, -1])
     print(f"  Loss: {loss.item():.4f}")
     loss.backward()
     print(f"  Backward OK")
 
     print("\nTesting create_world_model factory...")
     wm_factory = create_world_model("mlp", embed_dim=D, action_dim=A, window_size=K)
-    z_v_p, z_t_p = wm_factory(z_v_window, z_t_window, z_text, action)
+    z_v_p, z_s_p = wm_factory(z_v_window, z_s_window, z_sext, action)
     print(f"  Factory created: {type(wm_factory).__name__}")
 
     print("\nAll smoke tests passed.")

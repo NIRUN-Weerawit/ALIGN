@@ -9,7 +9,7 @@ indistinguishable to attention.
 
 Usage:
     pos_emb = SinusoidalPositionalEncoding(max_len=128, d_model=512)
-    z_t = z_t + pos_emb(z_t)  # broadcast over batch
+    z_s = z_s + pos_emb(z_s)  # broadcast over batch
 """
 
 import math

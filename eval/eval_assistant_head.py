@@ -169,10 +169,10 @@ def main():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                 mixed = model.encode_mixed(frames, state, texts)
                 z_v = mixed["z_v"].float()
-                z_t = mixed["z_t"].float()
-                z_text = mixed["z_text"].float()
+                z_s = mixed["z_s"].float()
+                z_sext = mixed["z_sext"].float()
 
-                action_pred = model.assistant_head(z_v, z_t, z_text)
+                action_pred = model.assistant_head(z_v, z_s, z_sext)
 
             # Compute metrics — single-step action prediction
             # action_pred and current_action are both (B, 6)

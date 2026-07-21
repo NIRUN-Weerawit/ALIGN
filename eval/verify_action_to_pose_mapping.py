@@ -122,15 +122,15 @@ def compute_displacement(p_before: dict, p_after: dict) -> dict:
     # Helper: robosuite returns quaternions in (w, x, y, z) order.
     # scipy.spatial.transform.Rotation uses (x, y, z, w) order.
     # Always convert (w, x, y, z) → (x, y, z, w) by rotating the elements.
-    def wxyz_to_xyzw(q):
+    def wxyz_so_xyzw(q):
         q = np.asarray(q, dtype=np.float64)
         if len(q) != 4:
             raise ValueError(f"Expected 4-element quaternion, got {q}")
         return np.array([q[1], q[2], q[3], q[0]])
 
     # Convert quaternions to scipy (x, y, z, w) format
-    q_before_xyzw = wxyz_to_xyzw(p_before["quat"])
-    q_after_xyzw = wxyz_to_xyzw(p_after["quat"])
+    q_before_xyzw = wxyz_so_xyzw(p_before["quat"])
+    q_after_xyzw = wxyz_so_xyzw(p_after["quat"])
 
     # Double-cover fix: pick the convention with positive w (closest to identity)
     if q_before_xyzw[3] < 0:

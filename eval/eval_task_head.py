@@ -7,7 +7,7 @@ Tests:
   2. OOD detection — ROC, recall, false positive rate
   3. Calibration — confidence vs correctness (ECE)
   4. α quality — distribution of (1-H)*(1-ood) across timesteps within episodes
-  5. z_text quality — cosine similarity of p@E_clip to the correct task embedding
+  5. z_sext quality — cosine similarity of p@E_clip to the correct task embedding
 
 Usage:
     PYTHONNOUSERSITE=1 python eval/eval_task_head.py \
@@ -58,12 +58,12 @@ def _encode_zv_zt(model, frames, state):
 
     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=True):
         z_v_raw = model.encode_vision(frames)
-        z_t_tokens_raw = model.encode_trajectory_tokens(state)
-        z_v_mixed, z_t_tokens_mixed, _ = model.cross_attention_mixer(
-            z_v_raw, z_t_tokens_raw, torch.zeros_like(z_v_raw),
+        z_s_tokens_raw = model.encode_trajectory_tokens(state)
+        z_v_mixed, z_s_tokens_mixed, _ = model.cross_attention_mixer(
+            z_v_raw, z_s_tokens_raw, torch.zeros_like(z_v_raw),
         )
-        z_t = z_t_tokens_mixed.mean(dim=1)
-    return z_v_mixed.float(), z_t.float()
+        z_s = z_s_tokens_mixed.mean(dim=1)
+    return z_v_mixed.float(), z_s.float()
 
 
 def build_task_vocabulary(h5_path: str) -> List[str]:
@@ -126,9 +126,9 @@ def test_1_classification(
         if not known_mask.any():
             continue
 
-        z_v, z_t = _encode_zv_zt(model, frames, state)
+        z_v, z_s = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
-            logits = task_head(z_v, z_t)
+            logits = task_head(z_v, z_s)
         logits = logits.float()
         known_logits = logits[:, :-1]
 
@@ -208,9 +208,9 @@ def test_2_ood_detection(
             ood_labels = torch.as_tensor(ood_labels)
         ood_labels = ood_labels.to(device)
 
-        z_v, z_t = _encode_zv_zt(model, frames, state)
+        z_v, z_s = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
-            logits = task_head(z_v, z_t)
+            logits = task_head(z_v, z_s)
         logits = logits.float()
         p = F.softmax(logits, dim=-1)
         p_ood = p[:, -1]
@@ -297,9 +297,9 @@ def test_3_calibration(
         if not known_mask.any():
             continue
 
-        z_v, z_t = _encode_zv_zt(model, frames, state)
+        z_v, z_s = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
-            logits = task_head(z_v, z_t)
+            logits = task_head(z_v, z_s)
         logits = logits.float()
         known_logits = logits[:, :-1]
 
@@ -398,9 +398,9 @@ def test_4_alpha_quality(
                 else:
                     f_t = f_t[np.newaxis]  # (1, V, H, W, 3) for multi-cam
 
-                z_v, z_t = _encode_zv_zt(model, f_t, p_t)
+                z_v, z_s = _encode_zv_zt(model, f_t, p_t)
                 with torch.no_grad():
-                    logits = task_head(z_v, z_t)
+                    logits = task_head(z_v, z_s)
                 logits = logits.float()
                 p = F.softmax(logits, dim=-1)
 
@@ -462,14 +462,14 @@ def test_4_alpha_quality(
 
 
 # ================================================================
-# Test 5: z_text quality
+# Test 5: z_sext quality
 # ================================================================
 
 def test_5_ztext_quality(
     model, task_head, e_clip, loader, device, known_tasks, use_bf16=True,
 ) -> Dict:
     """Cosine similarity of p@E_clip to the correct task's CLIP embedding."""
-    print("\n[Test 5] z_text quality (p@E_clip vs correct task embedding)")
+    print("\n[Test 5] z_sext quality (p@E_clip vs correct task embedding)")
     print("-" * 50)
 
     task_head.eval()
@@ -489,20 +489,20 @@ def test_5_ztext_quality(
         if not known_mask.any():
             continue
 
-        z_v, z_t = _encode_zv_zt(model, frames, state)
+        z_v, z_s = _encode_zv_zt(model, frames, state)
         with torch.no_grad():
-            logits = task_head(z_v, z_t)
+            logits = task_head(z_v, z_s)
         logits = logits.float()
         p = F.softmax(logits, dim=-1)
 
-        z_text = p @ e_clip  # (B, 256)
+        z_sext = p @ e_clip  # (B, 256)
 
         for i in range(len(task_ids)):
             if known_mask[i]:
                 gt_id = task_ids[i].item()
                 target_embedding = e_clip[gt_id]  # (256,)
                 cos = F.cosine_similarity(
-                    z_text[i].unsqueeze(0), target_embedding.unsqueeze(0), dim=-1
+                    z_sext[i].unsqueeze(0), target_embedding.unsqueeze(0), dim=-1
                 ).item()
                 all_cosines.append(cos)
 
@@ -654,7 +654,7 @@ def main():
         align, task_head, ds, device, n_episodes=args.n_episodes,
     )
 
-    # Test 5: z_text quality
+    # Test 5: z_sext quality
     report["test5_ztext_quality"] = test_5_ztext_quality(
         align, task_head, E_clip, loader, device, known_tasks,
     )
@@ -673,7 +673,7 @@ def main():
     print(f"  Test 2 (OOD Detection):   recall={t2['recall_at_0.5']:.3f}  AUROC={t2['auroc']:.3f}  FPR={t2['fpr_at_0.5']:.3f}")
     print(f"  Test 3 (Calibration):     ECE={t3['ece']:.3f}")
     print(f"  Test 4 (α Quality):       ramp={t4.get('alpha_ramp', 0):+.3f}  (first={t4.get('alpha_first_quartile', 0):.3f}  last={t4.get('alpha_last_quartile', 0):.3f})")
-    print(f"  Test 5 (z_text Quality):  mean_cos={t5['mean_cosine']:.3f}")
+    print(f"  Test 5 (z_sext Quality):  mean_cos={t5['mean_cosine']:.3f}")
     print("=" * 60)
 
     if args.output_json:

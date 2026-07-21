@@ -374,7 +374,7 @@ def _get_sim_frame(env, key="robot0_eye_in_hand_image",
 # World model input preparation helper
 # ================================================================
 
-def _prepare_world_model_input(world_model, z_v, z_t, K=5):
+def _prepare_world_model_input(world_model, z_v, z_s, K=5):
     """Add window dimension if the world model needs (B, K, D) input.
 
     Detects architecture via class name:
@@ -386,15 +386,15 @@ def _prepare_world_model_input(world_model, z_v, z_t, K=5):
         wm_window_size = getattr(world_model, "window_size", 0)
         if wm_window_size > 0:
             z_v_w = z_v.unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
-            z_t_w = z_t.unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
-            return z_v_w, z_t_w
-        return z_v, z_t
+            z_s_w = z_s.unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
+            return z_v_w, z_s_w
+        return z_v, z_s
     elif cls_name in ("WorldModelRNN", "WorldModelTransformer"):
         z_v_w = z_v.unsqueeze(1).expand(-1, K, -1).contiguous()
-        z_t_w = z_t.unsqueeze(1).expand(-1, K, -1).contiguous()
-        return z_v_w, z_t_w
+        z_s_w = z_s.unsqueeze(1).expand(-1, K, -1).contiguous()
+        return z_v_w, z_s_w
     else:
-        return z_v, z_t
+        return z_v, z_s
 
 
 # ================================================================
@@ -410,7 +410,7 @@ def run_episode_in_sim(
     expert_actions: np.ndarray,
     task_description: str,
     task_idx: str,
-    z_text: torch.Tensor,
+    z_sext: torch.Tensor,
     world_model=None,
     value_head=None,
     heads_model=None,
@@ -554,8 +554,8 @@ def run_episode_in_sim(
             with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frame_t, traj_t, [task_description])
             z_v = mixed["z_v"].float()
-            z_t = mixed["z_t"].float()
-            z_text_local = mixed["z_text"].float()
+            z_s = mixed["z_s"].float()
+            z_sext_local = mixed["z_sext"].float()
 
             current_action_t = torch.from_numpy(base_action[:6]).unsqueeze(0).float().to(device)
 
@@ -566,7 +566,7 @@ def run_episode_in_sim(
             a_model = np.zeros(6, dtype=np.float32)  # default fallback
             if heads_model is not None and hasattr(heads_model, 'assistant_head'):
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                    action_pred = heads_model.assistant_head(z_v, z_t, z_text_local)
+                    action_pred = heads_model.assistant_head(z_v, z_s, z_sext_local)
                 a_model = action_pred.squeeze(0).float().cpu().numpy()
                 # No scale conversion — model output is already in OSC units.
             # ── Compute α via counterfactual imagination ──
@@ -575,17 +575,17 @@ def run_episode_in_sim(
             elif not use_alpha_from_v or world_model is None or value_head is None:
                 alpha_val = 0.5
             else:
-                z_v_w, z_t_w = _prepare_world_model_input(world_model, z_v, z_t, K=traj_window)
+                z_v_w, z_s_w = _prepare_world_model_input(world_model, z_v, z_s, K=traj_window)
 
                 # Counterfactual: imagine next state for human action vs model action.
                 # In the current single-action design, both use the same action;
                 # in a multi-action design, a_model could be the assistant's
                 # suggested action instead.
-                z_v_h, z_t_h = world_model(z_v_w, z_t_w, z_text_local, current_action_t)
-                z_v_m, z_t_m = world_model(z_v_w, z_t_w, z_text_local, torch.from_numpy(a_model).unsqueeze(0).float().to(device))
+                z_v_h, z_s_h = world_model(z_v_w, z_s_w, z_sext_local, current_action_t)
+                z_v_m, z_s_m = world_model(z_v_w, z_s_w, z_sext_local, torch.from_numpy(a_model).unsqueeze(0).float().to(device))
 
-                v_h = value_head(z_v_h, z_t_h, z_text_local)
-                v_m = value_head(z_v_m, z_t_m, z_text_local)
+                v_h = value_head(z_v_h, z_s_h, z_sext_local)
+                v_m = value_head(z_v_m, z_s_m, z_sext_local)
 
                 diff = (v_m - v_h) / tau
                 alpha_val = float(torch.sigmoid(diff).item())
@@ -891,7 +891,7 @@ def evaluate_suite(
                     continue
                 print(f"    [match] {expert['text'][:60]} (frames: {expert['frames'].shape[0]})")
 
-                z_text = model.encode_text([task_name])
+                z_sext = model.encode_text([task_name])
 
                 bddl_path = get_bddl_path(suite_name, task_name)
                 if not os.path.exists(bddl_path):
@@ -927,7 +927,7 @@ def evaluate_suite(
                     expert_actions=expert["actions"],
                     task_description=task_name,
                     task_idx=task_idx,
-                    z_text=z_text,
+                    z_sext=z_sext,
                     noise_std=noise_std,
                     traj_window=5,
                     max_steps=max_steps,

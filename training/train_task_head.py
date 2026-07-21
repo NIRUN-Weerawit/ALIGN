@@ -3,13 +3,13 @@
 """ALIGN Task Identification Head — training script.
 
 Trains the TaskHead to predict which LIBERO task the user is performing
-from (z_v, z_t). The head's softmax is the source of both the gating
+from (z_v, z_s). The head's softmax is the source of both the gating
 signal α and the language conditioning for the assistant head
 (see docs/TASK_IDENTIFICATION_HEAD.md).
 
 The assistant head is trained separately — the task head only needs to
 produce good task beliefs. E_clip is built from the same CLIP text
-encoder the assistant head was trained on, so z_text = p @ E_clip is
+encoder the assistant head was trained on, so z_sext = p @ E_clip is
 already in the right semantic space.
 
 OOD training:
@@ -171,7 +171,7 @@ def split_vocabulary(
 
 
 # ================================================================
-# Collate: emits (z_v-ready frame, z_t-ready traj, text, task_id, ood_label)
+# Collate: emits (z_v-ready frame, z_s-ready traj, text, task_id, ood_label)
 # ================================================================
 
 def task_collate(
@@ -291,9 +291,9 @@ def evaluate(
         ood_labels = batch["ood_label"].to(device)
 
         with autocast_ctx:
-            # Run encoders + mixer (text not used — task head only sees z_v, z_t)
-            z_v, z_t = _encode_zv_zt(model, frames, state)
-            logits = task_head(z_v, z_t)         # (B, K+1)
+            # Run encoders + mixer (text not used — task head only sees z_v, z_s)
+            z_v, z_s = _encode_zv_zt(model, frames, state)
+            logits = task_head(z_v, z_s)         # (B, K+1)
         logits = logits.float()
         p = F.softmax(logits, dim=-1)
 
@@ -346,7 +346,7 @@ def _encode_zv_zt(
     state,                  # (B, 7) float32 v2 one-step state; (B, K, 6) legacy
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Encode a batch through vision, state, and the cross-attention
-    mixer, returning (z_v, z_t) — both (B, D) post-mixer.
+    mixer, returning (z_v, z_s) — both (B, D) post-mixer.
 
     v2 contract: ``state`` is a one-step (B, 7) robot state
     [pos(3), orientation(3), gripper(1)]. Legacy callers passing
@@ -357,12 +357,12 @@ def _encode_zv_zt(
       1. Encode raw vision (pooled) and state → (B, D) and (B, D)
       2. Pass through the cross-attention mixer with a zero text
          vector (no information, but keeps the mixer's K/V contract)
-      3. Return (z_v, z_t) — both (B, D)
+      3. Return (z_v, z_s) — both (B, D)
 
     At training time the mixer is frozen, so the fact that text is
-    always zero means z_v and z_t are deterministic functions of
+    always zero means z_v and z_s are deterministic functions of
     (vision, state) alone. At inference, the assistant head will use
-    the *task head's* z_text in its forward pass, not this one.
+    the *task head's* z_sext in its forward pass, not this one.
 
     Accepts numpy arrays (the default from `head_collate`) and torch
     tensors. If numpy, converts to float/uint8 tensors and moves them
@@ -380,17 +380,17 @@ def _encode_zv_zt(
 
     # Raw encoders (no mixer yet)
     z_v_raw = model.encode_raw_vision_pooled(frames)                    # (B, D)
-    z_t_raw = model.encode_state(state)                                 # (B, D) — handles (B, 7) and (B, K, 6)
+    z_s_raw = model.encode_state(state)                                 # (B, D) — handles (B, 7) and (B, K, 6)
     # Add a K=1 dim for the mixer's (B, K, D) traj contract
-    z_t_tokens_raw = z_t_raw.unsqueeze(1)                               # (B, 1, D)
+    z_s_tokens_raw = z_s_raw.unsqueeze(1)                               # (B, 1, D)
     # Cross-attention mixer with a zero text vector
-    z_v_mixed, z_t_tokens_mixed, _ = model.cross_attention_mixer(
-        z_v_raw, z_t_tokens_raw, torch.zeros_like(z_v_raw),
+    z_v_mixed, z_s_tokens_mixed, _ = model.cross_attention_mixer(
+        z_v_raw, z_s_tokens_raw, torch.zeros_like(z_v_raw),
     )
     # Mean-pool trajectory tokens — this is what the assistant head
     # and TaskHead both consume
-    z_t = z_t_tokens_mixed.mean(dim=1)                                  # (B, D)
-    return z_v_mixed, z_t
+    z_s = z_s_tokens_mixed.mean(dim=1)                                  # (B, D)
+    return z_v_mixed, z_s
 
 
 # ================================================================
@@ -633,8 +633,8 @@ def train_task_head(
             ood_labels = batch["ood_label"].to(device)
 
             with autocast_ctx:
-                z_v, z_t = _encode_zv_zt(model, frames, state)
-                logits = task_head(z_v, z_t)
+                z_v, z_s = _encode_zv_zt(model, frames, state)
+                logits = task_head(z_v, z_s)
                 loss, comps = task_head_loss(logits, task_ids, ood_labels)
             loss = loss.float()
 

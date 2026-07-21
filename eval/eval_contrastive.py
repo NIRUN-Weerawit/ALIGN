@@ -111,26 +111,26 @@ def get_raw_embeddings(
         texts: list of str, length B.
 
     Returns:
-        dict with 'z_v', 'z_t', 'z_text' (B, D) and
+        dict with 'z_v', 'z_s', 'z_sext' (B, D) and
         'cos_vt', 'cos_vl', 'cos_tl' (B,) pairwise similarities.
     """
     z_v = model.encode_raw_vision(frames)
-    z_t = model.encode_raw_trajectory(trajs)
-    z_text = model.encode_raw_text(texts)
-    if z_text is None:
-        z_text = torch.zeros_like(z_v)
+    z_s = model.encode_raw_trajectory(trajs)
+    z_sext = model.encode_raw_text(texts)
+    if z_sext is None:
+        z_sext = torch.zeros_like(z_v)
 
     z_v_n = F.normalize(z_v, dim=-1)
-    z_t_n = F.normalize(z_t, dim=-1)
-    z_text_n = F.normalize(z_text, dim=-1)
+    z_s_n = F.normalize(z_s, dim=-1)
+    z_sext_n = F.normalize(z_sext, dim=-1)
 
     return {
         "z_v": z_v.detach(),
-        "z_t": z_t.detach(),
-        "z_text": z_text.detach(),
-        "cos_vt": (z_v_n * z_t_n).sum(dim=-1).detach(),
-        "cos_vl": (z_v_n * z_text_n).sum(dim=-1).detach(),
-        "cos_tl": (z_t_n * z_text_n).sum(dim=-1).detach(),
+        "z_s": z_s.detach(),
+        "z_sext": z_sext.detach(),
+        "cos_vt": (z_v_n * z_s_n).sum(dim=-1).detach(),
+        "cos_vl": (z_v_n * z_sext_n).sum(dim=-1).detach(),
+        "cos_tl": (z_s_n * z_sext_n).sum(dim=-1).detach(),
     }
 
 
@@ -149,23 +149,23 @@ def get_mixed_embeddings(
         texts: list of str, length B.
 
     Returns:
-        dict with 'z_v', 'z_t', 'z_text' (B, D) and
+        dict with 'z_v', 'z_s', 'z_sext' (B, D) and
         'cos_vt', 'cos_vl', 'cos_tl' (B,) pairwise similarities.
     """
     mixed = model.encode_mixed(frames, trajs, texts)
-    z_v, z_t, z_text = mixed["z_v"], mixed["z_t"], mixed["z_text"]
+    z_v, z_s, z_sext = mixed["z_v"], mixed["z_s"], mixed["z_sext"]
 
     z_v_n = F.normalize(z_v, dim=-1)
-    z_t_n = F.normalize(z_t, dim=-1)
-    z_text_n = F.normalize(z_text, dim=-1)
+    z_s_n = F.normalize(z_s, dim=-1)
+    z_sext_n = F.normalize(z_sext, dim=-1)
 
     return {
         "z_v": z_v.detach(),
-        "z_t": z_t.detach(),
-        "z_text": z_text.detach(),
-        "cos_vt": (z_v_n * z_t_n).sum(dim=-1).detach(),
-        "cos_vl": (z_v_n * z_text_n).sum(dim=-1).detach(),
-        "cos_tl": (z_t_n * z_text_n).sum(dim=-1).detach(),
+        "z_s": z_s.detach(),
+        "z_sext": z_sext.detach(),
+        "cos_vt": (z_v_n * z_s_n).sum(dim=-1).detach(),
+        "cos_vl": (z_v_n * z_sext_n).sum(dim=-1).detach(),
+        "cos_tl": (z_s_n * z_sext_n).sum(dim=-1).detach(),
     }
 
 
@@ -192,25 +192,25 @@ def get_head_predictions(
         'cos_vt', 'cos_vl', 'cos_tl' (B,) from the mixer output.
     """
     mixed = model.encode_mixed(frames, trajs, texts)
-    z_v, z_t, z_text = mixed["z_v"], mixed["z_t"], mixed["z_text"]
+    z_v, z_s, z_sext = mixed["z_v"], mixed["z_s"], mixed["z_sext"]
 
     z_v_n = F.normalize(z_v, dim=-1)
-    z_t_n = F.normalize(z_t, dim=-1)
-    z_text_n = F.normalize(z_text, dim=-1)
+    z_s_n = F.normalize(z_s, dim=-1)
+    z_sext_n = F.normalize(z_sext, dim=-1)
 
-    alpha = model.decision_head(z_v, z_t, z_text)
+    alpha = model.decision_head(z_v, z_s, z_sext)
     if actions is None:
         # Backward-compat fallback: use last pose in the trajectory window
         actions = trajs[:, -1]
     # Single-step action prediction (no longer passes actions as input)
-    delta = model.assistant_head(z_v, z_t, z_text)
+    delta = model.assistant_head(z_v, z_s, z_sext)
 
     return {
         "alpha": alpha.detach(),
         "delta": delta.detach(),
-        "cos_vt": (z_v_n * z_t_n).sum(dim=-1).detach(),
-        "cos_vl": (z_v_n * z_text_n).sum(dim=-1).detach(),
-        "cos_tl": (z_t_n * z_text_n).sum(dim=-1).detach(),
+        "cos_vt": (z_v_n * z_s_n).sum(dim=-1).detach(),
+        "cos_vl": (z_v_n * z_sext_n).sum(dim=-1).detach(),
+        "cos_tl": (z_s_n * z_sext_n).sum(dim=-1).detach(),
     }
 
 

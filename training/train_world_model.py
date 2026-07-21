@@ -35,17 +35,17 @@ INPUT  (per sample, B = batch):
 
 OUTPUT (per sample, B = batch):
   - z_v_pred:   (B, 256)                    — predicted next visual embedding
-  - z_t_pred:   (B, 256)                    — predicted next trajectory embedding
+  - z_s_pred:   (B, 256)                    — predicted next trajectory embedding
 
 TARGET (one step ahead, t+1):
   - z_v_target: (B, 256)                    — encoded frame at t+1
-  - z_t_target: (B, 256)                    — mean-pooled encoded trajectory at t+1
+  - z_s_target: (B, 256)                    — mean-pooled encoded trajectory at t+1
   Both computed via align.encode_mixed(frames_next, traj_next, texts).
 
 LOSS:
-  - world_model_loss(z_v_pred, z_v_target, z_t_pred, z_t_target):
+  - world_model_loss(z_v_pred, z_v_target, z_s_pred, z_s_target):
       - loss_v = MSE(z_v_pred, z_v_target.detach())  — visual embedding MSE
-      - loss_t = MSE(z_t_pred, z_t_target.detach())  — trajectory embedding MSE
+      - loss_t = MSE(z_s_pred, z_s_target.detach())  — trajectory embedding MSE
       - total = (loss_v + loss_t) / 2
   - Why MSE (not cosine): imagined states must have the right SCALE
     for V(s') to be meaningful. Cosine only captures direction.
@@ -53,10 +53,10 @@ LOSS:
 METRICS (per epoch, logged to wandb + JSONL):
   - train/loss     (float, lower=better):  train MSE
   - train/cos_v    (float, [-1, 1]):       cosine sim of pred vs true z_v
-  - train/cos_t    (float, [-1, 1]):       cosine sim of pred vs true z_t
+  - train/cos_t    (float, [-1, 1]):       cosine sim of pred vs true z_s
   - val/loss       (float, lower=better):  val MSE
   - val/cos_v      (float, [-1, 1]):       val cosine sim z_v
-  - val/cos_t      (float, [-1, 1]):       val cosine sim z_t
+  - val/cos_t      (float, [-1, 1]):       val cosine sim z_s
 
 BEST CHECKPOINT:
   - Lowest val_loss on held-out split, saved as best.pt
@@ -477,7 +477,7 @@ def train_world_model(
             # v2 batch schema (from world_model_collate):
             #   frame_t, traj_t, action, frame_next, traj_next, text,
             #   state (B,7), state_next (B,7)
-            # The mixer still consumes a K-step traj window (z_t_tokens
+            # The mixer still consumes a K-step traj window (z_s_tokens
             # shape (B, K, D)); the v2 one-step `state` field is used as
             # the next-state target (matches `state_next` from the collate).
             # Fallback (frames_t/trajectory_t/...) is the legacy v1 schema.
@@ -523,19 +523,19 @@ def train_world_model(
                 z_v_window = align.encode_raw_vision_window(frames_t)  # (B, K, D)
 
                 # Encode trajectory and text
-                z_t_tokens = align.encode_raw_trajectory_tokens(traj_t)  # (B, K, D)
-                z_text = align.encode_raw_text(texts)                    # (B, D)
-                if z_text is None:
-                    z_text = torch.zeros_like(z_v_window[:, 0])
+                z_s_tokens = align.encode_raw_trajectory_tokens(traj_t)  # (B, K, D)
+                z_sext = align.encode_raw_text(texts)                    # (B, D)
+                if z_sext is None:
+                    z_sext = torch.zeros_like(z_v_window[:, 0])
 
                 # Through mixer — accepts (B, K, D) for z_v
-                z_v_window, z_t_tokens, z_text = align.cross_attention_mixer(
-                    z_v_window, z_t_tokens, z_text
+                z_v_window, z_s_tokens, z_sext = align.cross_attention_mixer(
+                    z_v_window, z_s_tokens, z_sext
                 )
 
                 # Slice to world model's window size (use last `window_size` timesteps)
                 z_v_window = z_v_window[:, -window_size:]
-                z_t_tokens = z_t_tokens[:, -window_size:]
+                z_s_tokens = z_s_tokens[:, -window_size:]
 
                 # -- Encode state_t+1 (target) via frozen ALIGNModel --
                 # v2: target is the one-step next state (B, 7). We still
@@ -543,14 +543,14 @@ def train_world_model(
                 # pass the future frames through encode_raw_vision and
                 # the future one-step state through encode_raw_trajectory_tokens.
                 z_v_target = align.encode_raw_vision(frames_next).float()  # (B, D)
-                z_t_target = align.encode_raw_trajectory_tokens(state_next).float()  # (B, D)
+                z_s_target = align.encode_raw_trajectory_tokens(state_next).float()  # (B, D)
 
             # -- Predict next state from window of past states + action --
-            z_v_pred, z_t_pred = world_model(z_v_window, z_t_tokens, z_text, action)
+            z_v_pred, z_s_pred = world_model(z_v_window, z_s_tokens, z_sext, action)
 
             # -- MSE loss (world_model_loss detaches targets internally
             #    via stop-gradient convention — encoder never trains) --
-            loss = world_model_loss(z_v_pred, z_v_target, z_t_pred, z_t_target)
+            loss = world_model_loss(z_v_pred, z_v_target, z_s_pred, z_s_target)
 
             opt.zero_grad()
             loss.backward()
@@ -562,7 +562,7 @@ def train_world_model(
                     z_v_pred, z_v_target, dim=-1
                 ).mean().item()
                 cos_t = torch.nn.functional.cosine_similarity(
-                    z_t_pred, z_t_target, dim=-1
+                    z_s_pred, z_s_target, dim=-1
                 ).mean().item()
 
             epoch_losses.append(loss.item())
@@ -585,7 +585,7 @@ def train_world_model(
         # -- Validation loop ------------------------------
         # Iterate the val_loader once, computing the same loss/metrics
         # as training but on held-out data. The world model is trained
-        # on (z_v_window, z_t_tokens, z_text, action) -> (z_v_target, z_t_target)
+        # on (z_v_window, z_s_tokens, z_sext, action) -> (z_v_target, z_s_target)
         # where targets are encoded state at t+1.
         val_losses: list = []
         val_cos_v: list = []
@@ -626,28 +626,28 @@ def train_world_model(
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     # Encode state_t (input)
                     z_v_w = align.encode_raw_vision_window(vf_t)
-                    z_t_tok = align.encode_raw_trajectory_tokens(vt_t)
-                    z_t_text = align.encode_raw_text(v_texts)
-                    if z_t_text is None:
-                        z_t_text = torch.zeros_like(z_v_w[:, 0])
-                    z_v_w, z_t_tok, z_t_text = align.cross_attention_mixer(
-                        z_v_w, z_t_tok, z_t_text
+                    z_s_tok = align.encode_raw_trajectory_tokens(vt_t)
+                    z_s_text = align.encode_raw_text(v_texts)
+                    if z_s_text is None:
+                        z_s_text = torch.zeros_like(z_v_w[:, 0])
+                    z_v_w, z_s_tok, z_s_text = align.cross_attention_mixer(
+                        z_v_w, z_s_tok, z_s_text
                     )
                     z_v_w = z_v_w[:, -window_size:]
-                    z_t_tok = z_t_tok[:, -window_size:]
+                    z_s_tok = z_s_tok[:, -window_size:]
 
                     # Encode state_t+1 (target) — v2 one-step next state
                     z_v_tgt = align.encode_raw_vision(vf_next).float()
-                    z_t_tgt = align.encode_raw_trajectory_tokens(v_state_next).float()
+                    z_s_tgt = align.encode_raw_trajectory_tokens(v_state_next).float()
 
                 # Predict + loss
-                z_v_p, z_t_p = world_model(z_v_w, z_t_tok, z_t_text, v_action)
-                v_loss = world_model_loss(z_v_p, z_v_tgt, z_t_p, z_t_tgt)
+                z_v_p, z_s_p = world_model(z_v_w, z_s_tok, z_s_text, v_action)
+                v_loss = world_model_loss(z_v_p, z_v_tgt, z_s_p, z_s_tgt)
                 v_cos_v = torch.nn.functional.cosine_similarity(
                     z_v_p, z_v_tgt, dim=-1
                 ).mean().item()
                 v_cos_t = torch.nn.functional.cosine_similarity(
-                    z_t_p, z_t_tgt, dim=-1
+                    z_s_p, z_s_tgt, dim=-1
                 ).mean().item()
                 val_losses.append(v_loss.item())
                 val_cos_v.append(v_cos_v)

@@ -421,7 +421,7 @@ def pretrain_from_stream(
                 # No explicit .float() — autocast handles precision of individual ops.
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     raw = model.encode_raw_all(frames, trajs, texts)
-                stats = criterion(raw["z_v"], raw["z_t"], raw["z_text"])
+                stats = criterion(raw["z_v"], raw["z_s"], raw["z_sext"])
                 loss = stats["loss"]
 
                 optimizer.zero_grad()
@@ -509,7 +509,7 @@ def pretrain_from_stream(
                             t_val = torch.cat([t_val, pad], dim=-1)
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                             raw_val = model.encode_raw_all(f_val, t_val, txt_val)
-                        s_val = criterion(raw_val["z_v"], raw_val["z_t"], raw_val["z_text"])
+                        s_val = criterion(raw_val["z_v"], raw_val["z_s"], raw_val["z_sext"])
                         val_losses.append(s_val["loss"].item())
                         val_vt.append(s_val["avg_cos_vt"].item())
                         val_vl.append(s_val["avg_cos_vl"].item())
@@ -577,7 +577,7 @@ def pretrain_from_stream(
                 # Mixer outputs
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                     mixed = model.encode_mixed(frames, trajs, texts)
-                stats = criterion(mixed["z_v"], mixed["z_t"], mixed["z_text"])
+                stats = criterion(mixed["z_v"], mixed["z_s"], mixed["z_sext"])
                 loss = stats["loss"]
 
                 optimizer.zero_grad()
@@ -665,7 +665,7 @@ def pretrain_from_stream(
                             t_val = torch.cat([t_val, pad], dim=-1)
                         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                             mixed_val = model.encode_mixed(f_val, t_val, txt_val)
-                        s_val = criterion(mixed_val["z_v"], mixed_val["z_t"], mixed_val["z_text"])
+                        s_val = criterion(mixed_val["z_v"], mixed_val["z_s"], mixed_val["z_sext"])
                         val_losses.append(s_val["loss"].item())
                         val_vt.append(s_val["avg_cos_vt"].item())
                         val_vl.append(s_val["avg_cos_vl"].item())
@@ -879,12 +879,12 @@ def train_heads_from_stream(
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, noisy_poses.unsqueeze(1).repeat(1, traj_window, 1), texts)
                 z_v = mixed["z_v"]
-                z_t = mixed["z_t"]
-                z_text = mixed["z_text"]
+                z_s = mixed["z_s"]
+                z_sext = mixed["z_sext"]
 
             # Joint loss: BCE(α) + 0.5 × MSE(Δ)
             # Assistant head input: the current human ACTION (delta from
-            # the actions_window), not the pose. The pose is encoded in z_t.
+            # the actions_window), not the pose. The pose is encoded in z_s.
             if actions_window is not None and isinstance(actions_window, torch.Tensor):
                 # Take the first step of the actions window as the "current" action
                 current_action = actions_window[:, 0, :6].to(device).float()
@@ -892,8 +892,8 @@ def train_heads_from_stream(
                 # Fallback: use the noisy pose diff (still 6D, but suboptimal)
                 current_action = noisy_poses[:, :6]
 
-            alpha_pred = model.decision_head(z_v, z_t, z_text)
-            delta_pred = model.assistant_head(z_v, z_t, z_text, current_action)
+            alpha_pred = model.decision_head(z_v, z_s, z_sext)
+            delta_pred = model.assistant_head(z_v, z_s, z_sext, current_action)
 
             loss = (F.binary_cross_entropy(alpha_pred.squeeze(-1), alpha_target) +
                     0.5 * F.mse_loss(delta_pred, delta_target))
@@ -997,9 +997,9 @@ def train_heads_from_stream(
                     with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                         val_mixed = model.encode_mixed(
                             f_val, val_noisy.unsqueeze(1).repeat(1, traj_window, 1), txt_val)
-                    v_alpha = model.decision_head(val_mixed["z_v"], val_mixed["z_t"], val_mixed["z_text"])
+                    v_alpha = model.decision_head(val_mixed["z_v"], val_mixed["z_s"], val_mixed["z_sext"])
                     # Val loop doesn't have actions_window — pass pose as fallback
-                    v_delta = model.assistant_head(val_mixed["z_v"], val_mixed["z_t"], val_mixed["z_text"], val_noisy[:, :6])
+                    v_delta = model.assistant_head(val_mixed["z_v"], val_mixed["z_s"], val_mixed["z_sext"], val_noisy[:, :6])
                     v_loss = (F.binary_cross_entropy(v_alpha.squeeze(-1), val_alpha_t) +
                               0.5 * F.mse_loss(v_delta, val_delta_t))
                     val_losses.append(v_loss.item())

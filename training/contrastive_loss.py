@@ -33,15 +33,15 @@ class ContrastiveLoss3Way(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,
-        z_t: torch.Tensor,
-        z_text: torch.Tensor,
+        z_s: torch.Tensor,
+        z_sext: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Compute 3-way contrastive loss.
 
         Args:
             z_v: (B, D) vision embeddings (raw, will be L2-normalized).
-            z_t: (B, D) trajectory embeddings (raw, will be L2-normalized).
-            z_text: (B, D) text embeddings (raw, will be L2-normalized).
+            z_s: (B, D) trajectory embeddings (raw, will be L2-normalized).
+            z_sext: (B, D) text embeddings (raw, will be L2-normalized).
 
         Returns:
             dict with 'loss', 'loss_vt', 'loss_vl', 'loss_tl', 'avg_cos_vt',
@@ -49,12 +49,12 @@ class ContrastiveLoss3Way(nn.Module):
         """
         # L2 normalize all embeddings — cosine similarity requires this
         z_v = F.normalize(z_v, dim=-1)
-        z_t = F.normalize(z_t, dim=-1)
-        z_text = F.normalize(z_text, dim=-1)
+        z_s = F.normalize(z_s, dim=-1)
+        z_sext = F.normalize(z_sext, dim=-1)
 
-        loss_vt, stats_vt = _pairwise_info_nce(z_v, z_t, self.temperature)
-        loss_vl, stats_vl = _pairwise_info_nce(z_v, z_text, self.temperature)
-        loss_tl, stats_tl = _pairwise_info_nce(z_t, z_text, self.temperature)
+        loss_vt, stats_vt = _pairwise_info_nce(z_v, z_s, self.temperature)
+        loss_vl, stats_vl = _pairwise_info_nce(z_v, z_sext, self.temperature)
+        loss_tl, stats_tl = _pairwise_info_nce(z_s, z_sext, self.temperature)
 
         loss = (loss_vt + loss_vl + loss_tl) / 3.0
 
@@ -102,8 +102,8 @@ def _pairwise_info_nce(
 
 def compute_contrastive_loss(
     z_v: torch.Tensor,
-    z_t: torch.Tensor,
-    z_text: torch.Tensor,
+    z_s: torch.Tensor,
+    z_sext: torch.Tensor,
     temperature: float = 0.07,
 ) -> dict[str, torch.Tensor]:
     """Standalone loss function wrapper.
@@ -111,4 +111,4 @@ def compute_contrastive_loss(
     Normalizes embeddings and computes 3-way InfoNCE.
     """
     criterion = ContrastiveLoss3Way(temperature=temperature)
-    return criterion(z_v, z_t, z_text)
+    return criterion(z_v, z_s, z_sext)

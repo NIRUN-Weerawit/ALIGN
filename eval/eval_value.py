@@ -98,8 +98,8 @@ def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
         mixed = model.encode_mixed(frames_t, traj_t, texts)
     return {
         "z_v": mixed["z_v"].float(),
-        "z_t": mixed["z_t"].float(),
-        "z_text": mixed["z_text"].float(),
+        "z_s": mixed["z_s"].float(),
+        "z_sext": mixed["z_sext"].float(),
         "action": torch.from_numpy(batch["action"]).float().to(device),
         "frame_next": batch.get("frame_next"),
         "traj_next": batch.get("traj_next"),
@@ -124,7 +124,7 @@ def test_1_v_has_variance(
             break
         emb = encode_batch(model, batch, device)
         with torch.no_grad():
-            v = value_head(emb["z_v"], emb["z_t"], emb["z_text"])
+            v = value_head(emb["z_v"], emb["z_s"], emb["z_sext"])
         values.extend(v.cpu().numpy().tolist())
 
     values = np.array(values)
@@ -212,13 +212,13 @@ def test_2_v_increases_along_trajectories(
                 f_last_t = torch.from_numpy(frames_last).to(device)
                 tr_last_t = torch.from_numpy(traj_last).float().to(device)
                 m_last = model.encode_mixed(f_last_t, tr_last_t, texts)
-                v_last = value_head(m_last["z_v"].float(), m_last["z_t"].float(), m_last["z_text"].float())
+                v_last = value_head(m_last["z_v"].float(), m_last["z_s"].float(), m_last["z_sext"].float())
 
                 # Encode first (using same traj window — approximation)
                 f_first_t = torch.from_numpy(frames_first).to(device)
                 tr_first_t = torch.from_numpy(traj_last).float().to(device)
                 m_first = model.encode_mixed(f_first_t, tr_first_t, texts)
-                v_first = value_head(m_first["z_v"].float(), m_first["z_t"].float(), m_first["z_text"].float())
+                v_first = value_head(m_first["z_v"].float(), m_first["z_s"].float(), m_first["z_sext"].float())
 
             # Check V_last >= V_first (or close)
             # Cast to FP32 first — BF16 outputs from value_head
@@ -278,8 +278,8 @@ def test_3_v_predicts_return(
             break
         emb = encode_batch(model, batch, device)
         with torch.no_grad():
-            v = value_head(emb["z_v"], emb["z_t"], emb["z_text"])
-            logits = gail_disc(emb["z_v"], emb["z_t"], emb["z_text"], emb["action"])
+            v = value_head(emb["z_v"], emb["z_s"], emb["z_sext"])
+            logits = gail_disc(emb["z_v"], emb["z_s"], emb["z_sext"], emb["action"])
             r = compute_reward(logits)
         v_list.extend(v.cpu().numpy().tolist())
         r_list.extend(r.cpu().numpy().tolist())
@@ -373,22 +373,22 @@ def test_4_v_counterfactual_discrimination(
         # repeating the current embedding K times.
         if use_window:
             z_v_w = emb["z_v"].unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
-            z_t_w = emb["z_t"].unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
+            z_s_w = emb["z_s"].unsqueeze(1).expand(-1, wm_window_size, -1).contiguous()
         else:
             z_v_w = emb["z_v"]
-            z_t_w = emb["z_t"]
+            z_s_w = emb["z_s"]
 
         # 1. Compute GAIL reward for the real (expert) action
         with torch.no_grad():
             expert_logits = gail_disc(
-                emb["z_v"], emb["z_t"], emb["z_text"], emb["action"]
+                emb["z_v"], emb["z_s"], emb["z_sext"], emb["action"]
             )
             expert_r = compute_reward(expert_logits)  # (B,)
 
             # 2. Sample random actions and compute their GAIL rewards
             random_action = torch.randn_like(emb["action"]) * 0.1
             rand_logits = gail_disc(
-                emb["z_v"], emb["z_t"], emb["z_text"], random_action
+                emb["z_v"], emb["z_s"], emb["z_sext"], random_action
             )
             rand_r = compute_reward(rand_logits)  # (B,)
 
@@ -401,19 +401,19 @@ def test_4_v_counterfactual_discrimination(
             # Imagine next states using the world model
             with torch.no_grad():
                 # s'_good = f(s, expert_action)
-                z_v_g, z_t_g = world_model(
-                    z_v_w[i:i+1], z_t_w[i:i+1],
-                    emb["z_text"][i:i+1], emb["action"][i:i+1]
+                z_v_g, z_s_g = world_model(
+                    z_v_w[i:i+1], z_s_w[i:i+1],
+                    emb["z_sext"][i:i+1], emb["action"][i:i+1]
                 )
                 # s'_bad = f(s, random_action)
-                z_v_b, z_t_b = world_model(
-                    z_v_w[i:i+1], z_t_w[i:i+1],
-                    emb["z_text"][i:i+1], random_action[i:i+1]
+                z_v_b, z_s_b = world_model(
+                    z_v_w[i:i+1], z_s_w[i:i+1],
+                    emb["z_sext"][i:i+1], random_action[i:i+1]
                 )
 
                 # V(s'_good) vs V(s'_bad) — value_head takes (B, D)
-                v_g = value_head(z_v_g, z_t_g, emb["z_text"][i:i+1]).float().item()
-                v_b = value_head(z_v_b, z_t_b, emb["z_text"][i:i+1]).float().item()
+                v_g = value_head(z_v_g, z_s_g, emb["z_sext"][i:i+1]).float().item()
+                v_b = value_head(z_v_b, z_s_b, emb["z_sext"][i:i+1]).float().item()
 
             n_pairs += 1
             if v_g > v_b:
@@ -466,10 +466,10 @@ def test_5_v_stability(
             break
         emb = encode_batch(model, batch, device)
         with torch.no_grad():
-            v1 = value_head(emb["z_v"], emb["z_t"], emb["z_text"])
+            v1 = value_head(emb["z_v"], emb["z_s"], emb["z_sext"])
             # Add small noise to z_v
             noise = torch.randn_like(emb["z_v"]) * noise_std
-            v2 = value_head(emb["z_v"] + noise, emb["z_t"], emb["z_text"])
+            v2 = value_head(emb["z_v"] + noise, emb["z_s"], emb["z_sext"])
         v_orig.extend(v1.cpu().numpy().tolist())
         v_noisy.extend(v2.cpu().numpy().tolist())
 

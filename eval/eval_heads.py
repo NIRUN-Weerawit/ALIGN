@@ -183,8 +183,8 @@ def evaluate(
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, state, texts)
                 z_v = mixed["z_v"].float()
-                z_t_tokens = mixed["z_t_tokens"].float()
-                z_text = mixed["z_text"].float()
+                z_s_tokens = mixed["z_s_tokens"].float()
+                z_sext = mixed["z_sext"].float()
 
             # Decision head (now a future prediction head)
             # Predict K future embeddings; compare against current-state embedding
@@ -195,26 +195,26 @@ def evaluate(
                 # In v2 there's no separate future-state field, so we use the
                 # current state's embedding as the target for self-prediction.
                 mixed_future = model.encode_mixed(frames, state, texts)
-                z_t_future_tokens = mixed_future["z_t_tokens"].float()
+                z_s_future_tokens = mixed_future["z_s_tokens"].float()
                 z_v_target = z_v.unsqueeze(1).expand(-1, K, -1)
                 z_v_window = z_v.unsqueeze(1).expand(-1, K, -1)
-                predicted_z_v, predicted_z_t = model.decision_head(
-                    z_v_window, z_t_tokens, z_text
+                predicted_z_v, predicted_z_s = model.decision_head(
+                    z_v_window, z_s_tokens, z_sext
                 )
             # Cosine loss for future prediction (lower = better)
             decision_loss = ALIGNModel.future_prediction_loss(
-                predicted_z_v, predicted_z_t, z_v_target, z_t_future_tokens
+                predicted_z_v, predicted_z_s, z_v_target, z_s_future_tokens
             )
             decision_losses.append(decision_loss.item())
 
             # Assistant head: input is current action, not pose
-            z_t = z_t_tokens.mean(dim=1)  # mean-pool for assistant head
+            z_s = z_s_tokens.mean(dim=1)  # mean-pool for assistant head
             _ca = batch.get("current_action", noisy_pose)
             if not isinstance(_ca, torch.Tensor):
                 _ca = torch.tensor(_ca, dtype=torch.float32)
             current_action = _ca.to(device)
             # Single-step action prediction: (B, 6)
-            action_pred = model.assistant_head(z_v, z_t, z_text)
+            action_pred = model.assistant_head(z_v, z_s, z_sext)
             rmse_per_batch = (action_pred - current_action).pow(2).mean(dim=1).sqrt()
             delta_rmses.extend(rmse_per_batch.cpu().tolist())
 

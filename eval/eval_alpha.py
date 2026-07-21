@@ -62,8 +62,8 @@ def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
         mixed = model.encode_mixed(frames_t, traj_t, texts)
     return {
         "z_v": mixed["z_v"].float(),
-        "z_t": mixed["z_t"].float(),
-        "z_text": mixed["z_text"].float(),
+        "z_s": mixed["z_s"].float(),
+        "z_sext": mixed["z_sext"].float(),
         "action": torch.from_numpy(batch["action"]).float().to(device),
     }
 
@@ -232,7 +232,7 @@ def main():
             # Compute alpha
             alpha, v_h, v_m = compute_alpha_batch(
                 world_model, value_head,
-                emb["z_v"], emb["z_t"], emb["z_text"],
+                emb["z_v"], emb["z_s"], emb["z_sext"],
                 a_human, a_model, tau=args.tau,
             )
             # Action divergence (how different are the two actions)

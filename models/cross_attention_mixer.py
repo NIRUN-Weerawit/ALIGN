@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Cross-Attention Mixer for ALIGN.
 
-Replaces simple concatenation of (z_v, z_t, z_text) with learned
+Replaces simple concatenation of (z_v, z_s, z_sext) with learned
 bidirectional cross-attention. Each modality is enriched by attending
 to the other two before the heads consume them.
 
@@ -145,11 +145,11 @@ class CrossAttentionMixer(nn.Module):
     """Bidirectional cross-attention mixer for ALIGN.
 
     Input:  z_v [B, 256] or [B, P, 256] (vision, single or patch tokens)
-            z_t [B, K, 256] (state / trajectory)
-            z_text [B, 256] (text)
+            z_s [B, K, 256] (state / trajectory)
+            z_sext [B, 256] (text)
     Output: z_v' [B, 256] or [B, P, 256]
-            z_t' [B, K, 256]
-            z_text' [B, 256]
+            z_s' [B, K, 256]
+            z_sext' [B, 256]
 
     The mixer is two stacked blocks. Each block has 3 cross-attention
     operations in this order: T → V → Text (trajectory conditions
@@ -265,18 +265,18 @@ class CrossAttentionMixer(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,
-        z_t: torch.Tensor,
-        z_text: torch.Tensor,
+        z_s: torch.Tensor,
+        z_sext: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Apply cross-attention mixer.
 
         Args:
             z_v: (B, D) or (B, K, D) — vision (single or batched frames)
-            z_t: (B, K, D) trajectory
-            z_text: (B, D) text
+            z_s: (B, K, D) trajectory
+            z_sext: (B, D) text
 
         Returns:
-            (z_v', z_t', z_text') — same shapes as inputs
+            (z_v', z_s', z_sext') — same shapes as inputs
         """
         # Handle both single vision token (B, D) and batched (B, K, D)
         v_is_batched = z_v.dim() == 3
@@ -287,8 +287,8 @@ class CrossAttentionMixer(nn.Module):
             B, D = z_v.shape
             v_h = self.input_proj["vision"](z_v).unsqueeze(1)  # (B, 1, mixer_dim)
 
-        t_h = self.input_proj["trajectory"](z_t)             # (B, K, mixer_dim)
-        x_h = self.input_proj["text"](z_text).unsqueeze(1)   # (B, 1, mixer_dim)
+        t_h = self.input_proj["trajectory"](z_s)             # (B, K, mixer_dim)
+        x_h = self.input_proj["text"](z_sext).unsqueeze(1)   # (B, 1, mixer_dim)
 
         # Add position embedding to trajectory (sinusoidal + learned)
         K = t_h.size(1)
@@ -316,9 +316,9 @@ class CrossAttentionMixer(nn.Module):
             z_v_out = z_v + self.output_proj["vision"](v_h)  # (B, K_v, D)
         else:
             z_v_out = z_v + self.output_proj["vision"](v_h).squeeze(1)  # (B, D)
-        z_t_out = z_t + self.output_proj["trajectory"](t_h)
-        z_text_out = z_text + self.output_proj["text"](x_h).squeeze(1)
-        return z_v_out, z_t_out, z_text_out
+        z_s_out = z_s + self.output_proj["trajectory"](t_h)
+        z_sext_out = z_sext + self.output_proj["text"](x_h).squeeze(1)
+        return z_v_out, z_s_out, z_sext_out
 
 
 # ================================================================
@@ -339,22 +339,22 @@ if __name__ == "__main__":
     )
 
     z_v = torch.randn(B, enc_dim)
-    z_t = torch.randn(B, K, enc_dim)
-    z_text = torch.randn(B, enc_dim)
+    z_s = torch.randn(B, K, enc_dim)
+    z_sext = torch.randn(B, enc_dim)
 
     # Test forward
-    z_v_out, z_t_out, z_text_out = mixer(z_v, z_t, z_text)
+    z_v_out, z_s_out, z_sext_out = mixer(z_v, z_s, z_sext)
     print(f"  Input  z_v:    {z_v.shape}")
-    print(f"  Input  z_t:    {z_t.shape}")
-    print(f"  Input  z_text: {z_text.shape}")
+    print(f"  Input  z_s:    {z_s.shape}")
+    print(f"  Input  z_sext: {z_sext.shape}")
     print(f"  Output z_v':   {z_v_out.shape}")
-    print(f"  Output z_t':   {z_t_out.shape}")
-    print(f"  Output z_text':{z_text_out.shape}")
+    print(f"  Output z_s':   {z_s_out.shape}")
+    print(f"  Output z_sext':{z_sext_out.shape}")
 
     # Test identity-ish init: output should be close to input
     diff_v = (z_v_out - z_v).abs().mean().item()
-    diff_t = (z_t_out - z_t).abs().mean().item()
-    diff_x = (z_text_out - z_text).abs().mean().item()
+    diff_t = (z_s_out - z_s).abs().mean().item()
+    diff_x = (z_sext_out - z_sext).abs().mean().item()
     print(f"\n  Mean |Δ| vision:     {diff_v:.4f}")
     print(f"  Mean |Δ| trajectory: {diff_t:.4f}")
     print(f"  Mean |Δ| text:       {diff_x:.4f}")
@@ -379,8 +379,8 @@ if __name__ == "__main__":
     assert 5e6 < n_params < 12e6, f"Unexpected param count: {n_params}"
 
     # Test gradient flow
-    z_v_out, z_t_out, z_text_out = mixer(z_v, z_t, z_text)
-    loss = (z_v_out ** 2).sum() + (z_t_out ** 2).sum() + (z_text_out ** 2).sum()
+    z_v_out, z_s_out, z_sext_out = mixer(z_v, z_s, z_sext)
+    loss = (z_v_out ** 2).sum() + (z_s_out ** 2).sum() + (z_sext_out ** 2).sum()
     loss.backward()
     n_grad = sum(1 for p in mixer.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
     n_total = sum(1 for p in mixer.parameters())

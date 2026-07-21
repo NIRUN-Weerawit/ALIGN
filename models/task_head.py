@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Task Identification Head for ALIGN.
 
-Predicts the LIBERO task the user is performing from (z_v, z_t) — the
+Predicts the LIBERO task the user is performing from (z_v, z_s) — the
 shared vision+trajectory embedding produced by the cross-attention mixer.
 
 Output is a (B, K+1) logit vector over K known tasks plus one OOD class.
@@ -12,7 +12,7 @@ The softmax of the logits does double duty:
         α = (1 - H) * (1 - p_ood) * safety_gate
 
   2. Task-aware language conditioning for the assistant head
-        z_text = p @ E_clip   # E_clip is a (K+1, 256) buffer of CLIP text
+        z_sext = p @ E_clip   # E_clip is a (K+1, 256) buffer of CLIP text
                               # embeddings, precomputed at construction
 
 Both come from the same softmax, so the model's confidence and the
@@ -23,7 +23,7 @@ Architecture
 ------------
     z_v (B, 256) ─┐
                    ├── cat → (B, 512) → Linear(512, 256) → ReLU
-    z_t (B, 256) ─┘                              → Linear(256, 256) → ReLU
+    z_s (B, 256) ─┘                              → Linear(256, 256) → ReLU
                                                   → Linear(256, K+1)
                                                   → logits (B, K+1)
 
@@ -70,7 +70,7 @@ class TaskHead(nn.Module):
 
     Inputs:
         z_v:  (B, 256) vision embedding (post-mixer)
-        z_t:  (B, 256) trajectory embedding (post-mixer)
+        z_s:  (B, 256) trajectory embedding (post-mixer)
 
     Outputs:
         logits: (B, K+1) where the last logit is the OOD class.
@@ -78,7 +78,7 @@ class TaskHead(nn.Module):
 
     The head is a small 3-layer MLP. No attention, no recurrence.
     The trajectory window's sub-phase information is already encoded in
-    z_t; the head only needs to identify which task those sub-phases
+    z_s; the head only needs to identify which task those sub-phases
     belong to.
     """
 
@@ -118,10 +118,10 @@ class TaskHead(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,    # (B, embed_dim)
-        z_t: torch.Tensor,    # (B, embed_dim)
+        z_s: torch.Tensor,    # (B, embed_dim)
     ) -> torch.Tensor:
         """Return (B, K+1) logits. Apply softmax(dim=-1) for probabilities."""
-        x = torch.cat([z_v, z_t], dim=-1)
+        x = torch.cat([z_v, z_s], dim=-1)
         return self.mlp(x)
 
 
@@ -178,7 +178,7 @@ class TaskHeadBundle(nn.Module):
     At inference, the same softmax `p = softmax(logits)` does two jobs:
 
       1. α (the gating signal) from entropy + OOD probability
-      2. z_text (the language conditioning for the assistant head) from
+      2. z_sext (the language conditioning for the assistant head) from
          `p @ E_clip`
 
     Both are coherent because they come from the same distribution.
@@ -200,7 +200,7 @@ class TaskHeadBundle(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,
-        z_t: torch.Tensor,
+        z_s: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         """Return all derived quantities from the head.
 
@@ -211,10 +211,10 @@ class TaskHeadBundle(nn.Module):
               "entropy":  (B,)    normalized entropy H/H_max in [0, 1],
               "p_ood":    (B,)    OOD probability p[:, -1],
               "alpha":    (B,)    (1 - H) * (1 - p_ood),
-              "z_text":   (B, D)  task-aware language embedding, p @ E_clip,
+              "z_sext":   (B, D)  task-aware language embedding, p @ E_clip,
             }
         """
-        logits = self.head(z_v, z_t)                    # (B, K+1)
+        logits = self.head(z_v, z_s)                    # (B, K+1)
         p = F.softmax(logits, dim=-1)                   # (B, K+1)
 
         # Normalized entropy: H in [0, 1], 0 = peaked, 1 = uniform.
@@ -229,7 +229,7 @@ class TaskHeadBundle(nn.Module):
 
         # Project task belief into the assistant head's language slot.
         # p @ E_clip is shape (B, D) where D = E_clip.shape[-1].
-        z_text = p @ self.E_clip                        # (B, D)
+        z_sext = p @ self.E_clip                        # (B, D)
 
         return {
             "logits": logits,
@@ -237,7 +237,7 @@ class TaskHeadBundle(nn.Module):
             "entropy": H_norm,
             "p_ood": p_ood,
             "alpha": alpha,
-            "z_text": z_text,
+            "z_sext": z_sext,
         }
 
     # ── convenience: build E_clip from a list of task strings ──
@@ -320,8 +320,8 @@ if __name__ == "__main__":
     B, D, K = 8, 256, 10
     head = TaskHead(embed_dim=D, num_known_classes=K)
     z_v = torch.randn(B, D)
-    z_t = torch.randn(B, D)
-    logits = head(z_v, z_t)
+    z_s = torch.randn(B, D)
+    logits = head(z_v, z_s)
     assert logits.shape == (B, K + 1), f"logits shape: {logits.shape}"
     print(f"  logits shape: {logits.shape}")
     print(f"  logits range: [{logits.min().item():.2f}, {logits.max().item():.2f}]")
@@ -339,10 +339,10 @@ if __name__ == "__main__":
     print("\nTesting TaskHeadBundle (E_clip)...")
     E_clip = torch.randn(K + 1, D)
     bundle = TaskHeadBundle(head, E_clip)
-    out = bundle(z_v, z_t)
+    out = bundle(z_v, z_s)
     for k, v in out.items():
         print(f"  {k:8s}: {tuple(v.shape)}")
-    assert out["z_text"].shape == (B, D)
+    assert out["z_sext"].shape == (B, D)
     assert torch.all(out["alpha"] >= 0) and torch.all(out["alpha"] <= 1)
     print(f"  alpha range: [{out['alpha'].min().item():.3f}, {out['alpha'].max().item():.3f}]")
 

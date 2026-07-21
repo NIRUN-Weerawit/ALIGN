@@ -76,7 +76,7 @@ from data.align_dataset import ALIGNDataset, world_model_collate
 def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
     """Encode a batch through the frozen encoder+mixer.
 
-    Returns dict with z_v (B, D), z_t (B, D), z_text (B, D), action (B, 6).
+    Returns dict with z_v (B, D), z_s (B, D), z_sext (B, D), action (B, 6).
 
     The `frame_t` field has different shapes depending on the camera setup:
       - Single camera: (B, K, H, W, 3) — K past frames
@@ -104,8 +104,8 @@ def encode_batch(model: ALIGNModel, batch: dict, device: torch.device) -> dict:
         mixed = model.encode_mixed(frames_t, traj_t, texts)
     return {
         "z_v": mixed["z_v"].float(),       # (B, D)
-        "z_t": mixed["z_t"].float(),       # (B, D) — mean-pooled
-        "z_text": mixed["z_text"].float(), # (B, D)
+        "z_s": mixed["z_s"].float(),       # (B, D) — mean-pooled
+        "z_sext": mixed["z_sext"].float(), # (B, D)
         "action": torch.from_numpy(batch["action"]).float().to(device),  # (B, 6)
     }
 
@@ -128,7 +128,7 @@ def test_1_reward_variance(
             break
         emb = encode_batch(model, batch, device)
         with torch.no_grad():
-            logits = discriminator(emb["z_v"], emb["z_t"], emb["z_text"], emb["action"])
+            logits = discriminator(emb["z_v"], emb["z_s"], emb["z_sext"], emb["action"])
             r = compute_reward(logits)
         rewards.extend(r.float().cpu().numpy().tolist())
 
@@ -174,12 +174,12 @@ def test_2_expert_vs_random(
         emb = encode_batch(model, batch, device)
         with torch.no_grad():
             # Expert
-            expert_logits = discriminator(emb["z_v"], emb["z_t"], emb["z_text"], emb["action"])
+            expert_logits = discriminator(emb["z_v"], emb["z_s"], emb["z_sext"], emb["action"])
             expert_r = compute_reward(expert_logits).float()
 
             # Random: sample from N(0, 0.1) — small but nonzero
             random_action = torch.randn_like(emb["action"]) * 0.1
-            random_logits = discriminator(emb["z_v"], emb["z_t"], emb["z_text"], random_action)
+            random_logits = discriminator(emb["z_v"], emb["z_s"], emb["z_sext"], random_action)
             random_r = compute_reward(random_logits).float()
 
         expert_rewards.extend(expert_r.cpu().numpy().tolist())
@@ -267,9 +267,9 @@ def test_3_reward_signals_progress(
                 with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=USE_BF16):
                     mixed = model.encode_mixed(f_t, p_t, text_i_str)
                     z_v = mixed["z_v"].float()
-                    z_t = mixed["z_t"].float()
-                    z_text = mixed["z_text"].float()
-                    logits = discriminator(z_v, z_t, z_text, a_t)
+                    z_s = mixed["z_s"].float()
+                    z_sext = mixed["z_sext"].float()
+                    logits = discriminator(z_v, z_s, z_sext, a_t)
                     r = compute_reward(logits).float().item()
                 rewards.append(r)
 
@@ -350,7 +350,7 @@ def test_4_reward_calibrated_to_action_distance(
                 # Action distance from expert (alpha * ||expert - random||)
                 action_dist = alpha * torch.norm(random_action - emb["action"], dim=-1)
 
-                logits = discriminator(emb["z_v"], emb["z_t"], emb["z_text"], a_interp)
+                logits = discriminator(emb["z_v"], emb["z_s"], emb["z_sext"], a_interp)
                 r = compute_reward(logits).float()
 
                 all_distances.extend(action_dist.cpu().numpy().tolist())
@@ -402,11 +402,11 @@ def test_5_reward_deterministic(
         emb = encode_batch(model, batch, device)
 
         with torch.no_grad():
-            logits1 = discriminator(emb["z_v"], emb["z_t"], emb["z_text"], emb["action"])
+            logits1 = discriminator(emb["z_v"], emb["z_s"], emb["z_sext"], emb["action"])
             r1 = compute_reward(logits1).float()
 
             # Same input, second evaluation
-            logits2 = discriminator(emb["z_v"], emb["z_t"], emb["z_text"], emb["action"])
+            logits2 = discriminator(emb["z_v"], emb["z_s"], emb["z_sext"], emb["action"])
             r2 = compute_reward(logits2).float()
 
         diff = (r1 - r2).abs().max().item()

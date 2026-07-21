@@ -23,7 +23,7 @@ from the value head (Stage 2, future work) which regresses on the
 GAIL reward.
 
 Implementation mirrors WorldModelMLP / WorldModelTransformer:
-  - Same input contract: (z_v, z_t, z_text, action) shape (B, 3*D + 6)
+  - Same input contract: (z_v, z_s, z_sext, action) shape (B, 3*D + 6)
   - Output: a SINGLE logit per sample (apply sigmoid for probability)
   - Loss: BCEWithLogitsLoss on expert vs rollout labels
   - Numerical stability: log() of small sigmoid values done via softplus
@@ -45,8 +45,8 @@ class GAILDiscriminatorMLP(nn.Module):
 
     Input layout (per sample):
       - z_v:    (B, embed_dim) current vision embedding
-      - z_t:    (B, embed_dim) current trajectory embedding
-      - z_text: (B, embed_dim) text embedding (constant for the task)
+      - z_s:    (B, embed_dim) current trajectory embedding
+      - z_sext: (B, embed_dim) text embedding (constant for the task)
       - action: (B, action_dim) the action to apply (6D OSC_POSE delta)
 
     Output:
@@ -100,8 +100,8 @@ class GAILDiscriminatorMLP(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,    # (B, embed_dim)
-        z_t: torch.Tensor,    # (B, embed_dim)
-        z_text: torch.Tensor, # (B, embed_dim)
+        z_s: torch.Tensor,    # (B, embed_dim)
+        z_sext: torch.Tensor, # (B, embed_dim)
         action: torch.Tensor, # (B, action_dim)
     ) -> torch.Tensor:
         """Compute discriminator logits.
@@ -110,7 +110,7 @@ class GAILDiscriminatorMLP(nn.Module):
             logits: (B,) — raw discriminator output. P(expert) = sigmoid(logits).
         """
         # Concatenate all inputs: (B, 3*embed_dim + action_dim)
-        x = torch.cat([z_v, z_t, z_text, action], dim=-1)
+        x = torch.cat([z_v, z_s, z_sext, action], dim=-1)
         # MLP: (B, 1) -> squeeze to (B,)
         out = self.mlp(x).squeeze(-1)
         return out
@@ -118,8 +118,8 @@ class GAILDiscriminatorMLP(nn.Module):
     def predict_proba(
         self,
         z_v: torch.Tensor,
-        z_t: torch.Tensor,
-        z_text: torch.Tensor,
+        z_s: torch.Tensor,
+        z_sext: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
         """Convenience: P(expert | s, a) ∈ (0, 1) (NOT for loss use).
@@ -127,7 +127,7 @@ class GAILDiscriminatorMLP(nn.Module):
         For training, use the logit output + BCEWithLogitsLoss directly.
         For reward computation, use `compute_reward(logits)` below.
         """
-        logits = self.forward(z_v, z_t, z_text, action)
+        logits = self.forward(z_v, z_s, z_sext, action)
         return torch.sigmoid(logits)
 
 
@@ -176,8 +176,8 @@ class GAILDiscriminatorTransformer(nn.Module):
     def forward(
         self,
         z_v: torch.Tensor,    # (B, embed_dim)
-        z_t: torch.Tensor,    # (B, embed_dim)
-        z_text: torch.Tensor, # (B, embed_dim)
+        z_s: torch.Tensor,    # (B, embed_dim)
+        z_sext: torch.Tensor, # (B, embed_dim)
         action: torch.Tensor, # (B, action_dim)
     ) -> torch.Tensor:
         """Compute discriminator logits.
@@ -187,7 +187,7 @@ class GAILDiscriminatorTransformer(nn.Module):
         """
         B = z_v.shape[0]
         # Stack the three state vectors + action into a single token
-        x = torch.cat([z_v, z_t, z_text, action], dim=-1)  # (B, 3D + A)
+        x = torch.cat([z_v, z_s, z_sext, action], dim=-1)  # (B, 3D + A)
         x = x.unsqueeze(1)  # (B, 1, 3D + A)
         # Project
         x = self.input_proj(x)  # (B, 1, d_model)
@@ -201,12 +201,12 @@ class GAILDiscriminatorTransformer(nn.Module):
     def predict_proba(
         self,
         z_v: torch.Tensor,
-        z_t: torch.Tensor,
-        z_text: torch.Tensor,
+        z_s: torch.Tensor,
+        z_sext: torch.Tensor,
         action: torch.Tensor,
     ) -> torch.Tensor:
         """Convenience: P(expert | s, a) ∈ (0, 1)."""
-        logits = self.forward(z_v, z_t, z_text, action)
+        logits = self.forward(z_v, z_s, z_sext, action)
         return torch.sigmoid(logits)
 
 
@@ -318,15 +318,15 @@ if __name__ == "__main__":
     B, D, A = 4, 256, 6
     disc_mlp = GAILDiscriminatorMLP(embed_dim=D, action_dim=A)
     z_v = torch.randn(B, D)
-    z_t = torch.randn(B, D)
-    z_text = torch.randn(B, D)
+    z_s = torch.randn(B, D)
+    z_sext = torch.randn(B, D)
     action = torch.randn(B, A)
-    logits = disc_mlp(z_v, z_t, z_text, action)
+    logits = disc_mlp(z_v, z_s, z_sext, action)
     assert logits.shape == (B,), f"logits shape: {logits.shape}"
     print(f"  Output shape OK: {logits.shape}")
 
     # predict_proba
-    proba = disc_mlp.predict_proba(z_v, z_t, z_text, action)
+    proba = disc_mlp.predict_proba(z_v, z_s, z_sext, action)
     assert proba.shape == (B,)
     assert (proba >= 0).all() and (proba <= 1).all()
     print(f"  predict_proba in [0, 1]: min={proba.min().item():.3f}, max={proba.max().item():.3f}")
@@ -346,7 +346,7 @@ if __name__ == "__main__":
 
     print("\nTesting GAILDiscriminatorTransformer...")
     disc_tx = GAILDiscriminatorTransformer(embed_dim=D, action_dim=A)
-    logits = disc_tx(z_v, z_t, z_text, action)
+    logits = disc_tx(z_v, z_s, z_sext, action)
     assert logits.shape == (B,), f"logits shape: {logits.shape}"
     print(f"  Output shape OK: {logits.shape}")
     loss, _, _ = gail_loss(logits, torch.randn(B))
@@ -355,7 +355,7 @@ if __name__ == "__main__":
 
     print("\nTesting create_gail_discriminator factory...")
     disc_factory = create_gail_discriminator("mlp", embed_dim=D, action_dim=A)
-    logits = disc_factory(z_v, z_t, z_text, action)
+    logits = disc_factory(z_v, z_s, z_sext, action)
     print(f"  Factory created: {type(disc_factory).__name__}")
 
     print("\nAll smoke tests passed.")

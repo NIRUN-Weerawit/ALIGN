@@ -17,13 +17,13 @@ TRAINING CONTRACT — train_heads.py (Phase 3: Assistant Head)
 INPUT  (per sample, B = batch):
   - MLP arch (default):
       - z_v:     (B, 256)            — current visual embedding (mean-pooled)
-      - z_t:     (B, 256)            — one-step state embedding (from robot_state: B, 7)
-      - z_text:  (B, 256)            — text embedding
+      - z_s:     (B, 256)            — one-step state embedding (from robot_state: B, 7)
+      - z_sext:  (B, 256)            — text embedding
   - Transformer arch (--assistant-arch transformer):
       - z_v_window: (B, K, 256)       — K past vision embeddings (K = --chunk-size)
-      - z_t_window: (B, K, 256)       — K-step state window (replicated from
-                                       one-step z_t in v2)
-      - z_text:     (B, 256)          — text embedding (broadcast over K)
+      - z_s_window: (B, K, 256)       — K-step state window (replicated from
+                                       one-step z_s in v2)
+      - z_sext:     (B, 256)          — text embedding (broadcast over K)
   - current_action: (B, 6)           — the human's current OSC action (target)
 
 OUTPUT (per sample, B = batch):
@@ -276,9 +276,9 @@ def train_heads_hdf5(
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 mixed = model.encode_mixed(frames, state, texts)
                 z_v = mixed["z_v"].float()
-                z_t = mixed["z_t"].float()
-                z_t_tokens = mixed["z_t_tokens"].float()  # (B, K, 256) for transformer
-                z_text = mixed["z_text"].float()
+                z_s = mixed["z_s"].float()
+                z_s_tokens = mixed["z_s_tokens"].float()  # (B, K, 256) for transformer
+                z_sext = mixed["z_sext"].float()
 
             # Assistant head: branch by architecture
             if model.assistant_arch == "transformer":
@@ -286,20 +286,20 @@ def train_heads_hdf5(
                 frames_window = torch.from_numpy(batch["frames_window"]).to(device)
                 z_v_window_raw = model.encode_raw_vision_window(frames_window)
                 # Transformer assistant expects (B, K, D) windows for both
-                # z_v and z_t. In v2 we have a one-step state; replicate
+                # z_v and z_s. In v2 we have a one-step state; replicate
                 # it K times to fake a K-step window of identical tokens.
-                # (The mixer already produces z_t_tokens with shape (B, K, D)
+                # (The mixer already produces z_s_tokens with shape (B, K, D)
                 #  where K=1 — replicate to the assistant's expected K.)
-                if z_t_tokens.shape[1] != K:
-                    z_t_window = z_t_tokens.expand(-1, K, -1)
+                if z_s_tokens.shape[1] != K:
+                    z_s_window = z_s_tokens.expand(-1, K, -1)
                 else:
-                    z_t_window = z_t_tokens
+                    z_s_window = z_s_tokens
                 z_v_window_mixed, _, _ = model.cross_attention_mixer(
-                    z_v_window_raw, z_t_window, z_text
+                    z_v_window_raw, z_s_window, z_sext
                 )
-                action_pred = model.assistant_head(z_v_window_mixed, z_t_window, z_text)
+                action_pred = model.assistant_head(z_v_window_mixed, z_s_window, z_sext)
             else:
-                action_pred = model.assistant_head(z_v, z_t, z_text)
+                action_pred = model.assistant_head(z_v, z_s, z_sext)
 
             # Single-step action loss (B, 6) vs (B, 6)
             # action_pred and current_action are both (B, 6) — current OSC action
@@ -339,24 +339,24 @@ def train_heads_hdf5(
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     vmixed = model.encode_mixed(vframes, vstate, vtexts)
                     vz_v = vmixed["z_v"].float()
-                    vz_t = vmixed["z_t"].float()
-                    vz_t_tokens = vmixed["z_t_tokens"].float()
-                    vz_text = vmixed["z_text"].float()
+                    vz_s = vmixed["z_s"].float()
+                    vz_s_tokens = vmixed["z_s_tokens"].float()
+                    vz_sext = vmixed["z_sext"].float()
                     if model.assistant_arch == "transformer":
                         vK = model.assistant_head.chunk_size
                         vframes_window = torch.from_numpy(vbatch["frames_window"]).to(device)
                         vz_v_window_raw = model.encode_raw_vision_window(vframes_window)
                         # v2: replicate one-step state to K-step window
-                        if vz_t_tokens.shape[1] != vK:
-                            vz_t_window = vz_t_tokens.expand(-1, vK, -1)
+                        if vz_s_tokens.shape[1] != vK:
+                            vz_s_window = vz_s_tokens.expand(-1, vK, -1)
                         else:
-                            vz_t_window = vz_t_tokens
+                            vz_s_window = vz_s_tokens
                         vz_v_window_mixed, _, _ = model.cross_attention_mixer(
-                            vz_v_window_raw, vz_t_window, vz_text
+                            vz_v_window_raw, vz_s_window, vz_sext
                         )
-                        vaction_pred = model.assistant_head(vz_v_window_mixed, vz_t_window, vz_text)
+                        vaction_pred = model.assistant_head(vz_v_window_mixed, vz_s_window, vz_sext)
                     else:
-                        vaction_pred = model.assistant_head(vz_v, vz_t, vz_text)
+                        vaction_pred = model.assistant_head(vz_v, vz_s, vz_sext)
                 vloss = F.mse_loss(vaction_pred, vcurrent_action)
                 val_losses.append(vloss.item())
                 val_actions.append(vaction_pred.detach().abs().mean().item())
