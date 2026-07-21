@@ -263,7 +263,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             z_s_all.append(model.state_encoder(s_t))
             
         # Stack: (B, S, V*P, comp_dim) and (B, S, state_dim)
-        z_v_mod_all = model.intention_encoder.encode_patches(torch.stack(z_v_pooled_all, dim=1) , torch.stack(z_s_all, dim=1))  # (B, S, V*P, comp_dim)
+        z_s_all = torch.stack(z_s_all, dim=1)
+        z_v_mod_all = model.intention_encoder.encode_patches(torch.stack(z_v_pooled_all, dim=1) , z_s_all)  # (B, S, V*P, comp_dim)
         # print(f"shapes: z_v_all: {z_v_mod_all.shape}")
         
         # Flatten patch axis into feature dim for head consumption (3D expected)
