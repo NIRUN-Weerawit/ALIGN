@@ -329,11 +329,6 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     h_for_head = h_current
                     # print(f"h_forhead shape: {h_for_head.shape}, z_v_win_for_head shape: {z_v_win_for_head.shape}")
 
-                # Predict actions (use model's own outputs for dim consistency)
-                actions_pred = model.predict_actions(
-                    z_v_win_for_head, z_t_win_model, h_for_head,
-                )
-
                 # Target: C future actions from current time
                 target_end = min(current_t + C, max_seg_len)
                 target = actions_seg[:, current_t:target_end]
@@ -341,24 +336,21 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     pad = target[:, -1:].expand(-1, C - target.shape[1], -1)
                     target = torch.cat([target, pad], dim=1)
 
-                # Pad model output with target's gripper if needed
-                if actions_pred.shape[-1] < target.shape[-1]:
-                    pad = target[..., actions_pred.shape[-1]:]
-                    actions_pred_loss = torch.cat([actions_pred, pad], dim=-1)
-                else:
-                    actions_pred_loss = actions_pred
-
                 # Loss
                 if args.head_type == "diffusion":
-                    # Slice actions_pred to target length K for diffusion loss (cond/action K must match)
-                    # print(f"  Diffusion loss: z_v_win_for_head shape: {z_v_win_for_head.shape}, z_t_win_model shape: {z_t_win_model.shape}, h_for_head shape: {h_for_head.shape}, target shape: {target.shape}")
+                    cond = model.intention_head(
+                        z_v_win_for_head, z_t_win_model, h_for_head,
+                    )
                     actions_pred = model.sample_actions(
                         z_v_win_for_head, z_t_win_model, h_for_head, num_steps=C
                     )
-                    pred_for_loss = actions_pred[:, :target.shape[1]]  # (B, C, cond_dim)
-                    loss = model.intention_head.loss(target, pred_for_loss)
+                    loss = model.intention_head.loss(target, cond)
                 else:
-                    loss = F.mse_loss(actions_pred_loss, target)
+                    # Predict actions (use model's own outputs for dim consistency)
+                    actions_pred = model.predict_actions(
+                        z_v_win_for_head, z_t_win_model, h_for_head,
+                    )
+                    loss = F.mse_loss(actions_pred, target)
 
             if args.skip_nan and not torch.isfinite(loss):
                 continue
@@ -412,27 +404,32 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]  # (B, mamba_output_dim) — latest
             # predict_actions returns actions (direct regression) or cond (flow head)
-            actions_pred = model.predict_actions(
-                out["z_v_pooled_seq"], out["z_t_seq"], h_current,
-            )  # (B, K, action_dim) — may be < target.shape[-1] if model
-                #   doesn't predict gripper
-
-            # Pad model output with target's gripper if needed.
-            # Model may output fewer dims (e.g. 6 for OSC deltas) than
-            # the dataset's action (7, including gripper). We pad with
-            # the target's gripper so the per-dim metrics are comparable.
-            if actions_pred.shape[-1] < target.shape[-1]:
-                pad = target[..., actions_pred.shape[-1]:]
-                actions_pred_for_loss = torch.cat([actions_pred, pad], dim=-1)
-            else:
-                actions_pred_for_loss = actions_pred
 
             # Loss depends on head type
             if args.head_type == "diffusion":
-                # Slice actions_pred to target length K for diffusion loss (cond/action K must match)
-                pred_for_loss = actions_pred[:, :target.shape[1]]  # (B, C, cond_dim)
-                loss = model.intention_head.loss(target, pred_for_loss)
+                cond = model.intention_head(
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                )
+                actions_pred = model.sample_actions(
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                    num_steps=target.shape[1],
+                )
+                loss = model.intention_head.loss(target, cond)
             else:
+                actions_pred = model.predict_actions(
+                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                )  # (B, K, action_dim) — may be < target.shape[-1] if model
+                    #   doesn't predict gripper
+
+                # Pad model output with target's gripper if needed.
+                # Model may output fewer dims (e.g. 6 for OSC deltas) than
+                # the dataset's action (7, including gripper). We pad with
+                # the target's gripper so the per-dim metrics are comparable.
+                if actions_pred.shape[-1] < target.shape[-1]:
+                    pad = target[..., actions_pred.shape[-1]:]
+                    actions_pred_for_loss = torch.cat([actions_pred, pad], dim=-1)
+                else:
+                    actions_pred_for_loss = actions_pred
                 # Direct regression: MSE on actions (use padded for fair comparison)
                 loss = F.mse_loss(actions_pred_for_loss, target)
 
@@ -486,46 +483,48 @@ def validate(model, loader, device, args):
     grip_total_total = 0          # # of gripper predictions
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False)
     for batch in pbar:
-        # V4 collate uses _segment keys; V3 uses _window keys
-        if "frames_segment" in batch:
-            frames = torch.from_numpy(batch["frames_segment"]).to(device)
-            state = torch.from_numpy(batch["states_segment"]).float().to(device)
-            target = torch.from_numpy(batch["actions_segment"]).float().to(device)
-        else:
-            frames = torch.from_numpy(batch["frames_window"]).to(device)
-            state = torch.from_numpy(batch["robot_state_window"]).float().to(device)
-            target = torch.from_numpy(batch["actions_window"]).float().to(device)
+
+        frames = torch.from_numpy(batch["frames_segment"]).to(device)
+        state = torch.from_numpy(batch["states_segment"]).float().to(device)
+        target = torch.from_numpy(batch["actions_segment"]).float().to(device)
+
+        # Use only the first observation (index 0) — matches training
+        # where current observation predicts next C actions
+        target_0 = target[:, :args.chunk_size]  # (B, C, 7)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out.get("intent_emb", out["h_seq"][:, -1])
             if args.head_type == "diffusion":
-                # For flow/diffusion heads, sample actions via generator's method
+                z_v_0 = out["z_v_pooled_seq"][:, 0:1]  # (B, 1, pool_out_dim)
+                z_t_0 = out["z_t_seq"][:, 0:1]          # (B, 1, state_dim)
                 actions_pred = model.sample_actions(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                    z_v_0, z_t_0, h_current, num_steps=args.chunk_size
                 )
                 # For loss reporting, also compute the generative head's loss
                 cond = model.intention_head(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                    z_v_0, z_t_0, h_current,
                 )
-                loss = model.intention_head.loss(target, cond)
+                loss = model.intention_head.loss(target_0, cond)
             else:
+                z_v_0 = out["z_v_pooled_seq"][:, 0:1]  # (B, 1, pool_out_dim)
+                z_t_0 = out["z_t_seq"][:, 0:1]          # (B, 1, state_dim)
                 actions_pred = model.predict_actions(
-                    out["z_v_pooled_seq"], out["z_t_seq"], h_current,
+                    z_v_0, z_t_0, h_current,
                 )
                 # Pad with target's gripper if needed
-                if actions_pred.shape[-1] < target.shape[-1]:
-                    pad = target[..., actions_pred.shape[-1]:]
+                if actions_pred.shape[-1] < target_0.shape[-1]:
+                    pad = target_0[..., actions_pred.shape[-1]:]
                     actions_pred_loss = torch.cat([actions_pred, pad], dim=-1)
                 else:
                     actions_pred_loss = actions_pred
-                loss = F.mse_loss(actions_pred_loss, target)
+                loss = F.mse_loss(actions_pred_loss, target_0)
 
         # Per-dim error accumulation (across batch and time)
         # Pad model output with target's gripper if needed so shapes match
-        if actions_pred.shape[-1] < target.shape[-1]:
-            pad = target[..., actions_pred.shape[-1]:].detach().float().cpu().numpy()
+        if actions_pred.shape[-1] < target_0.shape[-1]:
+            pad = target_0[..., actions_pred.shape[-1]:].detach().float().cpu().numpy()
             actions_pred_for_metric = np.concatenate(
                 [actions_pred.detach().float().cpu().numpy(), pad], axis=-1,
             )
@@ -533,7 +532,7 @@ def validate(model, loader, device, args):
             padded_gripper_batches += 1
         else:
             actions_pred_for_metric = actions_pred.detach().float().cpu().numpy()
-        target_np = target.detach().float().cpu().numpy()
+        target_np = target_0.detach().float().cpu().numpy()
         diff = actions_pred_for_metric - target_np  # (B, T, D)
         B, T, D = diff.shape
         if per_dim_squared is None:
@@ -546,10 +545,10 @@ def validate(model, loader, device, args):
         # Gripper accuracy (only meaningful if model output has >=7 dims
         # AND the model is actually predicting gripper, not just padded).
         # We track this only when the model's gripper prediction is genuine.
-        if actions_pred.shape[-1] >= 7 and target.shape[-1] >= 7:
+        if actions_pred.shape[-1] >= 7 and target_0.shape[-1] >= 7:
             genuine_gripper_batches += 1
             grip_pred = actions_pred[..., 6]  # model's gripper prediction
-            grip_target = target[..., 6]
+            grip_target = target_0[..., 6]
             # Convert continuous values to binary open/close
             grip_pred_binary = (grip_pred > 0).float()
             grip_target_binary = (grip_target > 0).float()
