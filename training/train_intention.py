@@ -274,6 +274,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         # Sequential T-loop
         last_actions_pred = None
+        actions_pred = None
         loss_accum = []
         for t in range(max_seg_len - C):
             # Build H-window ending at t+H-1
@@ -297,7 +298,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
                 out = model(f_win, s_win)
+                # print(f"out keys: {list(out.keys())}, z_v_pooled_seq shape: {out['z_v_pooled_seq'].shape}, z_t_seq shape: {out['z_t_seq'].shape}, h_seq shape: {out['h_seq'].shape}, intent_emb shape: {out.get('intent_emb', None).shape if out.get('intent_emb', None) is not None else None}")
                 intent_emb = out.get("intent_emb", None)
+                # print(f"Intent emb shape: {intent_emb.shape if intent_emb is not None else None}")
                 h_current = out["h_seq"][:, -1]
                 # Use model's own outputs to guarantee dim consistency
                 z_v_win_model = out["z_v_pooled_seq"]  # (B, H, pool_out_dim)
@@ -319,10 +322,12 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         # Warmup: store perceptual only, no retrieval
                         model.memory_module.store_perceptual_only(z_v_current)
                         z_v_win_for_head = z_v_win_model
-                        h_for_head = h_current
+                        h_for_head = intent_emb
+                    # print(f"Memory bank: h_forhead shape: {h_for_head.shape}, h_current shape: {h_current.shape},intention_fused shape: {intent_fused.shape if t >= H - 1 and intent_emb is not None else None}, z_v_win_for_head shape: {z_v_win_for_head.shape}, z_v_win_model shape: {z_v_win_model.shape}")
                 else:
                     z_v_win_for_head = z_v_win_model
                     h_for_head = h_current
+                    # print(f"h_forhead shape: {h_for_head.shape}, z_v_win_for_head shape: {z_v_win_for_head.shape}")
 
                 # Predict actions (use model's own outputs for dim consistency)
                 actions_pred = model.predict_actions(
@@ -344,8 +349,12 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     actions_pred_loss = actions_pred
 
                 # Loss
-                if args.head_type == "diffusion_policy":
+                if args.head_type == "diffusion":
                     # Slice actions_pred to target length K for diffusion loss (cond/action K must match)
+                    # print(f"  Diffusion loss: z_v_win_for_head shape: {z_v_win_for_head.shape}, z_t_win_model shape: {z_t_win_model.shape}, h_for_head shape: {h_for_head.shape}, target shape: {target.shape}")
+                    actions_pred = model.sample_actions(
+                        z_v_win_for_head, z_t_win_model, h_for_head, num_steps=C
+                    )
                     pred_for_loss = actions_pred[:, :target.shape[1]]  # (B, C, cond_dim)
                     loss = model.intention_head.loss(target, pred_for_loss)
                 else:
@@ -419,7 +428,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 actions_pred_for_loss = actions_pred
 
             # Loss depends on head type
-            if args.head_type == "diffusion_policy":
+            if args.head_type == "diffusion":
                 # Slice actions_pred to target length K for diffusion loss (cond/action K must match)
                 pred_for_loss = actions_pred[:, :target.shape[1]]  # (B, C, cond_dim)
                 loss = model.intention_head.loss(target, pred_for_loss)
@@ -477,15 +486,21 @@ def validate(model, loader, device, args):
     grip_total_total = 0          # # of gripper predictions
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False)
     for batch in pbar:
-        frames = torch.from_numpy(batch["frames_window"]).to(device)
-        state = torch.from_numpy(batch["robot_state_window"]).float().to(device)
-        target = torch.from_numpy(batch["actions_window"]).float().to(device)
+        # V4 collate uses _segment keys; V3 uses _window keys
+        if "frames_segment" in batch:
+            frames = torch.from_numpy(batch["frames_segment"]).to(device)
+            state = torch.from_numpy(batch["states_segment"]).float().to(device)
+            target = torch.from_numpy(batch["actions_segment"]).float().to(device)
+        else:
+            frames = torch.from_numpy(batch["frames_window"]).to(device)
+            state = torch.from_numpy(batch["robot_state_window"]).float().to(device)
+            target = torch.from_numpy(batch["actions_window"]).float().to(device)
 
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
-            h_current = out["h_seq"][:, -1]
-            if args.head_type == "diffusion_policy":
+            h_current = out.get("intent_emb", out["h_seq"][:, -1])
+            if args.head_type == "diffusion":
                 # For flow/diffusion heads, sample actions via generator's method
                 actions_pred = model.sample_actions(
                     out["z_v_pooled_seq"], out["z_t_seq"], h_current,
@@ -610,9 +625,9 @@ def parse_args():
     # Model
     parser.add_argument("--chunk-size", type=int, default=10)
     # Head selection
-    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion_policy"],
+    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion"],
                         default="mamba",
-                        help="Which head architecture: transformer, mamba, hybrid, or diffusion_policy")
+                        help="Which head architecture: transformer, mamba, hybrid, or diffusion")
     parser.add_argument("--use-history", action="store_true", default=True,
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
@@ -636,7 +651,7 @@ def parse_args():
                         help="Use CLS token instead of patch tokens from DINOv2.")
     parser.set_defaults(use_patch_tokens=True)
     # Per-patch compressed dim (SEVisualCompressor output)
-    parser.add_argument("--compressed-dim", type=int, default=16,
+    parser.add_argument("--compressed-dim", type=int, default=8,
                         help="Per-patch dim after SEVisualCompressor (default 16).")
     # V4: Intent tokens
     parser.add_argument("--use-intent-tokens", action="store_true", default=False,
@@ -661,20 +676,20 @@ def parse_args():
     parser.add_argument("--anchor-weight", type=float, default=0.0,
                         help="Weight for semantic anchoring loss (0 = disabled).")
     # Text modality (optional)
-    parser.add_argument("--use-text", action="store_true", default=True,
+    parser.add_argument("--use-text", action="store_true", default=False,
                         help="Enable text encoder + text-conditioned head.")
     parser.add_argument("--text-dim", type=int, default=256,
                         help="Text encoder output dim (default 256).")
     parser.add_argument("--task-text", type=str, default=None,
                         help="Task description for text conditioning (default: auto from dataset).")
     # IntentionTransformerHead params
-    parser.add_argument("--head-d-model", type=int, default=512,
+    parser.add_argument("--head-d-model", type=int, default=128,
                         help="IntentionTransformerHead model dimension (default: 512)")
-    parser.add_argument("--head-nhead", type=int, default=8,
+    parser.add_argument("--head-nhead", type=int, default=4,
                         help="IntentionTransformerHead number of head (default: 8)")
-    parser.add_argument("--head-num-layers", type=int, default=6,
+    parser.add_argument("--head-num-layers", type=int, default=2,
                         help="IntentionTransformerHead number of layer (default: 6)")
-    parser.add_argument("--head-dim-ff", type=int, default=1024,
+    parser.add_argument("--head-dim-ff", type=int, default=512,
                         help="IntentionTransformerHead feed-forward dimension (default: 1024)")
     # Training
     parser.add_argument("--output-dir", required=True)
@@ -714,9 +729,12 @@ def main():
     device = torch.device(args.device)
     print(f"\n=== ALIGN Intention (Mamba) Training ===")
     print(f"  Device:     {device}")
+    print(f"  Head Type:  {args.head_type} head")
     print(f"  Chunk (K):  {args.chunk_size}")
-    print(f"  Cameras:    {args.cameras}")
-
+    # Determine num_cameras from --cameras argument (auto-derived)
+    num_cameras = len(args.cameras)
+    print(f"  Cameras: {num_cameras} (from --cameras {args.cameras})")
+    
     # Output dir
     out_dir = Path(args.output_dir)
     if len(args.data) == 1:
@@ -755,10 +773,6 @@ def main():
     full_ds, train_ds, val_ds = build_datasets(args)
     train_loader, val_loader = build_loaders(train_ds, val_ds, args)
 
-    # Determine num_cameras from --cameras argument (auto-derived)
-    num_cameras = len(args.cameras)
-    print(f"  Cameras: {num_cameras} (from --cameras {args.cameras})")
-
     # Model
     print("\n  Building model...")
     model = build_model(args, num_cameras, device)
@@ -768,7 +782,6 @@ def main():
     # - Vision projection: always trainable (small, adapts generic features)
     # - State encoder: always trainable (no pretrained weights available)
     # - Intention encoder + head: always trainable
-    # Freeze the DINOv2 backbone (the only frozen component)
     for p in model.vision_encoder.backbone.parameters():
         p.requires_grad = False
     print("  DINOv2 backbone: frozen (ImageNet-pretrained)")
@@ -816,6 +829,7 @@ def main():
         else:
             dummy = frames_sample[0:1].to(device)
         z_v_dummy = model._vision_forward(dummy)
+        print(f"  Vision output shape: {z_v_dummy.shape}")
         if z_v_dummy.ndim == 2:
             N_tok_actual = z_v_dummy.shape[0]
         else:
@@ -830,7 +844,7 @@ def main():
     print(f"  Total model params: {n_total:,}")
 
     # Warn if LR is high (common cause of NaN with Mamba + BF16)
-    if args.lr > 1e-3:
+    if args.lr > 1e-3:  
         print(f"  ⚠️  WARNING: --lr {args.lr:.0e} is HIGH (default: 1e-4).")
         print(f"     Mamba + BF16 can be unstable at this LR. If you see NaN,")
         print(f"     lower --lr to 1e-4 (or 5e-4 for warmup).")
