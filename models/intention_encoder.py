@@ -258,6 +258,9 @@ class IntentionEncoder(nn.Module):
         self.vision_patch_encoder = VisionPatchEncoder(
             compressed_dim=compressed_dim, state_dim=state_dim,
             num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=se_reduction)
+        self.vision_patch_encoder_mamba = VisionPatchEncoder(
+            compressed_dim=compressed_dim // 2, state_dim=state_dim,
+            num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=se_reduction)
 
         # Mamba input: all VP positions x comp_dim + state embedding appended
         self.mamba_in_dim = self.total_tokens * compressed_dim + state_dim
@@ -310,6 +313,25 @@ class IntentionEncoder(nn.Module):
         z_v_mod_seq = []
         for t in range(T):
             out_t = self.vision_patch_encoder(z_v_patches[:, t], z_s[:, t])
+            z_v_mod_seq.append(out_t)
+        
+        return torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
+    
+    def encode_patches_for_mamba(self, z_v_patches: torch.Tensor, z_s: torch.Tensor
+                       ) -> torch.Tensor:
+        """Encode patches via VisionPatchEncoder without pooling.
+        
+        Args:
+            z_v_patches: (B, P_or_VP_tokens, raw_dim=768)
+            z_s:         (B, state_dim)
+        Returns:
+            (B, VP_tokens, compressed_dim) -- all VP positions preserved
+        """
+        B, T = z_v_patches.shape[:2]
+        # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
+        z_v_mod_seq = []
+        for t in range(T):
+            out_t = self.vision_patch_encoder_mamba(z_v_patches[:, t], z_s[:, t])
             z_v_mod_seq.append(out_t)
         
         return torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)

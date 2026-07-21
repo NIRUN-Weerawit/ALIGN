@@ -271,6 +271,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
         z_s_all = torch.stack(z_s_all, dim=1)
         z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
+        z_v_mamba_all = model.intention_encoder.encode_patches_for_mamba(z_v_all, z_s_all)  # (B, S, V*P, comp_dim //2 )
         # print(f"shapes: z_v_all: {z_v_mod_all.shape}")
         
         # Flatten patch axis into feature dim for head consumption (3D expected)
@@ -307,7 +308,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             # Forward through model (uses model's internal z_v_pooled_seq for consistency)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                out = model.forward_intent(z_v_win, z_s_win)
+                out = model.forward_intent(z_v_mamba_all[:, history_start:history_end], z_s_win)
                 # print(f"out keys: {list(out.keys())}, z_v_pooled_seq shape: {out['z_v_pooled_seq'].shape}, z_s_seq shape: {out['z_s_seq'].shape}, h_seq shape: {out['h_seq'].shape}, intent_emb shape: {out.get('intent_emb', None).shape if out.get('intent_emb', None) is not None else None}")
                 
                 intent_emb = out.get("intent_emb", None)
