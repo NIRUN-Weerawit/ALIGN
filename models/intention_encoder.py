@@ -259,7 +259,7 @@ class IntentionEncoder(nn.Module):
             compressed_dim=compressed_dim, state_dim=state_dim,
             num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=se_reduction)
         self.vision_patch_encoder_mamba = VisionPatchEncoder(
-            compressed_dim=compressed_dim // 2, state_dim=state_dim,
+            compressed_dim=4, state_dim=state_dim,
             num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=se_reduction)
 
         # Mamba input: all VP positions x comp_dim + state embedding appended
