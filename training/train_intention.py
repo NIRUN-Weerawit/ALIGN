@@ -257,9 +257,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         z_v_pooled_all = []
         z_s_all = []
         
-        B, S, V, H, W, C = frames_seg.shape
-        all_frames = frames_seg.reshape(B * S * V, H, W, C)  # (B*S*V, H, W, 3)
-        z_v_all = model._vision_forward(all_frames)            # (B*S*V, P, raw_dim=768)
+        B, S, V, H, W, C = frames_seg.shape 
+        z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P, raw_dim=768)
         _ ,P, raw_dim = z_v_all.shape
         z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
 
@@ -530,23 +529,21 @@ def validate(model, loader, device, args):
         max_seg_len = batch["frames_segment"].shape[1]
         z_v_pooled_all = []
         z_s_all = []
+        B, S, V, H, W, C = frames_seg.shape
+        all_frames = frames_seg.reshape(B * S * V, H, W, C)  # (B*S*V, H, W, 3)
+        z_v_all = model._vision_forward(all_frames)            # (B*S*V, P, raw_dim=768)
+        _ ,P, raw_dim = z_v_all.shape
+        z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
+
         for t in range(max_seg_len):
-            f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
+        #     f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
             s_t = states_seg[:, t]  # (B, 7)
-            z_v_t = model._vision_forward(f_t)
-            z_v_pooled_all.append(z_v_t)
+        #     z_v_pooled_all.append(model._vision_forward(f_t))
             z_s_all.append(model.state_encoder(s_t))
             
-        # Stack: (B, S, V*P, 768) and (B, S, state_dim)
-        z_v_all = torch.stack(z_v_pooled_all, dim=1)  # (B, S, V*P, 768)
+        # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
         z_s_all = torch.stack(z_s_all, dim=1)
-        
         z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
-        
-        # Flatten patch axis into feature dim for head consumption (3D expected)
-        B_seg, S, N_tok, comp_dim = z_v_mod_all.shape
-        z_v_all_stacked = z_v_mod_all.reshape(B_seg, S, N_tok * comp_dim)  # (B, S, V*P*comp_dim)
-
         # Sequential T-loop
         last_actions_pred = None
         actions_pred = None
@@ -562,7 +559,6 @@ def validate(model, loader, device, args):
             history_end = current_t + 1
 
             z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
-            z_v_win_stacked = z_v_all_stacked[:, history_start:history_end]  # (B, H_actual, pool_out_dim)
             z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
 
             valid_mask = seg_lens >= (current_t + C)
@@ -577,6 +573,9 @@ def validate(model, loader, device, args):
 
                 # Memory bank (3-stream: perceptual, cognitive, state)
                 if model.use_memory_bank:
+                    # Flatten patch axis into feature dim for head consumption (3D expected)
+                    B_seg, H_actual, VP, comp_dim = z_v_win.shape
+                    z_v_win_stacked = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, S, V*P*comp_dim)
                     z_v_current = z_v_win_stacked[:, -1]  # (B, pool_out_dim)
                     z_s_current = z_s_win[:, -1]  # (B, state_dim)
                     if intent_emb is not None:
