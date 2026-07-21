@@ -696,7 +696,7 @@ def parse_args():
     # Data
     parser.add_argument("--data", nargs="+", required=True,
                         help="Path(s) to HDF5 data file(s).")
-    parser.add_argument("--cameras", nargs="+", default=["wrist_image"],
+    parser.add_argument("--cameras", nargs="+", default=["image","wrist_image"],
                         help="Camera names to load (e.g. 'wrist_image image').")
     # NOTE: --num-cameras removed; auto-derived from --cameras.
     parser.add_argument("--val-split", type=float, default=0.1)
@@ -721,15 +721,15 @@ def parse_args():
                         help="Mamba conv kernel size (default 4).")
     parser.add_argument("--mamba-expand", type=int, default=2,
                         help="Mamba block expansion factor (default 2).")
-    parser.add_argument("--action-dim", type=int, default=6,
-                        help="Action output dim (default 6 for OSC).")
+    parser.add_argument("--action-dim", type=int, default=7,
+                        help="Action output dim (default 7).")
     # Patch tokens
     parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
                         action="store_false", default=True,
                         help="Use CLS token instead of patch tokens from DINOv2.")
     parser.set_defaults(use_patch_tokens=True)
     # Per-patch compressed dim (SEVisualCompressor output)
-    parser.add_argument("--compressed-dim", type=int, default=8,
+    parser.add_argument("--compressed-dim", type=int, default=16,
                         help="Per-patch dim after SEVisualCompressor (default 16).")
     # V4: Intent tokens
     parser.add_argument("--use-intent-tokens", action="store_true", default=False,
@@ -761,20 +761,20 @@ def parse_args():
     parser.add_argument("--task-text", type=str, default=None,
                         help="Task description for text conditioning (default: auto from dataset).")
     # IntentionTransformerHead params
-    parser.add_argument("--head-d-model", type=int, default=128,
+    parser.add_argument("--head-d-model", type=int, default=512,
                         help="IntentionTransformerHead model dimension (default: 512)")
-    parser.add_argument("--head-nhead", type=int, default=4,
+    parser.add_argument("--head-nhead", type=int, default=8,
                         help="IntentionTransformerHead number of head (default: 8)")
-    parser.add_argument("--head-num-layers", type=int, default=2,
+    parser.add_argument("--head-num-layers", type=int, default=6,
                         help="IntentionTransformerHead number of layer (default: 6)")
-    parser.add_argument("--head-dim-ff", type=int, default=512,
+    parser.add_argument("--head-dim-ff", type=int, default=1024,
                         help="IntentionTransformerHead feed-forward dimension (default: 1024)")
     # Training
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--run-name", default=None,
                         help="Custom run folder name (default: run_N auto-incremented).")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
