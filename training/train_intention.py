@@ -811,14 +811,10 @@ def main():
         else:
             frames_sample = sample
         # Take first timestep, add batch dim
-        if frames_sample.ndim == 5:
-            # (T, V, H, W, 3) -> (1, V, H, W, 3)
-            dummy = frames_sample[0:1].to(device)
-        elif frames_sample.ndim == 4:
-            # (T, H, W, 3) -> (1, H, W, 3)
-            dummy = frames_sample[0:1].to(device)
+        if isinstance(frames_sample, np.ndarray):
+            dummy = torch.from_numpy(frames_sample[0:1]).to(device)
         else:
-            raise ValueError(f"Unexpected frame shape: {frames_sample.shape}")
+            dummy = frames_sample[0:1].to(device)
         z_v_dummy = model._vision_forward(dummy)
         if z_v_dummy.ndim == 2:
             N_tok_actual = z_v_dummy.shape[0]
