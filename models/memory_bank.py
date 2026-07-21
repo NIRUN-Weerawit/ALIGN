@@ -326,7 +326,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         # Reshape N intent tokens to a single vector for query
         intent_query = intent_emb.reshape(intent_emb.shape[0], -1)   # [B, cognitive_dim]
         assert intent_query.shape[1] == self.cognitive_dim, f"Intent query should have a single token with {self.cognitive_dim} dimension after reshaping."
-        intent_query = intent_query.unsqueeze(1)                   # [B, 1, cognitive_dim]       
+        # intent_query = intent_query.unsqueeze(1)                   # [B, 1, cognitive_dim]       
         c_retrieved = self.cognitive_retrieval(
             intent_query, c_bank_pe, bank_mask=self._bank_mask,
         )  # (B, cognitive_dim)

@@ -278,7 +278,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_pred = None
         loss_accum = []
         num_windows = max_seg_len - H - C + 1
-
+        # print(f"Segment length: {max_seg_len}, num_windows: {num_windows}, H: {H}, C: {C}")
         for n in range(num_windows):
             # Build H-window ending at t+H-1
             # Current time = last frame in the window
@@ -700,8 +700,10 @@ def parse_args():
                         help="Camera names to load (e.g. 'wrist_image image').")
     # NOTE: --num-cameras removed; auto-derived from --cameras.
     parser.add_argument("--val-split", type=float, default=0.1)
+    
     # Model
     parser.add_argument("--chunk-size", type=int, default=10)
+    
     # Head selection
     parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion"],
                         default="mamba",
@@ -710,6 +712,7 @@ def parse_args():
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
                         help="Disable Mamba history component.")
+    
     # Architecture dimensions
     parser.add_argument("--state-dim", type=int, default=256,
                         help="Robot state encoder output dim (default 256).")
@@ -723,14 +726,17 @@ def parse_args():
                         help="Mamba block expansion factor (default 2).")
     parser.add_argument("--action-dim", type=int, default=7,
                         help="Action output dim (default 7).")
+    
     # Patch tokens
     parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
                         action="store_false", default=True,
                         help="Use CLS token instead of patch tokens from DINOv2.")
     parser.set_defaults(use_patch_tokens=True)
+    #
     # Per-patch compressed dim (SEVisualCompressor output)
     parser.add_argument("--compressed-dim", type=int, default=16,
                         help="Per-patch dim after SEVisualCompressor (default 16).")
+    
     # V4: Intent tokens
     parser.add_argument("--use-intent-tokens", action="store_true", default=False,
                         help="Enable learnable intent tokens (V4).")
@@ -738,11 +744,13 @@ def parse_args():
                         help="Number of intent tokens (default 2).")
     parser.add_argument("--intent-dim", type=int, default=512,
                         help="Intent token output dim (default 512).")
+    
     # V4: Memory bank
     parser.add_argument("--use-memory-bank", action="store_true", default=False,
                         help="Enable Perceptual-Cognitive Memory Bank (V4).")
     parser.add_argument("--memory-bank-len", type=int, default=16,
                         help="Max paired entries in bank (default 16).")
+    
     # V4: Segment training
     parser.add_argument("--history-size", type=int, default=20,
                         help="Past frames for Mamba window (default 20).")
@@ -750,9 +758,11 @@ def parse_args():
                         help="Min segment length = history_size * this (default 2).")
     parser.add_argument("--segment-max-mult", type=int, default=5,
                         help="Max segment length = history_size * this (default 5).")
+    
     # V4: Semantic anchoring
     parser.add_argument("--anchor-weight", type=float, default=0.0,
                         help="Weight for semantic anchoring loss (0 = disabled).")
+    
     # Text modality (optional)
     parser.add_argument("--use-text", action="store_true", default=False,
                         help="Enable text encoder + text-conditioned head.")
@@ -760,6 +770,7 @@ def parse_args():
                         help="Text encoder output dim (default 256).")
     parser.add_argument("--task-text", type=str, default=None,
                         help="Task description for text conditioning (default: auto from dataset).")
+    
     # IntentionTransformerHead params
     parser.add_argument("--head-d-model", type=int, default=512,
                         help="IntentionTransformerHead model dimension (default: 512)")
