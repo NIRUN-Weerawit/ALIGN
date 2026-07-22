@@ -339,21 +339,25 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
                             z_v_current, z_s_current, intent_emb
                         )
-                        z_v_win_for_head = z_v_fused
-                        z_s_win_for_head = z_s_fused
-                        h_for_head = intent_fused
+                        # Memory bank returns 2D (B, dim). Unsqueeze to (B, 1, dim)
+                        # so the head can apply per-step mean-pool (K=1).
+                        z_v_win_for_head = z_v_fused.unsqueeze(1)  # (B, 1, pool_out_dim)
+                        z_s_win_for_head = z_s_fused.unsqueeze(1)  # (B, 1, state_dim)
+                        h_for_head = intent_fused  # (B, N, intent_dim) — already 3D
                     else:
                         # Warmup: store perceptual + state, no retrieval
                         model.memory_module.store_perceptual_only(
                             z_v_current, z_s_current
                         )
-                        z_v_win_for_head = z_v_win_stacked
-                        z_s_win_for_head = z_s_win
+                        z_v_win_for_head = z_v_win_stacked[:, -1:]  # (B, 1, pool_out_dim)
+                        z_s_win_for_head = z_s_win[:, -1:]  # (B, 1, state_dim)
                         h_for_head = intent_emb
                 else:
-                    z_v_win_for_head = z_v_win
-                    z_s_win_for_head = z_s_win
-                    h_for_head = h_current
+                    # z_v_win: (B, Hs, V*P, comp_dim) — flatten to (B, Hs, V*P*comp_dim)
+                    B_seg, H_actual, VP, comp_dim = z_v_win.shape
+                    z_v_win_for_head = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, Hs, pool_out_dim)
+                    z_s_win_for_head = z_s_win  # (B, Hs, state_dim) — already 3D
+                    h_for_head = h_current  # (B, mamba_in_dim) — but the head expects 3D!
 
                 # Loss
                 if args.head_type == "diffusion":
@@ -587,9 +591,11 @@ def validate(model, loader, device, args):
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
                             z_v_current, z_s_current, intent_emb
                         )
-                        z_v_win_for_head = z_v_fused
-                        z_s_win_for_head = z_s_fused
-                        h_for_head = intent_fused
+                        # Memory bank returns 2D (B, dim). Unsqueeze to (B, 1, dim)
+                        # so the head can apply per-step mean-pool (K=1).
+                        z_v_win_for_head = z_v_fused.unsqueeze(1)  # (B, 1, pool_out_dim)
+                        z_s_win_for_head = z_s_fused.unsqueeze(1)  # (B, 1, state_dim)
+                        h_for_head = intent_fused  # (B, N, intent_dim) — already 3D
                     else:
                         # Warmup: store perceptual + state, no retrieval
                         model.memory_module.store_perceptual_only(z_v_current, z_s_current)
