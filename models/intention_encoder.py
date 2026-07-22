@@ -376,7 +376,7 @@ class IntentionEncoder(nn.Module):
             h_seq = self.mamba_to_hidden(h_seq)                # (B, T, mamba_output_dim)
             return h_seq
 
-    def forward_step(self, z_v_patches: torch.Tensor, z_s: torch.Tensor,
+    def forward_step(self, z_v_cls: torch.Tensor, z_s: torch.Tensor,
                      h_states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                      produce_intent: bool = False
                      ):
@@ -386,25 +386,28 @@ class IntentionEncoder(nn.Module):
         V4 (use_intent_tokens and produce_intent=True): returns (h_new, h_states, intent_emb)
 
         Args:
-            z_v_patches: (B, tokens, raw_dim=768)
-            z_s:         (B, state_dim)
-            h_states:    (conv_state, ssm_state) from prev step, or None
+            z_v_cls:    (B, V, raw_dim=768) — CLS tokens from DINOv2 (one per camera)
+            z_s:        (B, state_dim)
+            h_states:   (conv_state, ssm_state) from prev step, or None
             produce_intent: if True, run intent tokens through Mamba after history step
 
         Returns:
             (h_new, h_states) or (h_new, h_states, intent_emb)
+
+        NOTE: Following the design (CLS tokens for intention_encoder, patches for head),
+        this method takes CLS tokens directly. It does NOT use VisionPatchEncoder
+        (which is only used for the head's input via the memory bank).
         """
-        B = z_v_patches.shape[0]
+        B = z_v_cls.shape[0]
 
         if h_states is None:
             h_states = self.mamba.allocate_inference_cache(
                 batch_size=B, max_seqlen=1)
         conv_state, ssm_state = h_states
 
-        # Encode patches: SE compress + state modulate
-        z_v_mod = self.vision_patch_encoder(z_v_patches, z_s)  # (B, VP, comp_dim)
-        B_tok, N_tok, D_comp = z_v_mod.shape
-        mamba_in = torch.cat([z_v_mod.reshape(B_tok, N_tok * D_comp), z_s], dim=-1)
+        # Flatten CLS tokens and concat with z_s (same as forward())
+        B_tok, V, D = z_v_cls.shape
+        mamba_in = torch.cat([z_v_cls.reshape(B_tok, V * D), z_s], dim=-1)
 
         mamba_out, conv_state, ssm_state = self.mamba.step(
             mamba_in.unsqueeze(1),  # (B, 1, mamba_in_dim)

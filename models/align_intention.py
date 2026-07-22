@@ -336,8 +336,20 @@ class ALIGNIntentionModel(nn.Module):
             (z_v_pooled, z_s, h_new, h_states_new) or
             (z_v_pooled, z_s, h_new, h_states_new, intent_emb)
         """
-        z_v_patches = self._vision_forward(frames)
+        z_v_all = self._vision_forward(frames)  # (B, V*(P+1), 768) — patches + 1 CLS per camera
         z_s = self.state_encoder(robot_state)
+        V = self.num_cameras
+        # VisionEncoder output layout: [cam0_patches..., cam1_patches..., cam0_CLS, cam1_CLS, ...]
+        # Total tokens = V * (P + 1) where each camera has P patches + 1 CLS at the end.
+        total_tokens = z_v_all.shape[1]
+        P_plus_1 = total_tokens // V  # P + 1 per camera
+        P = P_plus_1 - 1
+        # Reshape to (B, V, P+1, 768) so we can split into patches and CLS per camera
+        z_v_all_reshaped = z_v_all.reshape(z_v_all.shape[0], V, P_plus_1, 768)
+        # CLS is the last position per camera: (B, V, 768)
+        z_v_cls = z_v_all_reshaped[:, :, -1, :]  # (B, V, 768)
+        # Patches are all positions except the last per camera: (B, V, P, 768)
+        z_v_patches = z_v_all_reshaped[:, :, :-1, :].reshape(z_v_all.shape[0], V * P, 768)
         z_v_pooled = z_v_patches
 
         # Build head on first call
@@ -347,7 +359,7 @@ class ALIGNIntentionModel(nn.Module):
 
         if self.use_history:
             result = self.intention_encoder.forward_step(
-                z_v_patches, z_s, h_states, produce_intent=produce_intent,
+                z_v_cls, z_s, h_states, produce_intent=produce_intent,
             )
             if self.use_intent_tokens and produce_intent:
                 h_new, h_states_new, intent_emb = result

@@ -258,16 +258,20 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         z_s_all = []
         
         
-        B, S, V, H, W, C = frames_seg.shape 
+        B, S, V, H, W, C = frames_seg.shape
         z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
-        
-        z_v_CLS_all = z_v_all[:, -1]  # (B*S*V, raw_dim=768) — CLS tokens only 
+
+        # Extract CLS tokens (last position per camera, NOT the last position overall).
+        # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
+        P_plus_1 = z_v_all.shape[1]
+        P = P_plus_1 - 1
+        z_v_all_reshaped = z_v_all.reshape(B * S, V, P_plus_1, 768)
+        z_v_CLS_all = z_v_all_reshaped[:, :, -1, :]  # (B*S, V, 768)
         z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
-        
-        z_v_all = z_v_all[:, :-1]  # (B*S*V, P, raw_dim=768) — patch tokens only
-        
-        # print(f"z_v_all shape: {z_v_all.shape}, z_v_CLS_all shape: {z_v_CLS_all.shape}")
-        
+
+        # Extract patches (all positions except the last per camera)
+        z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B * S, V * P, 768)
+
         _ ,P, raw_dim = z_v_all.shape
         z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
         
@@ -538,14 +542,22 @@ def validate(model, loader, device, args):
             model.memory_module.reset(batch_size=B_s, device=device)
 
         # Pre-encode vision for the entire segment (vision is the bottleneck)
-        B, S, V, H, W, C = frames_seg.shape 
+        B, S, V, H, W, C = frames_seg.shape
         z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
-        
-        z_v_CLS_all = z_v_all[:, -1]  # (B*S*V, raw_dim=768) — CLS tokens only 
+
+        # Extract CLS tokens (last position per camera, NOT the last position overall).
+        # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
+        # Total tokens per camera = P + 1
+        P_plus_1 = z_v_all.shape[1]
+        P = P_plus_1 - 1
+        # Reshape to (B*S*V, P+1, 768) then take last per camera
+        z_v_all_reshaped = z_v_all.reshape(B * S, V, P_plus_1, 768)
+        z_v_CLS_all = z_v_all_reshaped[:, :, -1, :]  # (B*S, V, 768)
         z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
-        
-        z_v_all = z_v_all[:, :-1]  # (B*S*V, P, raw_dim=768) — patch tokens only
-        
+
+        # Extract patches (all positions except the last per camera)
+        z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B * S, V * P, 768)
+
         _ ,P, raw_dim = z_v_all.shape
         z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
         
