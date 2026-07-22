@@ -30,7 +30,7 @@ INFERENCE FIXES
 - Full gating signal: α = need × consistency                         [8124ba6]
 - encoder_checkpoint flag for proper backbone loading                [inference fix]
 - detect chunk_size from checkpoint config                           [781ff7c]
-- Precomputed z_text cache for speed                                 [781ff7c]
+- Precomputed z_sext cache for speed                                 [781ff7c]
 
 SIMULATION EVAL (eval/eval_libero.py)
 - OffScreenRenderEnv with BDDL file path                             [eb0a63d]

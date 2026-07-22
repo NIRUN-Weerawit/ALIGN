@@ -74,6 +74,7 @@ BEST CHECKPOINT:
 
 import argparse
 import json
+from pyexpat import model
 import sys
 import time
 from datetime import datetime
@@ -237,20 +238,20 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         except StopIteration:
             break
 
-        H = args.history_size
-        C = args.chunk_size
-        B = len(batch["segment_len"])
-        max_seg_len = batch["frames_segment"].shape[1]
+        Hs = args.history_size
+        chunk_size = args.chunk_size
 
+        max_seg_len = batch["frames_segment"].shape[1]
+        # print(f"Segment length: {max_seg_len}, batch['frames_segment'].shape: {batch['frames_segment'].shape}")
         frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
         states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
         actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
-        
+        print(f"seg_lens: {seg_lens}")
         # Reset memory bank at start of segment
         if model.use_memory_bank:
-            model.memory_module.reset(batch_size=B, device=device)
+            model.memory_module.reset(batch_size=seg_lens.shape[0], device=device)
 
         # Pre-encode vision for the entire segment (vision is the bottleneck)
         # We process each timestep's frames through vision encoder
@@ -258,20 +259,28 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         z_s_all = []
         
         B, S, V, H, W, C = frames_seg.shape 
-        z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P, raw_dim=768)
+        z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
+        
+        z_v_CLS_all = z_v_all[:, -1]  # (B*S*V, raw_dim=768) — CLS tokens only 
+        z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
+        
+        z_v_all = z_v_all[:, :-1]  # (B*S*V, P, raw_dim=768) — patch tokens only
+        
+        # print(f"z_v_all shape: {z_v_all.shape}, z_v_CLS_all shape: {z_v_CLS_all.shape}")
+        
         _ ,P, raw_dim = z_v_all.shape
         z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
-
-        for t in range(max_seg_len):
-        #     f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
-            s_t = states_seg[:, t]  # (B, 7)
-        #     z_v_pooled_all.append(model._vision_forward(f_t))
-            z_s_all.append(model.state_encoder(s_t))
+        
+        _, _, state_dim = states_seg.shape
+        z_s_all = model.state_encoder(
+            states_seg.reshape(B * S, state_dim)
+        ).reshape(B, S, -1)
             
         # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
-        z_s_all = torch.stack(z_s_all, dim=1)
+        # z_s_all = torch.stack(z_s_all, dim=1)
         z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
-        z_v_mamba_all = model.intention_encoder.encode_patches_for_mamba(z_v_all, z_s_all)  # (B, S, V*P, comp_dim //2 )
+        
+        # z_v_mamba_all = model.intention_encoder.encode_patches_for_mamba(z_v_CLS_all, z_s_all)  # (B, S, V, comp_dim)
         # print(f"shapes: z_v_all: {z_v_mod_all.shape}")
         
         # Flatten patch axis into feature dim for head consumption (3D expected)
@@ -286,38 +295,35 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         last_actions_pred = None
         actions_pred = None
         loss_accum = []
-        num_windows = max_seg_len - H - C + 1
-        # print(f"Segment length: {max_seg_len}, num_windows: {num_windows}, H: {H}, C: {C}")
+        num_windows = max_seg_len - Hs - chunk_size + 1
+        time_ids = torch.arange(max_seg_len, device=device)
+        valid_time_mask = time_ids.unsqueeze(0) < seg_lens.unsqueeze(1)
+        # print(f"Segment length: {max_seg_len}, num_windows: {num_windows}, H: {Hs}, C: {chunk_size}")
         for n in range(num_windows):
             # Build H-window ending at t+H-1
             # Current time = last frame in the window
-            current_t = n + H - 1
+            current_t = n + Hs - 1
+            valid_mask = seg_lens >= (current_t + chunk_size)
+            if not valid_mask.any():
+                # No valid samples in this window, skip
+                continue
 
-            history_start = current_t - H + 1
+            history_start = current_t - Hs + 1
             history_end = current_t + 1
 
             z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
             z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
-            # print(f"z_v_win shape: {z_v_win.shape}, z_s_all shape: {z_s_all.shape}, history_start: {history_start}, history_end: {history_end}")
 
-            # frames_window = frames_seg[:, history_start:history_end]
-            # state_window = states_seg[:, history_start:history_end]
+            # Target: C future actions from current time
+            target = actions_seg[:, current_t: current_t + chunk_size]
+            assert target.shape[1] == chunk_size, f"target shape {target.shape} != chunk_size {chunk_size}"
             
-            valid_mask = seg_lens >= (current_t + C)
-
             # Forward through model (uses model's internal z_v_pooled_seq for consistency)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                out = model.forward_intent(z_v_mamba_all[:, history_start:history_end], z_s_win)
-                # print(f"out keys: {list(out.keys())}, z_v_pooled_seq shape: {out['z_v_pooled_seq'].shape}, z_s_seq shape: {out['z_s_seq'].shape}, h_seq shape: {out['h_seq'].shape}, intent_emb shape: {out.get('intent_emb', None).shape if out.get('intent_emb', None) is not None else None}")
-                
+                out = model.forward_intent(z_v_CLS_all[:, history_start:history_end], z_s_win) # input: (B, History, V, raw_dim=768)
                 intent_emb = out.get("intent_emb", None)
                 h_current = out["h_seq"][:, -1]
-                
-                # print(f"Intent emb shape: {intent_emb.shape if intent_emb is not None else None}")
-                # Use model's own outputs to guarantee dim consistency
-                # z_v_win_model = out["z_v_pooled_seq"]  # (B, H, pool_out_dim)
-                # z_s_win_model = out["z_s_seq"]          # (B, H, state_dim)
 
                 # Memory bank (3-stream: perceptual, cognitive, state)
                 if model.use_memory_bank:
@@ -326,59 +332,44 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     z_v_win_stacked = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, S, V*P*comp_dim)
                     z_v_current = z_v_win_stacked[:, -1]  # (B, pool_out_dim)
                     z_s_current = z_s_win[:, -1]  # (B, state_dim)
-                    # print(f"Memory bank: z_v_current shape: {z_v_current.shape}, z_s_current shape: {z_s_current.shape}, intent_emb shape: {intent_emb.shape if intent_emb is not None else None}")
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                            z_v_current, z_s_current, intent_emb
+                            z_v_current, z_s_current, intent_emb, valid_mask=valid_mask
                         )
-                        # print(f"Memory bank: z_v_fused shape: {z_v_fused.shape}, z_s_fused shape: {z_s_fused.shape}, intent_fused shape: {intent_fused.shape}")
-                        # z_v_win_for_head = z_v_win_model.clone()
                         z_v_win_for_head = z_v_fused
                         z_s_win_for_head = z_s_fused
-                        # z_v_win_for_head[:, -1] = z_v_fused
                         h_for_head = intent_fused
                     else:
                         # Warmup: store perceptual + state, no retrieval
                         model.memory_module.store_perceptual_only(z_v_current, z_s_current)
-                        z_v_win_for_head = z_v_win
+                        z_v_win_for_head = z_v_win_stacked
                         z_s_win_for_head = z_s_win
                         h_for_head = intent_emb
-                    # print(f"Memory bank: h_forhead shape: {h_for_head.shape}, h_current shape: {h_current.shape},intention_fused shape: {intent_fused.shape if n >= H - 1 and intent_emb is not None else None}, z_v_win_for_head shape: {z_v_win_for_head.shape}, z_v_win_model shape: {z_v_win_model.shape}")
                 else:
                     z_v_win_for_head = z_v_win
                     z_s_win_for_head = z_s_win
                     h_for_head = h_current
-                    # print(f"h_forhead shape: {h_for_head.shape}, z_v_win_for_head shape: {z_v_win_for_head.shape}")
-
-                # Target: C future actions from current time
-                target_end = min(current_t + C, max_seg_len)
-                # print(f"t={n}, current_t={current_t}, target_end={target_end}, actions_seg shape: {actions_seg.shape}")
-                target = actions_seg[:, current_t:target_end]
-                # if target.shape[1] < C:
-                #     pad = target[:, -1:].expand(-1, C - target.shape[1], -1)
-                #     target = torch.cat([target, pad], dim=1)
 
                 # Loss
                 if args.head_type == "diffusion":
-                    # print(f"Diffusion head: z_v_win_for_head shape: {z_v_win_for_head.shape}, z_s_win_for_head shape: {z_s_win_for_head.shape}, h_for_head shape: {h_for_head.shape}, target shape: {target.shape}")
                     cond = model.intention_head(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
                     )
                     actions_pred = model.sample_actions(
-                        z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=C
+                        z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
                     )
+                    assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
                     loss = model.intention_head.loss(target, cond)
+                    # Mask loss: only valid samples contribute
+                    if not valid_mask.all():
+                        loss = loss * valid_mask.float().mean()
                 else:
-                    # Predict actions (use model's own outputs for dim consistency)
                     actions_pred = model.predict_actions(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
                     )
-                    if valid_mask.any():
-                        loss = F.mse_loss(
-                            actions_pred[valid_mask],
-                            target[valid_mask]
-                        )
+                    loss = F.mse_loss(actions_pred, target, reduction='none')
+                    loss = loss[valid_mask].mean() if valid_mask.any() else loss.mean()
 
             if args.skip_nan and not torch.isfinite(loss):
                 continue
@@ -526,16 +517,24 @@ def validate(model, loader, device, args):
         if model.use_memory_bank:
             model.memory_module.reset(batch_size=B, device=device)
 
+        max_seg_len = frames_seg.shape[1]
         # Pre-encode vision for the entire segment (vision is the bottleneck)
-        max_seg_len = batch["frames_segment"].shape[1]
+        # We process each timestep's frames through vision encoder
         z_v_pooled_all = []
         z_s_all = []
-        B, S, V, H, W, C = frames_seg.shape
-        all_frames = frames_seg.reshape(B * S * V, H, W, C)  # (B*S*V, H, W, 3)
-        z_v_all = model._vision_forward(all_frames)            # (B*S*V, P, raw_dim=768)
+        
+        B, S, V, H, W, C = frames_seg.shape 
+        z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
+        
+        z_v_CLS_all = z_v_all[:, -1]  # (B*S*V, raw_dim=768) — CLS tokens only 
+        z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
+        
+        z_v_all = z_v_all[:, :-1]  # (B*S*V, P, raw_dim=768) — patch tokens only
+        
+        # print(f"z_v_all shape: {z_v_all.shape}, z_v_CLS_all shape: {z_v_CLS_all.shape}")
+        
         _ ,P, raw_dim = z_v_all.shape
         z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
-
         for t in range(max_seg_len):
         #     f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
             s_t = states_seg[:, t]  # (B, 7)
@@ -545,6 +544,7 @@ def validate(model, loader, device, args):
         # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
         z_s_all = torch.stack(z_s_all, dim=1)
         z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
+        
         # Sequential T-loop
         last_actions_pred = None
         actions_pred = None
@@ -567,8 +567,7 @@ def validate(model, loader, device, args):
             # Forward through model
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                out = model.forward_intent(z_v_win, z_s_win)
-                
+                out = model.forward_intent(z_v_CLS_all[:, history_start:history_end], z_s_win) # input: (B, History, V, raw_dim=768)
                 intent_emb = out.get("intent_emb", None)
                 h_current = out["h_seq"][:, -1]
 
@@ -582,14 +581,14 @@ def validate(model, loader, device, args):
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                            z_v_current, z_s_current, intent_emb
+                            z_v_current, z_s_current, intent_emb, valid_mask=valid_mask
                         )
                         z_v_win_for_head = z_v_fused
                         z_s_win_for_head = z_s_fused
                         h_for_head = intent_fused
                     else:
                         # Warmup: store perceptual + state, no retrieval
-                        model.memory_module.store_perceptual_only(z_v_current, z_s_current)
+                        model.memory_module.store_perceptual_only(z_v_current, z_s_current, valid_mask=valid_mask)
                         z_v_win_for_head = z_v_win_stacked
                         z_s_win_for_head = z_s_win
                         h_for_head = intent_emb
@@ -611,15 +610,14 @@ def validate(model, loader, device, args):
                         z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=C
                     )
                     loss = model.intention_head.loss(target, cond)
+                    if not valid_mask.all():
+                        loss = loss * valid_mask.float().mean()
                 else:
                     actions_pred = model.predict_actions(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
                     )
-                    if valid_mask.any():
-                        loss = F.mse_loss(
-                            actions_pred[valid_mask],
-                            target[valid_mask]
-                        )
+                    loss = F.mse_loss(actions_pred, target, reduction='none')
+                    loss = loss[valid_mask].mean() if valid_mask.any() else loss.mean()
 
             if args.skip_nan and not torch.isfinite(loss):
                 continue
@@ -950,7 +948,8 @@ def main():
             N_tok_actual = z_v_dummy.shape[0]
         else:
             N_tok_actual = z_v_dummy.shape[1]
-    pool_out_dim = N_tok_actual * args.compressed_dim
+    pool_out_dim = (N_tok_actual - num_cameras) * args.compressed_dim 
+    print(f"  Pool out dim: {pool_out_dim} (N_tok_actual={N_tok_actual}, compressed_dim={args.compressed_dim})")
     model._build_head_and_bank(pool_out_dim)
     print(f"  Head built: pool_out_dim={pool_out_dim} (VP_tokens={N_tok_actual})")
     trainable = [p for p in model.parameters() if p.requires_grad]

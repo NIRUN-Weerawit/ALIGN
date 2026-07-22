@@ -19,11 +19,11 @@ def test_random_embeddings():
     torch.manual_seed(42)
     B, D = 8, 256
     z_v = torch.randn(B, D) * 10
-    z_t = torch.randn(B, D) * 10
-    z_text = torch.randn(B, D) * 10
+    z_s = torch.randn(B, D) * 10
+    z_sext = torch.randn(B, D) * 10
 
     criterion = ContrastiveLoss3Way(temperature=0.07)
-    stats = criterion(z_v, z_t, z_text)
+    stats = criterion(z_v, z_s, z_sext)
 
     # Loss for random 8-way classification: ln(8) ≈ 2.08
     assert 1.5 < stats['loss'].item() < 3.5, \
@@ -37,13 +37,13 @@ def test_random_embeddings():
 
 
 def test_perfect_alignment():
-    """Identical z_v, z_t, z_text should give cosines = 1.0 and loss ≈ 0."""
+    """Identical z_v, z_s, z_sext should give cosines = 1.0 and loss ≈ 0."""
     B, D = 8, 256
     base = torch.randn(B, D)
-    z_v = z_t = z_text = base
+    z_v = z_s = z_sext = base
 
     criterion = ContrastiveLoss3Way(temperature=0.07)
-    stats = criterion(z_v, z_t, z_text)
+    stats = criterion(z_v, z_s, z_sext)
 
     for k in ['avg_cos_vt', 'avg_cos_vl', 'avg_cos_tl']:
         assert abs(stats[k].item() - 1.0) < 1e-5, \
@@ -55,14 +55,14 @@ def test_perfect_alignment():
 
 
 def test_anti_alignment():
-    """Anti-correlated z_v, z_t should give cos_vt = -1.0."""
+    """Anti-correlated z_v, z_s should give cos_vt = -1.0."""
     B, D = 8, 256
     z_v = torch.randn(B, D)
-    z_t = -z_v
-    z_text = torch.randn(B, D)
+    z_s = -z_v
+    z_sext = torch.randn(B, D)
 
     criterion = ContrastiveLoss3Way(temperature=0.07)
-    stats = criterion(z_v, z_t, z_text)
+    stats = criterion(z_v, z_s, z_sext)
 
     assert abs(stats['avg_cos_vt'].item() - (-1.0)) < 1e-5
     print("  ✅ test_anti_alignment passed")
@@ -78,9 +78,9 @@ def test_range_constraint():
         # Try various magnitudes
         for mag in [0.1, 1.0, 10.0, 100.0]:
             z_v = torch.randn(B, D) * mag
-            z_t = torch.randn(B, D) * mag
-            z_text = torch.randn(B, D) * mag
-            stats = criterion(z_v, z_t, z_text)
+            z_s = torch.randn(B, D) * mag
+            z_sext = torch.randn(B, D) * mag
+            stats = criterion(z_v, z_s, z_sext)
             for k in ['avg_cos_vt', 'avg_cos_vl', 'avg_cos_tl']:
                 v = stats[k].item()
                 assert -1.0 <= v <= 1.0, \
@@ -93,13 +93,13 @@ def test_temperature_scaling():
     B, D = 8, 256
     torch.manual_seed(0)
     z_v = torch.randn(B, D)
-    z_t = torch.randn(B, D)
-    z_text = torch.randn(B, D)
+    z_s = torch.randn(B, D)
+    z_sext = torch.randn(B, D)
 
     losses = []
     for tau in [0.01, 0.07, 0.5, 2.0]:
         c = ContrastiveLoss3Way(temperature=tau)
-        stats = c(z_v, z_t, z_text)
+        stats = c(z_v, z_s, z_sext)
         losses.append(stats['loss'].item())
 
     # Loss should be monotonically decreasing with temperature
@@ -153,9 +153,9 @@ def test_batch_size_invariance():
     for B in [4, 8, 16, 32, 64]:
         torch.manual_seed(0)
         z_v = torch.randn(B, D)
-        z_t = torch.randn(B, D)
-        z_text = torch.randn(B, D)
-        stats = criterion(z_v, z_t, z_text)
+        z_s = torch.randn(B, D)
+        z_sext = torch.randn(B, D)
+        stats = criterion(z_v, z_s, z_sext)
         losses[B] = stats['loss'].item()
         # Should be roughly ln(B) for random
         import math

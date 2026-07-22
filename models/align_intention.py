@@ -66,6 +66,7 @@ class ALIGNIntentionModel(nn.Module):
         use_text: bool = False,
         text_dim: int = 256,
         compressed_dim: int = 16,
+        raw_dim: int = 768,
         # V4 args
         use_intent_tokens: bool = False,
         num_intent_tokens: int = 2,
@@ -84,6 +85,7 @@ class ALIGNIntentionModel(nn.Module):
         self.use_text = use_text
         self.text_dim = text_dim
         self.compressed_dim = compressed_dim
+        self.raw_dim = raw_dim
         # V4 flags
         self.use_intent_tokens = use_intent_tokens
         self.num_intent_tokens = num_intent_tokens
@@ -102,7 +104,7 @@ class ALIGNIntentionModel(nn.Module):
 
         # Vision encoder (DINOv2 with patch tokens, outputs raw 768-D features)
         self.vision_encoder = VisionEncoder(
-            embed_dim=768,  # DINOv2 ViT-B/14 output dim, hardcoded
+            embed_dim=raw_dim,  # DINOv2 ViT-B/14 output dim, hardcoded
             num_cameras=num_cameras,
             use_patch_tokens=use_patch_tokens,
         )
@@ -120,6 +122,7 @@ class ALIGNIntentionModel(nn.Module):
                 mamba_output_dim=mamba_output_dim,
                 num_cameras=num_cameras,
                 compressed_dim=compressed_dim,
+                raw_dim=raw_dim,
                 mamba_d_state=mamba_d_state,
                 mamba_d_conv=mamba_d_conv,
                 mamba_expand=mamba_expand,
@@ -223,26 +226,21 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     # Batched training forward
     # ----------------------------------------------------------------
-    def forward_intent(self, z_v_patches_seq: torch.Tensor, z_s_seq: torch.Tensor) -> dict:
+    def forward_intent(self, z_v_cls_seq: torch.Tensor, z_s_seq: torch.Tensor) -> dict:
         """Batched T-step encoding (training) with intent tokens.
 
         Args:
-            z_v_patches_seq: (B, T, V*P, comp_dim)
-            z_s_seq:         (B, T, state_dim)
+            z_v_cls_seq: (B, T, V, raw_dim=768) — CLS tokens from DINOv2
+            z_s_seq:     (B, T, state_dim)
         Returns:
             dict with:
-              z_v_pooled_seq: (B, T, pool_out_dim)
-              z_s_seq:         (B, T, state_dim)
-              h_seq:           (B, T, mamba_output_dim) or (B, T, mamba_in_dim)
+              h_seq:           (B, T, mamba_in_dim)
               intent_emb:      (B, N, intent_dim)
         """
-        # B, T = z_v_patches_seq.shape[:2]
-        
         # Forward through intention encoder
         intent_emb = None
         if self.use_history:
-            # z_v_mod_seq = self.intention_encoder.encode_patches(z_v_patches_seq, z_s_seq)  # (B, T, VP, comp_dim)
-            result = self.intention_encoder(z_v_patches_seq, z_s_seq)
+            result = self.intention_encoder(z_v_cls_seq, z_s_seq)
             if self.use_intent_tokens:
                 h_seq, intent_emb = result
             else:
@@ -303,6 +301,7 @@ class ALIGNIntentionModel(nn.Module):
 
         # Build head and bank on first forward (now we know pool_out_dim)
         self._build_head_and_bank(pool_out_dim)
+        
 
         return {
             "z_v_pooled_seq": z_v_pooled_seq,

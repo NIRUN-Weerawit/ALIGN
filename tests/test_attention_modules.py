@@ -1,9 +1,9 @@
 """Test script for cross-camera and state-conditioned attention modules.
 
 Verifies that:
-  1. State-conditioned attention actually uses z_t (changes when z_t changes)
+  1. State-conditioned attention actually uses z_s (changes when z_s changes)
   2. Cross-camera attention actually uses both cameras
-  3. The pooled output can be decoded back to z_t (info roundtrip)
+  3. The pooled output can be decoded back to z_s (info roundtrip)
   4. Attention weights are sensible (focus on task-relevant patches)
 
 Usage:
@@ -51,15 +51,15 @@ def load_batch(h5_path: str, ep_key: str, cameras: list, n_frames: int = 5):
 
 
 def test_state_conditioned_pool(model, frames, states, device):
-    """Test that the state-conditioned attention pool actually uses z_t.
+    """Test that the state-conditioned attention pool actually uses z_s.
 
     Method:
-      1. Run pool with original z_t
-      2. Run pool with perturbed z_t (z_t + noise)
-      3. Run pool with zero z_t
-      Compare the outputs - if pool is sensitive to z_t, outputs differ.
+      1. Run pool with original z_s
+      2. Run pool with perturbed z_s (z_s + noise)
+      3. Run pool with zero z_s
+      Compare the outputs - if pool is sensitive to z_s, outputs differ.
     """
-    print("\n=== Test 1: State-conditioned pool uses z_t ===")
+    print("\n=== Test 1: State-conditioned pool uses z_s ===")
     f_t = torch.from_numpy(frames).unsqueeze(0).to(device)  # (1, K, V, H, W, 3)
     s_t = torch.from_numpy(states).float().unsqueeze(0).to(device)  # (1, K, 7)
     model.eval()
@@ -77,7 +77,7 @@ def test_state_conditioned_pool(model, frames, states, device):
         # z_v_patches_seq: (1, K, V, P, vision_dim) or (1, K, P, vision_dim)
         z_v_patches_seq = torch.stack(z_v_patches_per_step, dim=1)
         # Encode states
-        z_t_seq = model.state_encoder(s_t)  # (1, K, state_dim)
+        z_s_seq = model.state_encoder(s_t)  # (1, K, state_dim)
 
         # Helper: split concatenated (V*P, vision_dim) → (B, V, P, vision_dim)
         num_cams_cfg = (cfg or {}).get("num_cameras", 1) if False else 1  # not available
@@ -104,26 +104,26 @@ def test_state_conditioned_pool(model, frames, states, device):
         B, T = z_v_patches_seq.shape[:2]
         for t in range(T):
             z_v_t = to_per_cam(z_v_patches_seq[:, t], B)
-            z_t_t = z_t_seq[:, t]
-            pooled = intention_encoder.pool_patches(z_v_t, z_t_t)
+            z_s_t = z_s_seq[:, t]
+            pooled = intention_encoder.pool_patches(z_v_t, z_s_t)
             z_v_pooled_orig.append(pooled)
         z_v_pooled_orig = torch.stack(z_v_pooled_orig, dim=1)
-        # 2. Perturbed z_t
-        z_t_perturbed = z_t_seq + torch.randn_like(z_t_seq) * 0.5
+        # 2. Perturbed z_s
+        z_s_perturbed = z_s_seq + torch.randn_like(z_s_seq) * 0.5
         z_v_pooled_perturbed = []
         for t in range(T):
             z_v_t = to_per_cam(z_v_patches_seq[:, t], B)
-            z_t_t = z_t_perturbed[:, t]
-            pooled = intention_encoder.pool_patches(z_v_t, z_t_t)
+            z_s_t = z_s_perturbed[:, t]
+            pooled = intention_encoder.pool_patches(z_v_t, z_s_t)
             z_v_pooled_perturbed.append(pooled)
         z_v_pooled_perturbed = torch.stack(z_v_pooled_perturbed, dim=1)
-        # 3. Zero z_t
-        z_t_zero = torch.zeros_like(z_t_seq)
+        # 3. Zero z_s
+        z_s_zero = torch.zeros_like(z_s_seq)
         z_v_pooled_zero = []
         for t in range(T):
             z_v_t = to_per_cam(z_v_patches_seq[:, t], B)
-            z_t_t = z_t_zero[:, t]
-            pooled = intention_encoder.pool_patches(z_v_t, z_t_t)
+            z_s_t = z_s_zero[:, t]
+            pooled = intention_encoder.pool_patches(z_v_t, z_s_t)
             z_v_pooled_zero.append(pooled)
         z_v_pooled_zero = torch.stack(z_v_pooled_zero, dim=1)
     # Compare
@@ -132,9 +132,9 @@ def test_state_conditioned_pool(model, frames, states, device):
     print(f"  ||z_v_pooled(orig) - z_v_pooled(perturbed)||  = {diff_perturbed:.4f}")
     print(f"  ||z_v_pooled(orig) - z_v_pooled(zero)||     = {diff_zero:.4f}")
     if diff_perturbed > 0.1 and diff_zero > 0.1:
-        print("  ✓ Pool IS sensitive to z_t (state-conditioned)")
+        print("  ✓ Pool IS sensitive to z_s (state-conditioned)")
     else:
-        print("  ✗ Pool is NOT sensitive to z_t (state-conditioning may be broken)")
+        print("  ✗ Pool is NOT sensitive to z_s (state-conditioning may be broken)")
     return diff_perturbed, diff_zero
 
 
@@ -169,7 +169,7 @@ def test_cross_camera_attention(model, frames, states, device):
             z_v_t = model._vision_forward(f_t[:, t])
             z_v_patches_per_step.append(z_v_t)
         z_v_patches_seq = torch.stack(z_v_patches_per_step, dim=1)
-        z_t_seq = model.state_encoder(s_t)
+        z_s_seq = model.state_encoder(s_t)
         # Reshape to per-camera format (B, K, V, P, vision_dim) for proper pooling
         num_cams = intention_encoder.pool.num_cameras
         # z_v_patches_seq: (1, K, V*P, vision_dim) for multi-cam
@@ -183,7 +183,7 @@ def test_cross_camera_attention(model, frames, states, device):
         # 1. Original (both cameras)
         z_v_pooled_orig = []
         for t in range(T):
-            pooled = intention_encoder.pool_patches(z_v_patches_seq[:, t], z_t_seq[:, t])
+            pooled = intention_encoder.pool_patches(z_v_patches_seq[:, t], z_s_seq[:, t])
             z_v_pooled_orig.append(pooled)
         z_v_pooled_orig = torch.stack(z_v_pooled_orig, dim=1)
         # 2. Zero out camera 0
@@ -192,7 +192,7 @@ def test_cross_camera_attention(model, frames, states, device):
         z_v_pooled_zero_cam0 = []
         for t in range(T):
             pooled = intention_encoder.pool_patches(
-                z_v_patches_zero_cam0[:, t], z_t_seq[:, t]
+                z_v_patches_zero_cam0[:, t], z_s_seq[:, t]
             )
             z_v_pooled_zero_cam0.append(pooled)
         z_v_pooled_zero_cam0 = torch.stack(z_v_pooled_zero_cam0, dim=1)
@@ -202,7 +202,7 @@ def test_cross_camera_attention(model, frames, states, device):
         z_v_pooled_swap = []
         for t in range(T):
             pooled = intention_encoder.pool_patches(
-                z_v_patches_swap[:, t], z_t_seq[:, t]
+                z_v_patches_swap[:, t], z_s_seq[:, t]
             )
             z_v_pooled_swap.append(pooled)
         z_v_pooled_swap = torch.stack(z_v_pooled_swap, dim=1)
@@ -221,15 +221,15 @@ def test_cross_camera_attention(model, frames, states, device):
         print("  ✗ Order-invariant (no order info preserved)")
 
 
-def test_z_t_recovery(model, frames, states, device):
-    """Test that z_t info is preserved in the pooled output.
+def test_z_s_recovery(model, frames, states, device):
+    """Test that z_s info is preserved in the pooled output.
 
     Method:
-      1. Pool with original z_t → get z_v_pooled
-      2. Train a small linear probe to predict z_t from z_v_pooled
-      3. If probe works (low MSE), z_t info was preserved
+      1. Pool with original z_s → get z_v_pooled
+      2. Train a small linear probe to predict z_s from z_v_pooled
+      3. If probe works (low MSE), z_s info was preserved
     """
-    print("\n=== Test 3: z_t info preservation in pooled output ===")
+    print("\n=== Test 3: z_s info preservation in pooled output ===")
     f_t = torch.from_numpy(frames).unsqueeze(0).to(device)
     s_t = torch.from_numpy(states).float().unsqueeze(0).to(device)
     model.eval()
@@ -244,7 +244,7 @@ def test_z_t_recovery(model, frames, states, device):
             z_v_t = model._vision_forward(f_t[:, t])
             z_v_patches_per_step.append(z_v_t)
         z_v_patches_seq = torch.stack(z_v_patches_per_step, dim=1)
-        z_t_seq = model.state_encoder(s_t)
+        z_s_seq = model.state_encoder(s_t)
         # Reshape to per-camera format
         num_cams = intention_encoder.pool.num_cameras
         if num_cams > 1 and z_v_patches_seq.ndim == 4:
@@ -256,38 +256,38 @@ def test_z_t_recovery(model, frames, states, device):
         B, T = z_v_patches_seq.shape[:2]
         z_v_pooled_list = []
         for t in range(T):
-            pooled = intention_encoder.pool_patches(z_v_patches_seq[:, t], z_t_seq[:, t])
+            pooled = intention_encoder.pool_patches(z_v_patches_seq[:, t], z_s_seq[:, t])
             z_v_pooled_list.append(pooled)
         z_v_pooled = torch.stack(z_v_pooled_list, dim=1)  # (1, T, V*vision_dim)
-        z_t_target = z_t_seq
+        z_s_target = z_s_seq
     # Train a small linear probe (with holdout to avoid overfitting)
     pool_dim = z_v_pooled.shape[-1]
-    state_dim = z_t_target.shape[-1]
+    state_dim = z_s_target.shape[-1]
     probe = torch.nn.Linear(pool_dim, state_dim).to(device)
     optimizer = torch.optim.Adam(probe.parameters(), lr=1e-2)
     z_v_flat = z_v_pooled.reshape(B * T, pool_dim)
-    z_t_flat = z_t_target.reshape(B * T, state_dim)
+    z_s_flat = z_s_target.reshape(B * T, state_dim)
     # 80/20 train/val split
     n_train = max(1, int(0.8 * len(z_v_flat)))
     perm = torch.randperm(len(z_v_flat))
     train_idx = perm[:n_train]
     val_idx = perm[n_train:] if n_train < len(z_v_flat) else perm[:1]
-    z_v_train, z_t_train = z_v_flat[train_idx], z_t_flat[train_idx]
-    z_v_val, z_t_val = z_v_flat[val_idx], z_t_flat[val_idx]
+    z_v_train, z_s_train = z_v_flat[train_idx], z_s_flat[train_idx]
+    z_v_val, z_s_val = z_v_flat[val_idx], z_s_flat[val_idx]
     for step in range(500):
         pred = probe(z_v_train)
-        loss = F.mse_loss(pred, z_t_train)
+        loss = F.mse_loss(pred, z_s_train)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
     with torch.no_grad():
-        train_loss = F.mse_loss(probe(z_v_train), z_t_train).item()
-        val_loss = F.mse_loss(probe(z_v_val), z_t_val).item()
+        train_loss = F.mse_loss(probe(z_v_train), z_s_train).item()
+        val_loss = F.mse_loss(probe(z_v_val), z_s_val).item()
     # Baseline: predict the mean (from training set)
-    z_t_mean = z_t_train.mean(dim=0, keepdim=True)
+    z_s_mean = z_s_train.mean(dim=0, keepdim=True)
     with torch.no_grad():
         baseline_loss = F.mse_loss(
-            z_t_mean.expand_as(z_t_val), z_t_val
+            z_s_mean.expand_as(z_s_val), z_s_val
         ).item()
     recovery_ratio = val_loss / max(baseline_loss, 1e-6)
     print(f"  Train probe MSE:   {train_loss:.6f}")
@@ -295,11 +295,11 @@ def test_z_t_recovery(model, frames, states, device):
     print(f"  Baseline MSE:      {baseline_loss:.6f} (predict train mean)")
     print(f"  Recovery ratio:    {recovery_ratio:.2%} (lower = better info recovery)")
     if recovery_ratio < 0.3:
-        print("  ✓ z_t info IS well-preserved in pooled output")
+        print("  ✓ z_s info IS well-preserved in pooled output")
     elif recovery_ratio < 0.7:
-        print("  ~ z_t info is partially preserved")
+        print("  ~ z_s info is partially preserved")
     else:
-        print("  ✗ z_t info is NOT preserved (probe can't beat mean)")
+        print("  ✗ z_s info is NOT preserved (probe can't beat mean)")
 
 
 def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] = None,
@@ -363,7 +363,7 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
     print(f"  T = {T_ep} steps | patches_per_cam = {P_per_cam} (grid {grid_dim}x{grid_dim})")
 
     # ---------------------------------------------------------------------------
-    # 2. Extract per-timestep cross-attention weights (original z_t queries)      #
+    # 2. Extract per-timestep cross-attention weights (original z_s queries)      #
     # ---------------------------------------------------------------------------
 
     def _extract_weights_for_step(pt: torch.Tensor, st: torch.Tensor):
@@ -467,18 +467,18 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
                 # Single-cam fallback: use the per-camera video path
                 _save_timeline_video(out_dir, 0, img_rows, timeline_weights, T_ep, grid_dim)
 
-            # --- B. Per-camera attention comparison (original/zero/perturbed z_t on frame 0) ---
+            # --- B. Per-camera attention comparison (original/zero/perturbed z_s on frame 0) ---
             if frames.ndim == 5 and num_cams_cfg >= 2:
                 pt_0 = patches_seq[0, 0].detach()
                 st_0 = states_enc[0, 0].detach()
 
                 comparison_weights = {}   # label -> list of per-cam weights (P,)
-                for label, z_t_v in [
+                for label, z_s_v in [
                     ("original", st_0),
                     ("zero", torch.zeros_like(st_0)),
                     ("perturbed", st_0 + torch.randn_like(st_0) * 0.3),
                 ]:
-                    comparison_weights[label] = _extract_weights_for_step(pt_0, z_t_v)
+                    comparison_weights[label] = _extract_weights_for_step(pt_0, z_s_v)
 
                 n_cams = num_cams_cfg
                 n_labels = len(comparison_weights)
@@ -503,9 +503,9 @@ def test_attention_patterns(model, frames, states, device, cfg: Optional[dict] =
 
                         ax.imshow(img, alpha=0.6)
                         ax.imshow(norm_g, cmap="hot", alpha=0.5, interpolation="bilinear", extent=(0, img.shape[1], img.shape[0], 0))
-                        ax.set_title(f"cam {cam_idx}, z_t={label}"); ax.axis("off")
+                        ax.set_title(f"cam {cam_idx}, z_s={label}"); ax.axis("off")
 
-                fig.suptitle("Per-camera state-conditioned attention: rows=cams, cols=z_t variants")
+                fig.suptitle("Per-camera state-conditioned attention: rows=cams, cols=z_s variants")
                 fig.tight_layout()
                 fig.savefig(os.path.join(out_dir, "attention_comparison.png"), dpi=80, bbox_inches="tight")
                 plt.close(fig)
@@ -688,7 +688,7 @@ def visualize_attention(img: np.ndarray, attn_weights: np.ndarray,
 
 def side_by_side_attention(frames: np.ndarray, attn_weights_list: list,
                               labels: list, out_path: str):
-    """Side-by-side attention heatmaps for multiple z_t values.
+    """Side-by-side attention heatmaps for multiple z_s values.
 
     Args:
         frames: (V, H, W, 3) — V cameras
@@ -724,9 +724,9 @@ def side_by_side_attention(frames: np.ndarray, attn_weights_list: list,
                 attn_grid_norm, cmap="hot", alpha=0.5, interpolation="bilinear",
                 extent=(0, img.shape[1], img.shape[0], 0),
             )
-            ax.set_title(f"cam {cam_idx}, z_t={label}")
+            ax.set_title(f"cam {cam_idx}, z_s={label}")
             ax.axis("off")
-    fig.suptitle("State-conditioned attention: rows=cameras, cols=z_t")
+    fig.suptitle("State-conditioned attention: rows=cameras, cols=z_s")
     fig.tight_layout()
     fig.savefig(out_path, dpi=80, bbox_inches="tight")
     plt.close(fig)
@@ -778,7 +778,7 @@ def main():
         # Run tests
         test_state_conditioned_pool(model, frames, states, device)
         test_cross_camera_attention(model, frames, states, device)
-        test_z_t_recovery(model, frames, states, device)
+        test_z_s_recovery(model, frames, states, device)
         if i == 0:
             # Only run attention viz once (it's slow)
             test_attention_patterns(model, frames, states, device, cfg=cfg,

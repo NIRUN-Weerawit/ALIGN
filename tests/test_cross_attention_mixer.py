@@ -83,13 +83,13 @@ def test_mixer_output_shape():
     mixer = CrossAttentionMixer(enc_dim=enc_dim, mixer_dim=512, num_blocks=2)
     B, K = 4, 20
     z_v = torch.randn(B, enc_dim)
-    z_t = torch.randn(B, K, enc_dim)
-    z_text = torch.randn(B, enc_dim)
+    z_s = torch.randn(B, K, enc_dim)
+    z_sext = torch.randn(B, enc_dim)
 
-    z_v2, z_t2, z_text2 = mixer(z_v, z_t, z_text)
+    z_v2, z_s2, z_sext2 = mixer(z_v, z_s, z_sext)
     assert z_v2.shape == z_v.shape, f"vision: {z_v2.shape} != {z_v.shape}"
-    assert z_t2.shape == z_t.shape, f"trajectory: {z_t2.shape} != {z_t.shape}"
-    assert z_text2.shape == z_text.shape, f"text: {z_text2.shape} != {z_text.shape}"
+    assert z_s2.shape == z_s.shape, f"trajectory: {z_s2.shape} != {z_s.shape}"
+    assert z_sext2.shape == z_sext.shape, f"text: {z_sext2.shape} != {z_sext.shape}"
     print("  ✅ test_mixer_output_shape")
 
 
@@ -98,11 +98,11 @@ def test_mixer_preserves_dim_for_different_K():
     enc_dim = 256
     mixer = CrossAttentionMixer(enc_dim=enc_dim, mixer_dim=512, num_blocks=2)
     z_v = torch.randn(2, enc_dim)
-    z_text = torch.randn(2, enc_dim)
+    z_sext = torch.randn(2, enc_dim)
     for K in [1, 5, 10, 20, 50]:
-        z_t = torch.randn(2, K, enc_dim)
-        z_v2, z_t2, z_text2 = mixer(z_v, z_t, z_text)
-        assert z_t2.shape == (2, K, enc_dim), f"K={K}: {z_t2.shape}"
+        z_s = torch.randn(2, K, enc_dim)
+        z_v2, z_s2, z_sext2 = mixer(z_v, z_s, z_sext)
+        assert z_s2.shape == (2, K, enc_dim), f"K={K}: {z_s2.shape}"
     print("  ✅ test_mixer_preserves_dim_for_different_K")
 
 
@@ -112,10 +112,10 @@ def test_mixer_near_identity_at_init():
     mixer = CrossAttentionMixer(enc_dim=enc_dim, mixer_dim=512, num_blocks=2)
     B, K = 2, 10
     z_v = torch.randn(B, enc_dim)
-    z_t = torch.randn(B, K, enc_dim)
-    z_text = torch.randn(B, enc_dim)
-    z_v2, z_t2, z_text2 = mixer(z_v, z_t, z_text)
-    for name, z, z2 in [("v", z_v, z_v2), ("t", z_t, z_t2), ("text", z_text, z_text2)]:
+    z_s = torch.randn(B, K, enc_dim)
+    z_sext = torch.randn(B, enc_dim)
+    z_v2, z_s2, z_sext2 = mixer(z_v, z_s, z_sext)
+    for name, z, z2 in [("v", z_v, z_v2), ("t", z_s, z_s2), ("text", z_sext, z_sext2)]:
         delta = (z2 - z).abs().mean().item()
         assert delta < 0.1, f"{name} drift too large: {delta}"
     print("  ✅ test_mixer_near_identity_at_init")
@@ -126,10 +126,10 @@ def test_mixer_gradients_flow():
     mixer = CrossAttentionMixer(enc_dim=256, mixer_dim=512, num_blocks=2)
     B, K = 2, 10
     z_v = torch.randn(B, 256, requires_grad=False)
-    z_t = torch.randn(B, K, 256, requires_grad=False)
-    z_text = torch.randn(B, 256, requires_grad=False)
-    z_v2, z_t2, z_text2 = mixer(z_v, z_t, z_text)
-    loss = (z_v2 ** 2).sum() + (z_t2 ** 2).sum() + (z_text2 ** 2).sum()
+    z_s = torch.randn(B, K, 256, requires_grad=False)
+    z_sext = torch.randn(B, 256, requires_grad=False)
+    z_v2, z_s2, z_sext2 = mixer(z_v, z_s, z_sext)
+    loss = (z_v2 ** 2).sum() + (z_s2 ** 2).sum() + (z_sext2 ** 2).sum()
     loss.backward()
     n_with_grad = sum(1 for p in mixer.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
     n_total = sum(1 for p in mixer.parameters())
@@ -172,16 +172,16 @@ def test_mixer_does_not_modify_input():
     mixer = CrossAttentionMixer(enc_dim=256, mixer_dim=512, num_blocks=2)
     B, K = 2, 10
     z_v = torch.randn(B, 256)
-    z_t = torch.randn(B, K, 256)
-    z_text = torch.randn(B, 256)
+    z_s = torch.randn(B, K, 256)
+    z_sext = torch.randn(B, 256)
     z_v_orig = z_v.clone()
-    z_t_orig = z_t.clone()
-    z_text_orig = z_text.clone()
-    mixer(z_v, z_t, z_text)
+    z_s_orig = z_s.clone()
+    z_sext_orig = z_sext.clone()
+    mixer(z_v, z_s, z_sext)
     # Inputs should be unchanged (mixer is a function, residual is on the output)
     assert torch.equal(z_v, z_v_orig)
-    assert torch.equal(z_t, z_t_orig)
-    assert torch.equal(z_text, z_text_orig)
+    assert torch.equal(z_s, z_s_orig)
+    assert torch.equal(z_sext, z_sext_orig)
     print("  ✅ test_mixer_does_not_modify_input")
 
 

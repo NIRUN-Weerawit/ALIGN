@@ -65,7 +65,7 @@ def test_frozen_mixer_receives_no_gradients():
 
     # Use encode_mixed which routes through mixer
     mixed = model.encode_mixed(frames, traj, texts)
-    loss = mixed["z_v"].sum() + mixed["z_t"].sum() + mixed["z_text"].sum()
+    loss = mixed["z_v"].sum() + mixed["z_s"].sum() + mixed["z_sext"].sum()
     loss.backward()
 
     for name, p in model.cross_attention_mixer.named_parameters():
@@ -90,7 +90,7 @@ def test_trainable_mixer_receives_gradients():
     texts = ["test"] * B
 
     mixed = model.encode_mixed(frames, traj, texts)
-    loss = mixed["z_v"].sum() + mixed["z_t"].sum() + mixed["z_text"].sum()
+    loss = mixed["z_v"].sum() + mixed["z_s"].sum() + mixed["z_sext"].sum()
     loss.backward()
 
     n_with_grad = sum(
@@ -173,16 +173,16 @@ def test_encode_raw_all_no_mixer():
     texts = ["test"] * B
 
     raw = model.encode_raw_all(frames, traj, texts)
-    assert set(raw.keys()) == {"z_v", "z_t", "z_text"}, f"Unexpected keys: {raw.keys()}"
+    assert set(raw.keys()) == {"z_v", "z_s", "z_sext"}, f"Unexpected keys: {raw.keys()}"
     assert raw["z_v"].shape == (B, 256)
-    assert raw["z_t"].shape == (B, 256)
-    assert raw["z_text"].shape == (B, 256)
+    assert raw["z_s"].shape == (B, 256)
+    assert raw["z_sext"].shape == (B, 256)
 
     print("  ✅ test_encode_raw_all_no_mixer")
 
 
 def test_encode_mixed_uses_mixer():
-    """encode_mixed() should return post-mixer embeddings (z_v', z_t', z_text')."""
+    """encode_mixed() should return post-mixer embeddings (z_v', z_s', z_sext')."""
     model = ALIGNModel(embed_dim=256, use_text=True, device='cpu')
 
     B, K = 2, 10
@@ -191,12 +191,12 @@ def test_encode_mixed_uses_mixer():
     texts = ["test"] * B
 
     mixed = model.encode_mixed(frames, traj, texts)
-    assert set(mixed.keys()) == {"z_v", "z_t", "z_text", "z_t_tokens"}, \
+    assert set(mixed.keys()) == {"z_v", "z_s", "z_sext", "z_s_tokens"}, \
         f"Unexpected keys: {mixed.keys()}"
     assert mixed["z_v"].shape == (B, 256)
-    assert mixed["z_t"].shape == (B, 256)
-    assert mixed["z_text"].shape == (B, 256)
-    assert mixed["z_t_tokens"].shape == (B, K, 256)
+    assert mixed["z_s"].shape == (B, 256)
+    assert mixed["z_sext"].shape == (B, 256)
+    assert mixed["z_s_tokens"].shape == (B, K, 256)
 
     print("  ✅ test_encode_mixed_uses_mixer")
 
@@ -215,12 +215,12 @@ def test_raw_vs_mixed_differ():
 
     # Even with identity init, output projection adds small perturbations
     z_v_diff = (raw["z_v"] - mixed["z_v"]).abs().mean().item()
-    z_t_diff = (raw["z_t"] - mixed["z_t"]).abs().mean().item()
-    z_text_diff = (raw["z_text"] - mixed["z_text"]).abs().mean().item()
+    z_s_diff = (raw["z_s"] - mixed["z_s"]).abs().mean().item()
+    z_sext_diff = (raw["z_sext"] - mixed["z_sext"]).abs().mean().item()
 
-    print(f"  Raw vs Mixed diff: z_v={z_v_diff:.6f} z_t={z_t_diff:.6f} z_text={z_text_diff:.6f}")
+    print(f"  Raw vs Mixed diff: z_v={z_v_diff:.6f} z_s={z_s_diff:.6f} z_sext={z_sext_diff:.6f}")
     # They should differ at least slightly (mixer does add small perturbations via output_proj)
-    assert z_v_diff > 0 or z_t_diff > 0 or z_text_diff > 0, \
+    assert z_v_diff > 0 or z_s_diff > 0 or z_sext_diff > 0, \
         "encode_raw_all and encode_mixed should produce different outputs"
 
     print("  ✅ test_raw_vs_mixed_differ")
@@ -293,10 +293,10 @@ def test_checkpoint_round_trip():
         # Outputs should match (same weights loaded)
         assert torch.allclose(raw_before["z_v"], raw_after["z_v"], atol=1e-5), \
             "z_v should match after round-trip"
-        assert torch.allclose(raw_before["z_t"], raw_after["z_t"], atol=1e-5), \
-            "z_t should match after round-trip"
-        assert torch.allclose(raw_before["z_text"], raw_after["z_text"], atol=1e-5), \
-            "z_text should match after round-trip"
+        assert torch.allclose(raw_before["z_s"], raw_after["z_s"], atol=1e-5), \
+            "z_s should match after round-trip"
+        assert torch.allclose(raw_before["z_sext"], raw_after["z_sext"], atol=1e-5), \
+            "z_sext should match after round-trip"
 
         # Test full pretrain checkpoint (includes mixer)
         model.save_pretrain_checkpoint(
@@ -416,11 +416,11 @@ def test_text_free_mode():
     traj = torch.randn(B, K, 6)
 
     raw = model.encode_raw_all(frames, traj, texts=None)
-    assert torch.equal(raw["z_text"], torch.zeros_like(raw["z_v"])), \
-        "z_text should be zeros when no text encoder"
+    assert torch.equal(raw["z_sext"], torch.zeros_like(raw["z_v"])), \
+        "z_sext should be zeros when no text encoder"
 
     mixed = model.encode_mixed(frames, traj, texts=None)
-    assert mixed["z_text"].shape == (B, 256)
+    assert mixed["z_sext"].shape == (B, 256)
 
     out = model(frames, traj, texts=None)
     assert "alpha" in out and "delta" in out

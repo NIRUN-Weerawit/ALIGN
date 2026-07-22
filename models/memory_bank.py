@@ -185,8 +185,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         self.perceptual_bank: Optional[torch.Tensor] = None  # (B, L, perceptual_dim)
         self.cognitive_bank: Optional[torch.Tensor] = None   # (B, L, cognitive_dim)
         self.state_bank: Optional[torch.Tensor] = None       # (B, L, state_dim)
-        self._bank_mask: Optional[torch.Tensor] = None        # (B, L) bool
-        self._count: int = 0
+        self._count: Optional[torch.Tensor] = None
 
     @staticmethod
     def _make_timestep_pe(max_len: int, dim: int) -> torch.Tensor:
@@ -226,61 +225,44 @@ class PerceptualCognitiveMemoryModule(nn.Module):
             device: torch device
         """
         self.perceptual_bank = torch.zeros(
-            batch_size, 0, self.perceptual_dim, device=device,
+            batch_size, self.bank_len, self.perceptual_dim, device=device,
         )
         self.cognitive_bank = torch.zeros(
-            batch_size, 0, self.cognitive_dim, device=device,
+            batch_size, self.bank_len, self.cognitive_dim, device=device,
         )
         self.state_bank = torch.zeros(
-            batch_size, 0, self.state_dim, device=device,
+            batch_size, self.bank_len, self.state_dim, device=device,
         )
-        self._bank_mask = None
-        self._count = 0
+        self._count = torch.zeros(batch_size, dtype=torch.long, device=device)
 
     def store_perceptual_only(self, z_v_pooled: torch.Tensor,
-                                    z_s: torch.Tensor):
+                                    z_s: torch.Tensor,
+                                    valid_mask: Optional[torch.Tensor] = None):
         """Store only the perceptual and state fields (warmup phase, no intent_emb yet).
 
         Args:
             z_v_pooled: (B, perceptual_dim)
-            z_s:        (B, state_dim) or None
+            z_s:        (B, state_dim)
+            valid_mask: (B,) bool — which samples to store
         """
         B = z_v_pooled.shape[0]
         device = z_v_pooled.device
-        p_new = z_v_pooled.unsqueeze(1)  # (B, 1, perceptual_dim)
         # Dummy cognitive entry (zeros) — will be overwritten in active phase
-        c_new = torch.zeros(B, 1, self.cognitive_dim, device=device)
-        # State entry 
-        s_new = z_s.unsqueeze(1)  # (B, 1, state_dim)
+        c_new = torch.zeros(B, self.cognitive_dim, device=device)
 
-
-        if self.perceptual_bank is None or self.perceptual_bank.shape[1] == 0:
-            self.perceptual_bank = p_new
-            self.cognitive_bank = c_new
-            self.state_bank = s_new
-            self._count = 1
-            self._bank_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
-            return
-
-        p_combined = torch.cat([self.perceptual_bank, p_new], dim=1)
-        c_combined = torch.cat([self.cognitive_bank, c_new], dim=1)
-        s_combined = torch.cat([self.state_bank, s_new], dim=1)
-        new_count = self._count + 1
-
-        if new_count > self.bank_len:
-            p_combined, c_combined, s_combined, new_count = self._token_merge(
-                p_combined, c_combined, s_combined, new_count,
-            )
-
-        self.perceptual_bank = p_combined
-        self.cognitive_bank = c_combined
-        self.state_bank = s_combined
-        self._count = new_count
-        self._bank_mask = torch.ones(B, new_count, dtype=torch.bool, device=device)
+        for b in range(B):
+            if valid_mask is not None and not valid_mask[b]:
+                continue
+            idx = self._count[b] % self.bank_len
+            self.perceptual_bank[b, idx] = z_v_pooled[b]
+            self.cognitive_bank[b, idx] = c_new[b]
+            self.state_bank[b, idx] = z_s[b]
+            self._count[b] += 1
 
     def forward(self, z_v_pooled: torch.Tensor,
                       z_s: torch.Tensor, 
                       intent_emb: torch.Tensor,
+                      valid_mask: Optional[torch.Tensor] = None
                       ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Retrieve, fuse, and store.
 
@@ -288,6 +270,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
             z_v_pooled: (B, perceptual_dim)     — current pooled vision
             intent_emb: (B, N, cognitive_dim)   — current intent tokens
             z_s:        (B, state_dim)          — current robot state
+            valid_mask: (B,) bool — which samples are valid (not padding)
         Returns:
             z_v_pooled_fused: (B, perceptual_dim)
             intent_emb_fused: (B, N, cognitive_dim)
@@ -296,106 +279,72 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         B = z_v_pooled.shape[0]
         device = z_v_pooled.device
 
+        # Build mask: which bank slots are valid (have been written to)
+        bank_mask = torch.arange(self.bank_len, device=device).unsqueeze(0).expand(B, -1) < self._count.unsqueeze(1)  # (B, L)
+        max_count = self._count.max().item()
+
         # --- 1. Retrieve from banks ---
         # Add timestep PE to bank keys/values
-        p_bank_pe = self._add_timestep_pe(
-            self.perceptual_bank, self._count
-        ) if self.perceptual_bank is not None and self._count > 0 else (
-            self.perceptual_bank if self.perceptual_bank is not None
-            else torch.zeros(B, 0, self.perceptual_dim, device=device)
-        )
-        c_bank_pe = self._add_timestep_pe(
-            self.cognitive_bank, self._count
-        ) if self.cognitive_bank is not None and self._count > 0 else (
-            self.cognitive_bank if self.cognitive_bank is not None
-            else torch.zeros(B, 0, self.cognitive_dim, device=device)
-        )
-        s_bank_pe = self._add_timestep_pe(
-            self.state_bank, self._count
-        ) if self.state_bank is not None and self._count > 0 else (
-            self.state_bank if self.state_bank is not None
-            else torch.zeros(B, 0, self.state_dim, device=device)
-        )
+        p_bank_pe = self._add_timestep_pe(self.perceptual_bank, max_count)
+        c_bank_pe = self._add_timestep_pe(self.cognitive_bank, max_count)
+        s_bank_pe = self._add_timestep_pe(self.state_bank, max_count)
 
         # Perceptual retrieval: z_v_pooled queries perceptual bank
         p_retrieved = self.perceptual_retrieval(
-            z_v_pooled, p_bank_pe, bank_mask=self._bank_mask,
+            z_v_pooled, p_bank_pe, bank_mask=bank_mask,
         )  # (B, perceptual_dim)
 
         # Cognitive retrieval: intent_emb queries cognitive bank
-        # Reshape N intent tokens to a single vector for query
-        intent_query = intent_emb.reshape(intent_emb.shape[0], -1)   # [B, cognitive_dim]
-        assert intent_query.shape[1] == self.cognitive_dim, f"Intent query should have a single token with {self.cognitive_dim} dimension after reshaping."
-        # intent_query = intent_query.unsqueeze(1)                   # [B, 1, cognitive_dim]       
+        intent_query = intent_emb.reshape(intent_emb.shape[0], -1)   # (B, cognitive_dim)
         c_retrieved = self.cognitive_retrieval(
-            intent_query, c_bank_pe, bank_mask=self._bank_mask,
+            intent_query, c_bank_pe, bank_mask=bank_mask,
         )  # (B, cognitive_dim)
 
         # State retrieval: z_s queries state bank
         s_retrieved = self.state_retrieval(
-            z_s, s_bank_pe, bank_mask=self._bank_mask,
+            z_s, s_bank_pe, bank_mask=bank_mask,
         )  # (B, state_dim)
 
         # --- 2. Gate fusion ---
         z_v_pooled_fused    = self.perceptual_gate(z_v_pooled, p_retrieved)
         intent_emb_fused    = self.cognitive_gate(intent_query, c_retrieved)
         z_s_fused           = self.state_gate(z_s, s_retrieved)
-        # print(f"Memory bank: z_v_pooled_fused shape: {z_v_pooled_fused.shape}, intent_emb_fused shape: {intent_emb_fused.shape}, z_s_fused shape: {z_s_fused.shape}")
         
-        # --- 3. Store current triplet into bank ---
-        self._store(z_v_pooled_fused, z_s_fused, intent_query)
+        # --- 3. Store current triplet into bank (circular buffer) ---
+        self._store(z_v_pooled_fused, z_s_fused, intent_query, valid_mask)
         
         # Expand retrieved context back to N tokens
-        intent_emb_fused = intent_emb_fused.reshape(B, intent_emb.shape[1], -1) # (B, N, intent_dim)
-        assert intent_emb_fused.shape == intent_emb.shape, f"Intent embedding shape mismatch after fusion: expected {intent_emb.shape}, got {intent_emb_fused.shape}"
+        intent_emb_fused = intent_emb_fused.reshape(B, intent_emb.shape[1], -1)  # (B, N, intent_dim)
+        assert intent_emb_fused.shape == intent_emb.shape, \
+            f"Intent embedding shape mismatch after fusion: expected {intent_emb.shape}, got {intent_emb_fused.shape}"
         
         return z_v_pooled_fused, z_s_fused, intent_emb_fused
 
     def _store(self, z_v_pooled: torch.Tensor,
                      z_s: torch.Tensor, 
-                     intent_query: torch.Tensor):
-        """Store triplet entry. Consolidate if bank is full.
+                     intent_query: torch.Tensor,
+                     valid_mask: torch.Tensor):
+        """Store triplet entry into fixed-size circular buffer.
+
+        Overwrites oldest entry when bank is full (count > bank_len).
 
         Args:
             z_v_pooled:     (B, perceptual_dim)
             intent_query:   (B, cognitive_dim)    — pooled intent for storage
             z_s:            (B, state_dim)        — robot state
+            valid_mask:     (B,) bool — which samples to store
         """
         B = z_v_pooled.shape[0]
         device = z_v_pooled.device
 
-        # Append new entries
-        p_new = z_v_pooled.unsqueeze(1)     # (B, 1, perceptual_dim)
-        c_new = intent_query.unsqueeze(1)   # (B, 1, cognitive_dim)
-        s_new = z_s.unsqueeze(1)            # (B, 1, state_dim)
-
-
-        if self.perceptual_bank is None or self.perceptual_bank.shape[1] == 0:
-            # First entry
-            self.perceptual_bank = p_new
-            self.cognitive_bank = c_new
-            self.state_bank = s_new
-            self._count = 1
-            self._bank_mask = torch.ones(B, 1, dtype=torch.bool, device=device)
-            return
-
-        # Concatenate new entry
-        p_combined = torch.cat([self.perceptual_bank, p_new], dim=1)  # (B, L+1, D_p)
-        c_combined = torch.cat([self.cognitive_bank, c_new], dim=1)  # (B, L+1, D_c)
-        s_combined = torch.cat([self.state_bank, s_new], dim=1)  # (B, L+1, D_s)
-        new_count = self._count + 1
-
-        # Consolidate if over capacity
-        if new_count > self.bank_len:
-            p_combined, c_combined, s_combined, new_count = self._token_merge(
-                p_combined, c_combined, s_combined, new_count,
-            )
-
-        self.perceptual_bank = p_combined
-        self.cognitive_bank = c_combined
-        self.state_bank = s_combined
-        self._count = new_count
-        self._bank_mask = torch.ones(B, new_count, dtype=torch.bool, device=device)
+        for b in range(B):
+            if valid_mask is not None and not valid_mask[b]:
+                continue
+            idx = self._count[b] % self.bank_len
+            self.perceptual_bank[b, idx] = z_v_pooled[b]
+            self.cognitive_bank[b, idx] = intent_query[b]
+            self.state_bank[b, idx] = z_s[b]
+            self._count[b] += 1
 
     def _token_merge(self,  p_bank: torch.Tensor, 
                             c_bank: torch.Tensor,
@@ -418,6 +367,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
             s_merged: (B, L, state_dim)
             new_count: L
         """
+        print(f"p_bank shape: {p_bank.shape}, c_bank shape: {c_bank.shape}, s_bank shape: {s_bank.shape}, count: {count}")
         B = p_bank.shape[0]
         # Only consider valid entries (first `count` entries)
         p_valid = p_bank[:, :count]  # (B, L+1, D_p)

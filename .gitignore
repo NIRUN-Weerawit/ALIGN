@@ -11,6 +11,8 @@ wandb/
 eval/libero_results/
 eval/libero_traj_results/
 eval/*.mp4
+eval/*.png
+tests/run*
 
 # Optuna trials
 optuna_trials/
@@ -30,3 +32,4 @@ graphify-out/
 
 # docs
 docs/
+reports/

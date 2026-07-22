@@ -85,7 +85,7 @@ graceful degradation to pure teleoperation.
 
 | Pipeline | Source of α | Training signal | Status |
 |---|---|---|---|
-| **Prediction-error α** | `FuturePredictionHead` (Decision) | MSE on predicted future (z_v, z_t) | ✅ Default; ships in `train_heads.py` |
+| **Prediction-error α** | `FuturePredictionHead` (Decision) | MSE on predicted future (z_v, z_s) | ✅ Default; ships in `train_heads.py` |
 | **Counterfactual α** | `WorldModel` + `ValueHead` + `GAIL` discriminator | TD(λ) returns on GAIL reward | ✅ Code complete; runs after world model + GAIL trained |
 
 The two are alternatives, not stacked. Counterfactual α requires the

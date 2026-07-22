@@ -291,7 +291,7 @@ class VisionEncoder(nn.Module):
         # raw 768-D to compact 16-D per patch.
         # The `embed_dim` parameter is kept for API compatibility (used by
         # v1/CLS-mode fusion below).
-        self.projection = nn.Identity()
+        # self.projection = nn.Identity()
         # Multi-camera fusion (v1 only): concatenate V * embed_dim → embed_dim
         if num_cameras > 1 and not use_patch_tokens:
             self.fusion = nn.Sequential(
@@ -348,14 +348,18 @@ class VisionEncoder(nn.Module):
         with torch.no_grad():
             if self.use_patch_tokens:
                 # v2: get all patch tokens (no CLS) — preserves spatial info
-                features_dict = self.backbone.forward_features(x)
-                patch_features = features_dict["x_norm_patchtokens"]
+                features_dict   = self.backbone.forward_features(x)
+                
+                patch_features  = features_dict["x_norm_patchtokens"]   # (B*V, P, 768))
+                features_CLS    = features_dict["x_norm_clstoken"]      # (B*V, 768)
+                
+                features = torch.cat([patch_features,features_CLS.unsqueeze(1)], dim=1)  # (B*V, P+1, 768)
                 # (B*V, num_patches, 768) — raw DINOv2 features
                 # In new architecture, we DON'T project to embed_dim here.
                 # The cross-camera attention runs on raw 768-D features,
                 # then downstream SEVisualCompressor does the channel
                 # compression (768 → 16) per patch position.
-                features = self.projection(patch_features)  # (B*V, num_patches, 768)
+
                 # Reshape to (B, V * num_patches, 768) — multi-cam stacks
                 # patches along the sequence dim; single-cam is unchanged.
                 P = features.size(1)
@@ -372,7 +376,7 @@ class VisionEncoder(nn.Module):
             else:
                 # v1: CLS token only — collapses spatial info
                 features = self.backbone(x)  # (B*V, 768)
-                features = self.projection(features)  # (B*V, embed_dim)
+                # features = self.projection(features)  # (B*V, embed_dim)
                 if V > 1:
                     # Fuse multi-camera features
                     features = features.reshape(B, V * self.embed_dim)

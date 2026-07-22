@@ -247,7 +247,8 @@ class IntentionEncoder(nn.Module):
         self.mamba_output_dim = mamba_output_dim
         self.num_cameras = num_cameras
         self.compressed_dim = compressed_dim
-        self.total_tokens = num_cameras * 256
+        self.raw_dim = raw_dim
+        self.total_tokens = num_cameras
 
         # V4 intent token config
         self.use_intent_tokens = use_intent_tokens
@@ -258,15 +259,12 @@ class IntentionEncoder(nn.Module):
         self.vision_patch_encoder = VisionPatchEncoder(
             compressed_dim=compressed_dim, state_dim=state_dim,
             num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=se_reduction)
-        self.vision_patch_encoder_mamba = VisionPatchEncoder(
-            compressed_dim=4, state_dim=state_dim,
-            num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=se_reduction)
 
-        # Mamba input: all VP positions x comp_dim + state embedding appended
-        self.mamba_in_dim = self.total_tokens * compressed_dim + state_dim
+        # Mamba input: CLS tokens (V * raw_dim) + state embedding
+        self.mamba_in_dim = self.total_tokens * raw_dim + state_dim
 
-        self.pool_out_dim = self.total_tokens * compressed_dim
-        self.pool = self.vision_patch_encoder
+        # self.pool_out_dim = self.total_tokens * compressed_dim
+        # self.pool = self.vision_patch_encoder
 
         self.mamba = Mamba(
             d_model=self.mamba_in_dim,
@@ -303,10 +301,10 @@ class IntentionEncoder(nn.Module):
         """Encode patches via VisionPatchEncoder without pooling.
         
         Args:
-            z_v_patches: (B, P_or_VP_tokens, raw_dim=768)
-            z_s:         (B, state_dim)
+            z_v_patches: (B, T, P_or_VP_tokens, raw_dim=768)
+            z_s:         (B, T, state_dim)
         Returns:
-            (B, VP_tokens, compressed_dim) -- all VP positions preserved
+            (B, T, VP_tokens, compressed_dim) -- all VP positions preserved
         """
         B, T = z_v_patches.shape[:2]
         # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
@@ -317,28 +315,28 @@ class IntentionEncoder(nn.Module):
         
         return torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
     
-    def encode_patches_for_mamba(self, z_v_patches: torch.Tensor, z_s: torch.Tensor
+    def encode_patches_for_mamba(self, z_v_cls: torch.Tensor, z_s: torch.Tensor
                        ) -> torch.Tensor:
         """Encode patches via VisionPatchEncoder without pooling.
         
         Args:
-            z_v_patches: (B, P_or_VP_tokens, raw_dim=768)
-            z_s:         (B, state_dim)
+            z_v_pz_v_clsatches: (B, T, V, raw_dim=768)
+            z_s:         (B, T, state_dim)
         Returns:
-            (B, VP_tokens, compressed_dim) -- all VP positions preserved
+            (B, T, V, compressed_dim)
         """
-        B, T = z_v_patches.shape[:2]
+        B, T = z_v_cls.shape[:2]
         # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
         z_v_mod_seq = []
         for t in range(T):
-            out_t = self.vision_patch_encoder_mamba(z_v_patches[:, t], z_s[:, t])
+            out_t = self.vision_patch_encoder(z_v_cls[:, t], z_s[:, t])
             z_v_mod_seq.append(out_t)
         
-        return torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
+        return torch.stack(z_v_mod_seq, dim=1)  # (B, T, V, comp_dim)
         
-    def forward(self, z_v_mod_seq: torch.Tensor, z_s_seq: torch.Tensor
+    def forward(self, z_v_cls_seq: torch.Tensor, z_s_seq: torch.Tensor
                 ) -> torch.Tensor:
-        """Batched T-step Mamba forward.
+        """Batched T-step Mamba forward with CLS tokens.
 
         V3: returns h_seq (B, T, mamba_output_dim)
         V4 (use_intent_tokens=True): returns (h_seq, intent_emb)
@@ -346,36 +344,26 @@ class IntentionEncoder(nn.Module):
             intent_emb: (B, N, intent_dim) — intent token outputs
 
         Args:
-            z_v_mod_seq: (B, T, VP, comp_dim)
-            z_s_seq:         (B, T, state_dim)
+            z_v_cls_seq: (B, T, V, raw_dim=768) — CLS tokens from DINOv2
+            z_s_seq:     (B, T, state_dim)
         Returns:
             h_seq or (h_seq, intent_emb)
         """
-        # B, T = z_v_patches_seq.shape[:2]
-
-        # # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
-        # z_v_mod_seq = []
-        # for t in range(T):
-        #     out_t = self.vision_patch_encoder(z_v_patches_seq[:, t], z_s_seq[:, t])
-        #     z_v_mod_seq.append(out_t)
-        # z_v_mod_seq = torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
-
-        # z_v_mod_seq = self.encode_patches(z_v_patches_seq, z_s_seq)  # (B, T, VP, comp_dim)
-        
-        # Flatten token positions into feature dimension -> Mamba input
-        B, T, N_tok, D_comp = z_v_mod_seq.shape
+        # Flatten CLS tokens into feature dimension -> Mamba input
+        B, T, V, D = z_v_cls_seq.shape
         mamba_in = torch.cat([
-            z_v_mod_seq.reshape(B, T, N_tok * D_comp),
+            z_v_cls_seq.reshape(B, T, V * D),
             z_s_seq,
         ], dim=-1)  # (B, T, mamba_in_dim)
-
+        assert mamba_in.shape[-1] == self.mamba_in_dim, \
+            f"mamba_in last dim {mamba_in.shape[-1]} != expected {self.mamba_in_dim}"
         if self.use_intent_tokens:
             # Append intent tokens to the input sequence
             intent_tokens = self.intent_tokens.expand(B, -1, -1)  # (B, N, mamba_in_dim)
             mamba_in = torch.cat([mamba_in, intent_tokens], dim=1)  # (B, T+N, mamba_in_dim)
 
             h_full = self.mamba(mamba_in)  # (B, T+N, mamba_in_dim)
-
+            # print(f"h_full shape: {h_full.shape} it should be {(B, T + self.num_intent_tokens, self.mamba_in_dim)}")
             # Split: history outputs + intent outputs
             h_seq = h_full[:, :T, :]        # (B, T, mamba_in_dim)
             h_intent = h_full[:, T:, :]     # (B, N, mamba_in_dim)

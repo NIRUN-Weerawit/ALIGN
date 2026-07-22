@@ -323,12 +323,14 @@ class DiffusionPolicyUNet1D(nn.Module):
         skip0 = x
 
         x = self.down1(x)
+        # print("after down1", x.shape)
         x = self.enc1(x, cond_global, t_emb)
         skip1 = x
 
         x = self.enc2(x, cond_global, t_emb)
 
         x = self.down2(x)
+        # print("after down2", x.shape)
         x = self.enc3(x, cond_global, t_emb)
         skip2 = x
 
