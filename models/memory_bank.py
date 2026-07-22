@@ -66,6 +66,13 @@ class MemoryRetrieval(nn.Module):
         if bank_kv.shape[1] == 0:
             return query
 
+        # Handle bank with all masked entries (no valid entries to attend to).
+        # This happens when the bank is empty (no entries stored yet) and we still
+        # want to query it. Without this check, the attention softmax would be
+        # all-masked → NaN, which propagates through the FFN.
+        if bank_mask is not None and not bank_mask.any():
+            return query
+
         # Attention mask: True = attend, False = don't attend
         # nn.MultiheadAttention expects key_padding_mask where True = masked
         if bank_mask is not None:
