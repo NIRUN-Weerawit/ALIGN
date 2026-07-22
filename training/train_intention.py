@@ -519,10 +519,6 @@ def validate(model, loader, device, args):
 
         max_seg_len = frames_seg.shape[1]
         # Pre-encode vision for the entire segment (vision is the bottleneck)
-        # We process each timestep's frames through vision encoder
-        z_v_pooled_all = []
-        z_s_all = []
-        
         B, S, V, H, W, C = frames_seg.shape 
         z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
         
@@ -531,18 +527,14 @@ def validate(model, loader, device, args):
         
         z_v_all = z_v_all[:, :-1]  # (B*S*V, P, raw_dim=768) — patch tokens only
         
-        # print(f"z_v_all shape: {z_v_all.shape}, z_v_CLS_all shape: {z_v_CLS_all.shape}")
-        
         _ ,P, raw_dim = z_v_all.shape
         z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
-        for t in range(max_seg_len):
-        #     f_t = frames_seg[:, t]  # (B, V, H, W, 3) or (B, H, W, 3)
-            s_t = states_seg[:, t]  # (B, 7)
-        #     z_v_pooled_all.append(model._vision_forward(f_t))
-            z_s_all.append(model.state_encoder(s_t))
-            
-        # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
-        z_s_all = torch.stack(z_s_all, dim=1)
+        
+        _, _, state_dim = states_seg.shape
+        z_s_all = model.state_encoder(
+            states_seg.reshape(B * S, state_dim)
+        ).reshape(B, S, -1)
+        
         z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
         
         # Sequential T-loop
@@ -598,8 +590,7 @@ def validate(model, loader, device, args):
                     h_for_head = h_current
 
                 # Target: C future actions from current time
-                target_end = min(current_t + C, max_seg_len)
-                target = target_seg[:, current_t:target_end]
+                target = target_seg[:, current_t:current_t + C]
 
                 # Loss
                 if args.head_type == "diffusion":
