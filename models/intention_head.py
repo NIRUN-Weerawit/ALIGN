@@ -306,14 +306,24 @@ class DiffusionPolicyUNet1D(nn.Module):
 
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor,
                 t_emb: torch.Tensor) -> torch.Tensor:
+        """U-Net forward.
+
+        Args:
+            x_t:  (B, K, action_dim) — noisy action sequence
+            cond: (B, 1, cond_dim) — single per-timestep condition (broadcast across K)
+            t_emb: (B, time_dim) — time embedding
+        Returns:
+            (B, K, action_dim) — predicted noise
+        """
         B, K, _ = x_t.shape
-        
-        # cond: [B, C]
+
+        # cond: (B, 1, cond_dim) -> (B, cond_dim) for FiLM
         if cond.ndim == 3:
-            cond_global = cond.squeeze(1) if cond.shape[1] == 1 else cond.mean(dim=1)
+            assert cond.shape[1] == 1, f"cond should be (B, 1, cond_dim), got {cond.shape}"
+            cond_global = cond.squeeze(1)  # (B, cond_dim)
         else:
-            cond_global = cond
-        
+            cond_global = cond  # (B, cond_dim)
+
         # x = torch.cat([x_t, cond], dim=-1)              # (B, K, action+cond)
         x = x_t.permute(0, 2, 1)                          # (B, C, K)
         # print(f"DiffusionPolicyUNet1D: input x shape: {x.shape}, cond shape: {cond.shape}, t_emb shape: {t_emb.shape}")
@@ -371,6 +381,11 @@ class _Conv1dBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(film_dim, out_channels * 2),
         )
+        # Zero-init FiLM last layer so FiLM is initially identity (h * 1 + 0 = h).
+        # This is critical for stable training — random FiLM can amplify numerical
+        # errors in BF16 and cause NaN explosions in the U-Net.
+        nn.init.zeros_(self.film[-1].weight)
+        nn.init.zeros_(self.film[-1].bias)
 
     def forward(self, x, cond_global, t_emb):
         h = self.block(x)
@@ -455,21 +470,35 @@ class DiffusionPolicyHead(nn.Module):
     def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
                               z_s_window: torch.Tensor,
                               intent_emb: torch.Tensor = None) -> torch.Tensor:
-        """Build per-step condition (B, K, cond_dim).
+        """Build condition (B, 1, cond_dim).
 
-        Condition = concat[z_v_pooled, z_s, intent_pooled] per step.
-        Intent tokens are pooled to a single vector and repeated per-step.
+        Condition = concat[mean(z_v_pooled), z_s_last, intent_pooled].
+        This is a single per-timestep condition (not per-step). The U-Net
+        uses FiLM to broadcast this across all K action steps.
+        Intent tokens are pooled to a single vector.
         """
-        K = z_v_pooled_window.shape[1]
-        parts = [z_v_pooled_window, z_s_window]
+        parts = []
 
+        # Mean-pool z_v_pooled across the K window to get a single per-step vector
+        if z_v_pooled_window is not None:
+            z_v_pooled_mean = z_v_pooled_window.mean(dim=1, keepdim=True)  # (B, 1, pool_out_dim)
+            parts.append(z_v_pooled_mean)
+
+        # Take the last state (current time)
+        if z_s_window is not None:
+            z_s_last = z_s_window[:, -1:, :]  # (B, 1, state_dim)
+            parts.append(z_s_last)
+
+        # Intent tokens pooled to a single vector
         if intent_emb is not None:
             if intent_emb.ndim == 3:
-                intent_stacked = intent_emb.reshape(intent_emb.shape[0], -1)   # [B, intent_dim * N]
+                intent_stacked = intent_emb.reshape(intent_emb.shape[0], -1)  # (B, intent_dim * N)
             else:
                 intent_stacked = intent_emb
-            parts.append(intent_stacked)
-        cond = torch.cat(parts, dim=-1)  # (B, K, cond_dim)
+            intent_pooled = intent_stacked.unsqueeze(1)  # (B, 1, intent_dim * N)
+            parts.append(intent_pooled)
+
+        cond = torch.cat(parts, dim=-1)  # (B, 1, cond_dim)
         return cond
 
     def forward(self, z_v_pooled_window: torch.Tensor,
@@ -482,8 +511,14 @@ class DiffusionPolicyHead(nn.Module):
 
     def predict_noise(self, x_t: torch.Tensor, t: torch.Tensor,
                       cond: torch.Tensor) -> torch.Tensor:
-        """Predict noise given noisy actions and timestep."""
-        t_emb = self.time_emb(t.float() / self.num_inference_steps)
+        """Predict noise given noisy actions and timestep.
+
+        Args:
+            x_t:  (B, K, action_dim) — noisy action sequence
+            t:    (B,) — timestep per sample
+            cond: (B, K, cond_dim) — per-step condition (preserved for FiLM)
+        """
+        t_emb = self.time_emb(t.float() / self.num_inference_steps)  # (B, time_dim)
         return self.unet(x_t, cond, t_emb)
 
     def loss(self, actions_target: torch.Tensor,

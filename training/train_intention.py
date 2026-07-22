@@ -305,6 +305,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             # Current time = last frame in the window
             current_t = n + Hs - 1
             valid_mask = seg_lens >= (current_t + chunk_size)
+            print(f"valid_mask = {valid_mask}")
             if not valid_mask.any():
                 # No valid samples in this window, skip
                 continue
