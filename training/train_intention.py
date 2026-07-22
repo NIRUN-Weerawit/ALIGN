@@ -241,7 +241,6 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         Hs = args.history_size
         chunk_size = args.chunk_size
 
-        max_seg_len = batch["frames_segment"].shape[1]
         # print(f"Segment length: {max_seg_len}, batch['frames_segment'].shape: {batch['frames_segment'].shape}")
         frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
         states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
@@ -257,6 +256,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # We process each timestep's frames through vision encoder
         z_v_pooled_all = []
         z_s_all = []
+        
         
         B, S, V, H, W, C = frames_seg.shape 
         z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
@@ -295,6 +295,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         last_actions_pred = None
         actions_pred = None
         loss_accum = []
+        max_seg_len = S
         num_windows = max_seg_len - Hs - chunk_size + 1
         time_ids = torch.arange(max_seg_len, device=device)
         valid_time_mask = time_ids.unsqueeze(0) < seg_lens.unsqueeze(1)
@@ -342,7 +343,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         h_for_head = intent_fused
                     else:
                         # Warmup: store perceptual + state, no retrieval
-                        model.memory_module.store_perceptual_only(z_v_current, z_s_current)
+                        model.memory_module.store_perceptual_only(
+                            z_v_current, z_s_current, valid_mask=valid_mask,
+                        )
                         z_v_win_for_head = z_v_win_stacked
                         z_s_win_for_head = z_s_win
                         h_for_head = intent_emb
@@ -503,9 +506,9 @@ def validate(model, loader, device, args):
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False)
     for batch in pbar:
         
-        H = args.history_size
-        C = args.chunk_size
-        B = len(batch["segment_len"])
+        Hs = args.history_size
+        chunk_size = args.chunk_size
+        B_s = len(batch["segment_len"])
         
         frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
         states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
@@ -515,9 +518,8 @@ def validate(model, loader, device, args):
         
         # Reset memory bank at start of segment
         if model.use_memory_bank:
-            model.memory_module.reset(batch_size=B, device=device)
+            model.memory_module.reset(batch_size=B_s, device=device)
 
-        max_seg_len = frames_seg.shape[1]
         # Pre-encode vision for the entire segment (vision is the bottleneck)
         B, S, V, H, W, C = frames_seg.shape 
         z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
@@ -541,20 +543,23 @@ def validate(model, loader, device, args):
         last_actions_pred = None
         actions_pred = None
         loss_accum = []
-        num_windows = max_seg_len - H - C + 1
+        max_seg_len = S
+        num_windows = max_seg_len - Hs - chunk_size + 1
 
         for n in range(num_windows):
             # Build H-window ending at t+H-1
             # Current time = last frame in the window
-            current_t = n + H - 1
-
-            history_start = current_t - H + 1
+            current_t = n + Hs - 1
+            valid_mask = seg_lens >= (current_t + chunk_size)
+            if not valid_mask.any():
+                # No valid samples in this window, skip
+                continue
+            
+            history_start = current_t - Hs + 1
             history_end = current_t + 1
 
             z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
             z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
-
-            valid_mask = seg_lens >= (current_t + C)
 
             # Forward through model
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
@@ -589,8 +594,8 @@ def validate(model, loader, device, args):
                     z_s_win_for_head = z_s_win
                     h_for_head = h_current
 
-                # Target: C future actions from current time
-                target = target_seg[:, current_t:current_t + C]
+                # Target: chunk_size future actions from current time
+                target = target_seg[:, current_t:current_t + chunk_size]
 
                 # Loss
                 if args.head_type == "diffusion":
@@ -598,7 +603,7 @@ def validate(model, loader, device, args):
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
                     )
                     actions_pred = model.sample_actions(
-                        z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=C
+                        z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
                     )
                     loss = model.intention_head.loss(target, cond)
                     if not valid_mask.all():

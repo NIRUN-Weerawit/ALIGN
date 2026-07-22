@@ -41,10 +41,10 @@ class MemoryRetrieval(nn.Module):
         # Input is concat of query and attn_out -> 2*dim
         self.ffn = nn.Sequential(
             nn.LayerNorm(dim * 2),
-            nn.Linear(dim * 2, dim * 4),
+            nn.Linear(dim * 2, dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim * 4, dim),
+            nn.Linear(dim, dim),
         )
         self.out_norm = nn.LayerNorm(dim)
 
@@ -202,19 +202,23 @@ class PerceptualCognitiveMemoryModule(nn.Module):
     def _add_timestep_pe(self, bank: torch.Tensor, count: int) -> torch.Tensor:
         """Add timestep PE to bank entries (returns a copy, does not modify in-place).
 
+        For circular buffer, the count can exceed bank_len. We use modular PE
+        so positions in the circular buffer get a consistent PE that depends
+        only on their actual position in the circular buffer (0..bank_len-1).
+
         Args:
             bank: (B, L, dim)
-            count: number of valid entries (0..L)
+            count: number of valid entries (0..N, can exceed L)
         Returns:
-            (B, L, dim) with PE added to first `count` entries
+            (B, L, dim) with PE added to all bank entries
         """
         B, L, D = bank.shape
         if count == 0:
             return bank
-        # PE for positions 0..count-1
-        pe = self._timestep_pe[:count, :D].unsqueeze(0).expand(B, -1, -1)  # (B, count, D)
-        bank_with_pe = bank.clone()
-        bank_with_pe[:, :count] = bank[:, :count] + pe
+        # Use bank positions 0..L-1 for PE (not the count, which can exceed L)
+        # This ensures PE is consistent across overwrites
+        pe = self._timestep_pe[:L, :D].unsqueeze(0).expand(B, -1, -1)  # (B, L, D)
+        bank_with_pe = bank + pe
         return bank_with_pe
 
     def reset(self, batch_size: int, device: torch.device):
@@ -324,9 +328,11 @@ class PerceptualCognitiveMemoryModule(nn.Module):
                      z_s: torch.Tensor, 
                      intent_query: torch.Tensor,
                      valid_mask: torch.Tensor):
-        """Store triplet entry into fixed-size circular buffer.
+        """Store triplet entry with consolidation.
 
-        Overwrites oldest entry when bank is full (count > bank_len).
+        When the bank is full, run _token_merge first to make room by
+        merging the most similar pair. The bank stays fixed at bank_len
+        size; counts never exceed bank_len.
 
         Args:
             z_v_pooled:     (B, perceptual_dim)
@@ -340,7 +346,17 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         for b in range(B):
             if valid_mask is not None and not valid_mask[b]:
                 continue
-            idx = self._count[b] % self.bank_len
+            # If bank is full, consolidate first to free a slot
+            if self._count[b] >= self.bank_len:
+                # _token_merge reduces count by 1
+                (self.perceptual_bank[b:b+1], self.cognitive_bank[b:b+1],
+                 self.state_bank[b:b+1], new_count) = self._token_merge(
+                    self.perceptual_bank[b:b+1], self.cognitive_bank[b:b+1],
+                    self.state_bank[b:b+1], int(self._count[b].item()),
+                )
+                self._count[b] = new_count
+            # Now add the new entry
+            idx = int(self._count[b].item())
             self.perceptual_bank[b, idx] = z_v_pooled[b]
             self.cognitive_bank[b, idx] = intent_query[b]
             self.state_bank[b, idx] = z_s[b]
@@ -357,28 +373,34 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         (perceptual, cognitive, state) are averaged together as a unit.
 
         Args:
-            p_bank: (B, L+1, perceptual_dim)
-            c_bank: (B, L+1, cognitive_dim)
-            s_bank: (B, L+1, state_dim)
-            count: number of valid entries (L+1)
+            p_bank: (B, L, perceptual_dim)
+            c_bank: (B, L, cognitive_dim)
+            s_bank: (B, L, state_dim)
+            count: number of valid entries (0..L)
         Returns:
             p_merged: (B, L, perceptual_dim)
             c_merged: (B, L, cognitive_dim)
             s_merged: (B, L, state_dim)
-            new_count: L
+            new_count: L (unchanged)
         """
-        print(f"p_bank shape: {p_bank.shape}, c_bank shape: {c_bank.shape}, s_bank shape: {s_bank.shape}, count: {count}")
-        B = p_bank.shape[0]
+        B, L, D_p = p_bank.shape
         # Only consider valid entries (first `count` entries)
-        p_valid = p_bank[:, :count]  # (B, L+1, D_p)
+        if count < 2:
+            return p_bank, c_bank, s_bank, count
+        p_valid = p_bank[:, :count]  # (B, count, D_p)
 
         # Normalize for cosine similarity
-        p_norm = F.normalize(p_valid, dim=-1)  # (B, L+1, D_p)
+        p_norm = F.normalize(p_valid, dim=-1)  # (B, count, D_p)
 
-        # Cosine similarity between adjacent pairs
-        sim = (p_norm[:, :-1] * p_norm[:, 1:]).sum(dim=-1)  # (B, L)
+        # Cosine similarity between adjacent pairs (only valid positions)
+        # Pad with -inf to disable attention to invalid pairs
+        sim = (p_norm[:, :-1] * p_norm[:, 1:]).sum(dim=-1)  # (B, count-1)
+        # Mask out pairs that include invalid positions
+        valid_pair = torch.arange(count-1, device=p_bank.device) < (count - 1)
+        valid_pair = valid_pair.unsqueeze(0).expand(B, -1)  # (B, count-1)
+        sim = sim.masked_fill(~valid_pair, -1.0)
         # Average across batch to find globally most similar pair
-        sim_mean = sim.mean(dim=0)  # (L,)
+        sim_mean = sim.mean(dim=0)  # (count-1,)
         merge_idx = sim_mean.argmax().item()  # merge the MOST similar (highest cos)
 
         # Merge pair (merge_idx, merge_idx+1) by averaging all three fields
@@ -391,16 +413,21 @@ class PerceptualCognitiveMemoryModule(nn.Module):
             p_bank[:, :merge_idx],
             p_merged_vec.unsqueeze(1),
             p_bank[:, merge_idx + 2:],
-        ], dim=1)  # (B, L, D_p)
+        ], dim=1)  # (B, count-1, D_p)
         c_out = torch.cat([
             c_bank[:, :merge_idx],
             c_merged_vec.unsqueeze(1),
             c_bank[:, merge_idx + 2:],
-        ], dim=1)  # (B, L, D_c)
+        ], dim=1)  # (B, count-1, D_c)
         s_out = torch.cat([
             s_bank[:, :merge_idx],
             s_merged_vec.unsqueeze(1),
             s_bank[:, merge_idx + 2:],
-        ], dim=1)  # (B, L, D_s)
+        ], dim=1)  # (B, count-1, D_s)
 
-        return p_out, c_out, s_out, self.bank_len
+        # Pad to bank_len so the buffer stays fixed size
+        p_padded = F.pad(p_out, (0, 0, 0, L - p_out.shape[1]))
+        c_padded = F.pad(c_out, (0, 0, 0, L - c_out.shape[1]))
+        s_padded = F.pad(s_out, (0, 0, 0, L - s_out.shape[1]))
+        return p_padded, c_padded, s_padded, count - 1
+
