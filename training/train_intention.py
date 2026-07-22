@@ -248,7 +248,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
-        print(f"seg_lens: {seg_lens}")
+        # print(f"seg_lens: {seg_lens}")
         # Reset memory bank at start of segment
         if model.use_memory_bank:
             model.memory_module.reset(batch_size=seg_lens.shape[0], device=device)
