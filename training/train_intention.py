@@ -361,14 +361,26 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
                 # Loss
                 if args.head_type == "diffusion":
+                    if args.debug:
+                        print(f"[DEBUG] z_v_win_for_head: {z_v_win_for_head.shape}, "
+                              f"z_s_win_for_head: {z_s_win_for_head.shape}, "
+                              f"h_for_head: {h_for_head.shape if h_for_head is not None else None}")
                     cond = model.intention_head(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
                     )
+                    if args.debug:
+                        print(f"[DEBUG] cond: {cond.shape}, finite: {torch.isfinite(cond).all().item()}")
                     actions_pred = model.sample_actions(
                         z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
                     )
+                    if args.debug:
+                        print(f"[DEBUG] actions_pred: {actions_pred.shape}, "
+                              f"finite: {torch.isfinite(actions_pred).all().item()}, "
+                              f"abs.mean: {actions_pred.detach().abs().mean().item()}")
                     assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
                     loss = model.intention_head.loss(target, cond)
+                    if args.debug:
+                        print(f"[DEBUG] loss: {loss.item()}")
                     # Mask loss: only valid samples contribute
                     if not valid_mask.all():
                         loss = loss * valid_mask.float().mean()
