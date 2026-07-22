@@ -336,7 +336,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                            z_v_current, z_s_current, intent_emb, valid_mask=valid_mask
+                            z_v_current, z_s_current, intent_emb
                         )
                         z_v_win_for_head = z_v_fused
                         z_s_win_for_head = z_s_fused
@@ -344,7 +344,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     else:
                         # Warmup: store perceptual + state, no retrieval
                         model.memory_module.store_perceptual_only(
-                            z_v_current, z_s_current, valid_mask=valid_mask,
+                            z_v_current, z_s_current
                         )
                         z_v_win_for_head = z_v_win_stacked
                         z_s_win_for_head = z_s_win
@@ -578,14 +578,14 @@ def validate(model, loader, device, args):
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                            z_v_current, z_s_current, intent_emb, valid_mask=valid_mask
+                            z_v_current, z_s_current, intent_emb
                         )
                         z_v_win_for_head = z_v_fused
                         z_s_win_for_head = z_s_fused
                         h_for_head = intent_fused
                     else:
                         # Warmup: store perceptual + state, no retrieval
-                        model.memory_module.store_perceptual_only(z_v_current, z_s_current, valid_mask=valid_mask)
+                        model.memory_module.store_perceptual_only(z_v_current, z_s_current)
                         z_v_win_for_head = z_v_win_stacked
                         z_s_win_for_head = z_s_win
                         h_for_head = intent_emb

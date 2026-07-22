@@ -240,14 +240,16 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         self._count = torch.zeros(batch_size, dtype=torch.long, device=device)
 
     def store_perceptual_only(self, z_v_pooled: torch.Tensor,
-                                    z_s: torch.Tensor,
-                                    valid_mask: Optional[torch.Tensor] = None):
+                                    z_s: torch.Tensor):
         """Store only the perceptual and state fields (warmup phase, no intent_emb yet).
+
+        Always stores all samples in the batch. The past observations are
+        always valid (we observed them); whether the target is available
+        is a separate concern handled by the loss.
 
         Args:
             z_v_pooled: (B, perceptual_dim)
             z_s:        (B, state_dim)
-            valid_mask: (B,) bool — which samples to store
         """
         B = z_v_pooled.shape[0]
         device = z_v_pooled.device
@@ -255,9 +257,15 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         c_new = torch.zeros(B, self.cognitive_dim, device=device)
 
         for b in range(B):
-            if valid_mask is not None and not valid_mask[b]:
-                continue
-            idx = self._count[b] % self.bank_len
+            if self._count[b] >= self.bank_len:
+                # Consolidate first to free a slot
+                (self.perceptual_bank[b:b+1], self.cognitive_bank[b:b+1],
+                 self.state_bank[b:b+1], new_count) = self._token_merge(
+                    self.perceptual_bank[b:b+1], self.cognitive_bank[b:b+1],
+                    self.state_bank[b:b+1], int(self._count[b].item()),
+                )
+                self._count[b] = new_count
+            idx = int(self._count[b].item())
             self.perceptual_bank[b, idx] = z_v_pooled[b]
             self.cognitive_bank[b, idx] = c_new[b]
             self.state_bank[b, idx] = z_s[b]
@@ -265,8 +273,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
 
     def forward(self, z_v_pooled: torch.Tensor,
                       z_s: torch.Tensor, 
-                      intent_emb: torch.Tensor,
-                      valid_mask: Optional[torch.Tensor] = None
+                      intent_emb: torch.Tensor
                       ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Retrieve, fuse, and store.
 
@@ -274,7 +281,6 @@ class PerceptualCognitiveMemoryModule(nn.Module):
             z_v_pooled: (B, perceptual_dim)     — current pooled vision
             intent_emb: (B, N, cognitive_dim)   — current intent tokens
             z_s:        (B, state_dim)          — current robot state
-            valid_mask: (B,) bool — which samples are valid (not padding)
         Returns:
             z_v_pooled_fused: (B, perceptual_dim)
             intent_emb_fused: (B, N, cognitive_dim)
@@ -314,8 +320,8 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         intent_emb_fused    = self.cognitive_gate(intent_query, c_retrieved)
         z_s_fused           = self.state_gate(z_s, s_retrieved)
         
-        # --- 3. Store current triplet into bank (circular buffer) ---
-        self._store(z_v_pooled_fused, z_s_fused, intent_query, valid_mask)
+        # --- 3. Store current triplet into bank (with consolidation when full) ---
+        self._store(z_v_pooled_fused, z_s_fused, intent_query)
         
         # Expand retrieved context back to N tokens
         intent_emb_fused = intent_emb_fused.reshape(B, intent_emb.shape[1], -1)  # (B, N, intent_dim)
@@ -326,26 +332,23 @@ class PerceptualCognitiveMemoryModule(nn.Module):
 
     def _store(self, z_v_pooled: torch.Tensor,
                      z_s: torch.Tensor, 
-                     intent_query: torch.Tensor,
-                     valid_mask: torch.Tensor):
+                     intent_query: torch.Tensor):
         """Store triplet entry with consolidation.
 
         When the bank is full, run _token_merge first to make room by
         merging the most similar pair. The bank stays fixed at bank_len
-        size; counts never exceed bank_len.
+        size; counts never exceed bank_len. All samples in the batch
+        are stored (the past observations are always valid).
 
         Args:
             z_v_pooled:     (B, perceptual_dim)
             intent_query:   (B, cognitive_dim)    — pooled intent for storage
             z_s:            (B, state_dim)        — robot state
-            valid_mask:     (B,) bool — which samples to store
         """
         B = z_v_pooled.shape[0]
         device = z_v_pooled.device
 
         for b in range(B):
-            if valid_mask is not None and not valid_mask[b]:
-                continue
             # If bank is full, consolidate first to free a slot
             if self._count[b] >= self.bank_len:
                 # _token_merge reduces count by 1
