@@ -539,7 +539,13 @@ def validate(model, loader, device, args):
         ).reshape(B, S, -1)
         
         z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
-        
+
+        # Build head and memory bank on first segment (lazy build)
+        if not model._built:
+            B_seg, S, VP, comp_dim = z_v_mod_all.shape
+            # pool_out_dim = VP * comp_dim (the shape stored in memory bank)
+            model._build_head_and_bank(VP * comp_dim)
+
         # Sequential T-loop
         last_actions_pred = None
         actions_pred = None

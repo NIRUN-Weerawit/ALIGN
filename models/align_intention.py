@@ -236,6 +236,10 @@ class ALIGNIntentionModel(nn.Module):
             dict with:
               h_seq:           (B, T, mamba_in_dim)
               intent_emb:      (B, N, intent_dim)
+
+        NOTE: Does NOT trigger the lazy head build. The head should be built
+        explicitly by the caller (e.g., train loop) with the correct pool_out_dim
+        that matches the memory bank storage shape.
         """
         # Forward through intention encoder
         intent_emb = None
