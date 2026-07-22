@@ -603,9 +603,11 @@ def validate(model, loader, device, args):
                         z_s_win_for_head = z_s_win
                         h_for_head = intent_emb
                 else:
-                    z_v_win_for_head = z_v_win_stacked
-                    z_s_win_for_head = z_s_win
-                    h_for_head = h_current
+                    # z_v_win: (B, Hs, V*P, comp_dim) — flatten to (B, Hs, V*P*comp_dim)
+                    B_seg_v, H_actual_v, VP_v, comp_dim_v = z_v_win.shape
+                    z_v_win_for_head = z_v_win.reshape(B_seg_v, H_actual_v, VP_v * comp_dim_v)  # (B, Hs, pool_out_dim)
+                    z_s_win_for_head = z_s_win  # (B, Hs, state_dim) — already 3D
+                    h_for_head = h_current  # (B, mamba_in_dim) — but the head expects 3D!
 
                 # Target: chunk_size future actions from current time
                 target = target_seg[:, current_t:current_t + chunk_size]
