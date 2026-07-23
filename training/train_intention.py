@@ -90,6 +90,10 @@ import torch.nn.functional as F
 # kernel interact badly. Without this, you get CUDNN_STATUS_NOT_INITIALIZED
 # on the first conv2d inside DINOv2. See setup.sh for the same fix.
 torch.backends.cudnn.enabled = False
+
+# Enable TF32 for faster matmuls on Ampere+ GPUs (slight precision loss)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
@@ -374,14 +378,19 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     )
                     if getattr(args, "debug", False):
                         print(f"[DEBUG] cond: {cond.shape}, finite: {torch.isfinite(cond).all().item()}")
-                    actions_pred = model.sample_actions(
-                        z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
-                    )
-                    if getattr(args, "debug", False):
-                        print(f"[DEBUG] actions_pred: {actions_pred.shape}, "
-                              f"finite: {torch.isfinite(actions_pred).all().item()}, "
-                              f"abs.mean: {actions_pred.detach().abs().mean().item()}")
-                    assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
+                    # Sample actions for the action mean (5-10x slower than loss compute).
+                    # Skip in training if --no-sample-during-train is set.
+                    if getattr(args, "no_sample_during_train", False):
+                        actions_pred = None
+                    else:
+                        actions_pred = model.sample_actions(
+                            z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
+                        )
+                        if getattr(args, "debug", False):
+                            print(f"[DEBUG] actions_pred: {actions_pred.shape}, "
+                                  f"finite: {torch.isfinite(actions_pred).all().item()}, "
+                                  f"abs.mean: {actions_pred.detach().abs().mean().item()}")
+                        assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
                     loss = model.intention_head.loss(target, cond)
                     if getattr(args, "debug", False):
                         print(f"[DEBUG] loss: {loss.item()}")
@@ -810,7 +819,14 @@ def parse_args():
                         help="Enable Perceptual-Cognitive Memory Bank (V4).")
     parser.add_argument("--memory-bank-len", type=int, default=16,
                         help="Max paired entries in bank (default 16).")
-    
+
+    # Performance: skip expensive operations during training
+    parser.add_argument("--no-sample-during-train", action="store_true", default=False,
+                        help="Skip DDIM sampling for action mean during training (5-10x faster).")
+    parser.set_defaults(no_sample_during_train=True)  # Default: skip for speed
+    parser.add_argument("--torch-compile", action="store_true", default=False,
+                        help="Use torch.compile to speed up model (1.5-2x faster, may have issues).")
+
     # V4: Segment training
     parser.add_argument("--history-size", type=int, default=20,
                         help="Past frames for Mamba window (default 20).")
