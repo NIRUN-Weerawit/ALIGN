@@ -496,19 +496,18 @@ def run_model_in_sim(
     max_steps: int = 200,
     alpha: float = 1.0,
     action_scale: float = 1.0,
-    z_sext: Optional[torch.Tensor] = None,
     render_size: int = 256,
     use_camera: str = "agentview_image",
     flip_vertical: bool = True,
     flip_horizontal: bool = False,
     debug: bool = False,
 ) -> Dict:
-    """Run v3 model in MuJoCo sim. Record frames.
+    """Run V4 model in MuJoCo sim. Record frames.
 
     At each step:
       1. Render sim frame
       2. Build K-window of past (frames, states) from sim
-      3. Run v3 model -> a_model
+      3. Run V4 model -> a_model
       4. Apply: action = (1-alpha) * a_human + alpha * a_model
       5. Step sim
       6. Compute EEF position error vs dataset expert (if poses given)
@@ -532,6 +531,10 @@ def run_model_in_sim(
     sim_positions = []
     errors = []
     stored_actions = []
+
+    # Reset memory bank at start of episode
+    if getattr(model, 'use_memory_bank', False):
+        model.memory_module.reset(batch_size=1, device=device)
 
     # State buffer (K-window) — each entry is a (7,) state vector
     pose_buffer = []
@@ -589,22 +592,36 @@ def run_model_in_sim(
         f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)  # (1, K, V, H, W, 3)
         s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
 
-        # 4. Run v3 model
+        # 4. Run V4 model
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                      enabled=device.type == "cuda"):
                 with sdpa_kernel(backends=[SDPBackend.MATH]):
                     out = model(f_t, s_t)
                     h_current = out["h_seq"][:, -1]
-                    if model.head_type in ("flow", "diffusion_policy"):
+                    intent_emb = out.get("intent_emb", None)
+
+                    # Memory bank step (if enabled)
+                    if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
+                        # Use the last window's z_v_pooled and z_s for memory bank
+                        z_v_current = out["z_v_pooled_seq"][:, -1]
+                        z_s_current = out["z_s_seq"][:, -1]
+                        z_v_fused, z_s_fused, intent_fused = model.memory_module(
+                            z_v_current, z_s_current, intent_emb,
+                        )
+                        h_for_head = intent_fused
+                    else:
+                        h_for_head = intent_emb if intent_emb is not None else h_current
+
+                    if model.head_type == "diffusion":
                         a_model_full = model.sample_actions(
                             out["z_v_pooled_seq"], out["z_s_seq"],
-                            h_current, z_sext=z_sext,
+                            h_for_head,
                         )
                     else:
                         a_model_full = model.predict_actions(
                             out["z_v_pooled_seq"], out["z_s_seq"],
-                            h_current, z_sext=z_sext,
+                            h_for_head,
                         )
         a_model = a_model_full[0, 0, :].float().cpu().numpy()  # (6,) or (7,)
 
@@ -901,11 +918,6 @@ def main():
         print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key} → task='{task_name}'")
         print(f"    BDDL: {bddl_path}")
 
-        # Encode text (if model uses text)
-        z_sext_eval = None
-        if getattr(model, "text_encoder", None) is not None:
-            z_sext_eval = model.text_encoder([task_name] * 1)
-
         try:
             if OffScreenRenderEnv is None:
                 raise ImportError("OffScreenRenderEnv not available")
@@ -949,7 +961,6 @@ def main():
             max_steps=args.max_steps,
             alpha=args.alpha,
             action_scale=args.action_scale if args.action_scale is not None else 1.0,
-            z_sext=z_sext_eval,
             render_size=args.render_size,
             use_camera=args.cameras,
             flip_vertical=flip_vertical,
