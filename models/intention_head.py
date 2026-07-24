@@ -522,8 +522,16 @@ class DiffusionPolicyHead(nn.Module):
         return self.unet(x_t, cond, t_emb)
 
     def loss(self, actions_target: torch.Tensor,
-             cond: torch.Tensor) -> torch.Tensor:
-        """DDPM noise-prediction training loss."""
+             cond: torch.Tensor,
+             dim_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """DDPM noise-prediction training loss.
+
+        Args:
+            actions_target: (B, K, action_dim)
+            cond: (B, K, cond_dim)
+            dim_weights: (action_dim,) optional per-dimension loss weights.
+                         Use to down-weight gripper (e.g. [1,1,1,1,1,1,0.01]).
+        """
         B, K = actions_target.shape[:2]
         device = actions_target.device
 
@@ -536,7 +544,10 @@ class DiffusionPolicyHead(nn.Module):
         x_t = alpha_bar_t.sqrt() * actions_target.float() + sigma_t * noise
 
         predicted_noise = self.predict_noise(x_t, t_indices, cond)
-        return F.mse_loss(predicted_noise.float(), noise.float())
+        err = (predicted_noise.float() - noise.float()) ** 2  # (B, K, D)
+        if dim_weights is not None:
+            err = err * dim_weights.unsqueeze(0).unsqueeze(0)  # broadcast
+        return err.mean()
 
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, num_steps: int = None) -> torch.Tensor:

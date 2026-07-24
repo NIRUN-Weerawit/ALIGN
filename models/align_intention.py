@@ -211,7 +211,7 @@ class ALIGNIntentionModel(nn.Module):
                 cognitive_dim=self.intent_dim*self.num_intent_tokens if self.use_intent_tokens else self.mamba_output_dim,
                 state_dim=self.state_dim,
                 bank_len=self.memory_bank_len,
-                num_heads=2,
+                num_heads=4,
             ).to(device)
 
     # ----------------------------------------------------------------

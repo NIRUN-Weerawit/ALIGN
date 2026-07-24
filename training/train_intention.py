@@ -241,17 +241,22 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             batch = next(step_iter)
         except StopIteration:
             break
-
         Hs = args.history_size
         chunk_size = args.chunk_size
 
+        # Per-dimension loss weights: down-weight gripper (dim 6) so it doesn't dominate
+        dim_weights = torch.ones(args.action_dim, device=device)
+        if args.action_dim >= 7:
+            dim_weights[6] = 0.01  # gripper: binary 0/1, scale down 100×
+
+        max_seg_len = batch["frames_segment"].shape[1]
         # print(f"Segment length: {max_seg_len}, batch['frames_segment'].shape: {batch['frames_segment'].shape}")
         frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
         states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
         actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
-        # print(f"seg_lens: {seg_lens}")
+        print(f"seg_lens: {seg_lens}")
         # Reset memory bank at start of segment
         if model.use_memory_bank:
             model.memory_module.reset(batch_size=seg_lens.shape[0], device=device)
@@ -387,7 +392,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                                   f"finite: {torch.isfinite(actions_pred).all().item()}, "
                                   f"abs.mean: {actions_pred.detach().abs().mean().item()}")
                         assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
-                    loss = model.intention_head.loss(target, cond)
+                    loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
                     if getattr(args, "debug", False):
                         print(f"[DEBUG] loss: {loss.item()}")
                     # Mask loss: only valid samples contribute
@@ -446,6 +451,11 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
         state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
         target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 7)
 
+        # Per-dimension loss weights: down-weight gripper (dim 6) so it doesn't dominate
+        dim_weights = torch.ones(args.action_dim, device=device)
+        if args.action_dim >= 7:
+            dim_weights[6] = 0.01  # gripper: binary 0/1, scale down 100×
+
         # Forward (BF16 always on for speed; disabled automatically on CPU)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
@@ -462,7 +472,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                     out["z_v_pooled_seq"], out["z_s_seq"], h_current,
                     num_steps=target.shape[1],
                 )
-                loss = model.intention_head.loss(target, cond)
+                loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
             else:
                 actions_pred = model.predict_actions(
                     out["z_v_pooled_seq"], out["z_s_seq"], h_current,
@@ -535,7 +545,12 @@ def validate(model, loader, device, args):
         Hs = args.history_size
         chunk_size = args.chunk_size
         B_s = len(batch["segment_len"])
-        
+
+        # Per-dimension loss weights: down-weight gripper (dim 6) so it doesn't dominate
+        dim_weights = torch.ones(args.action_dim, device=device)
+        if args.action_dim >= 7:
+            dim_weights[6] = 0.01  # gripper: binary 0/1, scale down 100×
+
         frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
         states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
         target_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
@@ -646,7 +661,7 @@ def validate(model, loader, device, args):
                     actions_pred = model.sample_actions(
                         z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
                     )
-                    loss = model.intention_head.loss(target, cond)
+                    loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
                     if not valid_mask.all():
                         loss = loss * valid_mask.float().mean()
                 else:
