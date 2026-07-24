@@ -276,36 +276,52 @@ class ALIGNIntentionModel(nn.Module):
         """
         B, T = frames_seq.shape[:2]
 
-        # Encode each frame
-        z_v_patches_seq = []
-        for t in range(T):
-            z_v_t = self._vision_forward(frames_seq[:, t]) # shape already (B, V*P, comp_dim) or (B, P, comp_dim)
-            assert z_v_t.ndim == 3, f"Expected 3D tensor, got {z_v_t.ndim}D" 
-            z_v_patches_seq.append(z_v_t)
-        z_v_patches_seq = torch.stack(z_v_patches_seq, dim=1)  # (B, T, V*P, comp_dim)
+        # Batch DINOv2: reshape all frames into one big tensor
+        if frames_seq.ndim == 6:
+            # (B, T, V, H, W, 3) — multi-camera
+            V = frames_seq.shape[2]
+            z_v_all = self._vision_forward(
+                frames_seq.reshape(B * T * V, *frames_seq.shape[3:])
+            )  # (B*T*V, P+1, raw_dim=768)
+        else:
+            # (B, T, H, W, 3) — single camera
+            V = 1
+            z_v_all = self._vision_forward(
+                frames_seq.reshape(B * T, *frames_seq.shape[2:])
+            )  # (B*T, P+1, raw_dim=768)
+
+        # Split CLS tokens from patch tokens
+        z_v_CLS_all = z_v_all[:, -1]  # (B*T*V, raw_dim=768)
+        z_v_CLS_all = z_v_CLS_all.reshape(B, T, V, -1)  # (B, T, V, raw_dim=768)
+
+        z_v_all = z_v_all[:, :-1]  # (B*T*V, P, raw_dim=768)
+        _, P, raw_dim = z_v_all.shape
+        z_v_all = z_v_all.reshape(B, T, V * P, raw_dim)  # (B, T, V*P, raw_dim=768)
 
         # Encode states (batched)
         z_s_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
 
-        # Forward through intention encoder
-        intent = self.forward_intent(z_v_patches_seq, z_s_seq)
-        h_seq = intent["h_seq"]
-        intent_emb = intent.get("intent_emb", None)
-
-        # Get per-step per-patch features for the head
-        z_v_pooled_seq = []
-        for t in range(T):
-            z_v_t = z_v_patches_seq[:, t]
-            z_s_t = z_s_seq[:, t]
-            z_v_pooled_seq.append(z_v_t)    # (B, V*P, comp_dim)
-        z_v_pooled_seq = torch.stack(z_v_pooled_seq, dim=1)  # (B, T, V*P, comp_dim)
-        B, T, N_tok, comp_dim = z_v_pooled_seq.shape
-        pool_out_dim = N_tok * comp_dim
-        z_v_pooled_seq = z_v_pooled_seq.reshape(B, T, pool_out_dim)  # (B, T, pool_out_dim)
+        # Encode patches for head consumption
+        if self.use_history:
+            z_v_mod_seq = self.intention_encoder.encode_patches(z_v_all, z_s_seq)  # (B, T, V*P, comp_dim)
+            B, T, N_tok, comp_dim = z_v_mod_seq.shape
+            pool_out_dim = N_tok * comp_dim
+            z_v_pooled_seq = z_v_mod_seq.reshape(B, T, pool_out_dim)  # (B, T, pool_out_dim)
+        else:
+            pool_out_dim = 1
+            z_v_pooled_seq = torch.zeros(B, T, 1, device=frames_seq.device)
 
         # Build head and bank on first forward (now we know pool_out_dim)
         self._build_head_and_bank(pool_out_dim)
-        
+
+        # Forward through intention encoder (uses CLS tokens)
+        if self.use_history:
+            intent = self.forward_intent(z_v_CLS_all, z_s_seq)
+            h_seq = intent["h_seq"]
+            intent_emb = intent.get("intent_emb", None)
+        else:
+            h_seq = torch.zeros(B, T, 1, device=frames_seq.device)
+            intent_emb = None
 
         return {
             "z_v_pooled_seq": z_v_pooled_seq,
