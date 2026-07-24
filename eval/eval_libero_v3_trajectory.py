@@ -448,8 +448,12 @@ def run_replay_in_sim(
         # Pad with zero gripper
         pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
         actions = np.concatenate([actions, pad], axis=1)
+    # Pad to max_steps by repeating last action
+    if len(actions) < max_steps:
+        pad = np.tile(actions[-1:], (max_steps - len(actions), 1))
+        actions = np.concatenate([actions, pad], axis=0)
 
-    for step in range(min(len(actions), max_steps)):
+    for step in range(max_steps):
         # Get current frame BEFORE step
         frame = get_sim_frame(env, key=use_camera, render_size=render_size,
                                 flip_vertical=flip_vertical,
@@ -536,6 +540,7 @@ def run_model_in_sim(
     if actions.shape[1] < 7:
         pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
         actions = np.concatenate([actions, pad], axis=1)
+    ep_len = len(actions)  # original episode length (before padding to max_steps)
     # Pad actions to max_steps by repeating last action (safe for Phase 1 indexing)
     if len(actions) < max_steps:
         pad = np.tile(actions[-1:], (max_steps - len(actions), 1))
@@ -585,7 +590,7 @@ def run_model_in_sim(
         frame_buffer.append(init_frame_stack.copy())
 
     n_steps = max_steps
-    switch_step = int(min(len(actions), max_steps) * switch_at)
+    switch_step = int(ep_len * switch_at)
 
     for step in range(n_steps):
         # 1. Render current sim frame BEFORE step
@@ -650,11 +655,12 @@ def run_model_in_sim(
         else:
             # Phase 2: model controls
             final_action = a_model_scaled.copy()
-            # Gripper: use model's prediction
-            if a_model.shape[0] >= 7:
-                final_action[6] = 1.0 if a_model_scaled[6] >= 0.5 else -1.0
-            elif final_action.shape[0] >= 7:
-                final_action[6] = -1.0  # fallback: close gripper
+        
+        # Gripper:
+        if final_action.shape[0] >= 7:
+            final_action[6] = 1.0 if final_action[6] >= 0.5 else -1.0
+        else:
+            final_action[6] = -1.0  # fallback: close gripper
 
         if debug:
             print(f"Step {step}: phase={'expert' if step < switch_step else 'model'} "
@@ -736,6 +742,9 @@ def _extract_dataset_frames(
         if flip_horizontal:
             f = np.fliplr(f).copy()
         out.append(f)
+    # Pad to max_steps by repeating last frame (so video length matches model rollout)
+    while len(out) < max_steps:
+        out.append(out[-1].copy())
     return out
 
 
