@@ -479,8 +479,7 @@ def run_replay_in_sim(
             errors.append(err)
         else:
             errors.append(0.0)
-        if done:
-            break
+        # Don't break on done — keep running to max_steps for consistent video length
 
     return {
         "frames": frames,
@@ -658,7 +657,7 @@ def run_model_in_sim(
         
         # Gripper:
         if final_action.shape[0] >= 7:
-            final_action[6] = 1.0 if final_action[6] >= 0.5 else -1.0
+            final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
         else:
             final_action[6] = -1.0  # fallback: close gripper
 
@@ -679,8 +678,7 @@ def run_model_in_sim(
             errors.append(err)
         else:
             errors.append(0.0)
-        if done:
-            break
+        # Don't break on done — keep running to max_steps for consistent video length
 
     return {
         "frames": frames,
