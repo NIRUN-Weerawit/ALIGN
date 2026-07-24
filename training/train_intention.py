@@ -272,12 +272,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         z_v_all_reshaped = z_v_all.reshape(B * S, V, P_plus_1, 768)
         z_v_CLS_all = z_v_all_reshaped[:, :, -1, :]  # (B*S, V, 768)
         z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
-
         # Extract patches (all positions except the last per camera)
-        z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B * S, V * P, 768)
-
-        _ ,P, raw_dim = z_v_all.shape
-        z_v_all = z_v_all.reshape(B, S, V * P, raw_dim)            # (B, S, V*P, raw_dim=768)
+        z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B, S , V * P, 768)   # (B, S, V*P, raw_dim=768)     
         
         _, _, state_dim = states_seg.shape
         z_s_all = model.state_encoder(
