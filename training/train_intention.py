@@ -249,14 +249,12 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         if args.action_dim >= 7:
             dim_weights[6] = 0.01  # gripper: binary 0/1, scale down 100×
 
-        max_seg_len = batch["frames_segment"].shape[1]
-        # print(f"Segment length: {max_seg_len}, batch['frames_segment'].shape: {batch['frames_segment'].shape}")
         frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
         states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
         actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
-        print(f"seg_lens: {seg_lens}")
+        # print(f"seg_lens: {seg_lens}")
         # Reset memory bank at start of segment
         if model.use_memory_bank:
             model.memory_module.reset(batch_size=seg_lens.shape[0], device=device)
@@ -274,11 +272,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
         P_plus_1 = z_v_all.shape[1]
         P = P_plus_1 - 1
-        z_v_all_reshaped = z_v_all.reshape(B * S, V, P_plus_1, 768)
-        z_v_CLS_all = z_v_all_reshaped[:, :, -1, :]  # (B*S, V, 768)
+        z_v_all = z_v_all.reshape(B * S, V, P_plus_1, 768)
+        z_v_CLS_all = z_v_all[:, :, -1, :]  # (B*S, V, 768)
         z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
         # Extract patches (all positions except the last per camera)
-        z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B, S , V * P, 768)   # (B, S, V*P, raw_dim=768)     
+        z_v_all = z_v_all[:, :, :-1, :].reshape(B, S , V * P, 768)   # (B, S, V*P, raw_dim=768)     
         
         _, _, state_dim = states_seg.shape
         z_s_all = model.state_encoder(
