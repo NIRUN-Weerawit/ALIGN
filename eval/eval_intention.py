@@ -142,6 +142,22 @@ def load_intention_model(
         memory_bank_len=cfg.get("memory_bank_len", 16),
     ).to(device)
 
+    # Build head and bank by probing vision output shape
+    # Must happen BEFORE loading state dict so head/bank parameters exist
+    print(f"  Building head/bank (probing vision output shape)...")
+    with torch.no_grad():
+        num_cam = cfg["num_cameras"]
+        comp_dim = cfg.get("compressed_dim", 16)
+        dummy = torch.randint(0, 256, (1, num_cam, 224, 224, 3), dtype=torch.uint8, device=device)
+        z_v_dummy = model._vision_forward(dummy)
+        if z_v_dummy.ndim == 2:
+            N_tok_actual = z_v_dummy.shape[0]
+        else:
+            N_tok_actual = z_v_dummy.shape[1]
+        pool_out_dim = (N_tok_actual - num_cam) * comp_dim
+        print(f"    pool_out_dim={pool_out_dim} (N_tok={N_tok_actual}, comp_dim={comp_dim})")
+        model._build_head_and_bank(pool_out_dim)
+
     # Load the state dict. We try a strict load first; if that fails
     # (e.g. checkpoint was trained with slightly different head config)
     # we fall back to a non-strict load and report mismatches.

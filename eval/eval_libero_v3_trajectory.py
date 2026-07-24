@@ -496,6 +496,7 @@ def run_model_in_sim(
     max_steps: int = 200,
     alpha: float = 1.0,
     action_scale: float = 1.0,
+    switch_at: float = 0.5,
     render_size: int = 256,
     use_camera: str = "agentview_image",
     flip_vertical: bool = True,
@@ -504,11 +505,19 @@ def run_model_in_sim(
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
 
+    Phase 1 (steps < switch_at * max_steps):
+      Expert controls 100%. Model runs in background to build
+      Mamba state, memory bank, and intent tokens.
+
+    Phase 2 (steps >= switch_at * max_steps):
+      Model controls 100%. Uses accumulated context to continue
+      the task autonomously.
+
     At each step:
       1. Render sim frame
       2. Build K-window of past (frames, states) from sim
       3. Run V4 model -> a_model
-      4. Apply: action = (1-alpha) * a_human + alpha * a_model
+      4. Apply: action = expert (phase 1) or a_model (phase 2)
       5. Step sim
       6. Compute EEF position error vs dataset expert (if poses given)
 
@@ -519,6 +528,7 @@ def run_model_in_sim(
           - errors: (T,) EEF position error vs dataset expert (if poses given)
           - stored_actions: (T, 6) array of model predictions
           - n_steps: number of steps run
+          - switch_step: int — step at which model took over
     """
     # Pad expert_actions to (N, 7) for the "noised human" baseline (alpha-blend)
     n_actions = len(expert_actions)
@@ -533,7 +543,7 @@ def run_model_in_sim(
     stored_actions = []
 
     # Reset memory bank at start of episode
-    if getattr(model, 'use_memory_bank', False):
+    if getattr(model, 'use_memory_bank', False) and model.memory_module is not None:
         model.memory_module.reset(batch_size=1, device=device)
 
     # State buffer (K-window) — each entry is a (7,) state vector
@@ -570,7 +580,10 @@ def run_model_in_sim(
         pose_buffer.append(init_state.copy())
         frame_buffer.append(init_frame_stack.copy())
 
-    for step in range(min(len(actions), max_steps)):
+    n_steps = min(len(actions), max_steps)
+    switch_step = int(n_steps * switch_at)
+
+    for step in range(n_steps):
         # 1. Render current sim frame BEFORE step
         current_frame_stack = _render_all_cameras()  # (V, H, W, 3)
         # Record the first camera's view for video output
@@ -592,7 +605,7 @@ def run_model_in_sim(
         f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)  # (1, K, V, H, W, 3)
         s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
 
-        # 4. Run V4 model
+        # 4. Run V4 model (always — builds Mamba state, memory bank, intent tokens)
         with torch.no_grad():
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                      enabled=device.type == "cuda"):
@@ -603,7 +616,6 @@ def run_model_in_sim(
 
                     # Memory bank step (if enabled)
                     if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
-                        # Use the last window's z_v_pooled and z_s for memory bank
                         z_v_current = out["z_v_pooled_seq"][:, -1]
                         z_s_current = out["z_s_seq"][:, -1]
                         z_v_fused, z_s_fused, intent_fused = model.memory_module(
@@ -627,19 +639,23 @@ def run_model_in_sim(
 
         # 5. Build the final action
         a_model_scaled = a_model * action_scale
-        base_action = actions[step].copy()  # (7,)
-        final_action = (1.0 - alpha) * base_action.copy()
-        final_action[:6] = final_action[:6] + alpha * a_model_scaled[:6]
-        # Gripper: use model's gripper prediction if available, else keep base
-        if a_model.shape[0] >= 7 and final_action.shape[0] >= 7:
-            final_action[6] = 1.0 if a_model_scaled[6] >= 0.5 else -1.0
-            
-        elif final_action.shape[0] >= 7:
-            final_action[6] = -1.0  # fallback: close gripper
-        
+
+        if step < switch_step:
+            # Phase 1: expert controls, model observes
+            final_action = actions[step].copy()
+        else:
+            # Phase 2: model controls
+            final_action = a_model_scaled.copy()
+            # Gripper: use model's prediction
+            if a_model.shape[0] >= 7:
+                final_action[6] = 1.0 if a_model_scaled[6] >= 0.5 else -1.0
+            elif final_action.shape[0] >= 7:
+                final_action[6] = -1.0  # fallback: close gripper
+
         if debug:
-            print(f"Model action: {a_model}")
-            
+            print(f"Step {step}: phase={'expert' if step < switch_step else 'model'} "
+                  f"action={a_model}")
+
         stored_actions.append(a_model_scaled.copy())
 
         # 6. Step sim
@@ -662,6 +678,7 @@ def run_model_in_sim(
         "errors": np.array(errors),
         "stored_actions": np.array(stored_actions) if stored_actions else np.zeros((0, 6)),
         "n_steps": len(frames),
+        "switch_step": switch_step,
         "action_magnitude_model": float(np.mean(np.linalg.norm(
             np.array(stored_actions), axis=1
         ))) if stored_actions else 0.0,
@@ -807,6 +824,9 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0,
                         help="Blend factor: action = (1-alpha) * a_human + alpha * a_model. "
                              "Default 1.0 (use model only).")
+    parser.add_argument("--switch-at", type=float, default=0.5,
+                        help="Fraction of episode after which model takes over. "
+                             "0.5 = switch at halfway. 0.0 = model from start. 1.0 = expert only.")
     parser.add_argument("--action-scale", type=float, default=1.0,
                         help="Scale factor applied to model actions before applying to sim. "
                              "Useful if model outputs are too small/large. "
@@ -961,6 +981,7 @@ def main():
             max_steps=args.max_steps,
             alpha=args.alpha,
             action_scale=args.action_scale if args.action_scale is not None else 1.0,
+            switch_at=args.switch_at,
             render_size=args.render_size,
             use_camera=args.cameras,
             flip_vertical=flip_vertical,
@@ -976,8 +997,10 @@ def main():
 
         print(f"    Replay run:  {replay_result['n_steps']:3d} steps  "
               f"EEF err: {eef_err_replay:.4f} m  ({t_replay:.1f}s)")
+        switch_step = model_result.get("switch_step", 0)
         print(f"    Model run:   {model_result['n_steps']:3d} steps  "
-              f"EEF err: {eef_err_model:.4f} m  ({t_model:.1f}s)")
+              f"EEF err: {eef_err_model:.4f} m  ({t_model:.1f}s)  "
+              f"switch at step {switch_step}")
         # Diagnostic: action magnitude comparison
         mag_model = model_result.get("action_magnitude_model", 0.0)
         mag_dataset = model_result.get("action_magnitude_dataset", 0.0)
