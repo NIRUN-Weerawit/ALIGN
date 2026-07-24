@@ -536,6 +536,10 @@ def run_model_in_sim(
     if actions.shape[1] < 7:
         pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
         actions = np.concatenate([actions, pad], axis=1)
+    # Pad actions to max_steps by repeating last action (safe for Phase 1 indexing)
+    if len(actions) < max_steps:
+        pad = np.tile(actions[-1:], (max_steps - len(actions), 1))
+        actions = np.concatenate([actions, pad], axis=0)
     obs = env.reset()
     frames = []
     sim_positions = []
@@ -580,8 +584,8 @@ def run_model_in_sim(
         pose_buffer.append(init_state.copy())
         frame_buffer.append(init_frame_stack.copy())
 
-    n_steps = min(len(actions), max_steps)
-    switch_step = int(n_steps * switch_at)
+    n_steps = max_steps
+    switch_step = int(min(len(actions), max_steps) * switch_at)
 
     for step in range(n_steps):
         # 1. Render current sim frame BEFORE step
@@ -662,7 +666,7 @@ def run_model_in_sim(
         obs, reward, done, info = env.step(final_action)
         sim_eef_after = get_sim_eef_pose(obs)
         sim_positions[-1] = sim_eef_after
-        # 7. Compute EEF error vs dataset expert
+        # 7. Compute EEF error vs dataset expert (only while expert data exists)
         if expert_poses is not None and step < len(expert_poses):
             expert_eef = expert_poses[step]
             err = float(np.linalg.norm(sim_eef_after[:3] - expert_eef[:3]))
@@ -800,9 +804,9 @@ def main():
                              "(e.g. 'image wrist_image' for 2-cam checkpoints).")
     parser.add_argument("--n-episodes", type=int, default=1,
                         help="Number of episodes to evaluate.")
-    parser.add_argument("--noise-std", type=float, default=0.05,
+    parser.add_argument("--noise-std", type=float, default=0.00001,
                         help="Gaussian noise std for noised actions.")
-    parser.add_argument("--max-steps", type=int, default=200,
+    parser.add_argument("--max-steps", type=int, default=300,
                         help="Max steps per episode.")
     parser.add_argument("--task-text", type=str, default=None,
                         help="Task text (default: read from HDF5 if available).")
