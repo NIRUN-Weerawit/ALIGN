@@ -752,11 +752,20 @@ def save_video_3panel(
     model_frames: List[np.ndarray],
     out_path: str,
     fps: int = 20,
+    switch_step: int = 0,
 ) -> None:
-    """Save a 3-panel MP4 video: [dataset agentview, replay sim, model sim].
+    """Save a 3-panel MP4 video: [Dataset Recording | Expert Replay | Model Inference].
 
-    All three lists are stacked horizontally. If lengths differ, the
-    shortest is used (with looping for the dataset).
+    Each panel has a label overlay at the top. The model panel shows a
+    vertical line at the switch step to indicate when the model took over.
+
+    Args:
+        dataset_frames: original dataset recordings
+        replay_frames: expert actions replayed in sim
+        model_frames: model inference rollout in sim
+        out_path: output video path
+        fps: frames per second
+        switch_step: step at which model took over (for visual indicator)
     """
     try:
         import imageio
@@ -764,31 +773,67 @@ def save_video_3panel(
         print(f"    ⚠️  imageio not installed; cannot save video")
         return
 
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        _HAS_PIL = True
+    except ImportError:
+        _HAS_PIL = False
+
     n = min(len(dataset_frames), len(replay_frames), len(model_frames))
     if n == 0:
         return
 
+    # Labels for each panel
+    labels = [
+        "Dataset Recording",
+        "Expert Replay",
+        f"Model Inference  (switch at step {switch_step})",
+    ]
+
     writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=8)
     for i in range(n):
-        # Resize all to same H, W
         d = dataset_frames[i]
         r = replay_frames[i]
         m = model_frames[i]
-        # Resize if needed
-        target_h, target_w = min(d.shape[0], r.shape[0], m.shape[0]), \
-                              min(d.shape[1], r.shape[1], m.shape[1])
-        # Ensure all are 3-channel
+
+        # Ensure all are 3-channel uint8
         if d.ndim == 2:
             d = np.stack([d] * 3, axis=-1)
         if r.ndim == 2:
             r = np.stack([r] * 3, axis=-1)
         if m.ndim == 2:
             m = np.stack([m] * 3, axis=-1)
+
         # Crop to same size
-        d = d[:target_h, :target_w]
-        r = r[:target_h, :target_w]
-        m = m[:target_h, :target_w]
-        panel = np.concatenate([d, r, m], axis=1)  # horizontal stack
+        target_h = min(d.shape[0], r.shape[0], m.shape[0])
+        target_w = min(d.shape[1], r.shape[1], m.shape[1])
+        d = d[:target_h, :target_w].copy()
+        r = r[:target_h, :target_w].copy()
+        m = m[:target_h, :target_w].copy()
+
+        # Add label overlays
+        if _HAS_PIL:
+            for arr, label in zip([d, r, m], labels):
+                img = Image.fromarray(arr)
+                draw = ImageDraw.Draw(img)
+                try:
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+                except Exception:
+                    font = ImageFont.load_default()
+                # Semi-transparent black background bar at top
+                bbox = draw.textbbox((0, 0), label, font=font)
+                text_w = bbox[2] - bbox[0]
+                text_h = bbox[3] - bbox[1]
+                bar_h = text_h + 8
+                draw.rectangle([(0, 0), (arr.shape[1], bar_h)], fill=(0, 0, 0, 180))
+                draw.text((8, 4), label, fill=(255, 255, 255), font=font)
+                arr[:] = np.array(img)
+
+        # Add switch indicator on model panel (vertical red line)
+        if switch_step > 0 and i == switch_step and i < len(model_frames):
+            m[0:target_h, 0:3] = [255, 0, 0]  # red left edge marker
+
+        panel = np.concatenate([d, r, m], axis=1)
         writer.append_data(panel)
     writer.close()
 
@@ -1042,6 +1087,7 @@ def main():
                     model_frames=model_result["frames"],
                     out_path=video_path,
                     fps=20,
+                    switch_step=model_result.get("switch_step", 0),
                 )
                 print(f"    Video: {video_path}")
             except Exception as e:
