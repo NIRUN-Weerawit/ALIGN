@@ -986,9 +986,11 @@ def parse_args():
     parser.add_argument("--history-size", type=int, default=20,
                         help="Past frames for Mamba window (default 20).")
     parser.add_argument("--segment-min-mult", type=int, default=2,
-                        help="Min segment length = history_size * this (default 2).")
+                        help="Min segment length = history_size * this (default 2). "
+                             "Set to 0 to disable V4 segment training (use V3 instead).")
     parser.add_argument("--segment-max-mult", type=int, default=5,
-                        help="Max segment length = history_size * this (default 5).")
+                        help="Max segment length = history_size * this (default 5). "
+                             "Set to 0 to disable V4 segment training (use V3 instead).")
     
     # V4: Semantic anchoring
     parser.add_argument("--anchor-weight", type=float, default=0.0,
