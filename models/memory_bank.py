@@ -170,14 +170,22 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         self.bank_len = bank_len
         self._has_cognitive = cognitive_dim > 0
 
-        # Retrieval modules (one per stream)
+        # Retrieval modules (one per stream). Cognitive is only created if there
+        # are intent tokens (cognitive_dim > 0), otherwise nn.MultiheadAttention
+        # would fail with embed_dim=0.
         self.perceptual_retrieval   = MemoryRetrieval(perceptual_dim, num_heads)
-        self.cognitive_retrieval    = MemoryRetrieval(cognitive_dim, num_heads)
+        if cognitive_dim > 0:
+            self.cognitive_retrieval    = MemoryRetrieval(cognitive_dim, num_heads)
+        else:
+            self.cognitive_retrieval    = None
         self.state_retrieval        = MemoryRetrieval(state_dim, num_heads)
 
         # Gate fusion modules (one per stream)
         self.perceptual_gate        = MemoryGateFusion(perceptual_dim)
-        self.cognitive_gate         = MemoryGateFusion(cognitive_dim)
+        if cognitive_dim > 0:
+            self.cognitive_gate         = MemoryGateFusion(cognitive_dim)
+        else:
+            self.cognitive_gate         = None
         self.state_gate             = MemoryGateFusion(state_dim)
 
         # Sinusoidal timestep positional encoding (shared, not per-stream)
