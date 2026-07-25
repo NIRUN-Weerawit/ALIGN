@@ -136,31 +136,6 @@ def build_datasets(args):
             traj_window=traj_window, cameras=args.cameras,
         )
     n_total = len(ds)
-    if n_total == 0:
-        # Diagnose why the dataset is empty
-        is_v4 = (
-            getattr(args, "use_intent_tokens", False)
-            or getattr(args, "use_memory_bank", False)
-            or getattr(args, "segment_min_mult", 0) > 0
-            or getattr(args, "segment_max_mult", 0) > 0
-        )
-        if is_v4:
-            min_traj = max(
-                args.history_size * max(getattr(args, "segment_min_mult", 1), 1),
-                args.chunk_size,
-            )
-        else:
-            min_traj = args.chunk_size
-        raise ValueError(
-            f"Dataset is empty! n_total=0. This usually means the data file "
-            f"has no episodes with at least {min_traj + 8} frames "
-            f"(traj_window={min_traj} + frames_per_ep=8). "
-            f"Try:\n"
-            f"  - Using a different data file\n"
-            f"  - Setting --segment-min-mult 0 --segment-max-mult 0 "
-            f"(smaller traj_window)\n"
-            f"  - Or check that the HDF5 file is not corrupted"
-        )
     n_val = max(1, int(n_total * args.val_split))
     n_train = n_total - n_val
     train_ds, val_ds = random_split(
