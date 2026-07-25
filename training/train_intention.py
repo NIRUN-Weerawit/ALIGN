@@ -285,7 +285,10 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             
         # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
         # z_s_all = torch.stack(z_s_all, dim=1)
-        z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
+        z_v_mod_all = model.vision_patch_encoder(
+            z_v_all.reshape(B * S, V * P, 768),
+            z_s_all.reshape(B * S, -1),
+        ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
         
         # z_v_mamba_all = model.intention_encoder.encode_patches_for_mamba(z_v_CLS_all, z_s_all)  # (B, S, V, comp_dim)
         # print(f"shapes: z_v_all: {z_v_mod_all.shape}")
@@ -303,22 +306,28 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_pred = None
         loss_accum = []
         max_seg_len = S
-        num_windows = max_seg_len - Hs - chunk_size + 1
+        if model.use_history:
+            num_windows = max_seg_len - Hs - chunk_size + 1
+        else:
+            # No history: each timestep is independent
+            num_windows = max_seg_len - chunk_size + 1
         time_ids = torch.arange(max_seg_len, device=device)
         valid_time_mask = time_ids.unsqueeze(0) < seg_lens.unsqueeze(1)
-        # print(f"Segment length: {max_seg_len}, num_windows: {num_windows}, H: {Hs}, C: {chunk_size}")
         for n in range(num_windows):
-            # Build H-window ending at t+H-1
-            # Current time = last frame in the window
-            current_t = n + Hs - 1
+            if model.use_history:
+                # Build H-window ending at t+H-1
+                current_t = n + Hs - 1
+                history_start = current_t - Hs + 1
+                history_end = current_t + 1
+            else:
+                # Single timestep
+                current_t = n
+                history_start = n
+                history_end = n + 1
             valid_mask = seg_lens >= (current_t + chunk_size)
-            # print(f"valid_mask = {valid_mask}")
             if not valid_mask.any():
                 # No valid samples in this window, skip
                 continue
-
-            history_start = current_t - Hs + 1
-            history_end = current_t + 1
 
             z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
             z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
@@ -327,13 +336,17 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             target = actions_seg[:, current_t: current_t + chunk_size]
             assert target.shape[1] == chunk_size, f"target shape {target.shape} != chunk_size {chunk_size}"
             
-            # Forward through model (uses model's internal z_v_pooled_seq for consistency)
+            # Forward through model
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                out = model.forward_intent(z_v_CLS_all[:, history_start:history_end], z_s_win) # input: (B, History, V, raw_dim=768)
-                intent_emb = out.get("intent_emb", None)
-                h_current = out["h_seq"][:, -1]
-
+                if model.use_history:
+                    out = model.forward_intent(z_v_CLS_all[:, history_start:history_end], z_s_win)
+                    intent_emb = out.get("intent_emb", None)
+                    h_current = out["h_seq"][:, -1]
+                else:
+                    # No history: no Mamba forward, no intent tokens
+                    intent_emb = None
+                    h_current = torch.zeros(z_s_win.shape[0], 1, device=device)
                 # Memory bank (3-stream: perceptual, cognitive, state)
                 if model.use_memory_bank:
                     # Flatten patch axis into feature dim for head consumption (3D expected)
@@ -581,7 +594,10 @@ def validate(model, loader, device, args):
             states_seg.reshape(B * S, state_dim)
         ).reshape(B, S, -1)
         
-        z_v_mod_all = model.intention_encoder.encode_patches(z_v_all, z_s_all)  # (B, S, V*P, comp_dim)
+        z_v_mod_all = model.vision_patch_encoder(
+            z_v_all.reshape(B * S, V * P, 768),
+            z_s_all.reshape(B * S, -1),
+        ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
 
         # Build head and memory bank on first segment (lazy build)
         if not model._built:
@@ -594,29 +610,37 @@ def validate(model, loader, device, args):
         actions_pred = None
         loss_accum = []
         max_seg_len = S
-        num_windows = max_seg_len - Hs - chunk_size + 1
+        if model.use_history:
+            num_windows = max_seg_len - Hs - chunk_size + 1
+        else:
+            num_windows = max_seg_len - chunk_size + 1
 
         for n in range(num_windows):
-            # Build H-window ending at t+H-1
-            # Current time = last frame in the window
-            current_t = n + Hs - 1
+            if model.use_history:
+                current_t = n + Hs - 1
+                history_start = current_t - Hs + 1
+                history_end = current_t + 1
+            else:
+                current_t = n
+                history_start = n
+                history_end = n + 1
             valid_mask = seg_lens >= (current_t + chunk_size)
             if not valid_mask.any():
-                # No valid samples in this window, skip
                 continue
             
-            history_start = current_t - Hs + 1
-            history_end = current_t + 1
-
             z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
             z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
 
             # Forward through model
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
-                out = model.forward_intent(z_v_CLS_all[:, history_start:history_end], z_s_win) # input: (B, History, V, raw_dim=768)
-                intent_emb = out.get("intent_emb", None)
-                h_current = out["h_seq"][:, -1]
+                if model.use_history:
+                    out = model.forward_intent(z_v_CLS_all[:, history_start:history_end], z_s_win)
+                    intent_emb = out.get("intent_emb", None)
+                    h_current = out["h_seq"][:, -1]
+                else:
+                    intent_emb = None
+                    h_current = torch.zeros(z_s_win.shape[0], 1, device=device)
 
                 # Memory bank (3-stream: perceptual, cognitive, state)
                 if model.use_memory_bank:

@@ -116,6 +116,14 @@ class ALIGNIntentionModel(nn.Module):
         # Intention encoder (patch encoder + Mamba)
         self.use_history = mamba_output_dim > 0
 
+        # Vision patch encoder: always needed (SE compress + state modulate)
+        # Used for head input regardless of whether Mamba history is enabled
+        from models.intention_encoder import VisionPatchEncoder
+        self.vision_patch_encoder = VisionPatchEncoder(
+            compressed_dim=compressed_dim, state_dim=state_dim,
+            num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=8,
+        )
+
         if self.use_history:
             self.intention_encoder = IntentionEncoder(
                 state_dim=state_dim,
@@ -204,11 +212,12 @@ class ALIGNIntentionModel(nn.Module):
         # Move head to the same device as the rest of the model
         self.intention_head = self.intention_head.to(device)
 
-        # Build memory bank (3-stream: perceptual, cognitive, state)
+        # Build memory bank (2-stream: perceptual, state; cognitive optional)
         if self.use_memory_bank:
+            cognitive_dim = self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0
             self.memory_module = PerceptualCognitiveMemoryModule(
                 perceptual_dim=pool_out_dim,
-                cognitive_dim=self.intent_dim*self.num_intent_tokens if self.use_intent_tokens else self.mamba_output_dim,
+                cognitive_dim=cognitive_dim,
                 state_dim=self.state_dim,
                 bank_len=self.memory_bank_len,
                 num_heads=2,
@@ -301,15 +310,18 @@ class ALIGNIntentionModel(nn.Module):
         # Encode states (batched)
         z_s_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
 
-        # Encode patches for head consumption
-        if self.use_history:
-            z_v_mod_seq = self.intention_encoder.encode_patches(z_v_all, z_s_seq)  # (B, T, V*P, comp_dim)
-            B, T, N_tok, comp_dim = z_v_mod_seq.shape
-            pool_out_dim = N_tok * comp_dim
-            z_v_pooled_seq = z_v_mod_seq.reshape(B, T, pool_out_dim)  # (B, T, pool_out_dim)
-        else:
-            pool_out_dim = 1
-            z_v_pooled_seq = torch.zeros(B, T, 1, device=frames_seq.device)
+        # Encode patches for head consumption (always — even without history)
+        # We need the real pool_out_dim for head and memory bank construction
+        # vision_patch_encoder expects (B, VP, raw_dim) and (B, state_dim) per timestep
+        # So we flatten B*T together, process, then reshape back
+        B, T, N_tok, raw_dim = z_v_all.shape
+        z_v_mod_seq = self.vision_patch_encoder(
+            z_v_all.reshape(B * T, N_tok, raw_dim),
+            z_s_seq.reshape(B * T, -1),
+        )  # (B*T, VP, comp_dim)
+        z_v_mod_seq = z_v_mod_seq.reshape(B, T, N_tok, -1)  # (B, T, VP, comp_dim)
+        pool_out_dim = N_tok * z_v_mod_seq.shape[-1]
+        z_v_pooled_seq = z_v_mod_seq.reshape(B, T, pool_out_dim)  # (B, T, pool_out_dim)
 
         # Build head and bank on first forward (now we know pool_out_dim)
         self._build_head_and_bank(pool_out_dim)
@@ -320,6 +332,7 @@ class ALIGNIntentionModel(nn.Module):
             h_seq = intent["h_seq"]
             intent_emb = intent.get("intent_emb", None)
         else:
+            # No history: each timestep is independent, no Mamba recurrence
             h_seq = torch.zeros(B, T, 1, device=frames_seq.device)
             intent_emb = None
 

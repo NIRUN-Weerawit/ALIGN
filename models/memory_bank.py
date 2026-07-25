@@ -165,9 +165,10 @@ class PerceptualCognitiveMemoryModule(nn.Module):
                         num_heads: int = 4):
         super().__init__()
         self.perceptual_dim = perceptual_dim
-        self.cognitive_dim = cognitive_dim
+        self.cognitive_dim = max(cognitive_dim, 1)  # minimum 1 to avoid empty MultiheadAttention
         self.state_dim = state_dim
         self.bank_len = bank_len
+        self._has_cognitive = cognitive_dim > 0
 
         # Retrieval modules (one per stream)
         self.perceptual_retrieval   = MemoryRetrieval(perceptual_dim, num_heads)
@@ -311,11 +312,18 @@ class PerceptualCognitiveMemoryModule(nn.Module):
             z_v_pooled, p_bank_pe, bank_mask=bank_mask,
         )  # (B, perceptual_dim)
 
-        # Cognitive retrieval: intent_emb queries cognitive bank
-        intent_query = intent_emb.reshape(intent_emb.shape[0], -1)   # (B, cognitive_dim)
-        c_retrieved = self.cognitive_retrieval(
-            intent_query, c_bank_pe, bank_mask=bank_mask,
-        )  # (B, cognitive_dim)
+        # Cognitive retrieval: intent_emb queries cognitive bank (if enabled)
+        if self._has_cognitive and intent_emb is not None:
+            intent_query = intent_emb.reshape(intent_emb.shape[0], -1)   # (B, cognitive_dim)
+            c_retrieved = self.cognitive_retrieval(
+                intent_query, c_bank_pe, bank_mask=bank_mask,
+            )  # (B, cognitive_dim)
+            intent_emb_fused = self.cognitive_gate(intent_query, c_retrieved)
+            # Expand retrieved context back to N tokens
+            intent_emb_fused = intent_emb_fused.reshape(B, intent_emb.shape[1], -1)  # (B, N, intent_dim)
+        else:
+            intent_emb_fused = intent_emb  # pass through unchanged
+            c_retrieved = None
 
         # State retrieval: z_s queries state bank
         s_retrieved = self.state_retrieval(
@@ -324,22 +332,20 @@ class PerceptualCognitiveMemoryModule(nn.Module):
 
         # --- 2. Gate fusion ---
         z_v_pooled_fused    = self.perceptual_gate(z_v_pooled, p_retrieved)
-        intent_emb_fused    = self.cognitive_gate(intent_query, c_retrieved)
         z_s_fused           = self.state_gate(z_s, s_retrieved)
         
         # --- 3. Store current triplet into bank (with consolidation when full) ---
-        self._store(z_v_pooled_fused, z_s_fused, intent_query)
-        
-        # Expand retrieved context back to N tokens
-        intent_emb_fused = intent_emb_fused.reshape(B, intent_emb.shape[1], -1)  # (B, N, intent_dim)
-        assert intent_emb_fused.shape == intent_emb.shape, \
-            f"Intent embedding shape mismatch after fusion: expected {intent_emb.shape}, got {intent_emb_fused.shape}"
+        if self._has_cognitive and intent_emb is not None:
+            intent_query = intent_emb.reshape(intent_emb.shape[0], -1)
+            self._store(z_v_pooled_fused, z_s_fused, intent_query)
+        else:
+            self._store(z_v_pooled_fused, z_s_fused, None)
         
         return z_v_pooled_fused, z_s_fused, intent_emb_fused
 
     def _store(self, z_v_pooled: torch.Tensor,
                      z_s: torch.Tensor, 
-                     intent_query: torch.Tensor):
+                     intent_query: Optional[torch.Tensor] = None):
         """Store triplet entry with consolidation.
 
         When the bank is full, run _token_merge first to make room by
@@ -349,7 +355,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
 
         Args:
             z_v_pooled:     (B, perceptual_dim)
-            intent_query:   (B, cognitive_dim)    — pooled intent for storage
+            intent_query:   (B, cognitive_dim) or None — pooled intent for storage
             z_s:            (B, state_dim)        — robot state
         """
         B = z_v_pooled.shape[0]
@@ -368,7 +374,8 @@ class PerceptualCognitiveMemoryModule(nn.Module):
             # Now add the new entry
             idx = int(self._count[b].item())
             self.perceptual_bank[b, idx] = z_v_pooled[b]
-            self.cognitive_bank[b, idx] = intent_query[b]
+            if intent_query is not None:
+                self.cognitive_bank[b, idx] = intent_query[b]
             self.state_bank[b, idx] = z_s[b]
             self._count[b] += 1
 
