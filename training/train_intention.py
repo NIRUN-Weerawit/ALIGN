@@ -108,7 +108,19 @@ from training.wandb_utils import init_wandb
 
 def build_datasets(args):
     """Build train and val datasets from one or more HDF5 files."""
-    is_v4 = getattr(args, 'use_intent_tokens', False) or getattr(args, 'use_memory_bank', False)
+    # Match the training loop's is_v4 detection logic
+    if getattr(args, "v4_mode", None) is not None:
+        is_v4 = args.v4_mode
+    else:
+        has_segment_args = any([
+            getattr(args, "segment_min_mult", 0) > 0,
+            getattr(args, "segment_max_mult", 0) > 0,
+        ])
+        is_v4 = (
+            getattr(args, "use_intent_tokens", False)
+            or getattr(args, "use_memory_bank", False)
+            or has_segment_args
+        )
     if is_v4:
         # V4 collate needs at least H*segment_max_mult frames (default: 20*5=100).
         # __getitem__ returns frames_per_ep + traj_window, so we need enough runway.
@@ -142,7 +154,19 @@ def build_datasets(args):
 
 def build_loaders(train_ds, val_ds, args):
     """Build train and val dataloaders."""
-    is_v4 = args.use_intent_tokens or args.use_memory_bank
+    # Match the training loop's is_v4 detection logic
+    if getattr(args, "v4_mode", None) is not None:
+        is_v4 = args.v4_mode
+    else:
+        has_segment_args = any([
+            getattr(args, "segment_min_mult", 0) > 0,
+            getattr(args, "segment_max_mult", 0) > 0,
+        ])
+        is_v4 = (
+            args.use_intent_tokens
+            or args.use_memory_bank
+            or has_segment_args
+        )
     if is_v4:
         collate_fn = lambda b: v4_segment_collate(
             b, history_size=args.history_size, chunk_size=args.chunk_size,
@@ -813,6 +837,13 @@ def parse_args():
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
                         help="Disable Mamba history component.")
+    parser.add_argument("--v4-mode", action="store_true", default=None,
+                        help="Force V4 training (segment-based, train_v4_epoch) even when "
+                             "use_intent_tokens and use_memory_bank are both False. "
+                             "Auto-detected: enabled if either V4 feature is on, or if "
+                             "any segment-* arg is set.")
+    parser.add_argument("--no-v4-mode", dest="v4_mode", action="store_false",
+                        help="Disable V4 training even if V4 features are on.")
     
     # Architecture dimensions
     parser.add_argument("--state-dim", type=int, default=256,
@@ -1109,7 +1140,22 @@ def main():
     log_fp = open(log_path, "w")
 
     # Training loop
-    is_v4 = args.use_intent_tokens or args.use_memory_bank
+    # is_v4 is determined by:
+    # 1. Explicit --v4-mode / --no-v4-mode flag
+    # 2. Auto-detect: V4 features on OR any segment-* arg is set
+    if getattr(args, "v4_mode", None) is not None:
+        is_v4 = args.v4_mode
+    else:
+        # Auto-detect: V4 if any V4 feature is on or segment args are set
+        has_segment_args = any([
+            getattr(args, "segment_min_mult", 0) > 0,
+            getattr(args, "segment_max_mult", 0) > 0,
+        ])
+        is_v4 = (
+            args.use_intent_tokens
+            or args.use_memory_bank
+            or has_segment_args
+        )
     train_fn = train_v4_epoch if is_v4 else train_one_epoch
     print(f"  Training for {args.epochs} epochs..." + (" (V4 mode)" if is_v4 else " (V3 mode)"))
     best_val_loss = float("inf")
