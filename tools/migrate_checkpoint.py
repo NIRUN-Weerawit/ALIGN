@@ -50,14 +50,14 @@ def main():
     ckpt = torch.load(args.input, map_location="cpu", weights_only=False)
     print(f"Checkpoint keys: {list(ckpt.keys())[:5]}")
 
-    # Find the state dict (could be at 'state_dict', 'model', or the ckpt itself)
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        sd = ckpt["state_dict"]
-        sd_key = "state_dict"
-    elif isinstance(ckpt, dict) and "model" in ckpt:
-        sd = ckpt["model"]
-        sd_key = "model"
-    else:
+    # Find the state dict (could be at various keys)
+    sd_key = None
+    for candidate in ["state_dict", "model", "model_state_dict", "model_state", "weights"]:
+        if isinstance(ckpt, dict) and candidate in ckpt:
+            sd = ckpt[candidate]
+            sd_key = candidate
+            break
+    if sd_key is None:
         sd = ckpt
         sd_key = None
 
