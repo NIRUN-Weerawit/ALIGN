@@ -18,8 +18,11 @@ import torch
 # Map of old key prefix -> new key prefix
 KEY_REMAPS = [
     # The VisionPatchEncoder refactor (commit 4aa5904) inlined
-    # SEVisualCompressor into VisionPatchEncoder.
+    # SEVisualCompressor into VisionPatchEncoder. This affects keys
+    # both at the top level and nested under IntentionEncoder.
     ("vision_patch_encoder.se_compressor.", "vision_patch_encoder."),
+    ("intention_encoder.vision_patch_encoder.se_compressor.",
+     "intention_encoder.vision_patch_encoder."),
 ]
 
 
