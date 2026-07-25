@@ -485,21 +485,28 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                                 enabled=device.type == "cuda"):
             out = model(frames, state)
             h_current = out["h_seq"][:, -1]  # (B, mamba_output_dim) — latest
+            # Get intent_emb if available (V4 with intent tokens)
+            intent_emb = out.get("intent_emb", None)
             # predict_actions returns actions (direct regression) or cond (flow head)
 
             # Loss depends on head type
             if args.head_type == "diffusion":
+                # V4 head expects intent_emb (3D or None), not h_current.
+                # For V3 backward compat with no Mamba/no intent, pass None.
+                head_intent = intent_emb if intent_emb is not None and intent_emb.ndim == 3 else None
                 cond = model.intention_head(
-                    out["z_v_pooled_seq"], out["z_s_seq"], h_current,
+                    out["z_v_pooled_seq"], out["z_s_seq"], head_intent,
                 )
                 actions_pred = model.sample_actions(
-                    out["z_v_pooled_seq"], out["z_s_seq"], h_current,
+                    out["z_v_pooled_seq"], out["z_s_seq"], head_intent,
                     num_steps=target.shape[1],
                 )
                 loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
             else:
+                # V4 head expects intent_emb (3D or None), not h_current.
+                head_intent = intent_emb if intent_emb is not None and intent_emb.ndim == 3 else None
                 actions_pred = model.predict_actions(
-                    out["z_v_pooled_seq"], out["z_s_seq"], h_current,
+                    out["z_v_pooled_seq"], out["z_s_seq"], head_intent,
                 )  # (B, K, action_dim) — may be < target.shape[-1] if model
                     #   doesn't predict gripper
 
