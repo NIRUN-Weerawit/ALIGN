@@ -783,12 +783,6 @@ def save_video_3panel(
     if n == 0:
         return
 
-    # Labels for each panel
-    labels = [
-        "Dataset Recording",
-        "Expert Replay",
-        f"Model Inference  (switch at step {switch_step})",
-    ]
 
     writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=8)
     for i in range(n):
@@ -796,6 +790,19 @@ def save_video_3panel(
         r = replay_frames[i]
         m = model_frames[i]
 
+        # Labels for each panel
+        if i < switch_step:
+            labels = [
+                "Dataset Recording",
+                f"Expert Replay: t={i}",
+                f"Expert Replay (switch at t={switch_step})",
+            ]
+        else:
+            labels = [
+                "Dataset Recording",
+                f"Expert Replay: t={i}",
+                "Model Inference",
+            ]
         # Ensure all are 3-channel uint8
         if d.ndim == 2:
             d = np.stack([d] * 3, axis=-1)
@@ -817,7 +824,7 @@ def save_video_3panel(
                 img = Image.fromarray(arr)
                 draw = ImageDraw.Draw(img)
                 try:
-                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
+                    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 10)
                 except Exception:
                     font = ImageFont.load_default()
                 # Semi-transparent black background bar at top
@@ -890,10 +897,10 @@ def main():
                              "Default: 1.0 (no scaling).")
     parser.add_argument("--debug", action="store_true",
                         help="Print per-step model action values.")
-    parser.add_argument("--libero-suite", default="libero_spatial",
+    parser.add_argument("--libero-suite", default=None,
                         choices=["libero_spatial", "libero_object",
                                  "libero_goal", "libero_10", "libero_90"],
-                        help="LIBERO benchmark suite.")
+                        help="LIBERO benchmark suite. Auto-detected from --data filename if not set.")
     parser.add_argument("--render-size", type=int, default=256,
                         help="Frame size for MuJoCo rendering.")
     parser.add_argument("--no-flip-vertical", action="store_true",
@@ -926,6 +933,18 @@ def main():
         print(f"      Use --cameras to match the training config.")
     if cfg.get("use_text", False):
         print(f"  Text:        enabled (dim={cfg.get('text_dim', 256)})")
+
+    # Auto-detect libero suite from dataset filename if not specified
+    if args.libero_suite is None:
+        data_name = Path(args.data).stem  # e.g. "libero_spatial"
+        known_suites = ["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"]
+        for suite in known_suites:
+            if suite in data_name:
+                args.libero_suite = suite
+                break
+        if args.libero_suite is None:
+            args.libero_suite = "libero_spatial"  # fallback
+        print(f"  Auto-detected suite: {args.libero_suite}")
 
     # List episodes
     episodes = list_episodes(args.data)[:args.n_episodes]
