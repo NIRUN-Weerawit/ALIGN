@@ -373,11 +373,12 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         z_s_win_for_head = z_s_win[:, -1:]  # (B, 1, state_dim)
                         h_for_head = intent_emb
                 else:
-                    # z_v_win: (B, Hs, V*P, comp_dim) — flatten to (B, Hs, V*P*comp_dim)
+                    # No memory bank: pass raw features directly to head
                     B_seg, H_actual, VP, comp_dim = z_v_win.shape
                     z_v_win_for_head = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, Hs, pool_out_dim)
                     z_s_win_for_head = z_s_win  # (B, Hs, state_dim) — already 3D
-                    h_for_head = h_current  # (B, mamba_in_dim) — but the head expects 3D!
+                    # Only pass intent_emb if it exists (from Mamba with intent tokens)
+                    h_for_head = intent_emb if intent_emb is not None else None
 
                 # Loss
                 if args.head_type == "diffusion":
@@ -666,11 +667,12 @@ def validate(model, loader, device, args):
                         z_s_win_for_head = z_s_win
                         h_for_head = intent_emb
                 else:
-                    # z_v_win: (B, Hs, V*P, comp_dim) — flatten to (B, Hs, V*P*comp_dim)
+                    # No memory bank: pass raw features directly to head
                     B_seg_v, H_actual_v, VP_v, comp_dim_v = z_v_win.shape
                     z_v_win_for_head = z_v_win.reshape(B_seg_v, H_actual_v, VP_v * comp_dim_v)  # (B, Hs, pool_out_dim)
                     z_s_win_for_head = z_s_win  # (B, Hs, state_dim) — already 3D
-                    h_for_head = h_current  # (B, mamba_in_dim) — but the head expects 3D!
+                    # Only pass intent_emb if it exists (from Mamba with intent tokens)
+                    h_for_head = intent_emb if intent_emb is not None else None
 
                 # Target: chunk_size future actions from current time
                 target = target_seg[:, current_t:current_t + chunk_size]
