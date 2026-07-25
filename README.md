@@ -1,321 +1,265 @@
 # ALIGN: Assistive Latent Intention-Guided Network
 
-**ALIGN** is a shared autonomy framework for assistive teleoperation of robotic
-manipulators. It learns a shared **3-modal** vision–trajectory–language
-representation and uses it to drive two heads:
+**ALIGN** is a shared autonomy framework for robotic manipulation. It learns to infer human intent from visual observations and robot state, then assists by predicting corrective actions during teleoperation.
 
-- a **Decision head** that decides *when* to assist (the gating signal α)
-- an **Assistant head** that decides *what* to do (a chunk of corrective Δposes)
+The core idea: a human leads, the model observes. Over time, the model builds an understanding of the task through temporal context (Mamba), explicit intent tokens, and an episodic memory bank. It then generates smooth, task-appropriate actions via a diffusion policy head.
 
-The framework additionally supports an **action-conditioned world model** and a
-**GAIL discriminator** for counterfactual α computation (a separate gating
-paradigm from the prediction-error α), and ships a **deployment-time
-calibrator** for new robots/cameras.
+---
 
-> **Status:** End-to-end code pipeline runs on LIBERO (Franka Panda, 6-DoF
-> OSC_POSE) and supports both streaming and HDF5 training. Real-hardware
-> validation is the next milestone.
-
-## Quick Start
-
-```bash
-# 1. Clone and install
-git clone https://github.com/NIRUN-Weerawit/ALIGN.git && cd ALIGN
-
-# Option A — Conda (recommended for GPU training)
-conda env create -f environment.yml
-conda activate align
-
-# Option B — pip / venv
-python3 -m venv align-env && source align-env/bin/activate
-pip install torch==2.10.0 torchvision==0.25.0 torchcodec==0.10.0 \
-    --index-url https://download.pytorch.org/whl/cu128
-pip install xformers --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
-
-# Option C — auto-setup (detects conda/pip)
-./setup.sh
-
-# 2. Sanity check
-python scripts/check_deps.py
-
-# 3. Run the streaming pretraining + head pipeline (zero local disk)
-python training/pretrain_streaming.py \
-    --epochs-pretrain-encoder 40 \
-    --epochs-pretrain-mixer 10 \
-    --epochs-heads 30
-```
-
-## Core Idea
-
-ALIGN's three encoders are pretrained with a **3-way InfoNCE** objective that
-aligns vision, trajectory, and task-language into one shared space. From that
-shared representation, two heads consume it:
+## Architecture
 
 ```
-              ┌──────────────┐
-   frame ────►│ Vision       │ (DINOv2, frozen)
-              ├──────────────┤
-   pose K ───►│ Trajectory   │ (Transformer, trained)
-              ├──────────────┤
-   task  ────►│ Text         │ (CLIP, frozen)
-              └──────┬───────┘
-                     │ 3-way cross-attention mixer
-                     ▼
-        ┌────────────┴────────────┐
-        │                         │
-  Decision head              Assistant head
-  (when to assist)           (what to do)
-        │                         │
-        ▼                         ▼
-   α ∈ [0, 1]              chunk of K Δposes
+frames (B, T, V, H, W, 3)          states (B, T, 7)
+  │                                       │
+  ▼                                       ▼
+DINOv2 ViT-B/14 (frozen)           StateEncoder (MLP)
+  │                                       │
+  ▼                                       ▼
+CLS tokens (B, T, V, 768)          z_s (B, T, 256)
+patch tokens (B, T, V*P, 768)
+  │                                       │
+  ▼                                       ▼
+VisionPatchEncoder
+  ├─ SEVisualCompressor (768 → comp_dim)
+  └─ StateConditionalCrossAttn
+  │
+  ▼
+z_v_pooled (B, T, pool_out_dim)
 ```
 
-**Inference blending rule** (default, current production code):
+### Temporal Encoding (Mamba, optional)
 
-```python
-final_pose = (1 - α) * human_pose + α * (human_pose + chunk[0])
-           = human_pose + α · chunk[0]
-```
-
-α is small when any modality disagrees (novel scene, wrong task, OOD input) →
-graceful degradation to pure teleoperation.
-
-## Two α-pipelines (code supports both)
-
-| Pipeline | Source of α | Training signal | Status |
-|---|---|---|---|
-| **Prediction-error α** | `FuturePredictionHead` (Decision) | MSE on predicted future (z_v, z_s) | ✅ Default; ships in `train_heads.py` |
-| **Counterfactual α** | `WorldModel` + `ValueHead` + `GAIL` discriminator | TD(λ) returns on GAIL reward | ✅ Code complete; runs after world model + GAIL trained |
-
-The two are alternatives, not stacked. Counterfactual α requires the
-world model + GAIL to be trained first (`train_world_model.py`,
-`train_gail.py`, `train_value.py`); prediction-error α needs only the
-encoder pretraining + head stages.
-
-## Multi-Camera Support
-
-The vision encoder fuses **V camera views** through a learned linear layer
-(`Linear(V·256 → 256)`). Single-camera input is a special case (V=1) and
-requires no code change. All training/eval scripts accept `--cameras wrist
-agent` (or any combination of LIBERO camera keys).
-
-**Important:** Camera *selection* (wrist vs. front) at training time is
-sensitive to the `PYTHONNOUSERSITE` env flag (see `FIXES.md`). Be consistent
-between training and eval, or the frozen DINOv2 features will not match.
-
-## Repository Layout
+When `--use-history` is enabled, CLS tokens and states are fed through a Mamba SSM for temporal recurrence:
 
 ```
-ALIGN/
-├── README.md                     ← This file
-├── FIXES.md                      ← Bug-by-bug fix log (grep-friendly)
-│
-├── models/
-│   ├── align_model.py            ← DINOv2 + Transformer + CLIP, 3 encoders + 2 heads
-│   ├── cross_attention_mixer.py  ← Bidirectional gated cross-attention (Flamingo-style)
-│   ├── world_model.py            ← Action-conditioned single-step transition f(s,a)→s'
-│   ├── value_head.py             ← V(s) head, TD(λ) on GAIL reward
-│   ├── gail_discriminator.py     ← D(s,a) expert-vs-rollout classifier
-│   └── sinusoidal_pos_emb.py
-│
-├── training/
-│   ├── contrastive_loss.py       ← 3-way InfoNCE + helpers
-│   ├── pretrain.py               ← Contrastive pretraining (HDF5 data)
-│   ├── pretrain_streaming.py     ← Zero-disk streaming pretraining (LeRobot Hub)
-│   ├── train_heads.py            ← Decision + Assistant head training (HDF5/streaming)
-│   ├── train_world_model.py      ← World model f(s,a)→s'
-│   ├── train_gail.py             ← GAIL discriminator
-│   ├── train_value.py            ← Value head with TD(λ) + PPO/DQN/DDPG stability tricks
-│   ├── train_full_pipeline.py    ← End-to-end: open dataset → noise → pretrain → heads
-│   └── wandb_utils.py
-│
-├── data/
-│   ├── align_dataset.py          ← HDF5 dataset + collate
-│   ├── open_dataset.py           ← Adapters for Robomimic, DROID, Bridge, LeRobot v3
-│   └── (HDF5 cache written here by scripts/decode_libero_to_hdf5.py)
-│
-├── inference/
-│   ├── align_inference.py        ← 30Hz control loop
-│   └── deployment_calibrator.py  ← 5-10s axis/scale/hand-eye calibration per session
-│
-├── scripts/
-│   ├── decode_libero_to_hdf5.py  ← LIBERO LeRobot → HDF5 (faster than streaming)
-│   ├── align_data_recorder.py    ← Episode recording (frames + poses + text)
-│   ├── align_noise.py            ← Gaussian + tremor + fatigue noise injection
-│   ├── collect_episodes.py       ← Isaac Sim Franka + VR teleop
-│   ├── generate_ground_truth.py  ← SavGol + Quintic/DMP/CHOMP ground truth
-│   ├── align_dmp.py              ← DMP approach planner (Ijspeert 2013)
-│   ├── align_chomp.py            ← CHOMP trajectory optimizer (Ratliff 2009)
-│   ├── optuna_search.py          ← H100-scale hyperparam search (encoders/decision/assistant)
-│   ├── cache_libero_meta.py      ← Cache LIBERO task descriptions locally
-│   ├── replay_libero_in_sim.py   ← Replay a trajectory in LIBERO sim
-│   └── check_deps.py             ← Verify env is trainable
-│
-├── eval/
-│   ├── eval_contrastive.py       ← InfoNCE alignment scores
-│   ├── eval_world_model.py       ← World-model rollouts (incl. copy-baseline diagnostic)
-│   ├── eval_gail.py              ← Discriminator quality
-│   ├── eval_value.py             ← V(s) fit
-│   ├── eval_heads.py             ← Decision + Assistant accuracy
-│   ├── eval_assistant_head.py    ← Per-timestep assistant Δpose error
-│   ├── eval_libero.py            ← LIBERO success-rate eval
-│   ├── eval_libero_trajectory.py ← Replay-and-compare (no_align vs with_align)
-│   ├── eval_alpha.py             ← α signal analysis
-│   ├── compute_alpha.py          ← One-off α computation
-│   ├── flip_sim_frames.py        ← Fix LIBERO upside-down camera frame
-│   ├── print_sample_images.py    ← QA: print dataset sample images
-│   ├── verify_action_to_pose_mapping.py ← Sanity-check action semantics
-│   └── test_calibrator_lerobot.py ← Unit test the deployment calibrator
-│
-└── docs/                         ← Local-only design notes (not pushed to git)
+z_v_CLS (B, T, V, 768) + z_s (B, T, 256)
+  │
+  ▼
+Flatten + concat → (B, T, V*768 + 256)
+  │
+  ▼
+Mamba SSM (d_model = V*768 + state_dim)
+  │
+  ▼
+h_seq (B, T, d_model)
 ```
 
-## Training & Evaluation Pathways
+### Intent Tokens (optional)
 
-### A. Streaming (zero local disk)
+Learnable tokens appended to the Mamba input sequence. The SSM processes them with full temporal context, producing intent embeddings that encode the model's understanding of the current task:
 
-```bash
-# Full pipeline
-python training/pretrain_streaming.py \
-    --epochs-pretrain-encoder 40 --epochs-pretrain-mixer 10 --epochs-heads 30
-
-# Phase 1 only (encoder + mixer)
-python training/pretrain_streaming.py --stages pretrain
-
-# Phase 2 only (heads, given pretrain ckpt)
-python training/pretrain_streaming.py \
-    --stages heads --pretrained ./checkpoints/streaming/pretrain/best.pt
+```
+Input: [h_0, h_1, ..., h_T, INTENT_1, ..., INTENT_N]
+  │
+  ▼
+Mamba → h_seq (B, T, d_model) + intent_emb (B, N, intent_dim)
 ```
 
-### B. HDF5 (faster training, recommended for H100)
+### Memory Bank (optional)
 
-```bash
-# 1. Convert LIBERO LeRobot → HDF5 (5-10 min, then forever cached)
-python scripts/decode_libero_to_hdf5.py \
-    --data-dir ~/.cache/huggingface/lerobot/nvidia/LIBERO_LeRobot_v3/libero_10
+A fixed-size episodic memory that stores past (visual, state, intent) triplets. At each step, the current observation retrieves relevant context via cross-attention, which is then fused through learned gates:
 
-# 2. Pretrain + heads on HDF5
-python training/pretrain.py --data h5_data/libero_10.h5
-python training/train_heads.py \
-    --data h5_data/libero_10.h5 \
-    --pretrained checkpoints/pretrain/best.pt
+- **Perceptual stream**: past visual features
+- **Cognitive stream**: past intent embeddings
+- **State stream**: past robot states
+
+The bank uses a circular buffer with token-merge consolidation when full.
+
+### Diffusion Policy Head
+
+A 1D U-Net that denoises random noise into a chunk of K future actions via DDPM/DDIM. Conditioning is global (mean-pooled over the window) rather than per-step, using FiLM modulation:
+
+```
+noise (B, K, action_dim) + cond (B, 1, cond_dim)
+  │
+  ▼
+U-Net (10 DDIM steps)
+  │
+  ▼
+actions (B, K, action_dim)
 ```
 
-> **Why HDF5?** LeRobot's MP4 decoders don't support multi-worker
-> DataLoaders. Pre-decoding to HDF5 enables `num_workers > 0` and ~3-5×
-> faster training. See `FIXES.md` and the `align_data` H5 path.
+Condition = `concat[mean(z_v_pooled), z_s_last, intent_pooled]`
 
-### C. Counterfactual α (optional, after A or B)
-
-```bash
-python training/train_world_model.py --data h5_data/libero_10.h5
-python training/train_gail.py       --data h5_data/libero_10.h5
-python training/train_value.py      --data h5_data/libero_10.h5
-```
-
-### D. Inference
-
-```bash
-# 30Hz runtime
-python inference/align_inference.py \
-    --checkpoint checkpoints/heads_libero/best.pt \
-    --task "pick up the red mug"
-
-# New robot/camera: 5-10s calibration first
-python -c "from inference.deployment_calibrator import DeploymentCalibrator; \
-    c = DeploymentCalibrator(); c.run(robot, obs_fn); c.save('calib.yaml')"
-```
-
-### E. Optuna hyperparameter search
-
-```bash
-# Full search (H100, 30 trials)
-python scripts/optuna_search.py --n-trials 30 --epochs 30
-
-# Single-stage search
-python scripts/optuna_search.py \
-    --search-decision --skip-encoder-training \
-    --encoder-checkpoint checkpoints/pretrain/run_3/best.pt
-```
+---
 
 ## Key Design Decisions
 
-- **Frozen DINOv2 + CLIP backbones** — no retraining, works on novel objects
-  out of the box. DINOv2 ViT-B/14 for vision, CLIP ViT-B/32 for text.
-- **Cross-attention mixer, not concat** — Flamingo-style gated cross-attention
-  (identity-initialized gates near sigmoid(1.0) ≈ 0.7) so pretrained features
-  pass through cleanly during early training.
-- **Two head architectures** — both MLP (default) and Transformer (K-window)
-  variants for Decision and Assistant heads. Transformer variant uses
-  per-step loss weighting and reads K past frames separately
-  (`encode_raw_vision_window`).
-- **Text is computed once per task** — ~5 ms, cached. Enables 25–30 Hz control
-  on Jetson Orin.
-- **No hand-tuned α** — every gating signal is learned. The decision head
-  derives α from world-model prediction error; the value head derives it
-  from TD(λ) returns on GAIL reward.
-- **Pose-relative goals, not actions** — `chunk[k] = where EEF should be at
-  step k+1` relative to current pose. This is a *planning* quantity, not a
-  recovery correction, and composes cleanly with the α-blend at inference.
+| Decision | Rationale |
+|----------|-----------|
+| **DINOv2 frozen** | 86M-param ViT-B/14 is expensive to fine-tune; frozen features generalize across scenes |
+| **CLS tokens for Mamba** | CLS tokens carry global scene context; patch tokens go to the head for spatial detail |
+| **SE compression** | Squeeze-excitation reweights DINOv2 channels before projection, suppressing noisy dimensions |
+| **State-conditioned modulation** | Each patch token is modulated by robot state via cross-attention, not concatenation |
+| **Mamba (not Transformer)** | O(1) inference per step vs O(K) for attention; critical for 30-100Hz teleoperation |
+| **Intent tokens (not pooling)** | Learnable tokens let the SSM decide what to compress, rather than averaging all history |
+| **Circular memory bank** | Fixed-size avoids unbounded growth; token-merge preserves diversity |
+| **Diffusion head (not regression)** | DDPM produces multimodal action distributions; regression collapses to mean |
+| **Global conditioning** | Mean-pool over the window gives a single task context; avoids per-step overfitting |
 
-## Verified Datasets
+---
 
-| Dataset | Robot | Frames | EEF | Text | Wrist | Status |
-|---|---|---|---|---|---|---|
-| **nvidia/LIBERO_LeRobot_v3** | Franka Panda (sim) | 130K eps | ✅ 8D | ✅ Multi-step | ✅ 256×256 | Primary |
-| nvidia/BridgeData2_LeRobot_v3 | WidowX 250 (real) | 50K+ traj | ✅ | ✅ | ⚠️ Front | Adapter ready |
-| Robomimic (lift/can/pick_place) | MuJoCo sim | varies | ✅ | partial | ⚠️ | Adapter ready |
-| DROID | Franka (real) | large | ✅ | ✅ | ✅ | Adapter ready |
+## Training
 
-LIBERO is the primary target: same Franka, egocentric wrist, rich language,
-20 fps AV1. Requires `lerobot` + `torchcodec` for streaming; pre-decode to
-HDF5 for production training.
+### Data Format
 
-## Text Specificity Spectrum
+Episodes are stored as HDF5 files with the following structure:
 
-ALIGN calibrates confidence to text specificity during training by sampling
-multiple variants per episode:
+```
+ep_000000/
+├── frames/
+│   ├── image        (N, H, W, 3) uint8
+│   └── wrist_image  (N, H, W, 3) uint8
+├── poses           (N, 6) float32
+├── actions         (N, 7) float32  [dx, dy, dz, drx, dry, drz, gripper]
+├── gripper         (N,) float32
+└── texts           JSON string
+```
 
-| Text style | Expected α | Why |
-|---|---|---|
-| Specific ("pick up the red mug") | highest | Object disambiguated by CLIP |
-| Descriptive ("pick up the mug") | high (if unambiguous) | Single mug visible → no ambiguity |
-| Neutral ("pick and place") | moderate | General smoothing, no disambiguation |
-| None (text-free mode) | cos_sim_vt-driven | Vision-trajectory only |
+### Training Loop (V4)
 
-## Development Plan
+Each batch samples a variable-length segment (2-5× history_size) from each episode:
 
-| Phase | Platform | Scope | Status |
-|---|---|---|---|
-| 0 | Isaac Sim + Franka | Sim data collection, offline training | ✅ Complete |
-| 0.5 | LIBERO LeRobot v3 | Open-dataset validation, trajectory-replay eval | ✅ Complete |
-| 1 | Franka (real) | Real hardware, user studies | ⬜ Next |
-| 2 | Unitree G1 arm-only | Humanoid, fixed base | ⬜ |
-| 3 | Unitree G1 full-body | + locomotion coordination | ⬜ |
+1. **Pre-encode**: Batch DINOv2 over all frames → split CLS/patch tokens
+2. **Encode patches**: SE compress + state modulate patches → `z_v_pooled`
+3. **Window loop**: For each valid window in the segment:
+   - Forward CLS tokens through Mamba → `h_seq` + `intent_emb`
+   - Retrieve from memory bank → fused features
+   - Diffusion head → predict K future actions
+   - Compute DDPM noise-prediction loss
+4. **Optimizer step**: Sum all window losses, backward, clip, step
 
-## Venue Target
+### Flags
 
-ICRA 2026 / RA-L. Core contribution: a shared vision–trajectory–language
-embedding that simultaneously drives the **gating decision** (when to assist)
-and the **assistive action** (what to do) — plus an action-conditioned world
-model + GAIL-trained value head as an alternative counterfactual gating
-paradigm.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data` | required | Path to HDF5 dataset |
+| `--cameras` | `["wrist_image"]` | Camera names to use |
+| `--head-type` | `diffusion` | Head architecture |
+| `--action-dim` | 7 | Action dimensions (6 pose + 1 gripper) |
+| `--chunk-size` | 10 | Future action prediction horizon (K) |
+| `--history-size` | 1 | Mamba temporal window (H) |
+| `--compressed-dim` | 8 | Per-patch dimension after SE compression |
+| `--use-intent-tokens` | False | Enable learnable intent tokens |
+| `--use-memory-bank` | False | Enable episodic memory bank |
+| `--use-history` | True | Enable Mamba temporal encoder |
+| `--batch-size` | 16 | Batch size |
+| `--lr` | 1e-4 | Learning rate |
+| `--epochs` | 100 | Number of epochs |
 
-## Known Quirks (read before debugging)
+### Example
 
-- `PYTHONNOUSERSITE=1` is required when running in the `align` conda env to
-  prevent the user-site pip from shadowing torch.
-- Camera selection (wrist vs. agent) is sensitive to `PYTHONNOUSERSITE` — be
-  consistent between training and eval.
-- LIBERO MP4 decoders deadlock at `num_workers > 0` → use the HDF5 pipeline
-  for multi-worker training.
-- HDF5 pose field: legacy `noisy_poses` (misnomer-clean) and new `poses` are
-  both supported transparently.
-- Eval reads `poses` from sim observations, not `noisy_poses` from the
-  replay buffer — only actions are noised.
-- `docs/` is local-only and intentionally not tracked in git.
+```bash
+# Train with intent tokens + memory bank + diffusion head
+python training/train_intention.py \
+    --data data/libero_spatial.h5 \
+    --cameras image wrist_image \
+    --output-dir checkpoints/v4 \
+    --action-dim 7 \
+    --use-intent-tokens \
+    --use-memory-bank \
+    --epochs 100 \
+    --head-type diffusion \
+    --batch-size 16 \
+    --compressed-dim 8 \
+    --lr 1e-4
+
+# Train without history (no Mamba, no intent tokens)
+python training/train_intention.py \
+    --data data/libero_spatial.h5 \
+    --cameras image wrist_image \
+    --output-dir checkpoints/baseline \
+    --action-dim 7 \
+    --head-type diffusion \
+    --batch-size 16 \
+    --no-use-history
+```
+
+---
+
+## Evaluation
+
+### Offline (dataset replay)
+
+```bash
+python eval/eval_intention.py \
+    --data data/libero_spatial.h5 \
+    --checkpoint checkpoints/v4/libero_spatial/run_15/intention_best.pt \
+    --n-batches 20
+```
+
+### MuJoCo Simulator
+
+```bash
+python eval/eval_libero_v3_trajectory.py \
+    --data data/libero_spatial.h5 \
+    --checkpoint checkpoints/v4/libero_spatial/run_15/intention_best_fixed.pt \
+    --cameras image wrist_image \
+    --n-episodes 5 \
+    --switch-at 0.5
+```
+
+The `--switch-at` flag controls when the model takes over:
+- `0.0` = model from the start (fully autonomous)
+- `0.5` = expert controls first half, model second half (intent observation)
+- `1.0` = expert only (replay baseline)
+
+Outputs per-episode metrics, trajectory plots, and a 3-panel video (dataset recording | expert replay | model inference).
+
+---
+
+## Project Structure
+
+```
+ALIGN/
+├── data/               # Dataset loading and collation
+│   └── align_dataset.py
+├── models/
+│   ├── align_intention.py    # Main model (ALIGNIntentionModel)
+│   ├── align_model.py        # Vision encoder, state encoder
+│   ├── intention_encoder.py  # Mamba + SE compression + state modulation
+│   ├── intention_head.py     # Diffusion policy head (1D U-Net)
+│   └── memory_bank.py        # Episodic memory bank
+├── training/
+│   └── train_intention.py    # Training loop
+├── eval/
+│   ├── eval_intention.py              # Offline evaluation
+│   └── eval_libero_v3_trajectory.py   # MuJoCo sim evaluation
+├── inference/
+│   └── align_inference.py    # Real-time inference engine
+├── scripts/
+│   └── test_checkpoint_inference.py   # Checkpoint compatibility test
+└── docs/
+    ├── V4_PLAN.md
+    ├── V4_SYSTEM_OVERVIEW.md
+    └── V4_TRAINING_PSEUDOCODE.md
+```
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/NIRUN-Weerawit/ALIGN.git && cd ALIGN
+
+# Conda (recommended)
+conda env create -f environment.yml
+conda activate align
+
+# Verify
+python scripts/check_deps.py
+```
+
+Requires PyTorch 2.x, DINOv2, Mamba SSM, and LIBERO (for sim evaluation).
+
+---
 
 ## Citation
 
-Internal project, no paper yet. Pin to commit SHA when referencing.
+If you use this code, please cite the project repository.
+
+---
+
+## License
+
+MIT
