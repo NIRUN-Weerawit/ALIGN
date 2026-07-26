@@ -129,11 +129,14 @@ def build_datasets(args):
         ds = ALIGNDataset(
             args.data[0], mode="head",
             traj_window=traj_window, cameras=args.cameras,
+            dinov2_path=args.dinov2_path if args.use_precomputed_dinov2 else None,
         )
     else:
         ds = MultiALIGNDataset(
             args.data, mode="head",
             traj_window=traj_window, cameras=args.cameras,
+            dinov2_paths=([args.dinov2_path] * len(args.data)
+                          if args.use_precomputed_dinov2 else None),
         )
     n_total = len(ds)
     n_val = max(1, int(n_total * args.val_split))
@@ -275,10 +278,25 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # We process each timestep's frames through vision encoder
         z_v_pooled_all = []
         z_s_all = []
-        
-        
-        B, S, V, H, W, C = frames_seg.shape
-        z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
+
+
+        B, S = frames_seg.shape[:2]
+        # Detect pre-computed DINOv2 features (last dim = 768) vs raw
+        # frames (last dim = 3, shape = (B, S, V, H, W, 3)). When features
+        # are pre-computed, skip the DINOv2 forward entirely and just
+        # unpack the saved tokens.
+        frames_are_features = frames_seg.shape[-1] == 768
+        if frames_are_features:
+            # Pre-computed features: (B, S, V*257, 768) float32
+            # Layout per timestep: [cam0_patches(256), cam0_CLS(1), cam1_..., cam1_CLS, ...]
+            TOKENS = frames_seg.shape[2]   # V * 257
+            V = TOKENS // 257             # number of cameras
+            z_v_all = frames_seg.reshape(B * S * V, -1, 768)  # (B*S*V, P+1, raw_dim=768)
+            # print(f"Precomputed z_v_all shape: {z_v_all.shape}")  
+        else:
+            V, H, W, C = frames_seg.shape[2:]
+            z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
+            # print(f"raw z_v_all shape: {z_v_all.shape}")
 
         # Extract CLS tokens (last position per camera, NOT the last position overall).
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
@@ -323,8 +341,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         else:
             # No history: each timestep is independent
             num_windows = max_seg_len - chunk_size + 1
-        time_ids = torch.arange(max_seg_len, device=device)
-        valid_time_mask = time_ids.unsqueeze(0) < seg_lens.unsqueeze(1)
+
         for n in range(num_windows):
             if model.use_history:
                 # Build H-window ending at t+H-1
@@ -363,8 +380,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 if model.use_memory_bank:
                     # Flatten patch axis into feature dim for head consumption (3D expected)
                     B_seg, H_actual, VP, comp_dim = z_v_win.shape
-                    z_v_win_stacked = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, S, V*P*comp_dim)
-                    z_v_current = z_v_win_stacked[:, -1]  # (B, pool_out_dim)
+                    z_v_win = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, S, V*P*comp_dim)
+                    z_v_current = z_v_win[:, -1]  # (B, pool_out_dim)
                     z_s_current = z_s_win[:, -1]  # (B, state_dim)
                     if intent_emb is not None:
                         # Active phase: retrieve + fuse + store
@@ -381,7 +398,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         model.memory_module.store_perceptual_only(
                             z_v_current, z_s_current
                         )
-                        z_v_win_for_head = z_v_win_stacked[:, -1:]  # (B, 1, pool_out_dim)
+                        z_v_win_for_head = z_v_win[:, -1:]  # (B, 1, pool_out_dim)
                         z_s_win_for_head = z_s_win[:, -1:]  # (B, 1, state_dim)
                         h_for_head = intent_emb
                 else:
@@ -586,16 +603,45 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)  # (B,)
         Hs = args.history_size
         chunk_size = args.chunk_size
-        B, S, V, H, W, C = frames_seg.shape
+        # Pre-computed features arrive as (B, S, V*257, 768); raw frames as
+        # (B, S, V, H, W, 3). The model.forward path handles both via the
+        # `_vision_forward` skip below.
+        B, S = frames_seg.shape[:2]
+        frames_are_features = frames_seg.shape[-1] == 768
 
         # Forward (batched) through the model — one call for the whole segment
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
-            out = model(frames_seg, states_seg)
-            z_v_pooled_seq = out["z_v_pooled_seq"]  # (B, S, pool_out_dim)
-            z_s_seq = out["z_s_seq"]                # (B, S, state_dim)
-            h_seq = out["h_seq"]                    # (B, S, mamba_in_dim) or zeros
-            intent_emb = out.get("intent_emb", None)  # (B, N, intent_dim) or None
+            if frames_are_features:
+                # Skip DINOv2: feed features through forward_intent path manually.
+                # Build the same intermediates (z_v_CLS_all, z_v_all, z_s_seq)
+                # that the model's forward() would produce, then call head directly.
+                TOKENS = frames_seg.shape[2]
+                V = TOKENS // 257
+                P = 256
+                P_plus_1 = 257
+                features = frames_seg.float()  # ensure fp32 for vision_patch_encoder
+                features_4d = features.reshape(B * S, V, P_plus_1, 768)
+                z_v_CLS_all = features_4d[:, :, -1, :].reshape(B, S, V, 768)
+                z_v_all = features_4d[:, :, :-1, :].reshape(B, S, V * P, 768)
+                z_s_seq = model.state_encoder(states_seg.reshape(B * S, -1)).reshape(B, S, -1)
+                z_v_mod_seq = model.vision_patch_encoder(
+                    z_v_all.reshape(B * S, V * P, 768),
+                    z_s_seq.reshape(B * S, -1),
+                ).reshape(B, S, V * P, -1)
+                pool_out_dim = V * P * z_v_mod_seq.shape[-1]
+                if not model._built:
+                    model._build_head_and_bank(pool_out_dim)
+                z_v_pooled_seq = z_v_mod_seq.reshape(B, S, pool_out_dim)
+                # No Mamba history in batched mode (use_history=False required).
+                h_seq = torch.zeros(B, S, 1, device=device)
+                intent_emb = None
+            else:
+                out = model(frames_seg, states_seg)
+                z_v_pooled_seq = out["z_v_pooled_seq"]  # (B, S, pool_out_dim)
+                z_s_seq = out["z_s_seq"]                # (B, S, state_dim)
+                h_seq = out["h_seq"]                    # (B, S, mamba_in_dim) or zeros
+                intent_emb = out.get("intent_emb", None)  # (B, N, intent_dim) or None
 
             # Slide a window of size Hs ending at each timestep t, predict
             # the next chunk_size actions.
@@ -704,8 +750,16 @@ def validate(model, loader, device, args):
             model.memory_module.reset(batch_size=B_s, device=device)
 
         # Pre-encode vision for the entire segment (vision is the bottleneck)
-        B, S, V, H, W, C = frames_seg.shape
-        z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
+        B, S = frames_seg.shape[:2]
+        # Detect pre-computed DINOv2 features vs raw frames (see train_v4_epoch)
+        frames_are_features = frames_seg.shape[-1] == 768
+        if frames_are_features:
+            TOKENS = frames_seg.shape[2]
+            V = TOKENS // 257
+            z_v_all = frames_seg.reshape(B * S, TOKENS, 768)
+        else:
+            V, H, W, C = frames_seg.shape[2:]
+            z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
 
         # Extract CLS tokens (last position per camera, NOT the last position overall).
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
@@ -1037,6 +1091,14 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=1)
     # NOTE: --loss-mode removed; always 'action' for v3.
     # NOTE: --bf16 / --no-bf16 removed; BF16 is always on for speed.
+    # Pre-computed DINOv2 features (skips DINOv2 forward during training).
+    parser.add_argument("--use-precomputed-dinov2", action="store_true", default=False,
+                        help="Use pre-computed DINOv2 features from a sidecar HDF5. "
+                             "Generate with: python scripts/precompute_dinov2.py")
+    parser.add_argument("--dinov2-path", default=None,
+                        help="Path to DINOv2 sidecar HDF5. If omitted and "
+                             "--use-precomputed-dinov2 is set, defaults to "
+                             "<data path stem>.dinov2.h5 in the same directory.")
     parser.add_argument("--max-steps-per-epoch", type=int, default=0,
                         help="Cap steps per epoch (0 = use full loader).")
     # Wandb
@@ -1063,6 +1125,20 @@ def main():
     # Determine num_cameras from --cameras argument (auto-derived)
     num_cameras = len(args.cameras)
     print(f"  Cameras: {num_cameras} (from --cameras {args.cameras})")
+
+    # Default DINOv2 sidecar path: <data stem>.dinov2.h5 next to data file(s)
+    if args.use_precomputed_dinov2 and args.dinov2_path is None:
+        if len(args.data) == 1:
+            default_dinov2 = Path(args.data[0]).with_name(
+                Path(args.data[0]).stem + ".dinov2.h5"
+            )
+            args.dinov2_path = str(default_dinov2)
+        else:
+            raise ValueError(
+                "--dinov2-path is required when using multiple --data files "
+                "with --use-precomputed-dinov2"
+            )
+        print(f"  DINOv2 sidecar: {args.dinov2_path}")
     
     # Output dir
     out_dir = Path(args.output_dir)
@@ -1157,7 +1233,11 @@ def main():
             dummy = torch.from_numpy(frames_sample[0:1]).to(device)
         else:
             dummy = frames_sample[0:1].to(device)
-        z_v_dummy = model._vision_forward(dummy)
+        print(f" shape of dummy : {dummy.shape}")
+        if dummy.ndim == 3:
+            z_v_dummy = dummy
+        else:
+            z_v_dummy = model._vision_forward(dummy)
         print(f"  Vision output shape: {z_v_dummy.shape}")
         if z_v_dummy.ndim == 2:
             N_tok_actual = z_v_dummy.shape[0]
@@ -1211,6 +1291,8 @@ def main():
             "v4/anchor_weight": args.anchor_weight,
             "v4/segment_min_mult": args.segment_min_mult,
             "v4/segment_max_mult": args.segment_max_mult,
+            "dinov2/use_precomputed": args.use_precomputed_dinov2,
+            "dinov2/sidecar_path": args.dinov2_path,
         })
         # Watch gradients (for monitoring)
         wandb_trainer.watch(model, log="gradients", log_freq=200, log_graph=False)
