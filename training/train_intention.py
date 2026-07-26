@@ -756,7 +756,7 @@ def validate(model, loader, device, args):
         if frames_are_features:
             TOKENS = frames_seg.shape[2]
             V = TOKENS // 257
-            z_v_all = frames_seg.reshape(B * S, TOKENS, 768)
+            z_v_all = frames_seg.reshape(B * S * V, -1, 768)  # (B*S*V, P+1, raw_dim=768)
         else:
             V, H, W, C = frames_seg.shape[2:]
             z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
