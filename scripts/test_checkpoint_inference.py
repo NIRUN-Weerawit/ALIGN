@@ -27,9 +27,16 @@ def test_checkpoint(checkpoint_path: str, device_str: str = None):
 
     # 2. Build model with the checkpoint's config
     print(f"\nBuilding model...")
+    # If use_history is explicitly False in config, set mamba_output_dim=0
+    # so the model doesn't create the Mamba module at all
+    use_history = cfg.get("use_history", True)
+    mamba_output_dim = cfg.get("mamba_output_dim", 512)
+    if not use_history:
+        mamba_output_dim = 0
+
     model = ALIGNIntentionModel(
         state_dim=cfg.get("state_dim", 256),
-        mamba_output_dim=cfg.get("mamba_output_dim", 512),
+        mamba_output_dim=mamba_output_dim,
         action_dim=cfg.get("action_dim", 7),
         chunk_size=cfg.get("chunk_size", 10),
         history_size=cfg.get("history_size", 1),
@@ -47,10 +54,10 @@ def test_checkpoint(checkpoint_path: str, device_str: str = None):
         text_dim=cfg.get("text_dim", 256),
         compressed_dim=cfg.get("compressed_dim", 4),
         raw_dim=cfg.get("raw_dim", 768),
-        use_intent_tokens=cfg.get("use_intent_tokens", True),
+        use_intent_tokens=cfg.get("use_intent_tokens", False),
         num_intent_tokens=cfg.get("num_intent_tokens", 2),
         intent_dim=cfg.get("intent_dim", 512),
-        use_memory_bank=cfg.get("use_memory_bank", True),
+        use_memory_bank=cfg.get("use_memory_bank", False),
         memory_bank_len=cfg.get("memory_bank_len", 16),
     ).to(device)
 
@@ -120,7 +127,7 @@ def test_checkpoint(checkpoint_path: str, device_str: str = None):
                 print(f"  Memory bank: z_v_fused={z_v_fused.shape}, z_s_fused={z_s_fused.shape}, intent_fused={intent_fused.shape}")
                 h_for_head = intent_fused
             else:
-                h_for_head = intent_emb if intent_emb is not None else h_current
+                h_for_head = intent_emb if intent_emb is not None else None
 
             # Head forward
             if model.head_type == "diffusion":

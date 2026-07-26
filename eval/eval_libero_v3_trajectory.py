@@ -448,9 +448,9 @@ def run_replay_in_sim(
         # Pad with zero gripper
         pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
         actions = np.concatenate([actions, pad], axis=1)
-    # Pad to max_steps by repeating last action
+    # Pad to max_steps by with zeros action
     if len(actions) < max_steps:
-        pad = np.tile(actions[-1:], (max_steps - len(actions), 1))
+        pad = np.tile(np.zeros_like(actions[-1:]), (max_steps - len(actions), 1))
         actions = np.concatenate([actions, pad], axis=0)
 
     for step in range(max_steps):
@@ -483,6 +483,7 @@ def run_replay_in_sim(
 
     return {
         "frames": frames,
+        "expert_actions": actions,
         "sim_positions": np.array(sim_positions),
         "errors": np.array(errors),
         "n_steps": len(frames),
@@ -631,7 +632,7 @@ def run_model_in_sim(
                         )
                         h_for_head = intent_fused
                     else:
-                        h_for_head = intent_emb if intent_emb is not None else h_current
+                        h_for_head = intent_emb if intent_emb is not None else None
 
                     if model.head_type == "diffusion":
                         a_model_full = model.sample_actions(
@@ -863,6 +864,10 @@ def main():
                              "(e.g. 'image wrist_image' for 2-cam checkpoints).")
     parser.add_argument("--n-episodes", type=int, default=1,
                         help="Number of episodes to evaluate.")
+    parser.add_argument("--val-episodes", type=str, default=None,
+                        help="Path to a text file with episode keys to evaluate "
+                             "(one per line, e.g. 'ep_000001'). "
+                             "Use scripts/save_val_episodes.py to generate this from a training run.")
     parser.add_argument("--noise-std", type=float, default=0.00001,
                         help="Gaussian noise std for noised actions.")
     parser.add_argument("--max-steps", type=int, default=300,
@@ -947,15 +952,27 @@ def main():
         print(f"  Auto-detected suite: {args.libero_suite}")
 
     # List episodes
-    episodes = list_episodes(args.data)[:args.n_episodes]
+    episodes = list_episodes(args.data)
     if not episodes:
         print(f"  No episodes found in {args.data}")
         return
-    print(f"  Episodes:    {len(episodes)} (out of {len(list_episodes(args.data))} total)")
+
+    # If --val-episodes is set, filter to only those episodes
+    if args.val_episodes is not None:
+        val_keys = set()
+        with open(args.val_episodes) as f:
+            for line in f:
+                val_keys.add(line.strip())
+        episodes = [e for e in episodes if e in val_keys]
+        print(f"  Using {len(episodes)} val episodes (from {args.val_episodes})")
+    else:
+        print(f"  Episodes:    {len(episodes)} (all — use --val-episodes to filter)")
+
+    episodes = episodes[:args.n_episodes]
 
     # Output directory for plots
     if args.out_dir is None:
-        args.out_dir = str(Path(args.checkpoint).parent)
+        args.out_dir = str(Path(args.checkpoint).parent) + "/" + str(args.switch_at)
         
         # Make sure it exists
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -1106,7 +1123,7 @@ def main():
                     model_frames=model_result["frames"],
                     out_path=video_path,
                     fps=20,
-                    switch_step=model_result.get("switch_step", 0),
+                    switch_step=switch_step,
                 )
                 print(f"    Video: {video_path}")
             except Exception as e:
@@ -1134,17 +1151,18 @@ def main():
                 # )
                 # axes[-1].set_xlabel("timestep")
                 
-                fig, axes = plt.subplots(6, 1, figsize=(10, 6), sharex=True)
-                for i, (ax, name) in enumerate(zip(axes, ["x", "y", "z", "ax", "ay", "az"])):
+                fig, axes = plt.subplots(7, 1, figsize=(13, 10), sharex=True)
+                for i, (ax, name) in enumerate(zip(axes, ["x", "y", "z", "ax", "ay", "az", "gripper"])):
                     ax.plot(t_arr, model_result["stored_actions"][:, i],
                             label="model_sim", color="C0")
-                    if len(traj["actions"]) == len(t_arr):
-                        ax.plot(t_arr, traj["actions"][:, i],
-                                label="replay_sim", color="C2", alpha=0.6)
+                    # if len(traj["actions"]) == len(t_arr):
+                    ax.plot(t_arr, replay_result["expert_actions"][:, i],
+                            label="replay_sim", color="C2", alpha=0.6)
+                    ax.axvline(x=switch_step, color='red', linestyle='--')
                     ax.set_ylabel(f"action_{name}")
                     ax.legend()  
                 axes[0].set_title(
-                    f"{ep_key} — {task_name} (alpha={args.alpha})"
+                    f"{ep_key} — {task_name} (switch at t={switch_step})"
                 )
                 axes[-1].set_xlabel("timestep")      
                 fig.tight_layout()

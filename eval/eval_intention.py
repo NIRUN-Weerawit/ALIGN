@@ -105,19 +105,25 @@ def load_intention_model(
     if override_num_cameras is not None:
         cfg["num_cameras"] = override_num_cameras
 
+    # If use_history is explicitly False, don't create Mamba module
+    use_history = cfg.get("use_history", True)
+    mamba_output_dim = cfg["mamba_output_dim"]
+    if not use_history:
+        mamba_output_dim = 0
+
     print(f"  Loading:    {checkpoint_path}")
     print(f"  Epoch:      {ckpt.get('epoch', '?')}")
     print(f"  Val loss:   {ckpt.get('val_loss', ckpt.get('loss', '?'))}")
     print(f"  Chunk (K):  {cfg['chunk_size']}")
     print(f"  Cameras:    {cfg['num_cameras']}")
-    print(f"  Mamba dim:  {cfg['mamba_output_dim']}")
+    print(f"  Mamba dim:  {mamba_output_dim}")
     print(f"  Head:       {cfg.get('head_type', 'mamba')}")
     if cfg.get('use_text', False):
         print(f"  Text:       enabled (dim={cfg.get('text_dim', 256)})")
 
     model = ALIGNIntentionModel(
         state_dim=cfg["state_dim"],
-        mamba_output_dim=cfg["mamba_output_dim"],
+        mamba_output_dim=mamba_output_dim,
         action_dim=cfg.get("action_dim", 6),
         chunk_size=cfg["chunk_size"],
         history_size=cfg.get("history_size", cfg["chunk_size"]),
