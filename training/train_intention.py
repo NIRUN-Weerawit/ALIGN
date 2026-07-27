@@ -320,9 +320,6 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             z_s_all.reshape(B * S, -1),
         ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
         
-        # z_v_mamba_all = model.intention_encoder.encode_patches_for_mamba(z_v_CLS_all, z_s_all)  # (B, S, V, comp_dim)
-        # print(f"shapes: z_v_all: {z_v_mod_all.shape}")
-        
         # Flatten patch axis into feature dim for head consumption (3D expected)
         # B_seg, S, N_tok, comp_dim = z_v_mod_all.shape
         # z_v_all_stacked = z_v_mod_all.reshape(B_seg, S, N_tok * comp_dim)  # (B, S, V*P*comp_dim)

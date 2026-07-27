@@ -314,25 +314,6 @@ class IntentionEncoder(nn.Module):
             z_v_mod_seq.append(out_t)
         
         return torch.stack(z_v_mod_seq, dim=1)  # (B, T, VP, comp_dim)
-    
-    def encode_patches_for_mamba(self, z_v_cls: torch.Tensor, z_s: torch.Tensor
-                       ) -> torch.Tensor:
-        """Encode patches via VisionPatchEncoder without pooling.
-        
-        Args:
-            z_v_pz_v_clsatches: (B, T, V, raw_dim=768)
-            z_s:         (B, T, state_dim)
-        Returns:
-            (B, T, V, compressed_dim)
-        """
-        B, T = z_v_cls.shape[:2]
-        # Encode each timestep: raw -> SE compress -> state modulate (no pooling)
-        z_v_mod_seq = []
-        for t in range(T):
-            out_t = self.vision_patch_encoder(z_v_cls[:, t], z_s[:, t])
-            z_v_mod_seq.append(out_t)
-        
-        return torch.stack(z_v_mod_seq, dim=1)  # (B, T, V, comp_dim)
         
     def forward(self, z_v_cls_seq: torch.Tensor, z_s_seq: torch.Tensor
                 ) -> torch.Tensor:
