@@ -6,6 +6,7 @@ data/*.h5
 # Training artifacts
 checkpoints/
 wandb/
+replay/
 
 # Eval artifacts (regeneratable)
 eval/libero_results/
@@ -33,3 +34,4 @@ graphify-out/
 # docs
 docs/
 reports/
+paper/
