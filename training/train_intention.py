@@ -1090,12 +1090,14 @@ def parse_args():
     # NOTE: --bf16 / --no-bf16 removed; BF16 is always on for speed.
     # Pre-computed DINOv2 features (skips DINOv2 forward during training).
     parser.add_argument("--use-precomputed-dinov2", action="store_true", default=False,
-                        help="Use pre-computed DINOv2 features from a sidecar HDF5. "
+                        help="Use pre-computed DINOv2 features from a sidecar "
+                             "directory of per-episode .npy files. "
                              "Generate with: python scripts/precompute_dinov2.py")
     parser.add_argument("--dinov2-path", default=None,
-                        help="Path to DINOv2 sidecar HDF5. If omitted and "
-                             "--use-precomputed-dinov2 is set, defaults to "
-                             "<data path stem>.dinov2.h5 in the same directory.")
+                        help="Path to DINOv2 sidecar DIRECTORY (containing "
+                             "index.json + per-episode .npy files). If omitted "
+                             "and --use-precomputed-dinov2 is set, defaults to "
+                             "<data path stem>.dinov2/ in the same directory.")
     parser.add_argument("--max-steps-per-epoch", type=int, default=0,
                         help="Cap steps per epoch (0 = use full loader).")
     # Wandb
@@ -1123,11 +1125,11 @@ def main():
     num_cameras = len(args.cameras)
     print(f"  Cameras: {num_cameras} (from --cameras {args.cameras})")
 
-    # Default DINOv2 sidecar path: <data stem>.dinov2.h5 next to data file(s)
+    # Default DINOv2 sidecar path: <data stem>.dinov2/ next to data file(s)
     if args.use_precomputed_dinov2 and args.dinov2_path is None:
         if len(args.data) == 1:
             default_dinov2 = Path(args.data[0]).with_name(
-                Path(args.data[0]).stem + ".dinov2.h5"
+                Path(args.data[0]).stem + ".dinov2"
             )
             args.dinov2_path = str(default_dinov2)
         else:
@@ -1135,7 +1137,7 @@ def main():
                 "--dinov2-path is required when using multiple --data files "
                 "with --use-precomputed-dinov2"
             )
-        print(f"  DINOv2 sidecar: {args.dinov2_path}")
+        print(f"  DINOv2 sidecar dir: {args.dinov2_path}")
     
     # Output dir
     out_dir = Path(args.output_dir)
