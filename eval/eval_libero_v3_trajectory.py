@@ -622,7 +622,7 @@ def run_model_in_sim(
                     out = model(f_t, s_t)
                     h_current = out["h_seq"][:, -1]
                     intent_emb = out.get("intent_emb", None)
-
+                    intent_emb = torch.zeros_like(intent_emb)
                     # Memory bank step (if enabled)
                     if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
                         z_v_current = out["z_v_pooled_seq"][:, -1]
