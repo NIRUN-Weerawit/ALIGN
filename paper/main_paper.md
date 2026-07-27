@@ -91,9 +91,6 @@ We make four claims, each tied to an experiment in `paper/experiment_log.md`:
   demonstrating they are not merely a short-horizon action prior.
   *Evidence: EXP-C cosine-similarity probing.*
 
-- **C4 (systems)**: The DINOv2 pre-compute pipeline reduces training peak VRAM
-  from 81 GB to under 10 GB on an H100 NVL with no measurable change in final
-  validation loss. *Evidence: EXP-D wall-time + VRAM comparison.*
 
 ---
 

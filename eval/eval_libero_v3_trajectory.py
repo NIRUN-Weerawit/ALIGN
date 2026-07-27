@@ -366,7 +366,12 @@ def get_sim_eef_pose(obs: dict) -> np.ndarray:
 
 
 def get_bddl_path(suite_name: str, task_name: str) -> str:
-    """Get path to BDDL file for LIBERO task."""
+    """Get path to BDDL file for LIBERO task.
+
+    Searches the BDDL directory for a file whose name contains the
+    sanitized task name. This handles scene prefixes like
+    KITCHEN_SCENE3_ or LIVING_ROOM_SCENE5_ that LIBERO prepends.
+    """
     if get_libero_path is None:
         raise ImportError("libero not installed")
     # LIBERO task names are like "pick up the black bowl..."
@@ -374,7 +379,14 @@ def get_bddl_path(suite_name: str, task_name: str) -> str:
     safe_name = "".join(
         c if c.isalnum() else "_" for c in task_name.lower()
     ).strip("_")
-    return os.path.join(get_libero_path("bddl_files"), suite_name, f"{safe_name}.bddl")
+    bddl_dir = os.path.join(get_libero_path("bddl_files"), suite_name)
+    if not os.path.isdir(bddl_dir):
+        return os.path.join(bddl_dir, f"{safe_name}.bddl")
+    # Search for a file containing the task name (handles scene prefixes)
+    for fname in os.listdir(bddl_dir):
+        if safe_name in fname and fname.endswith(".bddl"):
+            return os.path.join(bddl_dir, fname)
+    return os.path.join(bddl_dir, f"{safe_name}.bddl")
 
 
 # Map of LIBERO suite name to task names
