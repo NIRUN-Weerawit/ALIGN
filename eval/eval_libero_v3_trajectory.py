@@ -550,6 +550,7 @@ def run_model_in_sim(
     sim_positions = []
     errors = []
     stored_actions = []
+    success = 0
 
     # Reset memory bank at start of episode
     if getattr(model, 'use_memory_bank', False) and model.memory_module is not None:
@@ -622,7 +623,7 @@ def run_model_in_sim(
                     out = model(f_t, s_t)
                     h_current = out["h_seq"][:, -1]
                     intent_emb = out.get("intent_emb", None)
-                    intent_emb = torch.zeros_like(intent_emb)
+                    # intent_emb = torch.zeros_like(intent_emb)
                     # Memory bank step (if enabled)
                     if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
                         z_v_current = out["z_v_pooled_seq"][:, -1]
@@ -680,6 +681,8 @@ def run_model_in_sim(
         else:
             errors.append(0.0)
         # Don't break on done — keep running to max_steps for consistent video length
+        if done: 
+            success += 1
 
     return {
         "frames": frames,
@@ -694,6 +697,7 @@ def run_model_in_sim(
         "action_magnitude_dataset": float(np.mean(np.linalg.norm(
             actions[:, :6], axis=1
         ))),
+        "success": True if success >= 1 else False,
     }
 
 
@@ -1092,7 +1096,8 @@ def main():
         switch_step = model_result.get("switch_step", 0)
         print(f"    Model run:   {model_result['n_steps']:3d} steps  "
               f"EEF err: {eef_err_model:.4f} m  ({t_model:.1f}s)  "
-              f"switch at step {switch_step}")
+              f"switch at step {switch_step}  "
+              f"Success: {model_result['success']}  ")
         # Diagnostic: action magnitude comparison
         mag_model = model_result.get("action_magnitude_model", 0.0)
         mag_dataset = model_result.get("action_magnitude_dataset", 0.0)
@@ -1180,6 +1185,7 @@ def main():
             "n_steps": model_result["n_steps"],
             "mean_error_replay": eef_err_replay,
             "mean_error_model": eef_err_model,
+            "success": model_result["success"],
         })
 
         try:
@@ -1202,7 +1208,10 @@ def main():
         if model_errs:
             print(f"  Model  EEF err:  {np.mean(model_errs):.4f} m  (n={len(model_errs)})")
         print(f"\n  Per-episode:")
+        
+        success_count = 0
         for r in mujoco_results:
+            success_count = success_count + 1 if r.get("success", False) else success_count
             tn = r.get("task_name", "?")
             print(f"    {tn[:50]:<50}  "
                   f"replay={r['mean_error_replay']:.4f}  "
@@ -1215,13 +1224,14 @@ def main():
             "data": args.data,
             "alpha": args.alpha,
             "n_episodes": len(mujoco_results),
+            "success_rate": f"{success_count}/{ len(mujoco_results)}",
             "episodes": mujoco_results,
             "aggregate": {
                 "mean_replay_err": float(np.mean(replay_errs)) if replay_errs else None,
                 "mean_model_err": float(np.mean(model_errs)) if model_errs else None,
             },
         }
-        summary_path = Path(args.checkpoint).with_suffix(".mujoco_eval.json")
+        summary_path = Path(args.checkpoint).with_suffix(f".mujoco_eval_{args.switch_at}.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(f"\n  Summary written to: {summary_path}")
