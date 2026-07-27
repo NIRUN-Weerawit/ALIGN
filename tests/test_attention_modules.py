@@ -153,11 +153,17 @@ def visualize_attention(model, frames, states, device, out_dir: str = None):
             k = v = z_v_comp
 
             # Get attention weights
+            # MultiheadAttention returns (attn_output, attn_weights)
+            # attn_weights shape: (B, num_heads, L, S) or (B, L, S) with average_attn_weights=True
             _, attn_weights = modulator.cross_attn(
-                q, k, v, need_weights=True, average_attn_weights=True
-            )  # (1, N_pos) — average over heads
-
-            weights = attn_weights[0].cpu().numpy()  # (N_pos,)
+                q, k, v, need_weights=True, average_attn_weights=True,
+            )
+            # attn_weights: (1, N_pos) with average_attn_weights=True
+            if attn_weights.ndim == 3:
+                # (1, 1, N_pos) — still has head dim
+                weights = attn_weights[0, 0].cpu().numpy()  # (N_pos,)
+            else:
+                weights = attn_weights[0].cpu().numpy()  # (N_pos,)
 
             # Split by camera
             P_per_cam = N_pos // V
@@ -189,8 +195,9 @@ def visualize_attention(model, frames, states, device, out_dir: str = None):
             matplotlib.use("Agg")
             import matplotlib.pyplot as plt
             from matplotlib import cm
+            from PIL import Image as PILImage
 
-            # Per-timestep heatmap grid
+            # Per-timestep heatmap grid (static)
             n_cols = min(T, 10)
             for c in range(V):
                 fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
@@ -198,16 +205,12 @@ def visualize_attention(model, frames, states, device, out_dir: str = None):
                     axes = [axes]
                 for t in range(n_cols):
                     ax = axes[t]
-                    # Get the frame for this camera
                     if frames.ndim == 5:
                         img = frames[t, c]
                     else:
                         img = frames[t]
-                    # Attention heatmap
                     w = all_weights[t][c].reshape(grid_dim, grid_dim)
                     w_norm = (w - w.min()) / (w.max() - w.min() + 1e-8)
-                    # Resize heatmap to image size
-                    from PIL import Image as PILImage
                     w_resized = np.array(
                         PILImage.fromarray(w_norm).resize(
                             (img.shape[1], img.shape[0]), PILImage.BILINEAR
@@ -227,6 +230,72 @@ def visualize_attention(model, frames, states, device, out_dir: str = None):
                 fig.tight_layout()
                 fig.savefig(os.path.join(out_dir, f"attention_timeline_cam{c}.png"), dpi=80)
                 plt.close(fig)
+
+            # Per-camera attention video (full episode)
+            for c in range(V):
+                try:
+                    import imageio
+                    vid_path = os.path.join(out_dir, f"attention_video_cam{c}.mp4")
+                    writer = imageio.get_writer(vid_path, fps=10, codec="libx264", quality=8)
+                    for t in range(T):
+                        if frames.ndim == 5:
+                            img = frames[t, c]
+                        else:
+                            img = frames[t]
+                        w = all_weights[t][c].reshape(grid_dim, grid_dim)
+                        w_norm = (w - w.min()) / (w.max() - w.min() + 1e-8)
+                        w_resized = np.array(
+                            PILImage.fromarray(w_norm).resize(
+                                (img.shape[1], img.shape[0]), PILImage.BILINEAR
+                            )
+                        )
+                        heat_rgb = cm.hot(w_resized)[:, :, :3]
+                        alpha = np.stack([w_resized] * 3, axis=-1)
+                        overlay = np.clip(
+                            img.astype(np.float32) * (1.0 - alpha * 0.5)
+                            + heat_rgb * 255 * (alpha * 0.5),
+                            0, 255,
+                        ).astype(np.uint8)
+                        writer.append_data(overlay)
+                    writer.close()
+                    print(f"  Saved attention video: {vid_path}")
+                except ImportError:
+                    print(f"  Skipping video: imageio not installed")
+
+            # Combined video (all cameras side-by-side)
+            if V > 1:
+                try:
+                    import imageio
+                    vid_path = os.path.join(out_dir, "attention_video_combined.mp4")
+                    writer = imageio.get_writer(vid_path, fps=10, codec="libx264", quality=8)
+                    for t in range(T):
+                        cam_frames = []
+                        for c in range(V):
+                            if frames.ndim == 5:
+                                img = frames[t, c]
+                            else:
+                                img = frames[t]
+                            w = all_weights[t][c].reshape(grid_dim, grid_dim)
+                            w_norm = (w - w.min()) / (w.max() - w.min() + 1e-8)
+                            w_resized = np.array(
+                                PILImage.fromarray(w_norm).resize(
+                                    (img.shape[1], img.shape[0]), PILImage.BILINEAR
+                                )
+                            )
+                            heat_rgb = cm.hot(w_resized)[:, :, :3]
+                            alpha = np.stack([w_resized] * 3, axis=-1)
+                            overlay = np.clip(
+                                img.astype(np.float32) * (1.0 - alpha * 0.5)
+                                + heat_rgb * 255 * (alpha * 0.5),
+                                0, 255,
+                            ).astype(np.uint8)
+                            cam_frames.append(overlay)
+                        combined = np.concatenate(cam_frames, axis=1)
+                        writer.append_data(combined)
+                    writer.close()
+                    print(f"  Saved combined attention video: {vid_path}")
+                except ImportError:
+                    pass
 
             # Side-by-side: original vs zero vs perturbed z_s on first frame
             f_t0 = torch.from_numpy(frames[0:1]).unsqueeze(0).to(device)
@@ -255,7 +324,10 @@ def visualize_attention(model, frames, states, device, out_dir: str = None):
                             q_v, z_v_comp0, z_v_comp0,
                             need_weights=True, average_attn_weights=True,
                         )
-                        w = aw[0].cpu().numpy()
+                        if aw.ndim == 3:
+                            w = aw[0, 0].cpu().numpy()
+                        else:
+                            w = aw[0].cpu().numpy()
                         Ppc = w.shape[0] // V
                         w_cam = w[c * Ppc:(c + 1) * Ppc].reshape(grid_dim, grid_dim)
                         w_norm = (w_cam - w_cam.min()) / (w_cam.max() - w_cam.min() + 1e-8)
