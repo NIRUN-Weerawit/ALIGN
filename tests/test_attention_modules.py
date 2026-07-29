@@ -127,7 +127,7 @@ def visualize_attention(model, frames, states, device, out_dir: str = None):
         print("  SKIP: no state_modulator in vision_patch_encoder")
         return
 
-    T = min(frames.shape[0], 20)  # limit to 20 timesteps for speed
+    T = frames.shape[0] 
     V = frames.shape[1] if frames.ndim == 5 else 1
 
     model.eval()
@@ -377,7 +377,7 @@ def main():
                         help="Camera names")
     parser.add_argument("--n-samples", type=int, default=3,
                         help="Number of episodes to test")
-    parser.add_argument("--n-frames", type=int, default=50,
+    parser.add_argument("--n-frames", type=int, default=100,
                         help="Frames per episode")
     parser.add_argument("--device", default=None)
     parser.add_argument("--out-dir", default=None,
