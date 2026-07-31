@@ -1064,18 +1064,19 @@ def main():
             continue
 
         # ── Run 1: Replay expert actions in sim ──
-        t0 = time.time()
-        replay_result = run_replay_in_sim(
-            env=env,
-            expert_actions=traj["actions"],
-            expert_poses=traj["poses"] if traj["poses"] is not None else None,
-            max_steps=args.max_steps,
-            render_size=args.render_size,
-            use_camera="agentview_image",
-            flip_vertical=flip_vertical,
-            flip_horizontal=flip_horizontal,
-        )
-        t_replay = time.time() - t0
+        if args.save_video:
+            t0 = time.time()
+            replay_result = run_replay_in_sim(
+                env=env,
+                expert_actions=traj["actions"],
+                expert_poses=traj["poses"] if traj["poses"] is not None else None,
+                max_steps=args.max_steps,
+                render_size=args.render_size,
+                use_camera="agentview_image",
+                flip_vertical=flip_vertical,
+                flip_horizontal=flip_horizontal,
+            )
+            t_replay = time.time() - t0
 
         # ── Run 2: Model rollout in sim ──
         t0 = time.time()
@@ -1101,10 +1102,11 @@ def main():
         # ── Compute metrics ──
         # EEF error for model rollout vs expert
         eef_err_model = float(np.mean(model_result["errors"])) if len(model_result["errors"]) > 0 else float("nan")
-        eef_err_replay = float(np.mean(replay_result["errors"])) if len(replay_result["errors"]) > 0 else float("nan")
+        if args.save_video:
+            eef_err_replay = float(np.mean(replay_result["errors"])) if len(replay_result["errors"]) > 0 else float("nan")
 
-        print(f"    Replay run:  {replay_result['n_steps']:3d} steps  "
-              f"EEF err: {eef_err_replay:.4f} m  ({t_replay:.1f}s)")
+            print(f"    Replay run:  {replay_result['n_steps']:3d} steps  "
+                f"EEF err: {eef_err_replay:.4f} m  ({t_replay:.1f}s)")
         switch_step = model_result.get("switch_step", 0)
         print(f"    Model run:   {model_result['n_steps']:3d} steps  "
               f"EEF err: {eef_err_model:.4f} m  ({t_model:.1f}s)  "
