@@ -1,0 +1,93 @@
+% Figure 2: Tree map of related work — standalone file
+% Drop into the paper with \input{figure_treemap}
+%
+% Requires: forest, xcolor, tikz (for tikz options)
+% Compile:  pdflatex figure_treemap.tex
+
+\documentclass[11pt]{standalone}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{forest}
+\usetikzlibrary{arrows.meta, positioning, calc}
+
+\definecolor{okblue}{HTML}{0072B2}
+\definecolor{okorange}{HTML}{E69F00}
+\definecolor{okgreen}{HTML}{009E73}
+\definecolor{okred}{HTML}{D55E00}
+\definecolor{okyellow}{HTML}{F0E442}
+
+\begin{document}
+\begin{forest}
+for tree={
+    grow'=east,
+    parent anchor=east,
+    child anchor=west,
+    edge path={
+        \noexpand\path [draw, \forestoption{edge}]
+        (!u.parent anchor) -| +(8pt,0) |- (.child anchor)\forestoption{edge label};
+    },
+    anchor=west,
+    align=left,
+    l sep=8pt,
+    s sep=4pt,
+    inner xsep=2pt,
+    inner ysep=2pt,
+    font=\small,
+    where level=0{
+        font=\bfseries\large,
+        fill=gray!20,
+        rounded corners=2pt,
+        inner xsep=6pt,
+    }{},
+    where level=1{
+        font=\bfseries,
+        rounded corners=2pt,
+    }{},
+    where level=2{
+        font=\itshape\small,
+    }{},
+    where level=3{
+        font=\scriptsize,
+        fill=white,
+    }{},
+}
+[Robotics
+  [{Autonomous\\Manipulation}, fill=okblue!25, draw=okblue, thick,
+    [{Imitation\\learning}, fill=okblue!15,
+      [{BC, ACT\\Diffusion Policy\\(Chi 2023)\\RT-2, RT-X}]
+    ]
+    [{Foundation\\VLAs}, fill=okblue!15,
+      [{OpenVLA, Octo\$\pi_0$, GR-1}]
+    ]
+    [{Memory-\\augmented}, fill=okblue!15,
+      [{MemoryVLA (2026)\\RAG-policy}]
+    ]
+  ]
+  [{Shared\\Autonomy}, fill=okorange!25, draw=okorange, thick,
+    [{Goal\\inference}, fill=okorange!15,
+      [{POMDP (Javdani)\\Visual goal\\quad (Jonnavittula)\\VLM-mediated\\quad (Casper, SAFe-Copilot)}]
+    ]
+    [{Arbitration}, fill=okorange!15,
+      [{$\alpha$-blending\\quad (Wang \& Losey)\\Forward-reverse\\quad (Yoneda)\\Bayesian posterior\\quad (RT-V3)\\Flow-match guidance\\quad (Assistron)}]
+    ]
+    [{Adaptive $\alpha$}, fill=okorange!15,
+      [{SA-DRL (Reddy)\\Atan (2024)\\Lima MPC (2024)}]
+    ]
+  ]
+  [{Task-Semantic\\Extraction\\(from RNN/SSM)}, fill=okgreen!25, draw=okgreen, thick,
+    [{Fixed query\\+ attention}, fill=okgreen!15,
+      [{BERT [CLS] (2018)\\Perceiver IO (2021)\\Slot Attention (2020)\\Set Transformer (2019)}]
+    ]
+    [{Fixed query\\+ RNN/SSM}, fill=okgreen!15,
+      [{Decision Mamba (2024)\\Prompt-DT (2022)\\LPDT (Yang \& Xu)}]
+    ]
+    [{Multimodal\\grounding}, fill=okgreen!15,
+      [{CLIP (Radford 2021)\\ALIGN (Caron 2021)\\Language-as-supervision}]
+    ]
+  ]
+  [{\bfseries ALIGN\\(this work)}, fill=okyellow!80, draw=okred, very thick,
+    tikz={\node[draw=none, fill=none] at () {};}
+  ]
+]
+\end{forest}
+\end{document}

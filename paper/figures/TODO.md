@@ -9,10 +9,30 @@ This must be replaced before submission.
 **Required state**: TikZ diagram with:
 - Color-coded boxes for each component (encoder, patch encoder, Mamba, head)
 - Data flow arrows with labeled tensor shapes
-- A small inset showing the memory bank's three streams
+- Drop shadow for the diffusion head (highlight)
+**Status**: NEEDS WORK.
 
-**Suggested tools**:
-- Use the `architecture-diagram` skill (already in Hermes)
+## Figure 2: Venn diagram of three lineages (Section 1) — NEW
+
+**Current state**: DRAFTED. See `figure_venn.tex` and `figure_venn_preview.svg`.
+**Required state**: Pick one of:
+- The TikZ version (`figure_venn.tex`, recommended for LaTeX paper)
+- The SVG version (convert to PDF via `inkscape` if needed)
+**Status**: READY. Compile with `pdflatex figure_venn.tex`.
+
+## Figure 3: Tree map of related work (Section 2) — NEW
+
+**Current state**: DRAFTED. See `figure_treemap.tex`.
+**Required state**: forest package rendering, may need width tuning to fit single column.
+**Status**: READY. Compile with `pdflatex figure_treemap.tex`.
+
+## Figure 4 (optional): Linear taxonomy variant (Section 1, slides)
+
+**Current state**: DRAFTED. See `figure_linear.tex`.
+**Required state**: For talks/slides; simpler than Venn diagram.
+**Status**: READY. Compile with `pdflatex figure_linear.tex`.
+
+## Figure 5: Architecture diagram (Section 3.2)
 - Use `tikz` with `positioning`, `arrows.meta`, `shapes.geometric` libraries
 - Compile with `pdflatex`
 
