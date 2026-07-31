@@ -420,6 +420,93 @@ class ALIGNIntentionModel(nn.Module):
             z_v_pooled_window, z_s_window, intent_emb=intent_emb,
         )
 
+    # ----------------------------------------------------------------
+    # Probe / interpretability forward
+    # ----------------------------------------------------------------
+    @torch.no_grad()
+    def forward_with_probe(
+        self,
+        frames_seq: torch.Tensor,
+        state_seq: torch.Tensor,
+    ) -> dict:
+        """One-shot forward pass that returns intent_emb + surrounding context.
+
+        Used by tools/probe_intent_clustering.py to inspect the structure of the
+        learned intent representations on held-out episodes without affecting
+        training.
+
+        This method re-uses the same forward path as `forward()` so the probe
+        matches training-time behavior exactly. No gradients are computed.
+
+        Args:
+            frames_seq: (B, T, V, H, W, 3) raw frames  OR
+                        (B, T, V*P+CLS, raw_dim=768) pre-computed DINOv2 features.
+                        Detected by ndim / last-dim value; see _vision_forward dispatch.
+            state_seq:  (B, T, 7) raw robot state
+
+        Returns:
+            dict with keys:
+              intent_emb:         (B, N, intent_dim)  or None if use_intent_tokens=False
+              z_v_pooled_seq:     (B, T, pool_out_dim)
+              z_s_seq:            (B, T, state_dim)
+              h_seq:              (B, T, mamba_output_dim)  or (B, T, 1) when no history
+              z_v_CLS_seq:        (B, T, V, raw_dim)
+        """
+        B, T = frames_seq.shape[:2]
+
+        # ---- Vision encoding (handles both raw frames and pre-computed features) ----
+        if frames_seq.ndim == 6:
+            V = frames_seq.shape[2]
+            z_v_all = self._vision_forward(
+                frames_seq.reshape(B * T * V, *frames_seq.shape[3:])
+            )  # (B*T*V, P+1, raw_dim=768)
+        else:
+            V = 1
+            z_v_all = self._vision_forward(
+                frames_seq.reshape(B * T, *frames_seq.shape[2:])
+            )  # (B*T, P+1, raw_dim=768)
+
+        # Split CLS from patches
+        z_v_CLS_all = z_v_all[:, -1]  # (B*T*V, raw_dim)
+        z_v_CLS_all = z_v_CLS_all.reshape(B, T, V, -1)  # (B, T, V, raw_dim)
+
+        z_v_patches = z_v_all[:, :-1]  # (B*T*V, P, raw_dim)
+        _, P, raw_dim = z_v_patches.shape
+        z_v_patches = z_v_patches.reshape(B, T, V * P, raw_dim)
+
+        # ---- State encoding ----
+        z_s_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
+
+        # ---- Patch encoding for head consumption ----
+        z_v_mod_seq = self.vision_patch_encoder(
+            z_v_patches.reshape(B * T, -1, raw_dim),
+            z_s_seq.reshape(B * T, -1),
+        )  # (B*T, V*P, comp_dim)
+        z_v_mod_seq = z_v_mod_seq.reshape(B, T, -1, z_v_mod_seq.shape[-1])
+        pool_out_dim = z_v_mod_seq.shape[2] * z_v_mod_seq.shape[3]
+        z_v_pooled_seq = z_v_mod_seq.reshape(B, T, pool_out_dim)
+
+        # Build head / memory bank on first call (same as training forward)
+        self._build_head_and_bank(pool_out_dim)
+
+        # ---- Intention encoder (Mamba + intent tokens) ----
+        intent_emb = None
+        h_seq = None
+        if self.use_history:
+            intent = self.forward_intent(z_v_CLS_all, z_s_seq)
+            h_seq = intent["h_seq"]
+            intent_emb = intent.get("intent_emb", None)
+        else:
+            h_seq = torch.zeros(B, T, 1, device=frames_seq.device)
+
+        return {
+            "intent_emb": intent_emb,
+            "z_v_pooled_seq": z_v_pooled_seq,
+            "z_s_seq": z_s_seq,
+            "h_seq": h_seq,
+            "z_v_CLS_seq": z_v_CLS_all,
+        }
+
     @torch.no_grad()
     def sample_actions(self, z_v_pooled_window: torch.Tensor,
                        z_s_window: torch.Tensor,

@@ -639,6 +639,64 @@ We trained on `libero_spatial` only. Cross-suite transfer (training on
 Spatial, evaluating on Object / Goal / Long) is left as future work; the
 model and pre-compute pipeline are suite-agnostic.
 
+## 5.7.1 EXP-D.5 — Intent embedding task clustering (probe)
+
+Without external supervision on the intent tokens (the CLIP anchor loss
+is roadmap, not yet implemented; see §7), the **interpretability** of
+the intent representation is an empirical question. We probe the
+structure of the learned intent embeddings on held-out episodes using a
+frozen checkpoint and a clustering analysis.
+
+**Method**: For each held-out episode, we run `forward_with_probe` (§3.2)
+to collect the intent embedding at the end of the window. We then
+evaluate task-discriminativity using:
+
+- Silhouette score (cluster coherence).
+- 5-fold cross-validated logistic regression accuracy (linear
+  separability of the 10 LIBERO Spatial task labels).
+- 5-fold cross-validated KNN classifier (non-parametric baseline).
+- Cluster purity with K-means clustering (K = 10).
+- Temporal stability: cosine similarity within-task vs cross-task.
+
+**Implementation**: `tools/probe_intent_clustering.py` adds
+`forward_with_probe` to `ALIGNIntentionModel`. The probe re-uses the
+exact same forward path as training (§3.2), so the captured `intent_emb`
+is identical to what the policy head sees during training. No gradients
+are computed.
+
+**Hypotheses**:
+
+- **H1 (strong positive)**: silhouette score > 0.1, logistic regression
+  accuracy > 50% (5× chance), clear t-SNE clusters. This would imply
+  that the policy loss alone drives the model to discover task structure
+  in the intent embedding space.
+- **H2 (partial positive)**: clustering by sub-task phase (reaching /
+  grasping / placing) rather than fine-grained task identity. The
+  tokens would be encoding a finer-grained abstraction than the task
+  label, but not a discrete task classifier.
+- **H3 (negative)**: silhouette score near 0, classifier near 10%
+  chance. The intent embeddings would be opaque; CLIP anchor (or
+  another supervision signal) would be necessary to force
+  interpretable structure.
+
+[EXPERIMENT PLACEHOLDER — fill in EXP-D.5 numbers, t-SNE figure,
+per-class confusion matrix]
+
+| Metric | Value | Interpretation |
+|--------|-------|----------------|
+| Silhouette score | [TBD] | cluster coherence |
+| Logistic regression (5-fold CV) | [TBD] | linear task separability |
+| KNN (5-fold CV, k=5) | [TBD] | non-parametric task separability |
+| Cluster purity (K-means, K=10) | [TBD] | best-cluster-task alignment |
+| Within-task cosine (mean ± std) | [TBD] | temporal stability |
+| Cross-task cosine (mean ± std) | [TBD] | cross-task separability |
+| Separation (within - cross) | [TBD] | how distinct are tasks |
+
+**Falsification criteria**: If EXP-D.5 fails (H3), this would indicate
+that the policy loss alone does not induce interpretable structure in
+the intent tokens. We discuss implications for §7 Limitations and
+propose CLIP anchoring as future work.
+
 ## 5.8 Compute
 
 [EXPERIMENT PLACEHOLDER — fill with actual numbers]

@@ -47,6 +47,17 @@ retrieval and token-merge consolidation.
 - **Null hypothesis**: similarity uniform → intent encodes action prior, not goal
 - **Script**: write `tools/probe_intent.py` to extract embeddings, write `paper/results/exp_c_intent.json`
 
+## EXP-D.5 — Intent embedding task clustering
+
+- **Setup**: load best checkpoint, run `forward_with_probe` on 50-100 held-out episodes per task (500-1000 episodes total), collect intent_emb per episode
+- **Metric**: silhouette score, 5-fold CV logistic regression accuracy, 5-fold CV KNN accuracy, K-means cluster purity (K=10), within-task and cross-task cosine similarity
+- **Expected (H1)**: silhouette > 0.1, logistic > 50% (5× chance), clear t-SNE clusters — intent tokens discover task structure without explicit supervision
+- **Expected (H2)**: clustering by sub-task phase rather than task identity — finer-grained abstraction
+- **Null (H3)**: silhouette ~ 0, classifier ~ 10% — opaque, requires CLIP anchor to force interpretable structure
+- **Script**: `tools/probe_intent_clustering.py` (IMPLEMENTED), reads from `--checkpoint`, outputs `results.json`, `intent_tsne.pdf`, `confusion_matrix.pdf`, `intent_embeddings.npz`
+- **Model change**: `forward_with_probe` added to `ALIGNIntentionModel` (no training impact, runs under `torch.no_grad()`)
+- **Priority**: HIGH — produces a strong figure for the paper, cheap to run
+
 ## EXP-D — DINOv2 pre-compute pipeline
 
 - **Setup**: train V4 with `--use-precomputed-dinov2` vs raw frames, same B/S
