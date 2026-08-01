@@ -44,7 +44,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 import h5py
 import numpy as np
@@ -519,6 +519,8 @@ def run_model_in_sim(
     flip_horizontal: bool = False,
     noise_std: float = 0.0,
     action_horizon: int = 1,
+    ensemble: str = "none",
+    ensemble_decay: float = 0.9,
     debug: bool = False,
     timing_log: Optional[List[Dict]] = None,
 ) -> Dict:
@@ -535,6 +537,17 @@ def run_model_in_sim(
     Note: `step_ms` includes rendering, sim step, etc. `inference_ms`
     measures only the model forward pass.
 
+    Ensemble modes:
+      - "none"   (default): keep only the first `action_horizon` actions
+                 of each chunk; execute them sequentially.
+      - "uniform": keep all `chunk_size` predictions of each chunk; at
+                 each env step, average all predictions whose target
+                 step equals the current step. With action_horizon=H
+                 and chunk_size=K, the average ensemble size is K/H.
+      - "decay":  like "uniform" but weights decay with source age:
+                 weight = ensemble_decay ** (current_call_index -
+                 source_call_index). Newer predictions dominate.
+
     Phase 1 (steps < switch_at * max_steps):
       Expert controls 100%. Model runs in background to build
       Mamba state, memory bank, and intent tokens.
@@ -546,7 +559,7 @@ def run_model_in_sim(
     At each step:
       1. Render sim frame
       2. Build K-window of past (frames, states) from sim
-      3. Run V4 model -> a_model
+      3. Run V4 model -> a_model (when buffer is empty / horizon reached)
       4. Apply: action = expert (phase 1) or a_model (phase 2)
       5. Step sim
       6. Compute EEF position error vs dataset expert (if poses given)
@@ -632,11 +645,30 @@ def run_model_in_sim(
             f"call."
         )
 
-    # Action buffer: stores future-step actions from the model's most recent
-    # chunk. Filled when empty (every `action_horizon` steps). When action_horizon=1,
-    # this buffer is always empty and the model is re-inferred every step (the
-    # original behavior).
-    pending_actions: List[np.ndarray] = []
+    # Validate ensemble mode.
+    if ensemble not in ("none", "uniform", "decay"):
+        raise ValueError(
+            f"ensemble must be one of 'none', 'uniform', 'decay' "
+            f"(got {ensemble!r})"
+        )
+    if not (0.0 < ensemble_decay <= 1.0):
+        raise ValueError(
+            f"ensemble_decay must be in (0, 1] (got {ensemble_decay})"
+        )
+
+    # Buffer of overlapping predictions. Each entry is
+    # (target_step, weight, action_vector).
+    # - ensemble="none":   only push the first `action_horizon` entries
+    #   from each chunk; pop them in FIFO order at execution time.
+    # - ensemble="uniform" / "decay": push all `chunk_size` entries
+    #   from each chunk; at execution time, weighted-average all
+    #   entries whose `target_step == step`.
+    pending_actions: List[Tuple[int, float, np.ndarray]] = []
+
+    # Tracks the chronological index of each model call (for "decay" mode).
+    n_model_calls_so_far: int = 0
+    # Maps each entry's source call index (so we can decay its weight).
+    pending_source_call_idx: List[int] = []
 
     for step in range(n_steps):
         step_t0 = time.perf_counter()  # wall-clock for the entire env step
@@ -662,11 +694,17 @@ def run_model_in_sim(
         f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)  # (1, K, V, H, W, 3)
         s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
 
-        # 4. Run V4 model only when the action buffer is empty.
-        # When action_horizon=1, this runs every step (original behavior).
-        # When action_horizon=H>1, this runs every H steps.
+        # 4. Run V4 model every `action_horizon` steps, OR when the buffer is
+        # empty (whichever comes first). With ensemble="none", the buffer
+        # drains after H steps, so this is equivalent to "every H steps".
+        # With ensemble="uniform" / "decay", the buffer keeps K predictions
+        # around for ensembling; we still call the model every H steps.
         model_inferred_this_step = False
-        if not pending_actions:
+        should_infer = (
+            step % action_horizon == 0  # every action_horizon steps
+            or not pending_actions      # buffer drained (only happens in "none")
+        )
+        if should_infer:
             with torch.no_grad():
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                          enabled=device.type == "cuda"):
@@ -698,20 +736,98 @@ def run_model_in_sim(
                             )
             inference_t1 = time.perf_counter()
 
-            # Consume `action_horizon` consecutive actions from the chunk.
-            # `a_model_full` has shape (1, chunk_size, A). We use actions at
-            # indices [0, 1, ..., action_horizon-1]. The first one is consumed
-            # now; the rest are queued for future steps.
-            a_model_full_np = a_model_full[0, :action_horizon, :].float().cpu().numpy()  # (H, A)
-            for i in range(action_horizon - 1, 0, -1):
-                # Push in reverse so the queue is FIFO (index 0 at front).
-                pending_actions.insert(0, a_model_full_np[i])
-            a_model = a_model_full_np[0]  # action for this step
+            # Record this model call's index for "decay" mode weighting.
+            source_call_idx = n_model_calls_so_far
+            n_model_calls_so_far += 1
+
+            # The chunk has shape (1, chunk_size, A). Decide how many
+            # predictions to push onto the buffer based on the ensemble mode.
+            chunk_np = a_model_full[0, :chunk_size, :].float().cpu().numpy()  # (K, A)
+            if ensemble == "none":
+                # Original horizon-only behavior: the first action is
+                # consumed immediately, the next `action_horizon - 1` are
+                # pushed to the queue in FIFO order.
+                for k in range(1, action_horizon):
+                    target = step + k
+                    weight = 1.0  # unused in "none" mode but kept for API consistency
+                    pending_actions.append((target, weight, chunk_np[k]))
+                    pending_source_call_idx.append(source_call_idx)
+                # Take action for this step now.
+                a_model = chunk_np[0]
+            else:
+                # "uniform" or "decay": push all chunk_size predictions
+                # (with weights); averaging happens at execution time below.
+                for k in range(chunk_size):
+                    target = step + k
+                    if ensemble == "uniform":
+                        weight = 1.0
+                    else:  # "decay"
+                        # Weight decays with age from this call. The current
+                        # call has age 0 (weight 1.0); future calls will decay
+                        # this entry's weight as they accumulate. The actual
+                        # decay is applied at execution time when we know
+                        # the current call index.
+                        weight = 1.0
+                    pending_actions.append((target, weight, chunk_np[k]))
+                    pending_source_call_idx.append(source_call_idx)
+                # a_model is computed by the ensemble-averaging block below,
+                # which averages all entries whose target_step == step.
+                a_model = None
             model_inferred_this_step = True
             inference_ms = (inference_t1 - step_t0) * 1000.0
         else:
-            # Reuse buffered action from the previous chunk.
-            a_model = pending_actions.pop(0)
+            # Buffer has entries from a previous model call.
+            if ensemble == "none":
+                # FIFO pop the front (the next-step action).
+                a_model = pending_actions.pop(0)[2]
+                pending_source_call_idx.pop(0)
+            else:
+                # Ensemble averaging happens below; placeholder.
+                a_model = None
+
+        # Ensemble averaging for non-"none" modes. Find all entries in the
+        # buffer whose target_step == step, weight them (with optional
+        # age-based decay), and average to produce a_model.
+        if ensemble != "none" and pending_actions:
+            matching = [
+                (w, a, sc) for (t, w, a), sc in zip(pending_actions, pending_source_call_idx)
+                if t == step
+            ]
+            if matching:
+                # Apply decay only in "decay" mode; "uniform" uses raw weights.
+                current_call_idx = n_model_calls_so_far
+                if ensemble == "decay":
+                    weights_arr = np.array([
+                        w * (ensemble_decay ** (current_call_idx - sc))
+                        for w, _, sc in matching
+                    ])
+                else:  # "uniform"
+                    weights_arr = np.array([w for w, _, _ in matching])
+                actions_arr = np.array([a for _, a, _ in matching])  # (E, A)
+                weights_arr /= weights_arr.sum()
+                a_model = (weights_arr[:, None] * actions_arr).sum(axis=0)
+            else:
+                # No matching entries — shouldn't happen with ensemble != "none"
+                # if K >= H. Fall back to a zero action.
+                action_dim = (
+                    getattr(model.intention_head, "action_dim", None)
+                    or 7  # default for LIBERO
+                )
+                a_model = np.zeros(action_dim, dtype=np.float32)
+
+        # Buffer pruning (only for ensemble != "none"): drop entries with
+        # target_step <= step (already used) and entries older than the chunk
+        # window (target_step > step + chunk_size, which means no future step
+        # can ever match them again).
+        if ensemble != "none":
+            new_pending = []
+            new_sources = []
+            for (t, w, a), sc in zip(pending_actions, pending_source_call_idx):
+                if t > step and t <= step + chunk_size:
+                    new_pending.append((t, w, a))
+                    new_sources.append(sc)
+            pending_actions = new_pending
+            pending_source_call_idx = new_sources
 
         if debug and model_inferred_this_step:
             print(f"Step {step}: model re-inferred (buffer size: {len(pending_actions)})")
@@ -997,6 +1113,18 @@ def main():
                              "the model is called every H steps (each call costs K/H "
                              "effective). Must satisfy 1 <= horizon <= chunk_size. "
                              "Default: 1 (re-infer every step, original behavior).")
+    parser.add_argument("--ensemble", type=str, default="none",
+                        choices=["none", "uniform", "decay"],
+                        help="Temporal ensembling mode for overlapping predictions. "
+                             "When 'none' (default), only the first `action_horizon` "
+                             "predictions from each chunk are used. When 'uniform' or "
+                             "'decay', all `chunk_size` predictions are kept and averaged "
+                             "with weights at each step. Average ensemble size is K/H. "
+                             "Compatible with --action-horizon.")
+    parser.add_argument("--ensemble-decay", type=float, default=0.9,
+                        help="Decay factor for ensemble='decay' mode. Weight of each "
+                             "entry is (ensemble_decay ** age_in_calls). Newer predictions "
+                             "dominate. Default: 0.9.")
     parser.add_argument("--save-timing", type=str, default=None,
                         help="If set, save per-step timing log (step_ms, inference_ms) "
                              "to the given path as JSON. Used by "
@@ -1185,6 +1313,8 @@ def main():
             flip_horizontal=flip_horizontal,
             noise_std=args.noise_std,
             action_horizon=args.action_horizon,
+            ensemble=args.ensemble,
+            ensemble_decay=args.ensemble_decay,
             timing_log=ep_timing_log,
             debug=args.debug,
         )
