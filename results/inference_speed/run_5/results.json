@@ -1,0 +1,24 @@
+{
+  "device": "cuda",
+  "device_name": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "batch_size": 1,
+  "seq_length": 10,
+  "n_cameras": 2,
+  "image_size": 224,
+  "model_params_M": 116.029794,
+  "trainable_params_M": 116.029794,
+  "use_intent_tokens": false,
+  "use_memory_bank": true,
+  "head_type": "diffusion",
+  "per_step_latency": {
+    "mean_ms": 171.4780129888095,
+    "std_ms": 2.4779606789873965,
+    "min_ms": 162.07470698282123,
+    "max_ms": 176.77765799453482,
+    "median_ms": 171.81472049560398,
+    "p95_ms": 175.12922714522574,
+    "n_runs": 100
+  },
+  "peak_vram_MB": 3136.38818359375,
+  "effective_control_rate_hz": 5.8316514319842225
+}

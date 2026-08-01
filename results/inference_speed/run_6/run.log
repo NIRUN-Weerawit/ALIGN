@@ -1,0 +1,26 @@
+Using cache found in /home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main
+/home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/swiglu_ffn.py:43: UserWarning: xFormers is available (SwiGLU)
+  warnings.warn("xFormers is available (SwiGLU)")
+/home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/attention.py:27: UserWarning: xFormers is available (Attention)
+  warnings.warn("xFormers is available (Attention)")
+/home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main/dinov2/layers/block.py:33: UserWarning: xFormers is available (Block)
+  warnings.warn("xFormers is available (Block)")
+[measure] device: cuda
+[measure] Loading checkpoint: checkpoints/v4/libero_goal/run_6/intention_best.pt
+[measure] Inferred flags from state_dict: {'use_intent_tokens': True, 'use_memory_bank': True, 'use_history': True, 'compressed_dim': 8}
+[measure] use_intent_tokens=True, num_intent_tokens=2, intent_dim=512
+[measure] model loaded (117.0M params)
+[measure] Building random batch: B=1, T=10, V=2, 224x224
+
+[measure] === Per-step latency (B=1, T=10) ===
+  mean_ms: 176.685
+  std_ms: 4.739
+  min_ms: 164.286
+  max_ms: 184.507
+  median_ms: 178.053
+  p95_ms: 183.369
+  n_runs: 100
+  effective control rate: 5.7 Hz
+
+[measure] Results saved to results/inference_speed/run_6/results.json
+[measure] Plots:    results/inference_speed/run_6
