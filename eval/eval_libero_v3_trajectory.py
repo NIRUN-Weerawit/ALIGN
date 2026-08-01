@@ -520,8 +520,20 @@ def run_model_in_sim(
     noise_std: float = 0.0,
     action_horizon: int = 1,
     debug: bool = False,
+    timing_log: Optional[List[Dict]] = None,
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
+
+    If `timing_log` is provided, each step appends a dict with per-step
+    timing information (used by tools/measure_action_horizon_speed.py
+    to compare horizons). Each entry has:
+      - step: int (env step index)
+      - model_called: bool (whether the model was inferred this step)
+      - step_ms: float (wall-clock time for this env step)
+      - inference_ms: float (model forward+sample time, 0 if not called)
+
+    Note: `step_ms` includes rendering, sim step, etc. `inference_ms`
+    measures only the model forward pass.
 
     Phase 1 (steps < switch_at * max_steps):
       Expert controls 100%. Model runs in background to build
@@ -546,7 +558,7 @@ def run_model_in_sim(
           - errors: (T,) EEF position error vs dataset expert (if poses given)
           - stored_actions: (T, 6) array of model predictions
           - n_steps: number of steps run
-          - switch_step: int — step at which model took over
+          - switch_step: int -- step at which model took over
     """
     # Pad expert_actions to (N, 7) for the "noised human" baseline (alpha-blend)
     n_actions = len(expert_actions)
@@ -627,6 +639,8 @@ def run_model_in_sim(
     pending_actions: List[np.ndarray] = []
 
     for step in range(n_steps):
+        step_t0 = time.perf_counter()  # wall-clock for the entire env step
+        inference_ms = 0.0             # model forward time (0 if not called)
         # 1. Render current sim frame BEFORE step
         current_frame_stack = _render_all_cameras()  # (V, H, W, 3)
         # Record the first camera's view for video output
@@ -682,6 +696,7 @@ def run_model_in_sim(
                                 out["z_v_pooled_seq"], out["z_s_seq"],
                                 h_for_head,
                             )
+            inference_t1 = time.perf_counter()
 
             # Consume `action_horizon` consecutive actions from the chunk.
             # `a_model_full` has shape (1, chunk_size, A). We use actions at
@@ -693,6 +708,7 @@ def run_model_in_sim(
                 pending_actions.insert(0, a_model_full_np[i])
             a_model = a_model_full_np[0]  # action for this step
             model_inferred_this_step = True
+            inference_ms = (inference_t1 - step_t0) * 1000.0
         else:
             # Reuse buffered action from the previous chunk.
             a_model = pending_actions.pop(0)
@@ -739,8 +755,20 @@ def run_model_in_sim(
             errors.append(err)
         else:
             errors.append(0.0)
+
+        # Timing log: record per-step wall-clock and inference time so the
+        # caller can compute env-step latency vs amortized model latency.
+        if timing_log is not None:
+            step_dt = (time.perf_counter() - step_t0) * 1000.0
+            timing_log.append({
+                "step": step,
+                "model_called": model_inferred_this_step,
+                "step_ms": step_dt,
+                "inference_ms": inference_ms,
+            })
+
         # Don't break on done — keep running to max_steps for consistent video length
-        if done: 
+        if done:
             success += 1
 
     return {
@@ -969,6 +997,11 @@ def main():
                              "the model is called every H steps (each call costs K/H "
                              "effective). Must satisfy 1 <= horizon <= chunk_size. "
                              "Default: 1 (re-infer every step, original behavior).")
+    parser.add_argument("--save-timing", type=str, default=None,
+                        help="If set, save per-step timing log (step_ms, inference_ms) "
+                             "to the given path as JSON. Used by "
+                             "tools/measure_action_horizon_speed.py to compare "
+                             "horizon settings.")
     parser.add_argument("--debug", action="store_true",
                         help="Print per-step model action values.")
     parser.add_argument("--libero-suite", default=None,
@@ -1077,6 +1110,7 @@ def main():
     print(f"  Flip horizontal: {flip_horizontal}  (--no-flip-horizontal to enable)")
 
     mujoco_results = []
+    all_timing_logs = []  # collected across episodes for --save-timing
     for ep_idx, ep_key in enumerate(episodes):
         traj = load_trajectory(args.data, ep_key, args.cameras)
         if traj is None:
@@ -1133,6 +1167,7 @@ def main():
 
         # ── Run 2: Model rollout in sim ──
         t0 = time.time()
+        ep_timing_log = [] if args.save_timing else None
         model_result = run_model_in_sim(
             env=env,
             model=model,
@@ -1150,8 +1185,11 @@ def main():
             flip_horizontal=flip_horizontal,
             noise_std=args.noise_std,
             action_horizon=args.action_horizon,
+            timing_log=ep_timing_log,
             debug=args.debug,
         )
+        if ep_timing_log is not None:
+            all_timing_logs.append({"episode": ep_key, "timing": ep_timing_log})
         t_model = time.time() - t0
 
         # ── Compute metrics ──
@@ -1304,6 +1342,15 @@ def main():
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(f"\n  Summary written to: {summary_path}")
+
+        # Optional: save per-step timing log for action-horizon benchmarks
+        if args.save_timing and all_timing_logs:
+            from pathlib import Path as _Path
+            timing_path = _Path(args.save_timing)
+            timing_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(timing_path, "w") as f:
+                json.dump(all_timing_logs, f, indent=2)
+            print(f"  Timing log written to: {timing_path} ({len(all_timing_logs)} episodes)")
 
 
 if __name__ == "__main__":
