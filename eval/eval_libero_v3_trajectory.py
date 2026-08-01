@@ -518,6 +518,7 @@ def run_model_in_sim(
     flip_vertical: bool = True,
     flip_horizontal: bool = False,
     noise_std: float = 0.0,
+    action_horizon: int = 1,
     debug: bool = False,
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
@@ -606,6 +607,25 @@ def run_model_in_sim(
     n_steps = max_steps
     switch_step = int(ep_len * switch_at)
 
+    # Validate action_horizon: must be at least 1 (always re-infer) and at most
+    # chunk_size (use the whole chunk before re-inferring).
+    if action_horizon < 1:
+        raise ValueError(
+            f"action_horizon must be >= 1 (got {action_horizon})"
+        )
+    if action_horizon > chunk_size:
+        raise ValueError(
+            f"action_horizon ({action_horizon}) cannot exceed chunk_size "
+            f"({chunk_size}); the model only outputs chunk_size actions per "
+            f"call."
+        )
+
+    # Action buffer: stores future-step actions from the model's most recent
+    # chunk. Filled when empty (every `action_horizon` steps). When action_horizon=1,
+    # this buffer is always empty and the model is re-inferred every step (the
+    # original behavior).
+    pending_actions: List[np.ndarray] = []
+
     for step in range(n_steps):
         # 1. Render current sim frame BEFORE step
         current_frame_stack = _render_all_cameras()  # (V, H, W, 3)
@@ -628,37 +648,57 @@ def run_model_in_sim(
         f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)  # (1, K, V, H, W, 3)
         s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
 
-        # 4. Run V4 model (always — builds Mamba state, memory bank, intent tokens)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                     enabled=device.type == "cuda"):
-                with sdpa_kernel(backends=[SDPBackend.MATH]):
-                    out = model(f_t, s_t)
-                    h_current = out["h_seq"][:, -1]
-                    intent_emb = out.get("intent_emb", None)
-                    # intent_emb = torch.zeros_like(intent_emb)
-                    # Memory bank step (if enabled)
-                    if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
-                        z_v_current = out["z_v_pooled_seq"][:, -1]
-                        z_s_current = out["z_s_seq"][:, -1]
-                        z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                            z_v_current, z_s_current, intent_emb,
-                        )
-                        h_for_head = intent_fused
-                    else:
-                        h_for_head = intent_emb if intent_emb is not None else None
+        # 4. Run V4 model only when the action buffer is empty.
+        # When action_horizon=1, this runs every step (original behavior).
+        # When action_horizon=H>1, this runs every H steps.
+        model_inferred_this_step = False
+        if not pending_actions:
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                         enabled=device.type == "cuda"):
+                    with sdpa_kernel(backends=[SDPBackend.MATH]):
+                        out = model(f_t, s_t)
+                        h_current = out["h_seq"][:, -1]
+                        intent_emb = out.get("intent_emb", None)
+                        # intent_emb = torch.zeros_like(intent_emb)
+                        # Memory bank step (if enabled)
+                        if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
+                            z_v_current = out["z_v_pooled_seq"][:, -1]
+                            z_s_current = out["z_s_seq"][:, -1]
+                            z_v_fused, z_s_fused, intent_fused = model.memory_module(
+                                z_v_current, z_s_current, intent_emb,
+                            )
+                            h_for_head = intent_fused
+                        else:
+                            h_for_head = intent_emb if intent_emb is not None else None
 
-                    if model.head_type == "diffusion":
-                        a_model_full = model.sample_actions(
-                            out["z_v_pooled_seq"], out["z_s_seq"],
-                            h_for_head,
-                        )
-                    else:
-                        a_model_full = model.predict_actions(
-                            out["z_v_pooled_seq"], out["z_s_seq"],
-                            h_for_head,
-                        )
-        a_model = a_model_full[0, 0, :].float().cpu().numpy()  # (6,) or (7,)
+                        if model.head_type == "diffusion":
+                            a_model_full = model.sample_actions(
+                                out["z_v_pooled_seq"], out["z_s_seq"],
+                                h_for_head,
+                            )
+                        else:
+                            a_model_full = model.predict_actions(
+                                out["z_v_pooled_seq"], out["z_s_seq"],
+                                h_for_head,
+                            )
+
+            # Consume `action_horizon` consecutive actions from the chunk.
+            # `a_model_full` has shape (1, chunk_size, A). We use actions at
+            # indices [0, 1, ..., action_horizon-1]. The first one is consumed
+            # now; the rest are queued for future steps.
+            a_model_full_np = a_model_full[0, :action_horizon, :].float().cpu().numpy()  # (H, A)
+            for i in range(action_horizon - 1, 0, -1):
+                # Push in reverse so the queue is FIFO (index 0 at front).
+                pending_actions.insert(0, a_model_full_np[i])
+            a_model = a_model_full_np[0]  # action for this step
+            model_inferred_this_step = True
+        else:
+            # Reuse buffered action from the previous chunk.
+            a_model = pending_actions.pop(0)
+
+        if debug and model_inferred_this_step:
+            print(f"Step {step}: model re-inferred (buffer size: {len(pending_actions)})")
 
         # 5. Build the final action
         a_model_scaled = a_model * action_scale
@@ -923,6 +963,12 @@ def main():
                              "Useful if model outputs are too small/large. "
                              "Example: 10.0 multiplies model action by 10. "
                              "Default: 1.0 (no scaling).")
+    parser.add_argument("--action-horizon", type=int, default=1,
+                        help="Number of consecutive actions taken from each model "
+                             "chunk before re-inferring. With horizon=H and chunk=K, "
+                             "the model is called every H steps (each call costs K/H "
+                             "effective). Must satisfy 1 <= horizon <= chunk_size. "
+                             "Default: 1 (re-infer every step, original behavior).")
     parser.add_argument("--debug", action="store_true",
                         help="Print per-step model action values.")
     parser.add_argument("--libero-suite", default=None,
@@ -1103,6 +1149,7 @@ def main():
             flip_vertical=flip_vertical,
             flip_horizontal=flip_horizontal,
             noise_std=args.noise_std,
+            action_horizon=args.action_horizon,
             debug=args.debug,
         )
         t_model = time.time() - t0
