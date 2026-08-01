@@ -517,6 +517,7 @@ def run_model_in_sim(
     use_camera: str = "agentview_image",
     flip_vertical: bool = True,
     flip_horizontal: bool = False,
+    noise_std: float = 0.0,
     debug: bool = False,
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
@@ -665,6 +666,12 @@ def run_model_in_sim(
         if step < switch_step:
             # Phase 1: expert controls, model observes
             final_action = actions[step].copy()
+            # Simulate human mistake / teleop noise on the expert action.
+            # Only noise the first 6 dimensions (pose deltas); keep gripper intact.
+            if noise_std > 0.0 and final_action.shape[0] >= 6:
+                final_action[:6] += np.random.normal(
+                    0.0, noise_std, size=6
+                ).astype(np.float32)
         else:
             # Phase 2: model controls
             final_action = a_model_scaled.copy()
@@ -1095,6 +1102,7 @@ def main():
             use_camera=args.cameras,
             flip_vertical=flip_vertical,
             flip_horizontal=flip_horizontal,
+            noise_std=args.noise_std,
             debug=args.debug,
         )
         t_model = time.time() - t0
@@ -1197,7 +1205,7 @@ def main():
             "episode": ep_key,
             "task_name": task_name,
             "n_steps": model_result["n_steps"],
-            "mean_error_replay": eef_err_replay,
+            "mean_error_replay": eef_err_replay if args.save_video else 0,
             "mean_error_model": eef_err_model,
             "success": model_result["success"],
         })
