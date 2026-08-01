@@ -13,14 +13,14 @@ Using cache found in /home/ucluser/.cache/torch/hub/facebookresearch_dinov2_main
 [measure] Building random batch: B=1, T=10, V=2, 224x224
 
 [measure] === Per-step latency (B=1, T=10) ===
-  mean_ms: 172.136
-  std_ms: 2.977
-  min_ms: 160.225
-  max_ms: 179.028
-  median_ms: 172.483
-  p95_ms: 176.194
+  mean_ms: 137.692
+  std_ms: 4.684
+  min_ms: 134.210
+  max_ms: 158.124
+  median_ms: 136.388
+  p95_ms: 150.055
   n_runs: 100
-  effective control rate: 5.8 Hz
+  effective control rate: 7.3 Hz
 
 [measure] Results saved to results/inference_speed/run_4/results.json
 [measure] Plots:    results/inference_speed/run_4
