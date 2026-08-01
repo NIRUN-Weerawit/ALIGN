@@ -74,12 +74,14 @@ printf "%-12s %-12s %-15s %-12s %-15s\n" "run" "mean_ms" "p95_ms" "Hz" "peak_vra
 for RUN_NAME in run_3 run_4 run_5 run_6; do
     OUT="results/inference_speed/${RUN_NAME}"
     if [ -f "$OUT/results.json" ]; then
-        /home/ucluser/miniconda3/envs/align/bin/python3 -c "
-import json
-r = json.load(open('$OUT/results.json'))
-lat = r['per_step_latency']
-vram = r.get('peak_vram_MB', 'n/a')
-hz = r.get('effective_control_rate_hz', 0)
-print(f\"{$RUN_NAME:<12} {lat['mean_ms']:<12.2f} {lat['p95_ms']:<15.2f} {hz:<12.1f} {str(vram):<15}\")"
+        RUN_NAME="$RUN_NAME" OUT="$OUT" /home/ucluser/miniconda3/envs/align/bin/python3 -c "
+import json, os
+run_name = os.environ['RUN_NAME']
+out = os.environ['OUT']
+d = json.load(open(f'{out}/results.json'))
+lat = d['per_step_latency']
+vram = d.get('peak_vram_MB', 'n/a')
+hz = d.get('effective_control_rate_hz', 0)
+print(f\"{run_name:<12} {lat['mean_ms']:<12.2f} {lat['p95_ms']:<15.2f} {hz:<12.1f} {str(vram):<15}\")"
     fi
 done
