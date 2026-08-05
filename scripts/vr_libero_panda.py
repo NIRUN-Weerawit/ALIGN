@@ -129,30 +129,29 @@ except ImportError as e:
 
 # --- VR coordinate frame conversion (Three.js -> LIBERO/MuJoCo world) ---
 # The browser client (A-Frame oculus-touch-controls) sends the controller's
-# grip pose as (position, quaternion). The position is the **controller
-# grip anchor's world position** (the point on the controller where the
-# user's hand grips it), NOT the wrist position. This means rotating the
-# wrist while keeping the hand still will cause the reported position to
-# sweep in an arc around the wrist. The Isaac script uses
-# R.from_euler('zy', [90,90]) for the position remap, which converts
-# Three.js (Y-up) to LIBERO's MuJoCo world (Z-up). We use the same
-# convention so that "JS up" maps to "LIBERO up". A user-tunable
-# --js-to-libero-rot-deg adds an extra Y-rotation offset on top.
+# grip pose as (position, quaternion). We need to map the JS-frame (Y-up)
+# controller pose to the LIBERO-frame (Z-up) scene pose.
 #
-# Most importantly, the position remap is applied via R.apply() and the
-# quaternion remap via R * q * R.inv() so axes stay consistent.
+# Instead of a rotation matrix, we use a direct axis permutation:
+#   --js-axis-perm "<LIBERO axis for JS-X>,<... for JS-Y>,<... for JS-Z>"
+# Each letter is one of X, Y, Z and tells which LIBERO axis that JS axis maps to.
+# Then --js-axis-sign "<sign_X>,<sign_Y>,<sign_Z>" applies a sign flip
+# (either +1 or -1) per LIBERO axis. This gives you full control without
+# having to specify Euler angles.
+#
+# Example: --js-axis-perm "Y,Z,X" --js-axis-sign "1,1,1" means
+#   JS-X (controller right)  -> LIBERO +Y
+#   JS-Y (controller up)     -> LIBERO +Z (up)
+#   JS-Z (controller fwd)    -> LIBERO +X (forward)
+#
+# The same permutation + sign is applied to BOTH positions and quaternions
+# so axes stay consistent. Quaternion transformation: q_libero = sign * q_js
+# (per axis sign flip on the i-th component of the quaternion, plus axis
+# permutation via component swap).
 
-# Default axis mapping: identity. JS-X -> LIBERO X, JS-Y -> LIBERO Y,
-# JS-Z -> LIBERO Z. This means "moving the controller right" moves
-# the EE in LIBERO +X. If the LIBERO scene's axes don't match
-# your physical intuition, pass --js-to-libero-zy-deg "Z_DEG,Y_DEG"
-# to apply a rotation that maps the controller's perceived axes to
-# the LIBERO scene's axes. The default was previously "90,90" (the
-# Isaac Sim script's convention) but that was tuned for a different
-# scene; for LIBERO we start from identity and let the user tune.
-
-DEFAULT_Z_DEG = 0.0
-DEFAULT_Y_DEG = 0.0
+# Default axis mapping: identity with no sign flips.
+DEFAULT_AXIS_PERM = "X,Y,Z"  # JS-X->X, JS-Y->Y, JS-Z->Z
+DEFAULT_AXIS_SIGN = "1,1,1"  # no axis sign flips
 
 
 # ---------------------------------------------------------------
@@ -161,24 +160,45 @@ DEFAULT_Y_DEG = 0.0
 class VRState:
     """Holds the latest MQTT message, accessible from the main sim loop."""
 
-    def __init__(self, z_deg: float = DEFAULT_Z_DEG, y_deg: float = DEFAULT_Y_DEG,
+    def __init__(self, axis_perm: str = DEFAULT_AXIS_PERM,
+                 axis_sign: str = DEFAULT_AXIS_SIGN,
                  pos_ema_alpha: float = 0.3):
         """
         Args:
-            z_deg: rotation around Z (degrees) applied first.
-            y_deg: rotation around Y (degrees) applied second.
-                The combined rotation R = R_y(y_deg) * R_z(z_deg) converts
-                JS controller (pos, quat) to LIBERO world frame.
-            pos_ema_alpha: EMA smoothing factor for the position signal,
-                in [0, 1]. Lower = more smoothing. The browser sends the
-                controller's grip anchor world position, which moves with
-                wrist rotation (the anchor sweeps an arc around the wrist).
-                A low-pass filter on position removes the high-frequency
-                rotation-bleeds-into-position artefact while preserving
-                the user's translational intent (which is low-frequency).
-                0.3 means ~70% new value, ~30% old -- a moderate smoothing.
-                Set to 1.0 for no smoothing.
+            axis_perm: "X,Y,Z" string specifying which LIBERO axis each
+                JS axis maps to. Each letter is one of {X, Y, Z}.
+                E.g. "Y,Z,X" means JS-X->LIBERO Y, JS-Y->LIBERO Z, JS-Z->LIBERO X.
+            axis_sign: "1,1,1" or "-1,1,-1" etc. sign flips applied to each
+                LIBERO axis after permutation.
+            pos_ema_alpha: [legacy] EMA filter for the position signal.
+                Defaults to 0.3 but the main loop currently uses raw positions
+                (the rotation-compensation logic requires unfiltered data).
         """
+        # Parse axis_perm: e.g. "Y,Z,X" -> perm_idx = [1, 2, 0]
+        # meaning JS-X (index 0) goes to LIBERO axis Y (index 1),
+        # JS-Y (index 1) goes to LIBERO axis Z (index 2),
+        # JS-Z (index 2) goes to LIBERO axis X (index 0).
+        perm_map = {"X": 0, "Y": 1, "Z": 2}
+        perm_letters = axis_perm.upper().split(",")
+        if len(perm_letters) != 3 or any(p not in perm_map for p in perm_letters):
+            raise ValueError(
+                f"axis_perm must be three letters from {{X,Y,Z}} (got '{axis_perm}')"
+            )
+        # perm_idx[i] is the LIBERO axis index that JS axis i maps to.
+        self.perm_idx = [perm_map[p] for p in perm_letters]
+        # Make sure it's a valid permutation (each LIBERO axis used once).
+        if sorted(self.perm_idx) != [0, 1, 2]:
+            raise ValueError(
+                f"axis_perm '{axis_perm}' is not a permutation of X,Y,Z"
+            )
+        # Parse axis_sign: e.g. "1,-1,1" -> sign_arr = [1, -1, 1]
+        sign_parts = axis_sign.split(",")
+        if len(sign_parts) != 3:
+            raise ValueError(
+                f"axis_sign must be three values from {{-1, +1}} (got '{axis_sign}')"
+            )
+        self.axis_sign = np.array([float(s) for s in sign_parts], dtype=np.float32)
+
         self.lock = Lock()
         # Pose (in LIBERO world frame, after axis remap)
         self.goal_pos = np.zeros(3)
@@ -190,32 +210,65 @@ class VRState:
         self.buttonA    = False
         self.buttonB    = False
         self.thumbstick = None
-        # Combined Z-then-Y rotation. Same matrix is applied to position
-        # and quaternion so axes stay consistent.
-        self.z_deg = z_deg
-        self.y_deg = y_deg
-        self._rot_remap = R.from_euler("zy", [z_deg, y_deg], degrees=True)
         # EMA filter state
         self.pos_ema_alpha = pos_ema_alpha
         self._initialized = False
 
+    def _remap_position(self, raw_pos: np.ndarray) -> np.ndarray:
+        """Apply axis permutation + sign flip to a JS-frame position vector.
+
+        For each JS axis i (0=X, 1=Y, 2=Z), look up the destination LIBERO
+        axis via self.perm_idx[i], then apply the LIBERO sign.
+        """
+        result = np.zeros(3)
+        for js_axis in range(3):
+            libero_axis = self.perm_idx[js_axis]
+            result[libero_axis] = raw_pos[js_axis] * self.axis_sign[libero_axis]
+        return result
+
+    def _remap_quaternion(self, q_xyzw: np.ndarray) -> np.ndarray:
+        """Apply axis permutation + sign flip to a JS-frame quaternion (xyzw).
+
+        For a permutation+sign remap that swaps axes and flips signs, the
+        quaternion component at the swapped axis is also flipped. This is
+        a well-known identity: if you swap axis X and Y (and apply a
+        parity-preserving rotation), the quaternion's X and Y components
+        swap; if you flip an axis (a reflection), you also flip the
+        quaternion's X, Y, Z components but not the W component, and the
+        handedness flips.
+
+        In practice, the simplest correct approach is to convert to a
+        rotation matrix, permute and sign the matrix, and convert back.
+        """
+        # NOTE: don't shadow the imported Rotation class with a local
+        # variable named R -- Python would treat the whole RHS as a local
+        # variable lookup and fail with UnboundLocalError.
+        R_mat = R.from_quat(q_xyzw).as_matrix()
+        R_remap = np.zeros((3, 3))
+        for i in range(3):
+            for j in range(3):
+                # Source axis i, dest axis j in JS frame.
+                # After perm: JS axis i goes to LIBERO axis perm_idx[i].
+                # Apply LIBERO sign.
+                src_i = self.perm_idx[i]
+                src_j = self.perm_idx[j]
+                R_remap[src_i, src_j] = (
+                    self.axis_sign[src_i] * self.axis_sign[src_j] * R_mat[i, j]
+                )
+        return R.from_matrix(R_remap).as_quat()
+
     def update(self, data: dict):
         with self.lock:
             co = data.get("controller_object", {})
-            # Position: apply the rotation matrix (consistent with rotation).
-            # Replaces the old sign-flip transform that was a mirror reflection
-            # (changing handedness) and not a true rotation.
+            # Position: apply the permutation + sign remap.
             raw_pos = np.array([
                 co.get("_x", 0.0),
                 co.get("_y", 0.0),
                 co.get("_z", 0.0),
             ])
-            self.goal_pos = self._rot_remap.apply(raw_pos)
+            self.goal_pos = self._remap_position(raw_pos)
 
-            # EMA filter to dampen the wrist-rotation-induced position drift
-            # (the controller's grip anchor sweeps an arc when the user
-            # rotates their wrist). The filter is initialized lazily on
-            # the first message.
+            # EMA filter (legacy, kept for backwards compat).
             if not self._initialized:
                 self.goal_pos_filtered = self.goal_pos.copy()
                 self._initialized = True
@@ -225,9 +278,7 @@ class VRState:
                     a * self.goal_pos + (1 - a) * self.goal_pos_filtered
                 )
 
-            # Rotation: apply the same rotation via conjugation so that
-            # pose composition (q_now_ctrl * q_start_ctrl^-1) remains
-            # consistent with the rotated position frame.
+            # Rotation: apply the same permutation + sign to the quaternion.
             q_raw = np.array([
                 co.get("_qx", 0.0),
                 co.get("_qy", 0.0),
@@ -237,9 +288,7 @@ class VRState:
             nrm = np.linalg.norm(q_raw)
             if nrm > 1e-8:
                 q_raw = q_raw / nrm
-            q_remap = (self._rot_remap * R.from_quat(q_raw) *
-                       self._rot_remap.inv()).as_quat()
-            self.goal_rot = q_remap
+            self.goal_rot = self._remap_quaternion(q_raw)
             nrm2 = np.linalg.norm(self.goal_rot)
             if nrm2 > 1e-8:
                 self.goal_rot = self.goal_rot / nrm2
@@ -423,20 +472,23 @@ def main():
                              "a display (X server / Wayland) — don't combine with "
                              "--headless. The offscreen cameras are still "
                              "captured for --save-video.")
-    parser.add_argument("--js-to-libero-zy-deg", type=str,
-                        default=f"{DEFAULT_Z_DEG},{DEFAULT_Y_DEG}",
-                        help="Axis remap from JS to LIBERO frame, as "
-                             "'Z_DEG,Y_DEG'. Default '0,0' (identity: JS-X->"
-                             "LIBERO X, JS-Y->LIBERO Y, JS-Z->LIBERO Z). "
-                             "The previous default '90,90' was tuned for "
-                             "the Isaac Sim scene used by sim_vr_panda_single.py "
-                             "and produced mixed-up axes in LIBERO. Try "
-                             "'90,0', '0,90', '90,90', '0,180' until "
-                             "controller movements feel right. Both "
-                             "rotations are applied to JS positions "
-                             "(via R.apply()) and JS quaternions (via "
-                             "R * q * R.inv()), so axes stay consistent.")
-    parser.add_argument("--pos-scale", type=float, default=2.0,
+    parser.add_argument("--js-axis-perm", type=str, default=DEFAULT_AXIS_PERM,
+                        help="Axis permutation from JS to LIBERO frame, as "
+                             "a comma-separated list of three letters from "
+                             "{X,Y,Z}. e.g. 'X,Y,Z' (identity), 'Y,Z,X' "
+                             "(rotate 90 deg around Y), 'Z,X,Y' (rotate 90 deg "
+                             "around Z). Each JS axis (X=right, Y=up, "
+                             "Z=forward in browser frame) is mapped to a "
+                             "LIBERO axis (X, Y, or Z). The same permutation "
+                             "is applied to BOTH positions and quaternions "
+                             "so axes stay consistent.")
+    parser.add_argument("--js-axis-sign", type=str, default=DEFAULT_AXIS_SIGN,
+                        help="Per-axis sign flips after the permutation, as "
+                             "comma-separated +1 or -1 for LIBERO X, Y, Z. "
+                             "e.g. '1,1,1' (no flips), '1,-1,1' (mirror Y), "
+                             "'-1,1,1' (mirror X). Use this to fix 'mirrored' "
+                             "axes without changing the permutation.")
+    parser.add_argument("--pos-scale", type=float, default=1.0,
                         help="Position-delta multiplier before clipping "
                              "(1.0 = match LIBERO's natural 0.05 m/step cap; "
                              "2.0 = move twice as fast).")
@@ -451,7 +503,7 @@ def main():
                              "(pos_delta[0:3], rot_delta[3:6], gripper[6]). "
                              "Useful for debugging axis mapping and "
                              "rotation translation issues.")
-    parser.add_argument("--rot-scale", type=float, default=2.0,
+    parser.add_argument("--rot-scale", type=float, default=1.0,
                         help="Rotation-delta multiplier before clipping "
                              "(1.0 = match LIBERO's natural 0.5 rad/step cap; "
                              "2.0 = rotate twice as fast).")
@@ -469,17 +521,21 @@ def main():
     # Build the VRState with the rotation-only transform. The position
     # and rotation are now both remapped through the same rotation matrix,
     # so axes stay consistent and handedness is preserved.
-    # Parse the zy axis remap from "Z_DEG,Y_DEG" string
+    # Build the VRState with the axis permutation + sign remap. This
+    # replaces the previous rotation-matrix approach and gives per-axis
+    # control (e.g. for fixing mirrored axes without changing the
+    # permutation).
+    print(f"[VR] Axis perm = {args.js_axis_perm}")
+    print(f"[VR] Axis sign = {args.js_axis_sign}")
     try:
-        z_str, y_str = args.js_to_libero_zy_deg.split(",")
-        z_deg = float(z_str)
-        y_deg = float(y_str)
-    except (ValueError, AttributeError):
-        print(f"[error] --js-to-libero-zy-deg must be 'Z_DEG,Y_DEG' (e.g., '90,90')")
+        vr_state = VRState(
+            axis_perm=args.js_axis_perm,
+            axis_sign=args.js_axis_sign,
+            pos_ema_alpha=args.pos_ema_alpha,
+        )
+    except ValueError as e:
+        print(f"[error] {e}")
         sys.exit(1)
-    print(f"[VR] Axis remap zy=[{z_deg}, {y_deg}] degrees")
-    vr_state = VRState(z_deg=z_deg, y_deg=y_deg,
-                       pos_ema_alpha=args.pos_ema_alpha)
 
     mqtt_inst = setup_mqtt(vr_state)
 
