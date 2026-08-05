@@ -430,6 +430,11 @@ def main():
                              "logic requires raw positions. Kept as a "
                              "placeholder in case future work adds filter "
                              "back as an optional post-processing step.")
+    parser.add_argument("--print-action", action="store_true",
+                        help="Print the 7-dim LIBERO action sent at every step "
+                             "(pos_delta[0:3], rot_delta[3:6], gripper[6]). "
+                             "Useful for debugging axis mapping and "
+                             "rotation translation issues.")
     parser.add_argument("--rot-scale", type=float, default=2.0,
                         help="Rotation-delta multiplier before clipping "
                              "(1.0 = match LIBERO's natural 0.5 rad/step cap; "
@@ -656,12 +661,15 @@ def main():
                         wrist_delta = wrist_pos_now - wrist_pos_start
                         target_pos = (pos_start_ee + wrist_delta).copy()
 
-                        # Rotation: world-frame delta
+                        # Rotation: world-frame delta in the remapped
+                        # (LIBERO) frame. The same R_remap matrix that maps
+                        # JS positions to LIBERO positions also maps JS
+                        # rotations to LIBERO rotations:
+                        #   R_ctrl_LIBERO = R_remap @ R_js @ R_remap^-1
+                        # Since both q_now_ctrl and quat_start_ctrl are
+                        # already in LIBERO frame (they were remapped in
+                        # VRState.update()), the delta is just:
                         rot_delta_world = q_now_ctrl * quat_start_ctrl.inv()
-                        # Apply same direction flip as the Isaac script
-                        dq = rot_delta_world.as_quat().copy()
-                        dq[0] = -dq[0]  # negate x-component
-                        rot_delta_world = R.from_quat(dq)
                         target_rot = (quat_start_ee * rot_delta_world).as_quat()
                     else:
                         target_pos = pos_save.copy()
@@ -707,6 +715,9 @@ def main():
                 )
 
                 # --- Step the env ---
+                if args.print_action and step < 50:  # only first 50 steps
+                    print(f"  [action] step {step:3d}  dp={action[:3].round(2).tolist()}  "
+                          f"dr={action[3:6].round(2).tolist()}  grip={action[6]:.1f}")
                 obs, reward, done, info = env.step(action)
 
                 # --- On-screen GUI viewer (no-op if not enabled) ---
