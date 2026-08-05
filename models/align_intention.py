@@ -32,6 +32,7 @@ from models.align_model import VisionEncoder, RobotStateEncoder
 from models.intention_encoder import IntentionEncoder
 from models.intention_head import (
     IntentionTransformerHead, MambaActionHead, DiffusionPolicyHead,
+    FlowMatchingPolicyHead,
 )
 from models.memory_bank import PerceptualCognitiveMemoryModule
 
@@ -205,6 +206,17 @@ class ALIGNIntentionModel(nn.Module):
                 num_inference_steps=10,
                 time_dim=64,
                 chunk_size=self.chunk_size,
+            )
+        elif self.head_type == "flow_matching":
+            cond_dim = pool_out_dim + self.state_dim + (self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0)
+            self.intention_head = FlowMatchingPolicyHead(
+                cond_dim=cond_dim,
+                action_dim=self.action_dim,
+                hidden_dim=self.head_d_model,
+                num_inference_steps=10,
+                time_dim=64,
+                chunk_size=self.chunk_size,
+                solver="euler",
             )
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
@@ -512,7 +524,7 @@ class ALIGNIntentionModel(nn.Module):
                        z_s_window: torch.Tensor,
                        intent_emb: torch.Tensor = None,
                        num_steps: int = None) -> torch.Tensor:
-        if isinstance(self.intention_head, DiffusionPolicyHead):
+        if isinstance(self.intention_head, (DiffusionPolicyHead, FlowMatchingPolicyHead)):
             cond = self.intention_head(
                 z_v_pooled_window, z_s_window, intent_emb=intent_emb,
             )

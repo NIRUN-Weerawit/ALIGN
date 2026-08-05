@@ -407,7 +407,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     h_for_head = intent_emb if intent_emb is not None else None
 
                 # Loss
-                if args.head_type == "diffusion":
+                if args.head_type in ("diffusion", "flow_matching"):
                     if getattr(args, "debug", False):
                         print(f"[DEBUG] z_v_win_for_head: {z_v_win_for_head.shape}, "
                               f"z_s_win_for_head: {z_s_win_for_head.shape}, "
@@ -504,7 +504,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
             # predict_actions returns actions (direct regression) or cond (flow head)
 
             # Loss depends on head type
-            if args.head_type == "diffusion":
+            if args.head_type in ("diffusion", "flow_matching"):
                 # V4 head expects intent_emb (3D or None), not h_current.
                 # For V3 backward compat with no Mamba/no intent, pass None.
                 head_intent = intent_emb if intent_emb is not None and intent_emb.ndim == 3 else None
@@ -661,7 +661,7 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                 target = actions_seg[:, current_t:current_t + chunk_size]  # (B, K, 7)
 
                 # Head: cond
-                if args.head_type == "diffusion":
+                if args.head_type in ("diffusion", "flow_matching"):
                     cond = model.intention_head(z_v_win, z_s_win, intent_emb)
                     if not getattr(args, "no_sample_during_train", False):
                         actions_pred = model.sample_actions(
@@ -859,7 +859,7 @@ def validate(model, loader, device, args):
                 target = target_seg[:, current_t:current_t + chunk_size]
 
                 # Loss
-                if args.head_type == "diffusion":
+                if args.head_type in ("diffusion", "flow_matching"):
                     cond = model.intention_head(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
                     )
@@ -987,9 +987,10 @@ def parse_args():
     parser.add_argument("--chunk-size", type=int, default=10)
     
     # Head selection
-    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion"],
+    parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion", "flow_matching"],
                         default="mamba",
-                        help="Which head architecture: transformer, mamba, hybrid, or diffusion")
+                        help="Which head architecture: transformer, mamba, hybrid, "
+                             "diffusion (DDPM), or flow_matching (CFM with Euler ODE).")
     parser.add_argument("--use-history", action="store_true", default=True,
                         help="Include Mamba history component (h) in head input.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",

@@ -574,6 +574,191 @@ class DiffusionPolicyHead(nn.Module):
         return x
 
 
+class FlowMatchingPolicyHead(nn.Module):
+    """Flow Matching policy head (Lipman et al. 2023).
+
+    Conditioned on intent tokens (pooled) + z_v_pooled + z_s, predicting a
+    continuous action trajectory. The network predicts the velocity field
+    v(x_t, t) of a linear ODE that transports noise (t=1) to data (t=0).
+
+    Loss: MSE between predicted velocity and true velocity (target - noise).
+    Sampling: Euler ODE integration with optional Heun correction.
+
+    Args:
+        cond_dim:          per-step condition dim (z_v + z_s + intent)
+        action_dim:        output dim (default 7)
+        hidden_dim:        U-Net base channels (default 128)
+        num_inference_steps: Euler/Heun integration steps (default 10)
+        time_dim:          sinusoidal time embedding dim (default 64)
+        chunk_size:        K — number of future actions per chunk
+        solver:            "euler" or "heun" ODE solver (default "euler")
+        sigma_min:         minimum noise level for v-prediction (default 0.0)
+
+    Note: Reuses the same 1D U-Net architecture as DiffusionPolicyHead. The
+    difference is only the training target (velocity vs. noise) and the
+    sampling procedure (ODE integration vs. DDIM denoising).
+    """
+    def __init__(self, cond_dim: int = 768, action_dim: int = 7,
+                 hidden_dim: int = 128, num_inference_steps: int = 10,
+                 time_dim: int = 64, chunk_size: int = 10,
+                 solver: str = "euler", sigma_min: float = 0.0):
+        super().__init__()
+        if solver not in ("euler", "heun"):
+            raise ValueError(f"solver must be 'euler' or 'heun' (got {solver!r})")
+        self.action_dim = action_dim
+        self.num_inference_steps = num_inference_steps
+        self.time_dim = time_dim
+        self.chunk_size = chunk_size
+        self.cond_dim = cond_dim
+        self.solver = solver
+        self.sigma_min = sigma_min
+
+        # Sinusoidal time embedding (continuous t in [0, 1])
+        self.time_emb = nn.Sequential(
+            SinusoidalPositionalEncoding(time_dim),
+            nn.Linear(time_dim, time_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_dim * 2, time_dim),
+        )
+
+        # Reuse the same 1D U-Net architecture as DiffusionPolicyHead.
+        # The U-Net predicts a tensor of shape (B, K, action_dim); we
+        # interpret it as the velocity field v(x_t, t) at the current point.
+        self.unet = DiffusionPolicyUNet1D(
+            action_dim=action_dim,
+            cond_dim=cond_dim,
+            time_dim=time_dim,
+            hidden_dim=hidden_dim,
+        )
+
+    def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
+                              z_s_window: torch.Tensor,
+                              intent_emb: torch.Tensor = None) -> torch.Tensor:
+        """Build per-step condition (B, 1, cond_dim). Same as DiffusionPolicyHead."""
+        parts = []
+
+        if z_v_pooled_window is not None:
+            z_v_pooled_mean = z_v_pooled_window.mean(dim=1, keepdim=True)  # (B, 1, pool_out_dim)
+            parts.append(z_v_pooled_mean)
+
+        if z_s_window is not None:
+            z_s_last = z_s_window[:, -1:, :]  # (B, 1, state_dim)
+            parts.append(z_s_last)
+
+        if intent_emb is not None:
+            if intent_emb.ndim == 3:
+                intent_stacked = intent_emb.reshape(intent_emb.shape[0], -1)
+            else:
+                intent_stacked = intent_emb
+            intent_pooled = intent_stacked.unsqueeze(1)  # (B, 1, intent_dim * N)
+            parts.append(intent_pooled)
+
+        cond = torch.cat(parts, dim=-1)  # (B, 1, cond_dim)
+        return cond
+
+    def forward(self, z_v_pooled_window: torch.Tensor,
+                z_s_window: torch.Tensor,
+                intent_emb: torch.Tensor = None) -> torch.Tensor:
+        """Build per-step condition. Returns cond for loss/sample."""
+        return self._build_per_step_cond(
+            z_v_pooled_window, z_s_window, intent_emb,
+        )
+
+    def predict_velocity(self, x_t: torch.Tensor, t: torch.Tensor,
+                          cond: torch.Tensor) -> torch.Tensor:
+        """Predict the velocity field v(x_t, t).
+
+        Args:
+            x_t:  (B, K, action_dim) — current point along the ODE trajectory
+            t:    (B,) — continuous time in [0, 1]; 0=data, 1=noise
+            cond: (B, 1, cond_dim) — per-step condition (broadcast across K)
+        """
+        t_emb = self.time_emb(t.float())  # (B, time_dim)
+        return self.unet(x_t, cond, t_emb)
+
+    def loss(self, actions_target: torch.Tensor,
+             cond: torch.Tensor,
+             dim_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Flow-matching velocity-prediction training loss.
+
+        For each sample:
+          - Sample t ~ Uniform[0, 1].
+          - Sample noise eps ~ N(0, I).
+          - Interpolated point: x_t = (1 - t) * actions_target + t * eps.
+          - Target velocity: v_target = eps - actions_target.
+          - Predicted velocity: v_pred = predict_velocity(x_t, t, cond).
+          - Loss = MSE(v_pred, v_target).
+
+        This is the standard conditional flow matching (CFM) loss from
+        Lipman et al. 2023, with a linear interpolant.
+
+        Args:
+            actions_target: (B, K, action_dim)
+            cond: (B, K, cond_dim)
+            dim_weights: (action_dim,) optional per-dimension loss weights.
+        """
+        B, K, D = actions_target.shape
+        device = actions_target.device
+
+        # Sample t in (0, 1) per sample (continuous-time formulation).
+        # Use uniform [0, 1] with anti-aliased epsilon to avoid t=0 and t=1 exactly.
+        t = torch.rand(B, device=device, dtype=torch.float32) * (1 - 1e-3) + 5e-4
+        # Broadcast to (B, 1, 1) for per-step multiplication.
+        t_b = t[:, None, None]
+
+        noise = torch.randn_like(actions_target, dtype=torch.float32)
+        # Linear interpolant: x_t = (1 - t) * data + t * noise.
+        x_t = (1.0 - t_b) * actions_target.float() + t_b * noise
+        # True velocity: derivative w.r.t. t is (noise - data).
+        v_target = noise - actions_target.float()
+
+        v_pred = self.predict_velocity(x_t, t, cond)
+        err = (v_pred.float() - v_target) ** 2  # (B, K, D)
+        if dim_weights is not None:
+            err = err * dim_weights.unsqueeze(0).unsqueeze(0)
+        return err.mean()
+
+    @torch.no_grad()
+    def sample(self, cond: torch.Tensor, num_steps: int = None) -> torch.Tensor:
+        """ODE integration from noise (t=1) to data (t=0).
+
+        Supports two solvers:
+          - "euler": explicit Euler steps (1 forward pass per step).
+          - "heun":  Euler + 1 corrective step using the trapezoidal rule
+                     (2 forward passes per step, more accurate).
+        """
+        if num_steps is None:
+            num_steps = self.num_inference_steps
+        B, K, D = cond.shape[0], self.chunk_size, self.action_dim
+        device = cond.device
+
+        # Start from noise (t = 1).
+        x = torch.randn(B, K, D, device=device)
+        # Timesteps from t=1 down to t=0, uniformly spaced (inclusive endpoints).
+        timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+
+        for i in range(num_steps):
+            t_cur = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_next - t_cur  # negative (we go from t=1 to t=0)
+
+            t_cur_batch = t_cur.expand(B)
+            v_cur = self.predict_velocity(x, t_cur_batch, cond)
+
+            if self.solver == "euler":
+                # x_{t+dt} = x_t + v * dt
+                x = x + v_cur * dt
+            else:  # "heun"
+                # Predictor: Euler step.
+                x_euler = x + v_cur * dt
+                # Corrector: re-evaluate velocity at predicted point, average.
+                t_next_batch = t_next.expand(B)
+                v_next = self.predict_velocity(x_euler, t_next_batch, cond)
+                x = x + 0.5 * (v_cur + v_next) * dt
+
+        return x
+
+
 # ================================================================
 # Sinusoidal time embedding
 # ================================================================
