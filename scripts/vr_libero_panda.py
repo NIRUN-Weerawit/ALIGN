@@ -14,7 +14,7 @@ so the **same browser page works unchanged**.
 Key design choice: the existing Isaac Sim script runs a heavy USD-based
 simulator; this script targets LIBERO's MuJoCo backend so the same VR
 hardware can be used for data collection on tasks that are evaluated in
-`eval/eval_libero_v3_trajectory.py` (libero_spatial / libero_goal).
+`eval/eval_libero_v4_trajectory.py` (libero_spatial / libero_goal).
 
 WORKFLOW
 --------
@@ -77,12 +77,21 @@ KEY CONFIGURATION
   Position tol   : input_max * 0.05 m = 0.05 m per step
   Orientation tol: input_max * 0.5 rad = 0.5 rad per step
 
+RENDERING MODES
+---------------
+  --gui           On-screen OpenGL viewer (agentview render_camera).
+                  Builds ControlEnv with has_renderer=True; calls
+                  env.render() every step. Requires a display (X/Wayland).
+  --headless      Force offscreen-only rendering (default).
+  --save-video    Always capture offscreen cameras; works in both modes.
+
 DEPENDENCIES
 ------------
   libero (libero.libero.envs)
   NumPy, SciPy
   OpenCV (for video saving)
   paho-mqtt
+  libero.libero.envs.env_wrapper.ControlEnv (for --gui)
 """
 
 import argparse
@@ -103,10 +112,15 @@ import paho.mqtt.client as mqtt_client
 # LIBERO imports (delayed to allow --help without libero installed)
 LIBERO_AVAILABLE = False
 OffScreenRenderEnv = None
+ControlEnv = None
 get_benchmark = None
 get_libero_path = None
 try:
     from libero.libero.envs import OffScreenRenderEnv
+    try:
+        from libero.libero.envs.env_wrapper import ControlEnv
+    except ImportError:
+        ControlEnv = None  # older LIBERO versions
     from libero.libero.benchmark import get_benchmark
     from libero.libero import get_libero_path
     LIBERO_AVAILABLE = True
@@ -346,6 +360,12 @@ def main():
                         help="Max env steps per episode")
     parser.add_argument("--headless", action="store_true",
                         help="Use headless rendering (no on-screen viewer)")
+    parser.add_argument("--gui", action="store_true",
+                        help="Show an on-screen OpenGL viewer (the agentview "
+                             "render-camera is displayed in a window). Requires "
+                             "a display (X server / Wayland) — don't combine with "
+                             "--headless. The offscreen cameras are still "
+                             "captured for --save-video.")
     parser.add_argument("--js-to-libero-rot-deg", type=float,
                         default=DEFAULT_ROT_OFFSET_DEG,
                         help="Rotation remap angle (degrees around X-axis) "
@@ -402,16 +422,10 @@ def main():
 
     # --- Pre-build env (one per task; rebuilt when cycling) ---
     def build_env(task_name):
-        bddl_path = os.path.join(
-            get_libero_path("bddl_files"),
-            args.suite,
-            # BDDL filename can have variant suffixes; get_benchmark already
-            # gave us a normalized task_name but the file may have a
-            # hash suffix, so we search the directory.
-            "",  # filled below
+        bddl_dir = os.path.join(
+            get_libero_path("bddl_files"), args.suite, "",
         )
         # Find the BDDL file matching task_name (it may have a hash suffix)
-        bddl_dir = bddl_path
         candidates = [
             f for f in os.listdir(bddl_dir)
             if f.startswith(task_name) and f.endswith(".bddl")
@@ -421,6 +435,40 @@ def main():
                 f"No BDDL file matching '{task_name}' in {bddl_dir}"
             )
         bddl_file = os.path.join(bddl_dir, candidates[0])
+
+        # Render-mode dispatch:
+        #   --gui          : on-screen OpenGL viewer (ControlEnv).
+        #                    The OffScreenRenderEnv subclass forces
+        #                    has_renderer=False, so we use the parent
+        #                    ControlEnv class for the GUI case.
+        #   --save-video (no --gui): offscreen only (OffScreenRenderEnv).
+        #   headless default : offscreen only (OffScreenRenderEnv).
+        use_gui = bool(getattr(args, "gui", False))
+
+        if use_gui:
+            if ControlEnv is None:
+                raise ImportError(
+                    "GUI mode requested but libero.libero.envs.env_wrapper."
+                    "ControlEnv is not importable. Update LIBERO or run "
+                    "without --gui."
+                )
+            print(f"[ENV] Building GUI env for task: {task_name}")
+            return ControlEnv(
+                bddl_file_name=bddl_file,
+                use_camera_obs=True,
+                camera_names=["agentview", "robot0_eye_in_hand"],
+                camera_widths=args.render_size,
+                camera_heights=args.render_size,
+                reward_shaping=False,
+                control_freq=20,
+                initialization_noise=None,
+                has_renderer=True,
+                has_offscreen_renderer=True,  # keep offscreen cams for video
+                render_camera="agentview",     # what the on-screen viewer shows
+            )
+
+        # Default: offscreen-only (faster, headless-safe).
+        print(f"[ENV] Building offscreen env for task: {task_name}")
         return OffScreenRenderEnv(
             bddl_file_name=bddl_file,
             use_camera_obs=True,
@@ -430,8 +478,6 @@ def main():
             reward_shaping=False,
             control_freq=20,
             initialization_noise=None,
-            has_renderer=not args.headless,
-            has_offscreen_renderer=True,
         )
 
     # --- VR teleoperation state ---
@@ -569,6 +615,10 @@ def main():
 
                 # --- Step the env ---
                 obs, reward, done, info = env.step(action)
+
+                # --- On-screen GUI viewer (no-op if not enabled) ---
+                if args.gui:
+                    env.render()
 
                 # --- Read new EEF pose ---
                 current_ee_pos = env.env._eef_xpos.copy()
