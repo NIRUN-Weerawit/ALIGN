@@ -142,8 +142,17 @@ except ImportError as e:
 # Most importantly, the position remap is applied via R.apply() and the
 # quaternion remap via R * q * R.inv() so axes stay consistent.
 
-DEFAULT_Z_DEG = 90.0
-DEFAULT_Y_DEG = 90.0
+# Default axis mapping: identity. JS-X -> LIBERO X, JS-Y -> LIBERO Y,
+# JS-Z -> LIBERO Z. This means "moving the controller right" moves
+# the EE in LIBERO +X. If the LIBERO scene's axes don't match
+# your physical intuition, pass --js-to-libero-zy-deg "Z_DEG,Y_DEG"
+# to apply a rotation that maps the controller's perceived axes to
+# the LIBERO scene's axes. The default was previously "90,90" (the
+# Isaac Sim script's convention) but that was tuned for a different
+# scene; for LIBERO we start from identity and let the user tune.
+
+DEFAULT_Z_DEG = 0.0
+DEFAULT_Y_DEG = 0.0
 
 
 # ---------------------------------------------------------------
@@ -414,12 +423,19 @@ def main():
                              "a display (X server / Wayland) — don't combine with "
                              "--headless. The offscreen cameras are still "
                              "captured for --save-video.")
-    parser.add_argument("--js-to-libero-y-deg", type=float,
-                        default=DEFAULT_Y_DEG,
-                        help="Additional Y-axis rotation (degrees) applied "
-                             "on top of the default zy=[90,90] remap. Useful "
-                             "for tuning the LIBERO scene's right/left "
-                             "axis to match your physical setup.")
+    parser.add_argument("--js-to-libero-zy-deg", type=str,
+                        default=f"{DEFAULT_Z_DEG},{DEFAULT_Y_DEG}",
+                        help="Axis remap from JS to LIBERO frame, as "
+                             "'Z_DEG,Y_DEG'. Default '0,0' (identity: JS-X->"
+                             "LIBERO X, JS-Y->LIBERO Y, JS-Z->LIBERO Z). "
+                             "The previous default '90,90' was tuned for "
+                             "the Isaac Sim scene used by sim_vr_panda_single.py "
+                             "and produced mixed-up axes in LIBERO. Try "
+                             "'90,0', '0,90', '90,90', '0,180' until "
+                             "controller movements feel right. Both "
+                             "rotations are applied to JS positions "
+                             "(via R.apply()) and JS quaternions (via "
+                             "R * q * R.inv()), so axes stay consistent.")
     parser.add_argument("--pos-scale", type=float, default=2.0,
                         help="Position-delta multiplier before clipping "
                              "(1.0 = match LIBERO's natural 0.05 m/step cap; "
@@ -453,7 +469,16 @@ def main():
     # Build the VRState with the rotation-only transform. The position
     # and rotation are now both remapped through the same rotation matrix,
     # so axes stay consistent and handedness is preserved.
-    vr_state = VRState(z_deg=DEFAULT_Z_DEG, y_deg=args.js_to_libero_y_deg,
+    # Parse the zy axis remap from "Z_DEG,Y_DEG" string
+    try:
+        z_str, y_str = args.js_to_libero_zy_deg.split(",")
+        z_deg = float(z_str)
+        y_deg = float(y_str)
+    except (ValueError, AttributeError):
+        print(f"[error] --js-to-libero-zy-deg must be 'Z_DEG,Y_DEG' (e.g., '90,90')")
+        sys.exit(1)
+    print(f"[VR] Axis remap zy=[{z_deg}, {y_deg}] degrees")
+    vr_state = VRState(z_deg=z_deg, y_deg=y_deg,
                        pos_ema_alpha=args.pos_ema_alpha)
 
     mqtt_inst = setup_mqtt(vr_state)
