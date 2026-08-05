@@ -617,8 +617,11 @@ def main():
                 obs, reward, done, info = env.step(action)
 
                 # --- On-screen GUI viewer (no-op if not enabled) ---
+                # Both ControlEnv and OffScreenRenderEnv are wrappers around
+                # the underlying robosuite env; the render() method lives on
+                # env.env. The call is a no-op when has_renderer=False.
                 if args.gui:
-                    env.render()
+                    env.env.render()
 
                 # --- Read new EEF pose ---
                 current_ee_pos = env.env._eef_xpos.copy()
