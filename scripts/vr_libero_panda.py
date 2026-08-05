@@ -128,28 +128,22 @@ except ImportError as e:
     print(f"[warn] LIBERO not available: {e}", file=sys.stderr)
 
 # --- VR coordinate frame conversion (Three.js -> LIBERO/MuJoCo world) ---
-# The browser client sends Three.js coords (Y-up) for the controller.
-# LIBERO's MuJoCo world is Z-up but with a different axis mapping than
-# Isaac Sim. Empirically the alignment that matches the existing
-# pipeline well is:
-#   pos_libero = (x_js, z_js, y_js)
-#   q_libero   = q_js rotated by a fixed -120 deg around (1,1,1)/sqrt(3)
-# The same axis swap is applied to both position and rotation so axes
-# stay consistent (this is what the existing script documents as
-# "POSITION_OFFSET = R.from_euler('zy', [90,90], degrees=True)").
+# The browser client (A-Frame oculus-touch-controls) sends the controller's
+# grip pose as (position, quaternion). The position is the **controller
+# grip anchor's world position** (the point on the controller where the
+# user's hand grips it), NOT the wrist position. This means rotating the
+# wrist while keeping the hand still will cause the reported position to
+# sweep in an arc around the wrist. The Isaac script uses
+# R.from_euler('zy', [90,90]) for the position remap, which converts
+# Three.js (Y-up) to LIBERO's MuJoCo world (Z-up). We use the same
+# convention so that "JS up" maps to "LIBERO up". A user-tunable
+# --js-to-libero-rot-deg adds an extra Y-rotation offset on top.
 #
-# In practice, LIBERO is also Y-up in world frame (mujoco convention).
-# We map JS-Y to LIBERO-Y by negating one axis; the simplest mapping
-# that produces sensible behaviour is:
-#
-#   pos_libero = (x_js,  y_js, -z_js)            # rotate 90 deg around +X
-#   q_libero   = Rx(90 deg) * q_js * Rx(-90 deg)
-#
-# You may need to tweak this offset per scene; it is exposed as
-# --js-to-libero-rot-deg / --js-to-libero-pos-axis CLI flags below.
+# Most importantly, the position remap is applied via R.apply() and the
+# quaternion remap via R * q * R.inv() so axes stay consistent.
 
-DEFAULT_POS_TRANSFORM = np.array([1.0, 1.0, -1.0])  # multiply raw (x,y,z)
-DEFAULT_ROT_OFFSET_DEG = -90.0                       # Rx by this many degrees
+DEFAULT_Z_DEG = 90.0
+DEFAULT_Y_DEG = 90.0
 
 
 # ---------------------------------------------------------------
@@ -158,10 +152,28 @@ DEFAULT_ROT_OFFSET_DEG = -90.0                       # Rx by this many degrees
 class VRState:
     """Holds the latest MQTT message, accessible from the main sim loop."""
 
-    def __init__(self, pos_axis=DEFAULT_POS_TRANSFORM, rot_offset_deg=DEFAULT_ROT_OFFSET_DEG):
+    def __init__(self, z_deg: float = DEFAULT_Z_DEG, y_deg: float = DEFAULT_Y_DEG,
+                 pos_ema_alpha: float = 0.3):
+        """
+        Args:
+            z_deg: rotation around Z (degrees) applied first.
+            y_deg: rotation around Y (degrees) applied second.
+                The combined rotation R = R_y(y_deg) * R_z(z_deg) converts
+                JS controller (pos, quat) to LIBERO world frame.
+            pos_ema_alpha: EMA smoothing factor for the position signal,
+                in [0, 1]. Lower = more smoothing. The browser sends the
+                controller's grip anchor world position, which moves with
+                wrist rotation (the anchor sweeps an arc around the wrist).
+                A low-pass filter on position removes the high-frequency
+                rotation-bleeds-into-position artefact while preserving
+                the user's translational intent (which is low-frequency).
+                0.3 means ~70% new value, ~30% old -- a moderate smoothing.
+                Set to 1.0 for no smoothing.
+        """
         self.lock = Lock()
         # Pose (in LIBERO world frame, after axis remap)
         self.goal_pos = np.zeros(3)
+        self.goal_pos_filtered = np.zeros(3)
         self.goal_rot = np.array([0, 0, 0, 1])  # xyzw quaternion
         # Buttons
         self.sending    = False
@@ -169,26 +181,44 @@ class VRState:
         self.buttonA    = False
         self.buttonB    = False
         self.thumbstick = None
-        # Configurable transforms (so you can re-tune without editing code)
-        self.pos_axis = pos_axis
-        self.rot_offset_deg = rot_offset_deg
-        # Cached rotation matrix for the JS -> LIBERO rotation remap
-        self._rot_remap = R.from_euler(
-            "x", rot_offset_deg, degrees=True
-        )
+        # Combined Z-then-Y rotation. Same matrix is applied to position
+        # and quaternion so axes stay consistent.
+        self.z_deg = z_deg
+        self.y_deg = y_deg
+        self._rot_remap = R.from_euler("zy", [z_deg, y_deg], degrees=True)
+        # EMA filter state
+        self.pos_ema_alpha = pos_ema_alpha
+        self._initialized = False
 
     def update(self, data: dict):
         with self.lock:
             co = data.get("controller_object", {})
-            # Position: multiply each axis by the configured sign
+            # Position: apply the rotation matrix (consistent with rotation).
+            # Replaces the old sign-flip transform that was a mirror reflection
+            # (changing handedness) and not a true rotation.
             raw_pos = np.array([
                 co.get("_x", 0.0),
                 co.get("_y", 0.0),
                 co.get("_z", 0.0),
             ])
-            self.goal_pos = raw_pos * self.pos_axis
+            self.goal_pos = self._rot_remap.apply(raw_pos)
 
-            # Rotation: apply the rotation remap around X
+            # EMA filter to dampen the wrist-rotation-induced position drift
+            # (the controller's grip anchor sweeps an arc when the user
+            # rotates their wrist). The filter is initialized lazily on
+            # the first message.
+            if not self._initialized:
+                self.goal_pos_filtered = self.goal_pos.copy()
+                self._initialized = True
+            else:
+                a = self.pos_ema_alpha
+                self.goal_pos_filtered = (
+                    a * self.goal_pos + (1 - a) * self.goal_pos_filtered
+                )
+
+            # Rotation: apply the same rotation via conjugation so that
+            # pose composition (q_now_ctrl * q_start_ctrl^-1) remains
+            # consistent with the rotated position frame.
             q_raw = np.array([
                 co.get("_qx", 0.0),
                 co.get("_qy", 0.0),
@@ -222,9 +252,20 @@ class VRState:
                 self.thumbstick = None
 
     def snapshot(self) -> dict:
+        """Return a point-in-time copy of all fields.
+
+        Returns the RAW (unfiltered) position. The rotation-compensation
+        logic in the main loop requires the unfiltered position to
+        correctly estimate grip_offset at trigger-down.
+
+        `goal_pos_filtered` is still available for callers that want it
+        (e.g. for plotting the raw vs. smoothed trace), but the main loop
+        should always use `goal_pos`.
+        """
         with self.lock:
             return {
                 "goal_pos":   self.goal_pos.copy(),
+                "goal_pos_filtered": self.goal_pos_filtered.copy(),
                 "goal_rot":   self.goal_rot.copy(),
                 "sending":    self.sending,
                 "grip":       self.grip,
@@ -232,6 +273,13 @@ class VRState:
                 "buttonB":    self.buttonB,
                 "thumbstick": self.thumbstick,
             }
+
+    def reset_filter(self):
+        """Reset the EMA filter so the next update re-initializes from the
+        raw signal. Call this at the start of each episode to avoid
+        propagating the previous episode's filter state."""
+        with self.lock:
+            self._initialized = False
 
 
 # ---------------------------------------------------------------
@@ -366,20 +414,22 @@ def main():
                              "a display (X server / Wayland) — don't combine with "
                              "--headless. The offscreen cameras are still "
                              "captured for --save-video.")
-    parser.add_argument("--js-to-libero-rot-deg", type=float,
-                        default=DEFAULT_ROT_OFFSET_DEG,
-                        help="Rotation remap angle (degrees around X-axis) "
-                             "for converting JS controller quaternion to "
-                             "LIBERO world frame. Tune per scene.")
-    parser.add_argument("--js-to-libero-pos-axis", default="1,1,-1",
-                        help="Axis sign multiplier for converting JS controller "
-                             "position to LIBERO world frame. Default '1,1,-1' "
-                             "is a 90-deg rotation around X (JS-Y -> LIBERO-Y, "
-                             "JS-Z -> LIBERO-Z negated). Tune per scene.")
+    parser.add_argument("--js-to-libero-y-deg", type=float,
+                        default=DEFAULT_Y_DEG,
+                        help="Additional Y-axis rotation (degrees) applied "
+                             "on top of the default zy=[90,90] remap. Useful "
+                             "for tuning the LIBERO scene's right/left "
+                             "axis to match your physical setup.")
     parser.add_argument("--pos-scale", type=float, default=2.0,
                         help="Position-delta multiplier before clipping "
                              "(1.0 = match LIBERO's natural 0.05 m/step cap; "
                              "2.0 = move twice as fast).")
+    parser.add_argument("--pos-ema-alpha", type=float, default=0.3,
+                        help="[legacy] EMA smoothing factor. No longer used "
+                             "by the main loop -- the rotation-compensation "
+                             "logic requires raw positions. Kept as a "
+                             "placeholder in case future work adds filter "
+                             "back as an optional post-processing step.")
     parser.add_argument("--rot-scale", type=float, default=2.0,
                         help="Rotation-delta multiplier before clipping "
                              "(1.0 = match LIBERO's natural 0.5 rad/step cap; "
@@ -395,14 +445,11 @@ def main():
         print("        Activate the ALIGN conda env: conda activate align")
         sys.exit(1)
 
-    # Parse pos axis
-    pos_axis = np.array([float(x) for x in args.js_to_libero_pos_axis.split(",")])
-    if pos_axis.shape != (3,):
-        print("[error] --js-to-libero-pos-axis must be three comma-separated floats.")
-        sys.exit(1)
-
-    vr_state = VRState(pos_axis=pos_axis,
-                       rot_offset_deg=args.js_to_libero_rot_deg)
+    # Build the VRState with the rotation-only transform. The position
+    # and rotation are now both remapped through the same rotation matrix,
+    # so axes stay consistent and handedness is preserved.
+    vr_state = VRState(z_deg=DEFAULT_Z_DEG, y_deg=args.js_to_libero_y_deg,
+                       pos_ema_alpha=args.pos_ema_alpha)
 
     mqtt_inst = setup_mqtt(vr_state)
 
@@ -485,6 +532,7 @@ def main():
     pos_start_ctrl = None
     quat_start_ctrl = None
     quat_start_ee   = None
+    grip_offset     = None  # estimated controller local-frame offset to EE
     pos_save  = None  # last target pos (held pose)
     quat_save = None
     alpha_pos = 0.0
@@ -524,11 +572,17 @@ def main():
             pos_start_ctrl = None
             quat_start_ctrl = None
             quat_start_ee   = None
+            grip_offset     = None
             pos_save  = current_ee_pos.copy()
             quat_save = R.from_matrix(current_ee_rot).as_quat()
             alpha_pos = 0.0
             alpha_rot = 0.0
             prev_trigger = False
+
+            # Reset the EMA filter so the new episode doesn't inherit the
+            # filter state from the previous one (would cause a 1-frame
+            # bias at the start of the episode).
+            vr_state.reset_filter()
 
             episode_frames = []  # list of (agentview_rgb, wrist_rgb) tuples
 
@@ -544,12 +598,27 @@ def main():
 
                 # --- Trigger edge: OFF -> ON ---
                 if sending and not prev_trigger:
-                    # Capture anchors (current EE pose + current VR pose)
+                    # Capture anchors (current EE pose + current VR pose).
+                    # We assume the user's hand is at "rest" at trigger-down,
+                    # so the controller's reported pose approximates the
+                    # EE pose plus a fixed grip_offset in the controller's
+                    # local frame:
+                    #   pos_start_ctrl ≈ pos_start_ee + R_ctrl_start * grip_offset
+                    # We can solve for grip_offset:
+                    #   grip_offset ≈ R_ctrl_start^-1 * (pos_start_ctrl - pos_start_ee)
+                    # At trigger-down, R_ctrl_start is whatever the controller
+                    # is currently rotated to -- we use its inverse to undo.
                     pos_start_ee   = current_ee_pos.copy()
                     pos_start_ctrl = goal_pos.copy()
                     quat_start_ctrl = R.from_quat(goal_rot)
                     quat_start_ee   = R.from_matrix(current_ee_rot)
-                    print(f"[VR] Trigger pressed — anchors recorded.")
+                    # Estimate the grip offset (controller's local-frame
+                    # offset from EE to controller grip anchor).
+                    grip_offset = quat_start_ctrl.inv().apply(
+                        pos_start_ctrl - pos_start_ee
+                    )
+                    print(f"[VR] Trigger pressed — anchors recorded. "
+                          f"grip_offset={grip_offset.round(3).tolist()}")
 
                 # --- If never calibrated yet, hold default pose ---
                 if quat_start_ee is None:
@@ -558,12 +627,36 @@ def main():
                     prev_trigger = sending
                 else:
                     if sending:
-                        # Position: additive delta in world frame
-                        ctrl_pos_delta = goal_pos - pos_start_ctrl
-                        target_pos = (pos_start_ee + ctrl_pos_delta).copy()
+                        # Position: subtract the rotation-induced grip
+                        # anchor sweep before computing the delta.
+                        #
+                        # The browser reports the controller's grip anchor
+                        # position, which is wrist_pos + R_ctrl * grip_offset.
+                        # When the user rotates the wrist, R_ctrl rotates and
+                        # the anchor sweeps an arc around the wrist. We
+                        # compensate by removing this rotation-induced offset:
+                        #   wrist_pos_now ≈ goal_pos - R_ctrl_now * grip_offset
+                        # The wrist translation since trigger-down is:
+                        #   wrist_delta = (goal_pos - R_ctrl_now * grip_offset)
+                        #               - pos_start_ctrl_start
+                        # and we apply it to the EE:
+                        #   target_pos = pos_start_ee + wrist_delta
+                        #
+                        # When wrist rotation is unchanged from trigger-down
+                        # (R_ctrl_now = R_ctrl_start), this reduces to the
+                        # original naive delta: target_pos = pos_start_ee +
+                        # (goal_pos - pos_start_ctrl), so the math is a strict
+                        # superset of the original behavior.
+                        q_now_ctrl = R.from_quat(goal_rot)
+                        wrist_pos_now = goal_pos - q_now_ctrl.apply(grip_offset)
+                        wrist_pos_start = (
+                            pos_start_ctrl
+                            - quat_start_ctrl.apply(grip_offset)
+                        )
+                        wrist_delta = wrist_pos_now - wrist_pos_start
+                        target_pos = (pos_start_ee + wrist_delta).copy()
 
                         # Rotation: world-frame delta
-                        q_now_ctrl = R.from_quat(goal_rot)
                         rot_delta_world = q_now_ctrl * quat_start_ctrl.inv()
                         # Apply same direction flip as the Isaac script
                         dq = rot_delta_world.as_quat().copy()
@@ -675,6 +768,7 @@ def main():
                         pos_start_ctrl = None
                         quat_start_ctrl = None
                         quat_start_ee = None
+                        grip_offset = None
                         pos_save = current_ee_pos.copy()
                         quat_save = R.from_matrix(current_ee_rot).as_quat()
                         alpha_pos = 0.0
