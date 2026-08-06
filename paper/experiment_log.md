@@ -58,6 +58,23 @@ retrieval and token-merge consolidation.
 - **Model change**: `forward_with_probe` added to `ALIGNIntentionModel` (no training impact, runs under `torch.no_grad()`)
 - **Priority**: HIGH — produces a strong figure for the paper, cheap to run
 
+## EXP-G — Inference speed measurement
+
+- **Setup**: load best checkpoint, run `tools/measure_inference_speed.py` on synthetic random batches at multiple batch sizes
+- **Metric**:
+  - **Per-step latency** (mean, std, p95 in ms) at B=1, T=30
+  - **Throughput scaling** (steps/sec) at B ∈ {1, 2, 4, 8, 16, 32, 64}
+  - **Component breakdown**: vision encoder, state encoder, Mamba, memory bank, diffusion head — each measured independently
+  - **Peak VRAM** during forward pass
+- **Expected**:
+  - Per-step latency < 50 ms on H100 NVL → effective control rate > 20 Hz
+  - Memory bank adds < 30 ms overhead
+  - Pre-computed features path eliminates vision encoder cost
+- **Script**: `tools/measure_inference_speed.py` (IMPLEMENTED)
+- **Outputs**: `results.json` (all metrics), `breakdown.png` (bar chart of components), `scaling.png` (batch-size vs throughput)
+- **Why it matters**: shared-autonomy teleoperation requires 30+ Hz; this experiment verifies ALIGN meets that bar. Key comparison point vs Assistron (VLA, ~100-300 ms), Yoneda (cheap), Casper (slow due to VLM).
+- **Priority**: MEDIUM — not a novelty claim, but required to back up the "real-time control" claim in the paper's contribution statement
+
 ## EXP-D — DINOv2 pre-compute pipeline
 
 - **Setup**: train V4 with `--use-precomputed-dinov2` vs raw frames, same B/S
@@ -80,7 +97,7 @@ retrieval and token-merge consolidation.
 
 ## EXP-F — Shared-autonomy eval (the key claim)
 
-- **Setup**: run `eval/eval_libero_v3_trajectory.py --switch-at 0.0 0.5 1.0` on trained model
+- **Setup**: run `eval/eval_libero_v4_trajectory.py --switch-at 0.0 0.5 1.0` on trained model
 - **Metric**: task success rate, mean trajectory deviation from optimal
 - **Expected**: switch-at=0.5 (half human, half model) > switch-at=0.0 (pure model) OR switch-at=1.0 (pure human), showing the model adds value to a noisy human
 - **Baseline**: pure-replay (switch-at=1.0) — must succeed in some episodes

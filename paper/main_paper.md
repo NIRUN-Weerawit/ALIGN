@@ -607,7 +607,7 @@ epochs and converges to a lower final loss than mean-pooling.
 **Claim tested (C6)**: the model improves human-teleop trajectories when blended
 with a noisy human via alpha-blending.
 
-**Setup**: run `eval/eval_libero_v3_trajectory.py --switch-at 0.0 0.5 1.0` on
+**Setup**: run `eval/eval_libero_v4_trajectory.py --switch-at 0.0 0.5 1.0` on
 the trained checkpoint. `--switch-at 0.5` is the shared-autonomy condition:
 model controls the second half of each trajectory, human controls the
 first half. `--switch-at 1.0` is pure-replay baseline. `--switch-at 0.0` is
@@ -766,7 +766,7 @@ negative result we have, and it deserves a frank discussion.
 The first possible cause is **train/eval mismatch**. The training loop
 uses `--no-sample-during-train` (the default), meaning the loss is the
 DDPM noise-prediction MSE; the policy action is *not* sampled during
-training. Evaluation in `eval_libero_v3_trajectory.py` uses the
+training. Evaluation in `eval_libero_v4_trajectory.py` uses the
 10-step DDIM sampler. A model that has converged on noise-prediction
 loss may still produce degenerate samples — e.g., collapsing to the
 mean action — until the sampler's input distribution is calibrated. We
