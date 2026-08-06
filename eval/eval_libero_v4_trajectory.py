@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Evaluate ALIGN v3 intention model on LIBERO trajectory data.
+"""Evaluate ALIGN v4 intention model on LIBERO trajectory data.
 
 This script replays a LIBERO trajectory (frames + states + actions) and
-compares the v3 intention model's predicted actions to:
+compares the v4 intention model's predicted actions to:
   1. Expert actions (ground truth)
   2. Noised human actions (simulated user mistakes)
 
-For each timestep, the v3 model takes the K past (frames, states) and
+For each timestep, the v4 model takes the K past (frames, states) and
 predicts K future actions. We compare:
   - prediction[k=0]   vs.  expert[k=0]    (next action)
   - prediction[k=0]   vs.  noised[k=0]    (noisy human action)
@@ -20,15 +20,15 @@ Metrics:
 
 Usage:
     # Single checkpoint
-    python eval/eval_libero_v3_trajectory.py \
+    python eval/eval_libero_v4_trajectory.py \
         --data data/libero_object.h5 \
-        --checkpoint checkpoints/v3/libero_object/run_1/intention_best.pt \
+        --checkpoint checkpoints/v4/libero_object/run_1/intention_best.pt \
         --n-episodes 5 --noise-std 0.05
 
     # With text
-    python eval/eval_libero_v3_trajectory.py \
+    python eval/eval_libero_v4_trajectory.py \
         --data data/libero_object.h5 \
-        --checkpoint checkpoints/v3/libero_object/run_1/intention_best.pt \
+        --checkpoint checkpoints/v4/libero_object/run_1/intention_best.pt \
         --task-text "pick up the cup"
 
 Outputs:
@@ -77,6 +77,40 @@ try:
 except ImportError:
     _Rotation = None
 
+# Optional: OpenCV for --live-view real-time display
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+
+def _live_view_show(frame: np.ndarray, step: int, title: str = "ALIGN Sim",
+                    live_view: bool = False) -> None:
+    """Display a sim frame in an OpenCV window (real-time monitor).
+
+    Called at every sim step when --live-view is active.
+    Press 'q' or ESC in the window to close it (the episode continues
+    without display after that).
+    """
+    if not live_view or not CV2_AVAILABLE:
+        return
+    # Frame is (H, W, 3) uint8 RGB → convert to BGR for OpenCV
+    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    # Annotate step number
+    cv2.putText(bgr, f"Step {step}", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.imshow(title, bgr)
+    key = cv2.waitKey(1) & 0xFF
+    if key in (ord('q'), 27):  # 'q' or ESC
+        cv2.destroyWindow(title)
+
+
+def _live_view_close() -> None:
+    """Close any open live-view windows."""
+    if CV2_AVAILABLE:
+        cv2.destroyAllWindows()
+
 
 # ================================================================
 # Trajectory loading
@@ -121,7 +155,7 @@ def load_trajectory(h5_path: str, episode_key: str,
             poses = group["noisy_poses"][:]
         actions = group["actions"][:]  # (N, 7)
         # Build states: concat[poses, gripper] = (N, 7)
-        # matches the v3 model's expected state format:
+        # matches the v4 model's expected state format:
         # [pos_x, pos_y, pos_z, roll, pitch, yaw, gripper]
         if poses is not None:
             gripper = actions[:, -1:]  # (N, 1)
@@ -434,6 +468,7 @@ def run_replay_in_sim(
     use_camera: str = "agentview_image",
     flip_vertical: bool = True,
     flip_horizontal: bool = False,
+    live_view: bool = False,
 ) -> Dict:
     """Replay dataset's expert actions in MuJoCo sim. Record frames.
 
@@ -473,6 +508,7 @@ def run_replay_in_sim(
         
         if frame is not None and frame.size > 0:
             frames.append(frame.copy())
+        _live_view_show(frame, step, title="ALIGN Replay (expert)", live_view=live_view)
         sim_eef = get_sim_eef_pose(obs)
         sim_positions.append(sim_eef)
         # Step sim with expert action
@@ -502,6 +538,18 @@ def run_replay_in_sim(
     }
 
 
+def _predict_action_chunk(model, z_v_pooled_seq, z_s_seq, h_for_head):
+    """Produce an action chunk using the API required by the configured head.
+
+    Diffusion and flow-matching heads are generative: their forward method only
+    builds the conditioning tensor, so both must use ``sample_actions``.
+    Deterministic heads directly return actions through ``predict_actions``.
+    """
+    if model.head_type in ("diffusion", "flow_matching"):
+        return model.sample_actions(z_v_pooled_seq, z_s_seq, h_for_head)
+    return model.predict_actions(z_v_pooled_seq, z_s_seq, h_for_head)
+
+
 def run_model_in_sim(
     env,
     model: torch.nn.Module,
@@ -523,6 +571,7 @@ def run_model_in_sim(
     ensemble_decay: float = 0.9,
     debug: bool = False,
     timing_log: Optional[List[Dict]] = None,
+    live_view: bool = False,
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
 
@@ -677,6 +726,7 @@ def run_model_in_sim(
         current_frame_stack = _render_all_cameras()  # (V, H, W, 3)
         # Record the first camera's view for video output
         frames.append(current_frame_stack[0].copy())
+        _live_view_show(current_frame_stack[0], step, title="ALIGN Model Rollout", live_view=live_view)
 
         sim_eef = get_sim_eef_pose(obs)
         sim_positions.append(sim_eef)
@@ -724,16 +774,12 @@ def run_model_in_sim(
                         else:
                             h_for_head = intent_emb if intent_emb is not None else None
 
-                        if model.head_type == "diffusion":
-                            a_model_full = model.sample_actions(
-                                out["z_v_pooled_seq"], out["z_s_seq"],
-                                h_for_head,
-                            )
-                        else:
-                            a_model_full = model.predict_actions(
-                                out["z_v_pooled_seq"], out["z_s_seq"],
-                                h_for_head,
-                            )
+                        a_model_full = _predict_action_chunk(
+                            model,
+                            out["z_v_pooled_seq"],
+                            out["z_s_seq"],
+                            h_for_head,
+                        )
             inference_t1 = time.perf_counter()
 
             # Record this model call's index for "decay" mode weighting.
@@ -1059,7 +1105,7 @@ def save_video_3panel(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate v3 intention model on LIBERO trajectory data."
+        description="Evaluate v4 intention model on LIBERO trajectory data."
     )
     parser.add_argument("--data", required=True,
                         help="Path to HDF5 dataset.")
@@ -1144,10 +1190,21 @@ def main():
     parser.add_argument("--no-flip-horizontal", action="store_true",
                         help="Skip horizontal flip on sim and dataset frames "
                              "(default: don't flip horizontal).")
+    parser.add_argument("--live-view", action="store_true",
+                        help="Open an OpenCV window showing each sim frame in "
+                             "real-time during eval. Requires opencv-python and "
+                             "a display (X-forwarding or local monitor). Press "
+                             "'q' or ESC to close the window.")
     args = parser.parse_args()
 
+    if args.live_view and not CV2_AVAILABLE:
+        print("  ⚠️  --live-view requested but opencv-python is not installed.")
+        print("      Install with: pip install opencv-python")
+        print("      Continuing without live view.")
+        args.live_view = False
+
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"\n=== ALIGN v3 Trajectory Evaluation ===")
+    print(f"\n=== ALIGN v4 Trajectory Evaluation ===")
     print(f"  Data:        {args.data}")
     print(f"  Checkpoint:  {args.checkpoint}")
     print(f"  Device:      {device}")
@@ -1290,6 +1347,7 @@ def main():
                 use_camera="agentview_image",
                 flip_vertical=flip_vertical,
                 flip_horizontal=flip_horizontal,
+                live_view=args.live_view,
             )
             t_replay = time.time() - t0
 
@@ -1317,6 +1375,7 @@ def main():
             ensemble_decay=args.ensemble_decay,
             timing_log=ep_timing_log,
             debug=args.debug,
+            live_view=args.live_view,
         )
         if ep_timing_log is not None:
             all_timing_logs.append({"episode": ep_key, "timing": ep_timing_log})
@@ -1481,6 +1540,8 @@ def main():
             with open(timing_path, "w") as f:
                 json.dump(all_timing_logs, f, indent=2)
             print(f"  Timing log written to: {timing_path} ({len(all_timing_logs)} episodes)")
+
+    _live_view_close()
 
 
 if __name__ == "__main__":

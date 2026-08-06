@@ -191,7 +191,7 @@ python eval/eval_intention.py \
 ### MuJoCo Simulator
 
 ```bash
-python eval/eval_libero_v3_trajectory.py \
+python eval/eval_libero_v4_trajectory.py \
     --data data/libero_spatial.h5 \
     --checkpoint checkpoints/v4/libero_spatial/run_15/intention_best_fixed.pt \
     --cameras image wrist_image \
@@ -224,7 +224,7 @@ ALIGN/
 │   └── train_intention.py    # Training loop
 ├── eval/
 │   ├── eval_intention.py              # Offline evaluation
-│   └── eval_libero_v3_trajectory.py   # MuJoCo sim evaluation
+│   └── eval_libero_v4_trajectory.py   # MuJoCo sim evaluation
 ├── inference/
 │   └── align_inference.py    # Real-time inference engine
 ├── scripts/

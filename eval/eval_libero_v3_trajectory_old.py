@@ -1,7 +1,7 @@
 """Evaluate a trained ALIGNIntentionModel checkpoint that was saved with
 the OLD vision projection (2-layer MLP) on LIBERO trajectory data.
 
-This is a backward-compat wrapper around eval/eval_libero_v3_trajectory.py
+This is a backward-compat wrapper around eval/eval_libero_v4_trajectory.py
 for checkpoints that were trained BEFORE the SE-bottleneck was added
 to the vision projection. Examples: run_11, run_12, run_13, run_14.
 
@@ -69,8 +69,8 @@ from inference.run_old_checkpoint import load_old_checkpoint
 # Strategy: monkey-patch the load_intention_model function that the v3 trajectory
 # eval imports, so that it uses our old-checkpoint-aware loader instead.
 
-import eval.eval_libero_v3_trajectory as v3_eval
-from eval.eval_libero_v3_trajectory import (
+import eval.eval_libero_v4_trajectory as v3_eval
+from eval.eval_libero_v4_trajectory import (
     run_replay_in_sim,
     run_model_in_sim,
     list_episodes,

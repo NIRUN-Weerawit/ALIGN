@@ -3,7 +3,7 @@
 """Measure and compare inference speed across --action-horizon settings.
 
 Workflow:
-    1. Run eval_libero_v3_trajectory.py for each horizon H of interest, with
+    1. Run eval_libero_v4_trajectory.py for each horizon H of interest, with
        --save-timing results/timing_H.json, on the same model + dataset.
     2. Run this script with all those JSONs as inputs:
          python tools/measure_action_horizon_speed.py \\

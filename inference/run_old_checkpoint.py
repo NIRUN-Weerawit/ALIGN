@@ -195,7 +195,7 @@ def run_inference(input_path: str, data_path: str, cameras: list,
     """
     import numpy as np
     from data.align_dataset import ALIGNDataset
-    from eval.eval_libero_v3_trajectory import (
+    from eval.eval_libero_v4_trajectory import (
         run_replay_in_sim, run_model_in_sim, _extract_dataset_frames,
         save_video_3panel,
     )
@@ -264,7 +264,7 @@ def run_inference(input_path: str, data_path: str, cameras: list,
         print(f"  frames: {tuple(frames.shape)}, states: {tuple(states.shape)}")
         print(f"  model output: actions_pred {tuple(actions_pred.shape)}")
         print(f"  ✓ Model forward pass succeeded with old checkpoint (SE initialized as identity)")
-        print(f"  Use eval/eval_libero_v3_trajectory.py with --checkpoint {input_path}")
+        print(f"  Use eval/eval_libero_v4_trajectory.py with --checkpoint {input_path}")
         print(f"  to run a full MuJoCo rollout.")
         n_done += 1
 
