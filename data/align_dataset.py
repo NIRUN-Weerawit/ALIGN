@@ -30,6 +30,12 @@ from PIL import Image
 from torch.utils.data import Dataset
 from data.gripper_state import previous_gripper_commands
 
+from data.semantic_intent_labels import (
+    event_for_timestep,
+    load_episode_labels,
+    semantic_sidecar_dir,
+)
+
 
 # ================================================================
 # Constants
@@ -112,6 +118,22 @@ class ALIGNDataset(Dataset):
                 raise ValueError(f"No episodes found in {h5_path}")
         else:
             self._single_episode = False
+
+        # Semantic-intent labels are optional and auto-detected from the HDF5
+        # filename: <stem>.semantic_intent/<episode_key>.json. Missing sidecars
+        # preserve backward compatibility; malformed present files fail loudly.
+        self.semantic_intent_path = semantic_sidecar_dir(self.h5_path)
+        self._semantic_intent_labels = {}
+        if self.semantic_intent_path.is_dir():
+            for episode_key in self._episode_keys:
+                label_path = self.semantic_intent_path / f"{episode_key}.json"
+                if label_path.exists():
+                    sidecar = load_episode_labels(label_path)
+                    if sidecar.episode_key != episode_key:
+                        raise ValueError(
+                            f"Semantic sidecar episode mismatch: {sidecar.episode_key} != {episode_key}"
+                        )
+                    self._semantic_intent_labels[episode_key] = sidecar
 
         # Auto-detect camera key from actual HDF5 structure
         first_ep = self._episode_keys[0]
@@ -593,6 +615,40 @@ class ALIGNDataset(Dataset):
         else:
             robot_state_next = robot_state.copy()
 
+        semantic_event = None
+        episode_key = self._episode_keys[ep_idx]
+        semantic_sidecar = self._semantic_intent_labels.get(episode_key)
+        if semantic_sidecar is not None:
+            # Label the current end-of-window observation with the event that
+            # contains it under half-open interval semantics.
+            event = event_for_timestep(semantic_sidecar, start + last_t_local)
+            if event is not None:
+                semantic_event = {
+                    "event_id": semantic_sidecar.events.index(event),
+                    "start": event.start,
+                    "end": event.end,
+                    "frame": {
+                        "operation": event.frame.operation,
+                        "theme_name": event.frame.theme_name,
+                        "relation": event.frame.relation,
+                        "reference_name": event.frame.reference_name,
+                        "constraint": event.frame.constraint,
+                    },
+                    "theme_grounding": {
+                        "camera": event.theme_grounding.camera,
+                        "frame_offset": event.theme_grounding.frame_offset,
+                        "kind": event.theme_grounding.kind,
+                        "value": event.theme_grounding.value,
+                    },
+                    "reference_grounding": None if event.reference_grounding is None else {
+                        "camera": event.reference_grounding.camera,
+                        "frame_offset": event.reference_grounding.frame_offset,
+                        "kind": event.reference_grounding.kind,
+                        "value": event.reference_grounding.value,
+                    },
+                    "confidence": event.confidence,
+                }
+
         return {
             "frames": frames,
             "poses": poses,
@@ -602,6 +658,7 @@ class ALIGNDataset(Dataset):
             "grippers": grippers,           # (N,) float32 per-step gripper
             "robot_state": robot_state,  # (7,) — [pos(3), euler(3), gripper(1)]
             "robot_state_next": robot_state_next,  # (7,) — state at t+1
+            "semantic_event": semantic_event,
         }
 
 
