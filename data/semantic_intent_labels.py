@@ -159,6 +159,27 @@ def _event_from_dict(data: dict[str, Any]) -> EventLabel:
     )
 
 
+def semantic_sidecar_dir(h5_path: Path | str) -> Path:
+    """Derive ``<dataset-stem>.semantic_intent/`` without a new CLI flag."""
+    path = Path(h5_path)
+    return path.with_name(f"{path.stem}.semantic_intent")
+
+
+def event_for_timestep(
+    sidecar: SemanticIntentSidecar,
+    timestep: int,
+) -> Optional[EventLabel]:
+    """Return the event containing ``timestep`` under half-open semantics."""
+    if timestep < 0:
+        return None
+    for event in sidecar.events:
+        if event.start <= timestep < event.end:
+            return event
+        if event.start > timestep:
+            break
+    return None
+
+
 def segment_gripper_events(
     commands: Sequence[float],
     *,

@@ -12,6 +12,8 @@ from data.semantic_intent_labels import (
     load_episode_labels,
     save_episode_labels,
     segment_gripper_events,
+    semantic_sidecar_dir,
+    event_for_timestep,
 )
 
 
@@ -174,3 +176,30 @@ def test_segment_gripper_events_merges_short_intervals():
         (0, 4),
         (4, 7),
     ]
+
+
+def test_semantic_sidecar_dir_is_auto_derived_from_dataset_filename(tmp_path):
+    dataset = tmp_path / "libero_object.h5"
+    assert semantic_sidecar_dir(dataset) == tmp_path / "libero_object.semantic_intent"
+
+
+def test_event_for_timestep_uses_half_open_intervals():
+    first = make_event()
+    second = EventLabel(
+        start=12,
+        end=20,
+        frame=first.frame,
+        theme_grounding=first.theme_grounding,
+        reference_grounding=first.reference_grounding,
+        confidence=first.confidence,
+        provenance=first.provenance,
+    )
+    sidecar = SemanticIntentSidecar(
+        schema_version=1,
+        episode_key="ep_000",
+        events=(first, second),
+    )
+
+    assert event_for_timestep(sidecar, 11) == first
+    assert event_for_timestep(sidecar, 12) == second
+    assert event_for_timestep(sidecar, 20) is None
