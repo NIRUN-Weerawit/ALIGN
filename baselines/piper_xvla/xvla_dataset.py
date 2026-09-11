@@ -59,9 +59,13 @@ def open_piper_xvla_dataset(root: str | Path) -> tuple["PiperXVLAAdapterDataset"
         raise ValueError(f"no intact replay episodes found under {root}")
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    source = LeRobotDataset(
-        repo_id="local/piper-replay", root=root, episodes=episodes, return_uint8=True
-    )
+    kwargs = {"repo_id": "local/piper-replay", "root": root, "episodes": episodes}
+    try:
+        source = LeRobotDataset(**kwargs, return_uint8=True)
+    except TypeError as exc:
+        if "return_uint8" not in str(exc):
+            raise
+        source = LeRobotDataset(**kwargs)
     lower, upper = _observed_gripper_limits(root)
     conversion = PiperXVLAConversion(lower, upper)
     return PiperXVLAAdapterDataset(source, conversion), conversion
