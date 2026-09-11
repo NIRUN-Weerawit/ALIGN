@@ -83,7 +83,20 @@ All run settings are in:
 piper_xvla/config/piper_xvla_single_task.json
 ```
 
-Edit that file to change output path, epochs, batch size, validation count, learning rate, checkpoint, or device. The CLI takes only an optional config path:
+This follows the official [X-VLA new-embodiment fine-tuning guidance](https://huggingface.co/docs/lerobot/en/xvla): BF16 full adaptation, with neither VLM encoder frozen and both the policy transformer and soft prompts trainable. The settings are explicit rather than inherited from library defaults:
+
+```text
+steps = 20,000
+batch_size = 4
+freeze_vision_encoder = false
+freeze_language_encoder = false
+train_policy_transformer = true
+train_soft_prompts = true
+```
+
+It also uses X-VLA's official optimizer preset: differential AdamW learning rates (VLM at 1/10 the base rate) and a 1,000-step warmup followed by cosine decay across the 20,000-step run. The Piper target remains `action_mode = ee6d`, not generic `auto`, because the data has a defined EE6D layout and binary gripper targets.
+
+Edit the file to change output path, steps, batch size, validation count, checkpoint, or device. The CLI takes only an optional config path:
 
 ```bash
 cd ~/ALIGN/baselines
@@ -97,7 +110,10 @@ Artifacts:
 ```text
 outputs/piper_xvla_single_task/split.json
 outputs/piper_xvla_single_task/best.pt
+outputs/piper_xvla_single_task/last.pt
 ```
+
+`best.pt` is selected by held-out validation loss. `last.pt` is overwritten every 1,000 steps and at the final step, so it contains optimizer and scheduler state suitable for inspecting the most recent run state.
 
 The default uses one-step action supervision at 20 Hz because each replay label is measured `state[t+1]`. The script explicitly sets:
 
@@ -113,7 +129,7 @@ This avoids fabricating 30-step targets from data that only records one-step mea
 Before treating a resulting checkpoint as deployable:
 
 1. Confirm `best.pt` exists and validation loss is finite.
-2. Plot train versus validation loss from the printed JSON epoch records; rising validation loss indicates overfit.
+2. Plot train versus validation loss from the printed JSON step records; rising validation loss indicates overfit.
 3. Run offline action-range inspection on held-out episodes. Confirm predicted xyz stays within the Piper workspace, quaternion norm is valid after conversion, and gripper output stays in `[0,1]`.
 4. Run a **read-only** camera/Piper observation pass with the saved checkpoint before enabling any motion path.
 5. Only after offline and read-only checks should a separate, explicit physical execution procedure be considered.

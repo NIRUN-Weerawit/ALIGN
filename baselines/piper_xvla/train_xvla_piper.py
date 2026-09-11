@@ -11,7 +11,6 @@ METRICS: train/loss and val/loss; best.pt is selected by val/loss.
 from __future__ import annotations
 
 import argparse
-import itertools
 import json
 from pathlib import Path
 
@@ -21,7 +20,13 @@ from torch.utils.data import DataLoader
 from piper_xvla.xvla_dataset import PiperXVLAConversion, PiperXVLALiberoAdapterDataset
 
 
-CONFIG_KEYS = {"manifest", "checkpoint", "output", "epochs", "batch_size", "val_episodes", "lr", "device"}
+CONFIG_KEYS = {
+    "manifest", "checkpoint", "output", "steps", "batch_size", "val_episodes", "device",
+    "action_mode", "freeze_vision_encoder", "freeze_language_encoder",
+    "train_policy_transformer", "train_soft_prompts", "optimizer_lr",
+    "scheduler_warmup_steps", "scheduler_decay_steps", "scheduler_decay_lr",
+    "validate_every_steps", "save_every_steps",
+}
 
 
 def load_config(path: str | Path) -> dict:
@@ -38,6 +43,22 @@ def split_episode_ids(episode_ids: list[int], val_count: int) -> tuple[list[int]
     if val_count <= 0 or val_count >= len(episode_ids):
         raise ValueError("val_count must be between 1 and len(episode_ids)-1")
     return episode_ids[:-val_count], episode_ids[-val_count:]
+
+
+def apply_xvla_finetuning_config(config, values: dict) -> None:
+    """Apply the official X-VLA new-embodiment fine-tuning settings explicitly."""
+    config.device = values["device"]
+    config.dtype = "bfloat16"
+    config.action_mode = values["action_mode"]
+    config.tokenizer_max_length = 64
+    # Piper pendant replay supplies one measured future-state label per frame.
+    config.chunk_size = config.n_action_steps = 1
+    for key in (
+        "freeze_vision_encoder", "freeze_language_encoder",
+        "train_policy_transformer", "train_soft_prompts", "optimizer_lr",
+        "scheduler_warmup_steps", "scheduler_decay_steps", "scheduler_decay_lr",
+    ):
+        setattr(config, key, values[key])
 
 
 def _dataset(root: str, episode_ids: list[int], gripper: dict):
@@ -63,21 +84,42 @@ def _prepare(batch: dict, tokenizer, device: str) -> dict:
     return {key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value for key, value in batch.items()}
 
 
-def _mean_loss(policy, loader, tokenizer, device: str, *, train: bool, optimizer=None) -> float:
+def _mean_loss(policy, loader, tokenizer, device: str) -> float:
     values = []
-    context = torch.enable_grad() if train else torch.no_grad()
-    with context:
+    with torch.no_grad():
         for batch in loader:
             batch = _prepare(batch, tokenizer, device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
                 loss, _ = policy(batch)
-            if train:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 10.0)
-                optimizer.step()
             values.append(float(loss.detach().cpu()))
     return sum(values) / len(values)
+
+
+def _train_step(policy, batch: dict, tokenizer, device: str, optimizer, scheduler, grad_clip_norm: float) -> float:
+    batch = _prepare(batch, tokenizer, device)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+        loss, _ = policy(batch)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+    optimizer.step()
+    scheduler.step()
+    return float(loss.detach().cpu())
+
+
+def _save_checkpoint(path: Path, *, step: int, policy, optimizer, scheduler, val_loss: float | None, split: dict) -> None:
+    torch.save(
+        {
+            "step": step,
+            "model": policy.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "val_loss": val_loss,
+            "split": split,
+            "xvla_config": policy.config.to_dict(),
+        },
+        path,
+    )
 
 
 def main() -> None:
@@ -96,21 +138,43 @@ def main() -> None:
     from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
     tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
     config = PreTrainedConfig.from_pretrained(config_values["checkpoint"])
-    config.device, config.dtype = config_values["device"], "bfloat16"
-    config.tokenizer_max_length, config.chunk_size, config.n_action_steps = 64, 1, 1
+    apply_xvla_finetuning_config(config, config_values)
     policy = XVLAPolicy.from_pretrained(config_values["checkpoint"], config=config, local_files_only=True, strict=True)
-    optimizer = torch.optim.AdamW(policy.parameters(), lr=config_values["lr"], betas=(0.9, 0.99))
+    optimizer_preset = config.get_optimizer_preset()
+    optimizer = optimizer_preset.build(policy.get_optim_params())
+    scheduler = config.get_scheduler_preset().build(optimizer, config_values["steps"])
 
     output = Path(config_values["output"]); output.mkdir(parents=True, exist_ok=True)
-    (output / "split.json").write_text(json.dumps({"train_episode_ids": train_ids, "val_episode_ids": val_ids}, indent=2) + "\n")
+    split = {"train_episode_ids": train_ids, "val_episode_ids": val_ids}
+    (output / "split.json").write_text(json.dumps(split, indent=2) + "\n")
     best = float("inf")
-    for epoch in range(1, config_values["epochs"] + 1):
-        policy.train(); train_loss = _mean_loss(policy, train_loader, tokenizer, config_values["device"], train=True, optimizer=optimizer)
-        policy.eval(); val_loss = _mean_loss(policy, val_loader, tokenizer, config_values["device"], train=False)
-        print(json.dumps({"epoch": epoch, "train/loss": train_loss, "val/loss": val_loss}))
-        if val_loss < best:
-            best = val_loss
-            torch.save({"epoch": epoch, "model": policy.state_dict(), "optimizer": optimizer.state_dict(), "val_loss": val_loss, "split": {"train": train_ids, "val": val_ids}}, output / "best.pt")
+    train_iter = iter(train_loader)
+    recent_train_losses: list[float] = []
+    for step in range(1, config_values["steps"] + 1):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+        policy.train()
+        recent_train_losses.append(_train_step(
+            policy, batch, tokenizer, config_values["device"], optimizer, scheduler,
+            optimizer_preset.grad_clip_norm,
+        ))
+
+        validate_now = step % config_values["validate_every_steps"] == 0 or step == config_values["steps"]
+        save_now = step % config_values["save_every_steps"] == 0 or step == config_values["steps"]
+        val_loss = None
+        if validate_now:
+            policy.eval()
+            val_loss = _mean_loss(policy, val_loader, tokenizer, config_values["device"])
+            print(json.dumps({"step": step, "train/loss": sum(recent_train_losses) / len(recent_train_losses), "val/loss": val_loss}))
+            recent_train_losses.clear()
+            if val_loss < best:
+                best = val_loss
+                _save_checkpoint(output / "best.pt", step=step, policy=policy, optimizer=optimizer, scheduler=scheduler, val_loss=val_loss, split=split)
+        if save_now:
+            _save_checkpoint(output / "last.pt", step=step, policy=policy, optimizer=optimizer, scheduler=scheduler, val_loss=val_loss, split=split)
 
 
 if __name__ == "__main__":
