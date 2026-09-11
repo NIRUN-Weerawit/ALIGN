@@ -17,16 +17,21 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from piper_xvla.xvla_dataset import PiperXVLAConversion, PiperXVLALiberoAdapterDataset
+from piper_xvla.xvla_dataset import CachedPiperXVLALiberoDataset, load_prepared_numeric_cache
 
 
 CONFIG_KEYS = {
-    "manifest", "checkpoint", "output", "steps", "batch_size", "val_episodes", "device",
+    "manifest", "prepared_cache", "checkpoint", "output", "steps", "batch_size", "val_episodes", "device",
     "action_mode", "freeze_vision_encoder", "freeze_language_encoder",
     "train_policy_transformer", "train_soft_prompts", "optimizer_lr",
     "scheduler_warmup_steps", "scheduler_decay_steps", "scheduler_decay_lr",
     "validate_every_steps", "save_every_steps",
 }
+
+
+def status(stage: int, total: int, message: str) -> None:
+    """Emit clear, flushed lifecycle markers for long-running remote training."""
+    print(f"[train stage {stage}/{total}] {message}", flush=True)
 
 
 def load_config(path: str | Path) -> dict:
@@ -61,7 +66,7 @@ def apply_xvla_finetuning_config(config, values: dict) -> None:
         setattr(config, key, values[key])
 
 
-def _dataset(root: str, episode_ids: list[int], gripper: dict):
+def _open_source_dataset(root: str, episode_ids: list[int]):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     kwargs = dict(repo_id="local/piper-replay", root=root, episodes=episode_ids)
     # LeRobot 0.5.x exposes return_uint8; older releases do not.  The
@@ -73,8 +78,7 @@ def _dataset(root: str, episode_ids: list[int], gripper: dict):
         if "return_uint8" not in str(exc):
             raise
         source = LeRobotDataset(**kwargs)
-    conversion = PiperXVLAConversion(gripper["raw_meters_min"], gripper["raw_meters_max"])
-    return PiperXVLALiberoAdapterDataset(source, conversion)
+    return source
 
 
 def _prepare(batch: dict, tokenizer, device: str) -> dict:
@@ -126,13 +130,28 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="piper_xvla/config/piper_xvla_single_task.json")
     args = parser.parse_args()
+    total_stages = 6
+    status(1, total_stages, "loading explicit training configuration")
     config_values = load_config(args.config)
 
+    status(2, total_stages, "loading manifest and validating prepared numeric cache")
     manifest = json.loads(Path(config_values["manifest"]).read_text())
+    prepared_cache = load_prepared_numeric_cache(config_values["prepared_cache"], manifest)
     train_ids, val_ids = split_episode_ids(manifest["source_episode_ids"], config_values["val_episodes"])
-    train_loader = DataLoader(_dataset(manifest["source_dataset"], train_ids, manifest["gripper_normalization"]), batch_size=config_values["batch_size"], shuffle=True, num_workers=0)
-    val_loader = DataLoader(_dataset(manifest["source_dataset"], val_ids, manifest["gripper_normalization"]), batch_size=config_values["batch_size"], shuffle=False, num_workers=0)
 
+    status(3, total_stages, "opening train/validation image sources and attaching shared prepared labels")
+    train_dataset = CachedPiperXVLALiberoDataset(
+        _open_source_dataset(manifest["source_dataset"], train_ids), prepared_cache,
+    )
+    val_dataset = CachedPiperXVLALiberoDataset(
+        _open_source_dataset(manifest["source_dataset"], val_ids), prepared_cache,
+    )
+    if len(train_dataset) + len(val_dataset) != manifest["frame_count"]:
+        raise ValueError("source frame split does not cover the manifest frame count")
+    train_loader = DataLoader(train_dataset, batch_size=config_values["batch_size"], shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_dataset, batch_size=config_values["batch_size"], shuffle=False, num_workers=0)
+
+    status(4, total_stages, "loading tokenizer, X-VLA checkpoint, optimizer, and scheduler")
     from transformers import AutoTokenizer
     from lerobot.configs import PreTrainedConfig
     from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
@@ -144,12 +163,14 @@ def main() -> None:
     optimizer = optimizer_preset.build(policy.get_optim_params())
     scheduler = config.get_scheduler_preset().build(optimizer, config_values["steps"])
 
+    status(5, total_stages, "writing reproducibility artifacts")
     output = Path(config_values["output"]); output.mkdir(parents=True, exist_ok=True)
     split = {"train_episode_ids": train_ids, "val_episode_ids": val_ids}
     (output / "split.json").write_text(json.dumps(split, indent=2) + "\n")
     best = float("inf")
     train_iter = iter(train_loader)
     recent_train_losses: list[float] = []
+    status(6, total_stages, f"starting {config_values['steps']:,} optimizer steps; validation/save every {config_values['validate_every_steps']:,}/{config_values['save_every_steps']:,} steps")
     for step in range(1, config_values["steps"] + 1):
         try:
             batch = next(train_iter)

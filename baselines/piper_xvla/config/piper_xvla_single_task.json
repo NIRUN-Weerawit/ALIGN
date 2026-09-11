@@ -1,5 +1,6 @@
 {
   "manifest": "data/piper_replay/xvla_training_manifest.json",
+  "prepared_cache": "data/piper_replay/piper_xvla_prepared_cache.pt",
   "checkpoint": "/media/ucluser/PortableSSD/hf_models/xvla-libero",
   "output": "outputs/piper_xvla_single_task",
   "steps": 20000,
