@@ -83,6 +83,23 @@ All run settings are in:
 piper_xvla/config/piper_xvla_single_task.json
 ```
 
+The cache contains only converted numeric tensors plus source frame/episode indices; it does **not** duplicate camera images. Its actual size for this dataset is 3.34 MiB. Build it once before training:
+
+```bash
+cd ~/ALIGN/baselines
+PYTHONPATH=. ~/miniconda3/envs/lerobot/bin/python \
+  -m piper_xvla.prepare_xvla_cache \
+  --config piper_xvla/config/piper_xvla_single_task.json
+```
+
+The configured artifact is:
+
+```text
+data/piper_replay/piper_xvla_prepared_cache.pt
+```
+
+The training script validates that the cache refers to the exact manifest/source episode set before opening images. It prints six explicit lifecycle stages: config, cache validation, image datasets, model/optimizer, artifact writing, and training. At 1,000-step intervals it prints a JSON train/validation loss record.
+
 This follows the official [X-VLA new-embodiment fine-tuning guidance](https://huggingface.co/docs/lerobot/en/xvla): BF16 full adaptation, with neither VLM encoder frozen and both the policy transformer and soft prompts trainable. The settings are explicit rather than inherited from library defaults:
 
 ```text

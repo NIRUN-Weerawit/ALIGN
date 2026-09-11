@@ -1,12 +1,13 @@
 import json
 
-from piper_xvla.train_xvla_piper import apply_xvla_finetuning_config, load_config
+from piper_xvla.train_xvla_piper import apply_xvla_finetuning_config, load_config, status
 
 
 def test_load_config_reads_every_training_setting_from_json(tmp_path):
     path = tmp_path / "config.json"
     payload = {
-        "manifest": "/data/manifest.json", "checkpoint": "/models/xvla", "output": "/output",
+        "manifest": "/data/manifest.json", "prepared_cache": "/data/prepared.pt",
+        "checkpoint": "/models/xvla", "output": "/output",
         "steps": 20_000, "batch_size": 4, "val_episodes": 4, "device": "cuda",
         "action_mode": "ee6d", "freeze_vision_encoder": False,
         "freeze_language_encoder": False, "train_policy_transformer": True,
@@ -46,3 +47,9 @@ def test_apply_xvla_finetuning_config_explicitly_enables_official_new_embodiment
         assert getattr(config, key) is True
     assert config.optimizer_lr == 1e-4
     assert config.scheduler_decay_steps == 20_000
+
+
+def test_status_prints_an_explicit_flushed_stage_marker(capsys):
+    status(3, 6, "attaching prepared labels")
+
+    assert capsys.readouterr().out == "[train stage 3/6] attaching prepared labels\n"

@@ -193,3 +193,120 @@ class PiperXVLALiberoAdapterDataset(PiperXVLAAdapterDataset):
             device=raw["observation.images.image"].device,
         )
         return raw
+
+
+def build_prepared_numeric_cache(
+    raw_states: np.ndarray,
+    raw_actions: np.ndarray,
+    global_indices: np.ndarray,
+    episode_indices: np.ndarray,
+    conversion: PiperXVLAConversion,
+) -> dict[str, Any]:
+    """Convert Piper numeric targets once, keyed by immutable dataset frame index.
+
+    Images are deliberately excluded. They remain in the legacy embedded-PNG
+    Parquet data, avoiding a large duplicate cache.
+    """
+    states = np.asarray(raw_states, dtype=np.float32)
+    actions = np.asarray(raw_actions, dtype=np.float32)
+    indices = np.asarray(global_indices, dtype=np.int64)
+    episodes = np.asarray(episode_indices, dtype=np.int64)
+    if states.ndim != 2 or states.shape[1] != 10 or actions.shape != states.shape:
+        raise ValueError("prepared cache requires matching raw state/action arrays with shape (N, 10)")
+    if len(indices) != len(states) or len(episodes) != len(states) or len(indices) == 0:
+        raise ValueError("prepared cache index arrays must be non-empty and match numeric rows")
+    if indices.min() < 0 or len(np.unique(indices)) != len(indices):
+        raise ValueError("prepared cache global frame indices must be unique non-negative integers")
+    if not np.isfinite(states).all() or not np.isfinite(actions).all():
+        raise ValueError("prepared cache source vectors must be finite")
+
+    capacity = int(indices.max()) + 1
+    state_cache = np.zeros((capacity, 8), dtype=np.float32)
+    action_cache = np.zeros((capacity, 20), dtype=np.float32)
+    available = np.zeros(capacity, dtype=np.bool_)
+    cached_episodes = np.full(capacity, -1, dtype=np.int64)
+
+    col0 = states[:, [3, 5, 7]].copy()
+    col1 = states[:, [4, 6, 8]].copy()
+    col0_norm = np.linalg.norm(col0, axis=1, keepdims=True)
+    if np.any(col0_norm <= 0):
+        raise ValueError("prepared cache found degenerate rotation-6D first column")
+    col0 /= col0_norm
+    col1 -= col0 * np.sum(col0 * col1, axis=1, keepdims=True)
+    col1_norm = np.linalg.norm(col1, axis=1, keepdims=True)
+    if np.any(col1_norm <= 0):
+        raise ValueError("prepared cache found degenerate rotation-6D second column")
+    col1 /= col1_norm
+    matrices = np.stack((col0, col1, np.cross(col0, col1)), axis=-1)
+    from scipy.spatial.transform import Rotation
+
+    state_cache[indices, :3] = states[:, :3]
+    state_cache[indices, 3:7] = Rotation.from_matrix(matrices).as_quat().astype(np.float32)
+    state_cache[indices, 7] = np.clip(
+        (states[:, 9] - conversion.gripper_min_m) / (conversion.gripper_max_m - conversion.gripper_min_m), 0.0, 1.0
+    )
+    action_cache[indices, :9] = actions[:, :9]
+    action_cache[indices, 9] = np.clip(
+        (actions[:, 9] - conversion.gripper_min_m) / (conversion.gripper_max_m - conversion.gripper_min_m), 0.0, 1.0
+    )
+    available[indices] = True
+    cached_episodes[indices] = episodes
+    return {
+        "format": "piper-xvla-prepared-cache-v1",
+        "state": torch.from_numpy(state_cache),
+        "action": torch.from_numpy(action_cache),
+        "available": torch.from_numpy(available),
+        "episode_index": torch.from_numpy(cached_episodes),
+        "frame_count": len(indices),
+    }
+
+
+def load_prepared_numeric_cache(path: str | Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Load and validate a cache against the exact immutable source manifest."""
+    cache_path = Path(path)
+    if not cache_path.is_file():
+        raise FileNotFoundError(
+            f"prepared cache not found: {cache_path}; run python -m piper_xvla.prepare_xvla_cache first"
+        )
+    cache = torch.load(cache_path, map_location="cpu", weights_only=True)
+    expected_root = str(Path(manifest["source_dataset"]).resolve())
+    expected_episodes = [int(x) for x in manifest["source_episode_ids"]]
+    if cache.get("format") != "piper-xvla-prepared-cache-v1":
+        raise ValueError("prepared cache format is unsupported")
+    if cache.get("source_dataset") != expected_root:
+        raise ValueError("prepared cache source dataset does not match manifest")
+    if cache.get("source_episode_ids") != expected_episodes:
+        raise ValueError("prepared cache episode IDs do not match manifest")
+    if cache.get("frame_count") != manifest["frame_count"]:
+        raise ValueError("prepared cache frame count does not match manifest")
+    if int(cache["available"].sum()) != manifest["frame_count"]:
+        raise ValueError("prepared cache availability mask does not match manifest frame count")
+    return cache
+
+
+class CachedPiperXVLALiberoDataset(Dataset):
+    """Read images from source data while using precomputed X-VLA numeric tensors."""
+
+    def __init__(self, source: Any, prepared_cache: dict[str, Any]) -> None:
+        if prepared_cache.get("format") != "piper-xvla-prepared-cache-v1":
+            raise ValueError("unrecognized prepared Piper X-VLA cache format")
+        self.source = source
+        self.cache = prepared_cache
+
+    def __len__(self) -> int:
+        return len(self.source)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        raw = dict(self.source[index])
+        global_index = int(raw["index"])
+        if global_index >= len(self.cache["available"]) or not bool(self.cache["available"][global_index]):
+            raise KeyError(f"prepared cache lacks source frame index {global_index}")
+        raw["observation.state"] = self.cache["state"][global_index]
+        raw["action"] = self.cache["action"][global_index]
+        raw["observation.images.image"] = raw.pop("observation.images.global_rgb")
+        raw["observation.images.image2"] = raw.pop("observation.images.wrist_rgb")
+        raw["observation.images.empty_camera_0"] = torch.zeros(
+            (3, 224, 224), dtype=raw["observation.images.image"].dtype,
+            device=raw["observation.images.image"].device,
+        )
+        return raw
