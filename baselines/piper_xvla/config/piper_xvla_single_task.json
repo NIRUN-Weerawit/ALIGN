@@ -1,0 +1,10 @@
+{
+  "manifest": "data/piper_replay/xvla_training_manifest.json",
+  "checkpoint": "/media/ucluser/PortableSSD/hf_models/xvla-libero",
+  "output": "outputs/piper_xvla_single_task",
+  "epochs": 10,
+  "batch_size": 1,
+  "val_episodes": 11,
+  "lr": 1e-05,
+  "device": "cuda"
+}
