@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Piper X-VLA — Collection & Review</title>
+<style>
+  :root {
+    --bg: #0f1216; --panel: #171c22; --panel2: #1d242c; --border: #2a333d;
+    --fg: #e6edf3; --muted: #8b98a5; --accent: #4ea1ff; --ok: #3fb950;
+    --warn: #d29922; --err: #f85149; --chip: #232c36;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  h1 { font-size: 17px; margin: 0; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
+       color: var(--muted); margin: 0 0 10px; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 18px;
+           background: var(--panel); border-bottom: 1px solid var(--border);
+           position: sticky; top: 0; z-index: 5; }
+  header .title { display:flex; flex-direction:column; gap:2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .pills { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
+  .pill { background: var(--chip); border: 1px solid var(--border); border-radius: 20px;
+          padding: 4px 12px; font-size: 12px; display:flex; gap:6px; align-items:center; }
+  .pill b { font-weight: 600; }
+  .dot { width:8px; height:8px; border-radius:50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+  main { display: grid; grid-template-columns: minmax(360px, 420px) 1fr; gap: 16px; padding: 16px; }
+  @media (max-width: 980px){ main { grid-template-columns: 1fr; } }
+  .col { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  button { background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
+           border-radius: 7px; padding: 8px 13px; font-size: 13px; cursor: pointer; transition: .12s; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color:#04121f; border-color: var(--accent); font-weight:600; }
+  button.danger { background: #3a1518; color:#ffb3ad; border-color:#5c2226; font-weight:600; }
+  button.warn { background:#3a2e12; color:#ffd791; border-color:#5c4a1f; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input[type=text], input[type=number] { background: var(--panel2); border:1px solid var(--border);
+        color:var(--fg); border-radius:7px; padding:8px 10px; font-size:13px; }
+  .cam-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .cam { position:relative; background:#000; border-radius:8px; overflow:hidden; aspect-ratio:4/3; }
+  .cam img { width:100%; height:100%; object-fit:cover; display:block; }
+  .cam .lbl { position:absolute; top:6px; left:6px; background:rgba(0,0,0,.6); padding:2px 8px;
+              border-radius:5px; font-size:11px; }
+  .kv { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px dashed var(--border); font-size:13px; }
+  .kv:last-child{ border-bottom:none; }
+  .kv .k{ color:var(--muted); }
+  .bar { height:8px; background:var(--panel2); border-radius:5px; overflow:hidden; margin-top:6px; }
+  .bar > div { height:100%; background:var(--accent); width:0%; transition:width .3s; }
+  .log { background:#0b0e12; border:1px solid var(--border); border-radius:8px; padding:10px;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; height:150px;
+         overflow:auto; white-space:pre-wrap; color:#a9c4d8; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--border); }
+  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
+  tr.ep { cursor:pointer; } tr.ep:hover { background:var(--panel2); }
+  tr.ep.active { background:#1c2a3a; }
+  .thumbs { display:flex; gap:4px; }
+  .thumbs img { width:56px; height:42px; object-fit:cover; border-radius:4px; border:1px solid var(--border); }
+  canvas.chart { width:100%; height:180px; background:#0b0e12; border:1px solid var(--border); border-radius:8px; }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:6px; }
+  .legend span i { display:inline-block; width:10px; height:3px; margin-right:4px; vertical-align:middle; }
+  video { width:100%; border-radius:8px; background:#000; max-height:420px; }
+  .muted{ color:var(--muted); font-size:12px; }
+  .spacer{ flex:1; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; background:var(--chip); border:1px solid var(--border);}
+  .badge.ok{ color:var(--ok); border-color:#2a4a30;} .badge.no{ color:var(--muted);}
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media (max-width:760px){ .grid2{ grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <div class="title">
+    <h1>Piper X-VLA — Collection &amp; Review</h1>
+    <div class="sub" id="conn-sub">connecting…</div>
+  </div>
+  <div class="pills">
+    <span class="pill"><span class="dot" id="d-mode"></span><b id="p-mode">—</b></span>
+    <span class="pill">teach <b id="p-teach">—</b></span>
+    <span class="pill">err <b id="p-err">—</b></span>
+    <span class="pill"><span class="dot" id="d-driver"></span><b id="p-driver">—</b></span>
+  </div>
+</header>
+
+<main>
+  <!-- LEFT: control + live -->
+  <section class="col">
+    <div class="card">
+      <h2>Live Cameras</h2>
+      <div class="cam-grid">
+        <div class="cam"><span class="lbl">global</span><img id="cam-global" alt="global"></div>
+        <div class="cam"><span class="lbl">wrist</span><img id="cam-wrist" alt="wrist"></div>
+      </div>
+      <div class="muted" style="margin-top:8px" id="cam-note">polling every 1.5 s</div>
+    </div>
+
+    <div class="card">
+      <h2>Status</h2>
+      <div class="kv"><span class="k">feedback</span><b id="s-feedback">—</b></div>
+      <div class="kv"><span class="k">control mode</span><b id="s-mode">—</b></div>
+      <div class="kv"><span class="k">arm state</span><b id="s-arm">—</b></div>
+      <div class="kv"><span class="k">teach state</span><b id="s-teach">—</b></div>
+      <div class="kv"><span class="k">motion</span><b id="s-motion">—</b></div>
+      <div class="kv"><span class="k">error code</span><b id="s-err">—</b></div>
+      <div class="kv"><span class="k">drivers</span><b id="s-drivers">—</b></div>
+      <div class="kv"><span class="k">joints (deg)</span><b id="s-joints" style="font-size:11px">—</b></div>
+    </div>
+
+    <div class="card">
+      <h2>Runtime Settings</h2>
+      <div class="row" style="margin-bottom:9px">
+        <label class="muted">Replay speed (%)</label><input type="number" id="cfg-speed" min="1" max="100" style="width:75px">
+        <button onclick="saveSettings()">Save settings</button>
+        <button onclick="loadSettings()">Reload</button>
+      </div>
+      <div class="grid2">
+        <div>
+          <div class="muted" style="margin-bottom:5px">Global camera</div>
+          <input type="text" id="cfg-global-device" placeholder="/dev/video14" style="width:100%;margin-bottom:5px">
+          <div class="row"><input type="number" id="cfg-global-width" placeholder="width" style="width:78px"><input type="number" id="cfg-global-height" placeholder="height" style="width:78px"><input type="number" id="cfg-global-fps" placeholder="fps" style="width:62px"></div>
+        </div>
+        <div>
+          <div class="muted" style="margin-bottom:5px">Wrist camera</div>
+          <input type="text" id="cfg-wrist-device" placeholder="/dev/video8" style="width:100%;margin-bottom:5px">
+          <div class="row"><input type="number" id="cfg-wrist-width" placeholder="width" style="width:78px"><input type="number" id="cfg-wrist-height" placeholder="height" style="width:78px"><input type="number" id="cfg-wrist-fps" placeholder="fps" style="width:62px"></div>
+        </div>
+      </div>
+      <div class="muted" style="margin-top:8px" id="cfg-note">Loading settings…</div>
+    </div>
+
+    <div class="card">
+      <h2>Arm Control</h2>
+      <div class="row" style="margin-bottom:8px">
+        <button class="primary" data-needs-feedback onclick="replay('start')">▶ Replay</button>
+        <button data-needs-feedback onclick="replay('pause')">⏸ Pause</button>
+        <button data-needs-feedback onclick="replay('move_start')">→ Move to start</button>
+      </div>
+      <div class="row">
+        <button data-needs-feedback onclick="arm('enable')">Enable</button>
+        <button data-needs-feedback onclick="arm('disable')">Disable</button>
+        <button data-needs-feedback onclick="setMode('standby')">Mode: Standby</button>
+        <button data-needs-feedback onclick="setMode('can')">Mode: CAN control</button>
+        <button data-needs-feedback onclick="arm('reset')">Reset</button>
+        <button class="danger" onclick="estop()">⛔ E-STOP</button>
+      </div>
+      <div class="muted" style="margin-top:8px">Replay/offline mode is pendant-owned; host mode controls only Standby and CAN control.</div>
+    </div>
+
+    <div class="card">
+      <h2>Collect Episode</h2>
+      <div class="row" style="margin-bottom:8px">
+        <input type="text" id="task" placeholder="task description, e.g. put cube in basket" style="flex:1; min-width:180px">
+        <button onclick="saveTask()">Set task</button>
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <label class="muted">window cap (s)</label>
+        <input type="number" id="window" value="40" min="5" max="300" style="width:80px">
+        <button class="primary" id="btn-collect-start" onclick="startCollect()">● Start collect</button>
+        <button class="danger" id="btn-collect-stop" onclick="stopCollect()" disabled>Stop</button>
+      </div>
+      <div class="muted" style="margin-top:8px">Start collect only records camera + measured arm state. When you are ready, press Replay separately; stop collection manually after the motion finishes.</div>
+      <div class="kv"><span class="k">state</span><b id="c-state">idle</b></div>
+      <div class="kv"><span class="k">frames</span><b id="c-frames">0</b></div>
+      <div class="bar"><div id="c-bar"></div></div>
+      <div class="log" id="c-log"></div>
+    </div>
+  </section>
+
+  <!-- RIGHT: dataset + review -->
+  <section class="col">
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <h2 style="margin:0">Dataset</h2>
+        <span class="spacer"></span>
+        <span class="muted" id="ds-summary">—</span>
+        <button onclick="loadDataset()">↻ Refresh</button>
+      </div>
+      <table id="ep-table">
+        <thead><tr><th>#</th><th>Frames</th><th>Dur</th><th>Task</th><th>Video</th><th></th></tr></thead>
+        <tbody id="ep-body"><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card" id="detail-card" style="display:none">
+      <h2 id="detail-title">Episode detail</h2>
+      <div class="thumbs" id="detail-thumbs"></div>
+      <div class="grid2" style="margin-top:14px">
+        <div>
+          <div class="muted" style="margin-bottom:6px">observation.state (10-D)</div>
+          <canvas class="chart" id="chart-state" width="520" height="180"></canvas>
+        </div>
+        <div>
+          <div class="muted" style="margin-bottom:6px">action = next measured state (10-D)</div>
+          <canvas class="chart" id="chart-action" width="520" height="180"></canvas>
+        </div>
+      </div>
+      <div class="legend" id="chart-legend"></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="margin-bottom:10px"><h2 style="margin:0">Review Video</h2><span class="spacer"></span><button onclick="migrateVideos()">Convert legacy videos to H.264</button><button onclick="loadVideos()">↻ Refresh</button></div>
+      <div class="row" style="margin-bottom:10px">
+        <select id="video-select" style="flex:1; background:var(--panel2); color:var(--fg); border:1px solid var(--border); border-radius:7px; padding:8px;"></select>
+        <a id="video-download" class="badge" download>Download</a>
+      </div>
+      <video id="player" controls playsinline></video>
+      <div class="muted" id="video-note" style="margin-top:8px">Browser-ready H.264 videos are written to images/review/. Legacy mp4v videos can be converted with the button above.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+const API = "";
+let statusTimer=null, camTimer=null, collectTimer=null;
+
+async function j(url, opts){
+  const r = await fetch(API+url, opts);
+  let body={}; try{ body=await r.json(); }catch(_){ body={detail:await r.text()}; }
+  if(!r.ok) throw new Error(body.detail || body.error || r.statusText);
+  return body;
+}
+async function jp(url, body){ return j(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}); }
+async function report(label, work){ try{return await work();}catch(e){ const m=`${label}: ${e.message}`; log(m); alert(m); return null; } }
+
+function log(msg){ const el=document.getElementById('c-log'); el.textContent += msg+"\n"; el.scrollTop=el.scrollHeight; }
+
+// ---- status -------------------------------------------------------------
+async function pollStatus(){
+  try{
+    const s = await j('/api/status');
+    const source=s.feedback_state||'UNKNOWN';
+    const usable=!!s.feedback_ok;
+    const detail=s.feedback_reason||'';
+    const rates=s.feedback_hz||{};
+    document.getElementById('conn-sub').textContent = `can=${s.can} · ${source} · ${detail}${source==='LIVE'?` · status ${rates.status||0} Hz`:''} · speed ${s.speed}%`;
+    document.getElementById('s-feedback').textContent = `${source}${detail?` — ${detail}`:''}`;
+    document.querySelectorAll('[data-needs-feedback]').forEach(b=>{ b.disabled=!usable; b.title=usable?'':'Disabled: live Piper feedback is unavailable'; });
+    const resumeButton=document.getElementById('btn-replay-resume');
+    resumeButton.title=usable?'Continue taught trajectory reproduction':'Disabled: live Piper feedback is unavailable';
+    const modeName=usable?s.ctrl_mode_name:'UNAVAILABLE';
+    setPill('mode', modeName, usable && s.err_code===0 && ['TEACHING','STANDBY','CAN_CTRL'].includes(s.ctrl_mode_name));
+    document.getElementById('p-teach').textContent = usable?s.teach_status_name:'—';
+    const errOk = usable && s.err_code===0;
+    setDot('d-mode', errOk?'ok':'err');
+    document.getElementById('p-err').textContent = usable?('0x'+(s.err_code>>>0).toString(16)):'—';
+    const drvAll = usable && (s.drivers||[]).every(d=>d===1);
+    setPill('driver', !usable?'UNKNOWN':(drvAll?'ENABLED':((s.drivers||[]).some(d=>d===1)?'PARTIAL':'OFF')), drvAll);
+    document.getElementById('s-mode').textContent = usable?s.ctrl_mode_name:'UNAVAILABLE';
+    document.getElementById('s-arm').textContent = usable?s.arm_status_name:'—';
+    document.getElementById('s-teach').textContent = usable?s.teach_status_name:'—';
+    document.getElementById('s-motion').textContent = usable && s.motion_status>=0?('0x'+(s.motion_status>>>0).toString(16)):'—';
+    document.getElementById('s-err').textContent = usable?('0x'+(s.err_code>>>0).toString(16)):'—';
+    document.getElementById('s-drivers').textContent = usable?(s.drivers||[]).map(d=>d===1?'●':(d===0?'○':'?')).join(' '):'—';
+    document.getElementById('s-joints').textContent = usable?(s.joints_deg||[]).map(v=>v==null?'—':v.toFixed(2)).join('  '):'—';
+    if(!document.getElementById('task').value) document.getElementById('task').value = s.task||'';
+  }catch(e){ document.getElementById('conn-sub').textContent = 'connection lost: '+e.message; }
+}
+function setPill(id, text, ok){ const el=document.getElementById('p-'+id); if(el) el.textContent=text; }
+function setDot(id, cls){ const el=document.getElementById(id); if(el){ el.className='dot '+(cls||''); } }
+
+// ---- persistent runtime settings ----------------------------------------
+function cameraForm(role, c){
+  const p='cfg-'+role+'-';
+  document.getElementById(p+'device').value=c.device||'';
+  document.getElementById(p+'width').value=c.width||'';
+  document.getElementById(p+'height').value=c.height||'';
+  document.getElementById(p+'fps').value=c.fps||'';
+}
+function cameraPayload(role){
+  const p='cfg-'+role+'-';
+  return {device:document.getElementById(p+'device').value.trim(), width:+document.getElementById(p+'width').value, height:+document.getElementById(p+'height').value, fps:+document.getElementById(p+'fps').value};
+}
+async function loadSettings(){
+  return report('load settings', async()=>{
+    const c=await j('/api/config');
+    document.getElementById('cfg-speed').value=c.replay_speed;
+    cameraForm('global',c.cameras.global_camera||{}); cameraForm('wrist',c.cameras.wrist_camera||{});
+    document.getElementById('cfg-note').textContent=`CAN ${c.can} · data ${c.data_dir} · persisted in ${c.camera_config_path}`;
+    return c;
+  });
+}
+async function saveSettings(){
+  return report('save settings', async()=>{
+    const body={replay_speed:+document.getElementById('cfg-speed').value,cameras:{global_camera:cameraPayload('global'),wrist_camera:cameraPayload('wrist')}};
+    const c=await j('/api/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    log(`settings saved: replay speed ${c.replay_speed}%`); await loadSettings(); await pollCameras(); return c;
+  });
+}
+
+// ---- cameras ------------------------------------------------------------
+async function pollCameras(){
+  try{
+    const c = await j('/api/cameras');
+    for(const role of ['global','wrist']){
+      const img=document.getElementById('cam-'+role);
+      if(c[role] && c[role].frame_b64){ img.src='data:image/jpeg;base64,'+c[role].frame_b64; }
+      else { img.removeAttribute('src'); document.getElementById('cam-note').textContent = (c[role]&&c[role].reason)||'no frame'; }
+    }
+  }catch(e){
+    if(String(e.message).includes('suspended while collection')) document.getElementById('cam-note').textContent='Preview suspended: collection owns both cameras.';
+    else document.getElementById('cam-note').textContent='Camera preview: '+e.message;
+  }
+}
+
+// ---- arm control --------------------------------------------------------
+async function replay(action){ return report(`replay ${action}`,async()=>{ const r=await jp('/api/replay',{action}); const frame=r.can_id?` · requested ${r.can_id}#${r.payload_hex}`:''; log(`replay ${action}: ${r.ok?'ok':r.error}${frame}`); await pollStatus(); return r; }); }
+async function arm(a){ return report(a,async()=>{ const r=await jp('/api/'+a,{}); log(`${a}: ${r.ok?'ok':r.error}`); await pollStatus(); return r; }); }
+async function setMode(mode){
+  const label = mode==='can' ? 'CAN control' : 'Standby';
+  if(!confirm(`Switch Piper to ${label} mode?`)) return;
+  return report(`mode ${mode}`,async()=>{ const r=await jp('/api/mode',{mode}); log(`mode ${mode}: ${r.ok?(r.message||'ok'):r.error}`); await pollStatus(); return r; });
+}
+async function estop(){ return report('E-STOP',async()=>{ const r=await jp('/api/estop',{}); log(`estop: ${r.ok?'sent':r.error}`); await pollStatus(); return r; }); }
+
+// ---- task ---------------------------------------------------------------
+async function saveTask(){ const t=document.getElementById('task').value.trim(); if(!t){ alert('Task cannot be empty'); return; } return report('set task',async()=>{ const r=await j('/api/task',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:t})}); log('task set: '+t); return r; }); }
+
+// ---- collect ------------------------------------------------------------
+async function startCollect(){
+  const t=document.getElementById('task').value.trim(); if(!t){ alert('Set a task first'); return; }
+  return report('start collect',async()=>{
+    await j('/api/task',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:t})});
+    const w=parseFloat(document.getElementById('window').value)||40;
+    await jp('/api/collect/start',{window_s:w}); log(`collect started (cap ${w}s)`); startCollectPoll(); await pollCollect();
+  });
+}
+async function stopCollect(){ return report('stop collect',async()=>{ await jp('/api/collect/stop',{}); log('stop requested'); }); }
+function startCollectPoll(){ if(collectTimer) return; collectTimer=setInterval(pollCollect, 400); }
+async function pollCollect(){
+  try{
+    const s=await j('/api/collect/status');
+    document.getElementById('c-state').textContent=s.status+(s.message?(' — '+s.message):'');
+    document.getElementById('c-frames').textContent=s.frames;
+    const pct=Math.min(100, (s.elapsed_s/s.window_s)*100)||0;
+    document.getElementById('c-bar').style.width=pct.toFixed(0)+'%';
+    const busy=['opening','recording','finalizing'].includes(s.status);
+    document.getElementById('btn-collect-start').disabled=busy;
+    document.getElementById('btn-collect-stop').disabled=!busy;
+    if(busy){ document.getElementById('cam-note').textContent='Preview suspended: collection owns both cameras.'; }
+    if(!busy){ clearInterval(collectTimer); collectTimer=null; loadDataset(); loadVideos(); pollCameras(); }
+  }catch(e){ document.getElementById('c-state').textContent='status error: '+e.message; }
+}
+
+// ---- dataset ------------------------------------------------------------
+async function loadDataset(){
+  try{
+    const d=await j('/api/dataset');
+    if(!d.exists){ document.getElementById('ds-summary').textContent='no dataset yet'; document.getElementById('ep-body').innerHTML='<tr><td colspan="6" class="muted">No dataset. Run a collect to create one.</td></tr>'; return; }
+    document.getElementById('ds-summary').textContent=`${d.num_episodes} episodes · ${d.num_frames} frames · ${d.fps} Hz`;
+    const e=await j('/api/episodes');
+    const body=document.getElementById('ep-body'); body.innerHTML='';
+    for(const ep of e.episodes){
+      const tr=document.createElement('tr'); tr.className='ep'; tr.dataset.index=ep.index;
+      tr.innerHTML=`<td>${ep.index}</td><td>${ep.length}</td><td>${ep.duration_s}s</td>
+        <td class="muted">${(ep.tasks||[]).join(', ')}</td>
+        <td>${ep.has_video?'<span class="badge ok">mp4</span>':'<span class="badge no">—</span>'}</td>
+        <td><button onclick="selectEpisode(${ep.index}, event)">view</button></td>`;
+      tr.onclick=(ev)=>{ if(ev.target.tagName!=='BUTTON') selectEpisode(ep.index, ev); };
+      body.appendChild(tr);
+    }
+  }catch(err){ document.getElementById('ds-summary').textContent='error: '+err.message; }
+}
+
+async function selectEpisode(index, ev){
+  if(ev) ev.stopPropagation();
+  document.querySelectorAll('tr.ep').forEach(r=>r.classList.toggle('active', r.dataset.index==index));
+  const card=document.getElementById('detail-card'); card.style.display='block';
+  document.getElementById('detail-title').textContent=`Episode ${index}`;
+  document.getElementById('detail-thumbs').innerHTML='<span class="muted">loading…</span>';
+  try{
+    const d=await j('/api/episode/'+index);
+    const th=document.getElementById('detail-thumbs'); th.innerHTML='';
+    for(const b64 of d.thumbnails_b64){ const im=new Image(); im.src='data:image/jpeg;base64,'+b64; th.appendChild(im); }
+    drawChart('chart-state', d.states, 'state');
+    drawChart('chart-action', d.actions, 'action');
+  }catch(e){ document.getElementById('detail-thumbs').innerHTML='<span class="muted">error: '+e.message+'</span>'; }
+}
+
+const COLORS=['#4ea1ff','#3fb950','#d29922','#f85149','#a371f7','#39c5cf','#ff7b72','#7ee787','#ffa657','#d2a8ff'];
+function drawChart(id, series, label){
+  const cv=document.getElementById(id); const ctx=cv.getContext('2d');
+  const W=cv.width, H=cv.height; ctx.clearRect(0,0,W,H);
+  if(!series || !series.length) return;
+  // compute global min/max across all dims for a shared scale
+  let mn=Infinity, mx=-Infinity;
+  for(const row of series){ for(const v of row){ if(v<mn)mn=v; if(v>mx)mx=v; } }
+  if(!isFinite(mn)||!isFinite(mx)){mn=0;mx=1;} if(mn===mx){mn-=1;mx+=1;}
+  const pad=24, n=series.length;
+  // axes
+  ctx.strokeStyle='#2a333d'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad,H-20); ctx.lineTo(W-6,H-20); ctx.stroke();
+  for(let i=0;i<series[0].length;i++){
+    const color=COLORS[i%COLORS.length];
+    ctx.strokeStyle=color; ctx.lineWidth=1.4; ctx.beginPath();
+    for(let t=0;t<n;t++){ const x=pad+(W-pad-8)*(n<=1?0:t/(n-1)); const y=(H-20)-(H-34)*((series[t][i]-mn)/(mx-mn)); if(t===0)ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
+  }
+  // legend
+  const leg=document.getElementById('chart-legend');
+  leg.innerHTML=series[0].map((_,i)=>`<span><i style="background:${COLORS[i%COLORS.length]}"></i>${label}[${i}]</span>`).join('');
+}
+
+// ---- videos -------------------------------------------------------------
+function playVideo(url, label){
+  const player=document.getElementById('player'); const note=document.getElementById('video-note');
+  player.pause(); player.src=API+url; player.load();
+  document.getElementById('video-download').href=API+url;
+  note.textContent=`${label} — H.264 MP4; use the player controls or Download.`;
+}
+async function loadVideos(){
+  try{
+    const v=await j('/api/videos');
+    const sel=document.getElementById('video-select'); sel.innerHTML='';
+    const ready=v.videos.filter(x=>x.browser_ready);
+    if(!v.videos.length){ document.getElementById('player').removeAttribute('src'); document.getElementById('video-note').textContent='No review videos yet. They appear after a collect finishes.'; document.getElementById('video-download').removeAttribute('href'); return; }
+    for(const vid of v.videos){
+      const o=document.createElement('option'); o.value=vid.url; o.dataset.ready=vid.browser_ready?'1':'0';
+      o.textContent=`${vid.name}  (${vid.size_mb} MB · ${vid.codec||'unknown'}${vid.browser_ready?'':' · convert needed'})`; sel.appendChild(o);
+    }
+    sel.onchange=()=>{ const o=sel.selectedOptions[0]; if(o.dataset.ready==='1') playVideo(sel.value,o.textContent); else document.getElementById('video-note').textContent='This legacy video must be converted to H.264 first.'; };
+    const first=ready[0];
+    if(first){ sel.value=first.url; playVideo(first.url, first.name); }
+    else document.getElementById('video-note').textContent='All review videos are legacy mp4v. Click “Convert legacy videos to H.264”.';
+  }catch(e){ document.getElementById('video-note').textContent='Video list error: '+e.message; }
+}
+async function migrateVideos(){
+  return report('convert videos',async()=>{
+    document.getElementById('video-note').textContent='Converting videos to H.264. This can take a moment…';
+    const r=await jp('/api/videos/migrate',{});
+    const ok=r.results.filter(x=>x.ok).length;
+    log(`video migration: ${ok}/${r.results.length} converted or already H.264`);
+    await loadVideos(); return r;
+  });
+}
+document.getElementById('player').addEventListener('error',()=>{ document.getElementById('video-note').textContent='The browser could not play this video. Convert it to H.264, then refresh the list.'; });
+
+// ---- boot ---------------------------------------------------------------
+function boot(){ pollStatus(); camTimer=setInterval(pollCameras,1500); statusTimer=setInterval(pollStatus,2000); loadSettings(); loadDataset(); loadVideos(); startCollectPoll(); pollCameras(); }
+boot();
+</script>
+</body>
+</html>

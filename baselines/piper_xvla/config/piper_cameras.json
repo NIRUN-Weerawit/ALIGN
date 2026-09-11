@@ -1,0 +1,20 @@
+{
+  "wrist_camera": {
+    "device": "/dev/video14",
+    "width": 640,
+    "height": 480,
+    "fps": 20,
+    "pixel_format": "YUYV",
+    "verified": true,
+    "notes": "User identified /dev/video8 as the Piper gripper/wrist view on 2026-08-28. Device numbering can change after reconnecting; verify with camera_checks before a collection session."
+  },
+  "global_camera": {
+    "device": "/dev/video8",
+    "width": 640,
+    "height": 480,
+    "fps": 20,
+    "pixel_format": "YUYV",
+    "verified": true,
+    "notes": "User identified /dev/video14 as the fixed/global workspace view (re-confirmed 2026-08-31 after USB reconnect; second RealSense re-enumerated on usb port -1.4). Device numbering can change after reconnecting; verify with camera_check before a collection session."
+  }
+}
