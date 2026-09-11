@@ -36,7 +36,7 @@
     "raw_meters_max": 0.0478999987244606,
     "raw_meters_min": -0.042399998754262924
   },
-  "source_dataset": "/home/ucluser/ALIGN/baselines/data/piper_replay/dataset",
+  "source_dataset": "/mnt/bigdata/00_students/wee_ucl/ALIGN/baselines/data/piper_replay/dataset",
   "source_episode_ids": [
     12,
     13,

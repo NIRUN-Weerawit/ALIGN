@@ -3,7 +3,7 @@ align_data/
 h5_data/
 data/*.h5
 baselines/data/piper_replay/piper_xvla_prepared_cache.pt
-
+data/
 # Training artifacts
 checkpoints/
 wandb/
