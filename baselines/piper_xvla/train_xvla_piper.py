@@ -50,6 +50,18 @@ def split_episode_ids(episode_ids: list[int], val_count: int) -> tuple[list[int]
     return episode_ids[:-val_count], episode_ids[-val_count:]
 
 
+def load_xvla_config(checkpoint: str | Path):
+    """Load a typed X-VLA config across LeRobot public-API layouts."""
+    # Importing the concrete class registers the checkpoint's `type: xvla`
+    # discriminator with LeRobot's generic configuration loader.
+    from lerobot.policies.xvla.configuration_xvla import XVLAConfig  # noqa: F401
+    try:
+        from lerobot.configs import PreTrainedConfig
+    except ImportError:
+        from lerobot.configs.policies import PreTrainedConfig
+    return PreTrainedConfig.from_pretrained(checkpoint)
+
+
 def apply_xvla_finetuning_config(config, values: dict) -> None:
     """Apply the official X-VLA new-embodiment fine-tuning settings explicitly."""
     config.device = values["device"]
@@ -153,10 +165,9 @@ def main() -> None:
 
     status(4, total_stages, "loading tokenizer, X-VLA checkpoint, optimizer, and scheduler")
     from transformers import AutoTokenizer
-    from lerobot.configs import PreTrainedConfig
     from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
     tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
-    config = PreTrainedConfig.from_pretrained(config_values["checkpoint"])
+    config = load_xvla_config(config_values["checkpoint"])
     apply_xvla_finetuning_config(config, config_values)
     policy = XVLAPolicy.from_pretrained(config_values["checkpoint"], config=config, local_files_only=True, strict=True)
     optimizer_preset = config.get_optimizer_preset()
