@@ -42,7 +42,16 @@ def split_episode_ids(episode_ids: list[int], val_count: int) -> tuple[list[int]
 
 def _dataset(root: str, episode_ids: list[int], gripper: dict):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    source = LeRobotDataset(repo_id="local/piper-replay", root=root, episodes=episode_ids, return_uint8=True)
+    kwargs = dict(repo_id="local/piper-replay", root=root, episodes=episode_ids)
+    # LeRobot 0.5.x exposes return_uint8; older releases do not.  The
+    # checkpoint processor accepts either image representation, so keep the
+    # training entrypoint usable with the older environment as well.
+    try:
+        source = LeRobotDataset(**kwargs, return_uint8=True)
+    except TypeError as exc:
+        if "return_uint8" not in str(exc):
+            raise
+        source = LeRobotDataset(**kwargs)
     conversion = PiperXVLAConversion(gripper["raw_meters_min"], gripper["raw_meters_max"])
     return PiperXVLALiberoAdapterDataset(source, conversion)
 
