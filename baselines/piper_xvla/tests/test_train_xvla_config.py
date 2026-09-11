@@ -1,6 +1,11 @@
 import json
 
-from piper_xvla.train_xvla_piper import apply_xvla_finetuning_config, load_config, status
+from piper_xvla.train_xvla_piper import (
+    apply_xvla_finetuning_config,
+    load_config,
+    load_xvla_config,
+    status,
+)
 
 
 def test_load_config_reads_every_training_setting_from_json(tmp_path):
@@ -53,3 +58,9 @@ def test_status_prints_an_explicit_flushed_stage_marker(capsys):
     status(3, 6, "attaching prepared labels")
 
     assert capsys.readouterr().out == "[train stage 3/6] attaching prepared labels\n"
+
+
+def test_load_xvla_config_accepts_the_checkpoint_type_discriminator():
+    config = load_xvla_config("/media/ucluser/PortableSSD/hf_models/xvla-libero")
+
+    assert config.type == "xvla"
