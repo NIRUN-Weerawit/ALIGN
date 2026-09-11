@@ -91,19 +91,17 @@ def get_attention_stats(model, frames, states, device):
 
 def main():
     runs = [
-        (15, "checkpoints/v4/libero_spatial/run_15/intention_best_fixed.pt"),
-        (17, "checkpoints/v4/libero_spatial/run_17/intention_best_fixed.pt"),
-        (18, "checkpoints/v4/libero_spatial/run_18/intention_best_fixed.pt"),
-        (21, "checkpoints/v4/libero_spatial/run_21/intention_best.pt"),
-        (22, "checkpoints/v4/libero_spatial/run_22/intention_best.pt"),
-        (23, "checkpoints/v4/libero_spatial/run_23/intention_best.pt"),
+        (1, "checkpoints/v4/libero_goal/run_1/intention_best.pt"),
+        (2, "checkpoints/v4/libero_goal/run_2/intention_best.pt"),
+        (3, "checkpoints/v4/libero_goal/run_3/intention_best.pt"),
+        # (24, "checkpoints/v4/libero_goal/run_4/intention_best.pt"),
     ]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}\n")
 
     # Load one episode for testing
-    data_path = "data/libero_spatial.h5"
+    data_path = "data/libero_goal.h5"
     with h5py.File(data_path, "r") as f:
         ep_keys = sorted([k for k in f.keys() if k.startswith("ep_")])
     ep_key = ep_keys[0]

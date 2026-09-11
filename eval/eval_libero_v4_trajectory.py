@@ -806,14 +806,27 @@ def run_model_in_sim(
                         h_current = out["h_seq"][:, -1]
                         intent_emb = out.get("intent_emb", None)
                         # intent_emb = torch.zeros_like(intent_emb)
-                        z_v_for_head, z_s_for_head, h_for_head = model.condition_actions(
-                            out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
-                            **({"observed_mask":out.get("observed_mask"),"timestamp":out.get("timestamp")}
-                               if getattr(model,"use_memory_bank",False) else {}),
-                        )
-                        a_model_full = _predict_action_chunk(
-                            model, z_v_for_head, z_s_for_head, h_for_head, text_emb,
-                        )
+                        # Memory bank step (if enabled)
+                        if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
+                            z_v_current = out["z_v_pooled_seq"][:, -1]
+                            z_s_current = out["z_s_seq"][:, -1]
+                            z_v_fused, z_s_fused, intent_fused = model.memory_module(
+                                z_v_current, z_s_current, intent_emb,
+                            )
+                            h_for_head = intent_fused
+                        else:
+                            h_for_head = intent_emb if intent_emb is not None else None
+
+                        if model.head_type in ["diffusion", "flow_matching"]:
+                            a_model_full = model.sample_actions(
+                                out["z_v_pooled_seq"], out["z_s_seq"],
+                                h_for_head,
+                            )
+                        else:
+                            a_model_full = model.predict_actions(
+                                out["z_v_pooled_seq"], out["z_s_seq"],
+                                h_for_head,
+                            )
             inference_t1 = time.perf_counter()
 
             # Record this model call's index for "decay" mode weighting.
