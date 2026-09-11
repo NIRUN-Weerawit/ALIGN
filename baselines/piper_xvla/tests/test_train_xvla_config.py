@@ -5,6 +5,7 @@ from piper_xvla.train_xvla_piper import (
     configure_cuda_attention,
     load_config,
     load_xvla_config,
+    serialize_policy_config,
     status,
 )
 
@@ -80,3 +81,14 @@ def test_configure_cuda_attention_disables_only_cudnn_sdpa(monkeypatch):
     configure_cuda_attention("cuda")
 
     assert calls == [False]
+
+
+def test_serialize_policy_config_falls_back_to_dataclass_fields_when_to_dict_is_absent():
+    from dataclasses import dataclass
+
+    @dataclass
+    class LegacyXVLAConfig:
+        action_mode: str = "ee6d"
+        chunk_size: int = 1
+
+    assert serialize_policy_config(LegacyXVLAConfig()) == {"action_mode": "ee6d", "chunk_size": 1}

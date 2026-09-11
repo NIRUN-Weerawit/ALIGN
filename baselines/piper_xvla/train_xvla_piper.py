@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 import torch
@@ -134,6 +135,16 @@ def _train_step(policy, batch: dict, tokenizer, device: str, optimizer, schedule
     return float(loss.detach().cpu())
 
 
+def serialize_policy_config(config) -> dict:
+    """Serialize both modern and legacy LeRobot configuration objects."""
+    to_dict = getattr(config, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    if is_dataclass(config):
+        return asdict(config)
+    return dict(vars(config))
+
+
 def _save_checkpoint(path: Path, *, step: int, policy, optimizer, scheduler, val_loss: float | None, split: dict) -> None:
     torch.save(
         {
@@ -143,7 +154,7 @@ def _save_checkpoint(path: Path, *, step: int, policy, optimizer, scheduler, val
             "scheduler": scheduler.state_dict(),
             "val_loss": val_loss,
             "split": split,
-            "xvla_config": policy.config.to_dict(),
+            "xvla_config": serialize_policy_config(policy.config),
         },
         path,
     )
