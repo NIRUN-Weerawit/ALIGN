@@ -113,6 +113,8 @@ train_soft_prompts = true
 
 It also uses X-VLA's official optimizer preset: differential AdamW learning rates (VLM at 1/10 the base rate) and a 1,000-step warmup followed by cosine decay across the 20,000-step run. The Piper target remains `action_mode = ee6d`, not generic `auto`, because the data has a defined EE6D layout and binary gripper targets.
 
+It also disables only PyTorch's **cuDNN SDPA** backend before model loading. This works around the `No valid execution plans built` error observed on the training GPU while leaving Flash and efficient SDPA kernels enabled.
+
 Edit the file to change output path, steps, batch size, validation count, checkpoint, or device. The CLI takes only an optional config path:
 
 ```bash

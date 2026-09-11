@@ -50,6 +50,17 @@ def split_episode_ids(episode_ids: list[int], val_count: int) -> tuple[list[int]
     return episode_ids[:-val_count], episode_ids[-val_count:]
 
 
+def configure_cuda_attention(device: str) -> bool:
+    """Avoid cuDNN SDPA plan failures while retaining Flash/efficient attention."""
+    if not device.startswith("cuda"):
+        return False
+    enable_cudnn_sdp = getattr(torch.backends.cuda, "enable_cudnn_sdp", None)
+    if not callable(enable_cudnn_sdp):
+        return False
+    enable_cudnn_sdp(False)
+    return True
+
+
 def load_xvla_config(checkpoint: str | Path):
     """Load a typed X-VLA config across LeRobot public-API layouts."""
     # Importing the concrete class registers the checkpoint's `type: xvla`
@@ -164,6 +175,8 @@ def main() -> None:
     val_loader = DataLoader(val_dataset, batch_size=config_values["batch_size"], shuffle=False, num_workers=0)
 
     status(4, total_stages, "loading tokenizer, X-VLA checkpoint, optimizer, and scheduler")
+    if configure_cuda_attention(config_values["device"]):
+        print("[train stage 4/6] disabled cuDNN SDPA; retaining Flash/efficient SDPA backends", flush=True)
     from transformers import AutoTokenizer
     from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
     tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")

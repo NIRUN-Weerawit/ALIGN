@@ -2,6 +2,7 @@ import json
 
 from piper_xvla.train_xvla_piper import (
     apply_xvla_finetuning_config,
+    configure_cuda_attention,
     load_config,
     load_xvla_config,
     status,
@@ -64,3 +65,18 @@ def test_load_xvla_config_accepts_the_checkpoint_type_discriminator():
     config = load_xvla_config("/media/ucluser/PortableSSD/hf_models/xvla-libero")
 
     assert config.type == "xvla"
+
+
+def test_configure_cuda_attention_disables_only_cudnn_sdpa(monkeypatch):
+    calls = []
+
+    class Backend:
+        @staticmethod
+        def enable_cudnn_sdp(enabled):
+            calls.append(enabled)
+
+    monkeypatch.setattr("piper_xvla.train_xvla_piper.torch.backends.cuda", Backend())
+
+    configure_cuda_attention("cuda")
+
+    assert calls == [False]
