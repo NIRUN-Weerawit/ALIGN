@@ -2,9 +2,19 @@
   "manifest": "data/piper_replay/xvla_training_manifest.json",
   "checkpoint": "/media/ucluser/PortableSSD/hf_models/xvla-libero",
   "output": "outputs/piper_xvla_single_task",
-  "epochs": 10,
-  "batch_size": 1,
+  "steps": 20000,
+  "batch_size": 4,
   "val_episodes": 11,
-  "lr": 1e-05,
-  "device": "cuda"
+  "device": "cuda",
+  "action_mode": "ee6d",
+  "freeze_vision_encoder": false,
+  "freeze_language_encoder": false,
+  "train_policy_transformer": true,
+  "train_soft_prompts": true,
+  "optimizer_lr": 0.0001,
+  "scheduler_warmup_steps": 1000,
+  "scheduler_decay_steps": 20000,
+  "scheduler_decay_lr": 0.0000025,
+  "validate_every_steps": 1000,
+  "save_every_steps": 1000
 }
