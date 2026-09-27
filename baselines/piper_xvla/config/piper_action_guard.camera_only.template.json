@@ -1,0 +1,10 @@
+{
+  "workspace_min_m": ["REPLACE_X_MIN", "REPLACE_Y_MIN", "REPLACE_Z_MIN"],
+  "workspace_max_m": ["REPLACE_X_MAX", "REPLACE_Y_MAX", "REPLACE_Z_MAX"],
+  "max_position_step_m": "REPLACE_VERIFIED_LIMIT",
+  "max_rotation_step_deg": "REPLACE_VERIFIED_LIMIT",
+  "max_gripper_step_normalized": "REPLACE_VERIFIED_LIMIT",
+  "max_inactive_arm_l2": "REPLACE_VERIFIED_LIMIT",
+  "max_camera_age_s": "REPLACE_VERIFIED_LIMIT",
+  "max_feedback_age_s": "REPLACE_VERIFIED_LIMIT"
+}

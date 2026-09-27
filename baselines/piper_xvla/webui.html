@@ -3,232 +3,379 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Piper X-VLA — Collection & Review</title>
+<title>Piper X-VLA · Operator Console</title>
 <style>
   :root {
-    --bg: #0f1216; --panel: #171c22; --panel2: #1d242c; --border: #2a333d;
-    --fg: #e6edf3; --muted: #8b98a5; --accent: #4ea1ff; --ok: #3fb950;
-    --warn: #d29922; --err: #f85149; --chip: #232c36;
+    color-scheme: dark;
+    --bg:#101419; --panel:#191f26; --panel-raised:#202831; --border:#303b46;
+    --fg:#edf2f6; --muted:#9aa8b5; --accent:#67c5bd; --accent-ink:#09201e;
+    --ok:#63c98a; --warn:#e7b85d; --err:#f27676; --chip:#28323c;
+    --radius:12px; --shadow:0 8px 24px rgba(0,0,0,.14);
   }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg);
-         font: 14px/1.45 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-  a { color: var(--accent); text-decoration: none; }
-  h1 { font-size: 17px; margin: 0; }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em;
-       color: var(--muted); margin: 0 0 10px; }
-  header { display: flex; align-items: center; gap: 16px; padding: 12px 18px;
-           background: var(--panel); border-bottom: 1px solid var(--border);
-           position: sticky; top: 0; z-index: 5; }
-  header .title { display:flex; flex-direction:column; gap:2px; }
-  header .sub { color: var(--muted); font-size: 12px; }
-  .pills { display: flex; gap: 8px; margin-left: auto; flex-wrap: wrap; }
-  .pill { background: var(--chip); border: 1px solid var(--border); border-radius: 20px;
-          padding: 4px 12px; font-size: 12px; display:flex; gap:6px; align-items:center; }
-  .pill b { font-weight: 600; }
-  .dot { width:8px; height:8px; border-radius:50%; background: var(--muted); }
-  .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
-  main { display: grid; grid-template-columns: minmax(360px, 420px) 1fr; gap: 16px; padding: 16px; }
-  @media (max-width: 980px){ main { grid-template-columns: 1fr; } }
-  .col { display:flex; flex-direction:column; gap:16px; min-width:0; }
-  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
-  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-  button { background: var(--panel2); color: var(--fg); border: 1px solid var(--border);
-           border-radius: 7px; padding: 8px 13px; font-size: 13px; cursor: pointer; transition: .12s; }
-  button:hover { border-color: var(--accent); }
-  button.primary { background: var(--accent); color:#04121f; border-color: var(--accent); font-weight:600; }
-  button.danger { background: #3a1518; color:#ffb3ad; border-color:#5c2226; font-weight:600; }
-  button.warn { background:#3a2e12; color:#ffd791; border-color:#5c4a1f; }
-  button:disabled { opacity:.45; cursor:not-allowed; }
-  input[type=text], input[type=number] { background: var(--panel2); border:1px solid var(--border);
-        color:var(--fg); border-radius:7px; padding:8px 10px; font-size:13px; }
-  .cam-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-  .cam { position:relative; background:#000; border-radius:8px; overflow:hidden; aspect-ratio:4/3; }
-  .cam img { width:100%; height:100%; object-fit:cover; display:block; }
-  .cam .lbl { position:absolute; top:6px; left:6px; background:rgba(0,0,0,.6); padding:2px 8px;
-              border-radius:5px; font-size:11px; }
-  .kv { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px dashed var(--border); font-size:13px; }
-  .kv:last-child{ border-bottom:none; }
-  .kv .k{ color:var(--muted); }
-  .bar { height:8px; background:var(--panel2); border-radius:5px; overflow:hidden; margin-top:6px; }
-  .bar > div { height:100%; background:var(--accent); width:0%; transition:width .3s; }
-  .log { background:#0b0e12; border:1px solid var(--border); border-radius:8px; padding:10px;
-         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; height:150px;
-         overflow:auto; white-space:pre-wrap; color:#a9c4d8; }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--border); }
-  th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.04em; }
-  tr.ep { cursor:pointer; } tr.ep:hover { background:var(--panel2); }
-  tr.ep.active { background:#1c2a3a; }
-  .thumbs { display:flex; gap:4px; }
-  .thumbs img { width:56px; height:42px; object-fit:cover; border-radius:4px; border:1px solid var(--border); }
-  canvas.chart { width:100%; height:180px; background:#0b0e12; border:1px solid var(--border); border-radius:8px; }
-  .legend { display:flex; gap:10px; flex-wrap:wrap; font-size:11px; color:var(--muted); margin-top:6px; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+  a { color:var(--accent); text-decoration:none; }
+  h1,h2,p { margin:0; }
+  h1 { font-size:20px; line-height:1.2; letter-spacing:-.02em; }
+  h2 { font-size:12px; line-height:1.2; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); font-weight:700; }
+  header { position:sticky; top:0; z-index:5; display:flex; align-items:center; gap:18px; min-height:68px; padding:10px clamp(14px,2.4vw,32px); background:rgba(16,20,25,.94); border-bottom:1px solid var(--border); backdrop-filter:blur(14px); }
+  .brand { display:grid; gap:3px; min-width:210px; }
+  .eyebrow { color:var(--accent); font-size:10px; font-weight:800; letter-spacing:.14em; }
+  header .sub { color:var(--muted); font-size:11px; }
+  .pills { display:flex; align-items:center; gap:6px; flex-wrap:wrap; margin-left:auto; }
+  .pill { display:flex; align-items:center; gap:7px; padding:5px 9px; border:1px solid var(--border); border-radius:999px; background:var(--panel); color:var(--muted); font-size:11px; white-space:nowrap; }
+  .pill b { color:var(--fg); font-weight:650; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#74818e; }
+  .dot.ok { background:var(--ok); box-shadow:0 0 9px #63c98a66; } .dot.warn { background:var(--warn); } .dot.err { background:var(--err); }
+  main { width:min(1720px,100%); margin:0 auto; padding:16px clamp(12px,2vw,28px) 32px; display:grid; grid-template-columns:minmax(280px,350px) minmax(0,1fr) minmax(0,1fr); grid-template-areas:"status cameras cameras" "arm collect xvla" "manual dataset dataset" "settings detail detail" "settings video video"; gap:12px; align-items:start; }
+  .card { min-width:0; padding:14px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); }
+  .card-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+  .card-head .spacer { flex:1; }
+  .status-card { grid-area:status; }
+  .status-slot { grid-area:status; min-width:0; }
+  .status-card.is-floating { position:fixed; top:var(--status-float-top,78px); right:clamp(12px,2vw,28px); z-index:8; width:min(350px,calc(100vw - 24px)); max-height:calc(100vh - var(--status-float-top,78px) - 12px); overflow:auto; border-color:#49625f; box-shadow:0 16px 44px #0009; }
+  .status-card.is-floating .status-grid { grid-template-columns:repeat(3,minmax(0,1fr)); gap:5px; }
+  .status-card.is-floating .status-tile { padding:6px 7px; }
+  .status-card.is-floating .status-tile b { font-size:11px; }
+  .status-card.is-floating .status-wide { grid-column:1/-1; }
+  #btn-send-xvla.holding { color:#fff; background:#8d3238; border-color:var(--err); box-shadow:0 0 0 3px #f2767630; }
+  #btn-send-xvla { touch-action:none; user-select:none; }
+  .status-output { margin-top:9px; border-top:1px solid var(--border); }
+  .status-output > summary { padding:8px 1px 2px; color:var(--muted); cursor:pointer; font-size:11px; font-weight:650; }
+  .status-output .log { height:96px; margin-top:6px; }
+  .camera-card { grid-area:cameras; }
+  .arm-card { grid-area:arm; }
+  .collect-card { grid-area:collect; }
+  .xvla-card { grid-area:xvla; }
+  .manual-card { grid-area:manual; }
+  .settings-card { grid-area:settings; }
+  .dataset-card { grid-area:dataset; }
+  .detail-card { grid-area:detail; }
+  .video-card { grid-area:video; }
+  .row { display:flex; align-items:center; gap:7px; flex-wrap:wrap; }
+  button { min-height:34px; padding:7px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel-raised); color:var(--fg); font-family:inherit; font-size:12px; font-weight:600; line-height:1.2; cursor:pointer; transition:border-color .15s,background .15s,transform .1s; }
+  button:hover:not(:disabled) { border-color:var(--accent); background:#28343d; }
+  button:active:not(:disabled) { transform:translateY(1px); }
+  button.primary { color:var(--accent-ink); background:var(--accent); border-color:var(--accent); }
+  button.primary:hover:not(:disabled) { background:#85d8d0; }
+  button.danger { color:#ffd7d7; background:#3b2024; border-color:#714047; }
+  button.danger:hover:not(:disabled) { background:#56282d; border-color:var(--err); }
+  button.warn { color:#ffe3aa; background:#392f1c; border-color:#67532e; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  input[type=text],input[type=number],select { min-width:0; min-height:34px; padding:7px 9px; border:1px solid var(--border); border-radius:8px; background:#12171c; color:var(--fg); font:inherit; font-size:12px; }
+  input:focus,select:focus,button:focus-visible,summary:focus-visible { outline:2px solid #67c5bd88; outline-offset:2px; }
+  .cam-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .cam { position:relative; overflow:hidden; aspect-ratio:16/9; border:1px solid #36424c; border-radius:9px; background:#080a0c; }
+  .cam img { display:block; width:100%; height:100%; object-fit:cover; }
+  .cam .lbl { position:absolute; top:8px; left:8px; padding:3px 7px; border:1px solid #ffffff20; border-radius:6px; background:#080c10c9; color:#fff; font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; }
+  .cam-note { margin-top:8px; }
+  .status-grid { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
+  .status-tile { min-width:0; padding:8px 9px; border:1px solid var(--border); border-radius:8px; background:#14191f; }
+  .status-tile .k { display:block; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
+  .status-tile b { display:block; margin-top:2px; overflow-wrap:anywhere; font-size:12px; }
+  .status-wide { grid-column:1/-1; }
+  .kv { display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px solid #2d3740; font-size:12px; }
+  .kv:last-child { border-bottom:0; } .kv .k { color:var(--muted); }
+  hr { height:0; margin:11px 0; border:0; border-top:1px solid var(--border); }
+  .muted { color:var(--muted); font-size:11px; line-height:1.45; }
+  .spacer { flex:1; }
+  .badge { display:inline-flex; align-items:center; padding:3px 8px; border:1px solid var(--border); border-radius:999px; background:var(--chip); font-size:10px; font-weight:700; white-space:nowrap; }
+  .badge.ok { color:var(--ok); border-color:#315843; } .badge.no { color:var(--muted); }
+  .badge.warn { color:var(--warn); border-color:#66522d; }
+  details.fold { padding:0; overflow:hidden; }
+  details.fold > summary { display:flex; align-items:center; gap:10px; min-height:48px; padding:12px 14px; cursor:pointer; list-style:none; color:var(--fg); font-size:13px; font-weight:700; }
+  details.fold > summary::-webkit-details-marker { display:none; }
+  details.fold > summary::before { content:"＋"; color:var(--accent); font-size:12px; }
+  details.fold[open] > summary::before { content:"−"; }
+  details.fold[open] > summary { border-bottom:1px solid var(--border); }
+  .fold-body { padding:12px 14px 14px; }
+  .bar { height:6px; margin-top:8px; overflow:hidden; border-radius:9px; background:#11161b; }
+  .bar > div { width:0; height:100%; background:var(--accent); transition:width .25s; }
+  .log { height:82px; overflow:auto; padding:8px; border:1px solid var(--border); border-radius:8px; background:#11161b; color:#bdcbd5; font:11px/1.45 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { padding:7px 8px; border-bottom:1px solid var(--border); text-align:left; }
+  th { color:var(--muted); font-size:10px; font-weight:700; letter-spacing:.07em; text-transform:uppercase; }
+  tr.ep { cursor:pointer; } tr.ep:hover { background:var(--panel-raised); } tr.ep.active { background:#203733; }
+  .thumbs { display:flex; gap:5px; flex-wrap:wrap; }
+  .thumbs img { width:64px; height:48px; object-fit:cover; border:1px solid var(--border); border-radius:6px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  canvas.chart { width:100%; height:150px; border:1px solid var(--border); border-radius:8px; background:#11161b; }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; color:var(--muted); font-size:10px; }
   .legend span i { display:inline-block; width:10px; height:3px; margin-right:4px; vertical-align:middle; }
-  video { width:100%; border-radius:8px; background:#000; max-height:420px; }
-  .muted{ color:var(--muted); font-size:12px; }
-  .spacer{ flex:1; }
-  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px; background:var(--chip); border:1px solid var(--border);}
-  .badge.ok{ color:var(--ok); border-color:#2a4a30;} .badge.no{ color:var(--muted);}
-  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
-  @media (max-width:760px){ .grid2{ grid-template-columns:1fr; } }
+  video { width:100%; max-height:380px; border-radius:8px; background:#080a0c; }
+  .jog-grid { display:grid; grid-template-columns:repeat(3,minmax(46px,62px)); gap:5px; align-items:center; }
+  .jog-grid button { min-height:36px; font-family:ui-monospace,monospace; font-weight:700; }
+  .joint-controls { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px 12px; margin-top:8px; }
+  .joint-control { display:grid; grid-template-columns:24px minmax(60px,1fr) 58px; gap:6px; align-items:center; }
+  .joint-control label { color:var(--muted); font:11px ui-monospace,monospace; }
+  .joint-control input[type=number] { width:58px; padding:5px; }
+  input[type=range] { width:100%; accent-color:var(--accent); cursor:pointer; }
+  .gripper-control { display:grid; grid-template-columns:minmax(70px,1fr) 64px; gap:6px; align-items:center; }
+  .danger-action { min-width:84px; min-height:38px; font-weight:800; letter-spacing:.02em; }
+  @media (max-width:1120px) { main { grid-template-columns:minmax(260px,320px) minmax(0,1fr); grid-template-areas:"status cameras" "arm collect" "manual xvla" "settings dataset" "settings detail" "settings video"; } }
+  @media (max-width:760px) { header { position:static; align-items:flex-start; flex-wrap:wrap; } .brand { min-width:0; } .pills { margin-left:0; order:3; width:100%; } main { grid-template-columns:minmax(0,1fr); grid-template-areas:"status" "cameras" "arm" "collect" "xvla" "manual" "dataset" "detail" "video" "settings"; padding:10px; gap:9px; } .grid2,.joint-controls { grid-template-columns:1fr; } .cam-grid { gap:6px; } .card { padding:11px; } .status-card { position:static; } }
 </style>
 </head>
 <body>
 <header>
-  <div class="title">
-    <h1>Piper X-VLA — Collection &amp; Review</h1>
+  <div class="brand">
+    <div class="eyebrow">PIPER · X-VLA</div>
+    <h1>Operator console</h1>
     <div class="sub" id="conn-sub">connecting…</div>
   </div>
-  <div class="pills">
-    <span class="pill"><span class="dot" id="d-mode"></span><b id="p-mode">—</b></span>
+  <div class="pills" aria-label="Robot status">
+    <span class="pill"><span class="dot" id="d-mode"></span>mode <b id="p-mode">—</b></span>
     <span class="pill">teach <b id="p-teach">—</b></span>
-    <span class="pill">err <b id="p-err">—</b></span>
+    <span class="pill">error <b id="p-err">—</b></span>
     <span class="pill"><span class="dot" id="d-driver"></span><b id="p-driver">—</b></span>
   </div>
+  <button class="danger danger-action" onclick="estop()">E-STOP</button>
 </header>
 
 <main>
-  <!-- LEFT: control + live -->
-  <section class="col">
-    <div class="card">
-      <h2>Live Cameras</h2>
-      <div class="cam-grid">
-        <div class="cam"><span class="lbl">global</span><img id="cam-global" alt="global"></div>
-        <div class="cam"><span class="lbl">wrist</span><img id="cam-wrist" alt="wrist"></div>
+  <div class="status-slot" id="status-slot">
+    <section class="card status-card" id="status-card">
+      <div class="card-head"><h2>Robot status</h2><span class="spacer"></span><span class="badge" id="s-feedback">—</span></div>
+      <div class="status-grid">
+        <div class="status-tile"><span class="k">Control mode</span><b id="s-mode">—</b></div>
+        <div class="status-tile"><span class="k">Arm state</span><b id="s-arm">—</b></div>
+        <div class="status-tile"><span class="k">Teach state</span><b id="s-teach">—</b></div>
+        <div class="status-tile"><span class="k">Drivers</span><b id="s-drivers">—</b></div>
+        <div class="status-tile"><span class="k">Motion</span><b id="s-motion">—</b></div>
+      <div class="status-tile"><span class="k">Error code</span><b id="s-err">—</b></div>
+      <div class="status-tile status-wide"><span class="k">Joints (degrees)</span><b id="s-joints">—</b></div>
+      <div class="status-tile status-wide"><span class="k">EEF position (metres)</span><b id="s-eef-xyz">—</b></div>
+      <div class="status-tile status-wide"><span class="k">EEF orientation (Euler degrees)</span><b id="s-eef-euler">—</b></div>
+      <div class="status-tile status-wide"><span class="k">Gripper opening (mm)</span><b id="s-gripper">—</b></div>
+    </div>
+    <details class="status-output">
+      <summary>Recent output</summary>
+      <div class="log" id="status-log" aria-live="polite"></div>
+    </details>
+  </section>
+  </div>
+
+  <section class="card camera-card">
+    <div class="card-head"><h2>Live cameras</h2><span class="spacer"></span><span class="muted">Preview pauses during collection or inference</span></div>
+    <div class="cam-grid">
+      <div class="cam"><span class="lbl">Global</span><img id="cam-global" alt="Global camera"></div>
+      <div class="cam"><span class="lbl">Wrist</span><img id="cam-wrist" alt="Wrist camera"></div>
+    </div>
+    <div class="muted cam-note" id="cam-note">polling every 1.5 s</div>
+  </section>
+
+  <section class="card arm-card">
+    <div class="card-head"><h2>Arm controls</h2><span class="spacer"></span><span class="muted">Manual / replay</span></div>
+    <div class="row" style="margin-bottom:8px">
+      <button class="primary" data-needs-feedback disabled onclick="replay('start')">▶ Replay</button>
+      <button data-needs-feedback disabled onclick="replay('pause')">⏸ Pause</button>
+      <button id="btn-replay-resume" data-needs-feedback disabled onclick="replay('resume')">▶ Resume</button>
+      <button class="danger" data-needs-feedback disabled onclick="replay('stop')">■ Stop replay</button>
+      <button data-needs-feedback disabled onclick="replay('move_start')">→ Move to start</button>
+    </div>
+    <div class="row">
+      <button data-needs-feedback disabled onclick="arm('enable')">Enable</button>
+      <button data-needs-feedback disabled onclick="arm('disable')">Disable</button>
+      <button data-needs-feedback disabled onclick="setMode('standby')">Standby</button>
+      <button data-needs-feedback disabled onclick="setMode('can')">CAN control</button>
+      <button data-needs-feedback disabled onclick="arm('reset')">Reset</button>
+    </div>
+    <p class="muted" style="margin-top:8px">Replay mode belongs to the pendant; host mode controls only Standby and CAN control.</p>
+  </section>
+
+  <section class="card collect-card">
+    <div class="card-head"><h2>Collect an episode</h2><span class="spacer"></span><span class="badge" id="c-state">idle</span></div>
+    <div class="row" style="margin-bottom:8px">
+      <input type="text" id="task" placeholder="Task, e.g. put cube in cup" style="flex:1">
+      <button onclick="saveTask()">Set task</button>
+    </div>
+    <div class="row">
+      <label class="muted" for="window">Cap (s)</label>
+      <input type="number" id="window" value="40" min="5" max="300" style="width:72px">
+      <button class="primary" id="btn-collect-start" onclick="startCollect()">● Start collect</button>
+      <button class="danger" id="btn-collect-stop" onclick="stopCollect()" disabled>■ Stop</button>
+    </div>
+    <div class="row" style="justify-content:space-between;margin-top:9px"><span class="muted">Frames captured</span><b id="c-frames">0</b></div>
+    <div class="bar"><div id="c-bar"></div></div>
+    <p class="muted" style="margin:8px 0">Collection records camera and measured state. Start or stop replay separately.</p>
+    <div class="log" id="c-log" aria-live="polite"></div>
+  </section>
+
+  <section class="card xvla-card">
+    <div class="card-head"><h2>X-VLA inference</h2><span class="spacer"></span><span class="badge warn">Operator-gated</span></div>
+    <p class="muted" style="margin-bottom:9px">Inference is idle until held control is pressed. While held, the runner sends only fresh guard-approved actions at its 20 Hz target.</p>
+    <div class="row">
+      <label class="muted" for="xvla-frames">Frames</label>
+      <input id="xvla-frames" type="number" value="0" min="0" max="100" style="width:65px" title="0 runs until stopped">
+      <label class="muted"><input id="xvla-record-images" type="checkbox" checked> Record images</label>
+      <button class="warn" onclick="startXvlaDiagnostic()">Run diagnostic</button>
+      <button class="danger" onclick="stopXvlaDiagnostic()">Stop</button>
+    </div>
+    <p class="muted" style="margin:6px 0 9px">Use 0 frames for continuous inference.</p>
+    <div class="kv"><span class="k">Status / guard</span><b id="xvla-status">idle</b></div>
+    <div class="kv"><span class="k">Loop / control</span><b id="xvla-result">—</b></div>
+    <div class="kv"><span class="k">Image recording</span><b id="xvla-recording">Off</b></div>
+    <div class="muted" id="xvla-recording-path" style="overflow-wrap:anywhere"></div>
+    <div class="kv"><span class="k">Predicted pose</span><b id="xvla-predicted">—</b></div>
+    <div class="kv"><span class="k">Predicted gripper</span><b id="xvla-predicted-gripper">—</b></div>
+    <div class="kv"><span class="k">Measured pose</span><b id="xvla-measured">—</b></div>
+    <div class="row" style="margin-top:9px"><button id="btn-send-xvla" class="warn" disabled onpointerdown="startXvlaHold(event)" onpointerup="stopXvlaHold('released')" onpointercancel="stopXvlaHold('cancelled')" onlostpointercapture="stopXvlaHold('released')" onkeydown="startXvlaKeyHold(event)" onkeyup="stopXvlaHold('released')">Hold to send controls</button><span class="badge" id="xvla-hold-status">READY</span></div>
+    <p class="muted" style="margin-top:6px">Requires continuous inference and Manual Control ON. Release, lose focus, or hide this page to revoke the short control lease.</p>
+    <div class="muted" id="xvla-note" style="margin-top:6px"></div>
+    <details style="margin-top:10px">
+      <summary>Guard limits</summary>
+      <form id="xvla-guard-form" onsubmit="event.preventDefault();saveXvlaGuard()" style="margin-top:9px">
+        <div class="grid2" id="xvla-guard-fields"></div>
+        <div class="muted" style="margin:10px 0 5px">Workspace bounds (metres)</div>
+        <div id="xvla-guard-workspace"></div>
+        <div class="row" style="margin-top:9px"><button id="xvla-guard-apply" class="primary" type="submit" disabled>Apply limits</button><button type="button" onclick="loadXvlaGuard()">Reload saved</button></div>
+        <p class="muted" style="margin-top:6px">Applying limits stops held control. New limits are used on the next prediction and saved for future runs.</p>
+        <div class="muted" id="xvla-guard-note" aria-live="polite"></div>
+      </form>
+    </details>
+  </section>
+
+  <details class="card fold manual-card">
+    <summary>Manual control <span class="spacer"></span><span class="badge no" id="manual-note">CONTROL OFF</span></summary>
+    <div class="fold-body">
+      <div class="row">
+        <input id="manual-arm-confirm" type="text" placeholder="Type ARM" style="width:100px">
+        <button class="warn" onclick="setManualControl(true)">Turn control on</button>
+        <button onclick="setManualControl(false)">Turn off</button>
       </div>
-      <div class="muted" style="margin-top:8px" id="cam-note">polling every 1.5 s</div>
+      <p class="muted" style="margin-top:6px">Control stays on until switched off, E-stop, or server shutdown. Keep the physical E-stop reachable.</p>
+      <div class="kv"><span class="k">Measured XYZ</span><b id="manual-live-xyz">—</b></div>
+      <div class="kv"><span class="k">Measured Euler</span><b id="manual-live-euler">—</b></div>
+      <div class="kv"><span class="k">Measured gripper</span><b id="manual-live-gripper">—</b></div>
+      <hr>
+      <div class="grid2">
+        <div>
+          <div class="row"><b>Jog</b><span class="muted">hold to move</span></div>
+          <div class="row" style="margin:7px 0">
+            <label class="muted" for="jog-step-mm">XYZ mm</label><input id="jog-step-mm" type="number" value="2" min="0.1" max="20" step="0.1" style="width:64px">
+            <label class="muted" for="jog-step-deg">Euler °</label><input id="jog-step-deg" type="number" value="2" min="0.1" max="20" step="0.1" style="width:64px">
+            <label class="muted" for="m-speed">Speed %</label><input id="m-speed" type="number" value="10" min="1" max="10" style="width:60px">
+          </div>
+          <div class="jog-grid">
+            <button data-jog data-axis="x" data-direction="-1">−X</button><button data-jog data-axis="z" data-direction="1">+Z ↑</button><button data-jog data-axis="x" data-direction="1">+X</button>
+            <button data-jog data-axis="y" data-direction="-1">−Y ←</button><button disabled>STOP</button><button data-jog data-axis="y" data-direction="1">→ +Y</button>
+            <span></span><button data-jog data-axis="z" data-direction="-1">−Z ↓</button><span></span>
+          </div>
+          <div class="row" style="margin-top:7px"><b>Rotate</b>
+            <button data-jog data-axis="rx" data-direction="-1">−RX</button><button data-jog data-axis="rx" data-direction="1">+RX</button>
+            <button data-jog data-axis="ry" data-direction="-1">−RY</button><button data-jog data-axis="ry" data-direction="1">+RY</button>
+            <button data-jog data-axis="rz" data-direction="-1">−RZ</button><button data-jog data-axis="rz" data-direction="1">+RZ</button>
+          </div>
+          <p class="muted" style="margin-top:6px">Robot-base XYZ and measured Euler XYZ increments. Release to stop requesting moves.</p>
+        </div>
+        <div>
+          <div class="row"><b>Absolute target</b><button onclick="loadCurrentPose()">Use measured pose</button></div>
+          <p class="muted" style="margin:7px 0 4px">XYZ (m)</p>
+          <div class="row"><input id="m-x" type="number" step="0.001" placeholder="X"><input id="m-y" type="number" step="0.001" placeholder="Y"><input id="m-z" type="number" step="0.001" placeholder="Z"></div>
+          <p class="muted" style="margin:7px 0 4px">Euler XYZ (deg)</p>
+          <div class="row"><input id="m-rx" type="number" step="1" placeholder="RX"><input id="m-ry" type="number" step="1" placeholder="RY"><input id="m-rz" type="number" step="1" placeholder="RZ"></div>
+          <div class="row" style="margin-top:7px"><label class="muted" title="How long the same target is repeatedly transmitted. This is not guaranteed travel time.">Command hold (s)</label><input id="m-duration" type="number" value="1" min=".1" max="5" step=".1" style="width:62px"><button class="primary" onclick="sendEndPose()">Send end pose</button></div>
+          <p class="muted" style="margin-top:5px">Bounded retransmission interval, not guaranteed travel time. Manual speed capped at validated 10%.</p>
+        </div>
+      </div>
+      <hr>
+      <div class="row"><b>Joint target (MOVE-J)</b><button onclick="loadCurrentJoints()">Use measured joints</button></div>
+      <div class="joint-controls">
+        <div class="joint-control"><label for="js-1">J1</label><input id="js-1" type="range" min="-150" max="150" step="1" value="0" oninput="jointControlChanged('js-1','j-1')"><input id="j-1" type="number" min="-150" max="150" step="1" value="0" oninput="jointControlChanged('j-1','js-1')"></div>
+        <div class="joint-control"><label for="js-2">J2</label><input id="js-2" type="range" min="0" max="180" step="1" value="0" oninput="jointControlChanged('js-2','j-2')"><input id="j-2" type="number" min="0" max="180" step="1" value="0" oninput="jointControlChanged('j-2','js-2')"></div>
+        <div class="joint-control"><label for="js-3">J3</label><input id="js-3" type="range" min="-170" max="0" step="1" value="0" oninput="jointControlChanged('js-3','j-3')"><input id="j-3" type="number" min="-170" max="0" step="1" value="0" oninput="jointControlChanged('j-3','js-3')"></div>
+        <div class="joint-control"><label for="js-4">J4</label><input id="js-4" type="range" min="-100" max="100" step="1" value="0" oninput="jointControlChanged('js-4','j-4')"><input id="j-4" type="number" min="-100" max="100" step="1" value="0" oninput="jointControlChanged('j-4','js-4')"></div>
+        <div class="joint-control"><label for="js-5">J5</label><input id="js-5" type="range" min="-70" max="70" step="1" value="0" oninput="jointControlChanged('js-5','j-5')"><input id="j-5" type="number" min="-70" max="70" step="1" value="0" oninput="jointControlChanged('j-5','js-5')"></div>
+        <div class="joint-control"><label for="js-6">J6</label><input id="js-6" type="range" min="-120" max="120" step="1" value="0" oninput="jointControlChanged('js-6','j-6')"><input id="j-6" type="number" min="-120" max="120" step="1" value="0" oninput="jointControlChanged('j-6','js-6')"></div>
+      </div>
+      <div class="row" style="margin-top:8px"><label class="muted"><input id="joint-engage" type="checkbox" onchange="setJointEngage(this.checked)"> Engage continuous sliders</label><button class="primary" onclick="sendJoints()">Send joints</button></div>
+      <p class="muted" style="margin-top:5px">Continuous sliders are off by default. While engaged, changing a target streams it at the current manual speed; requests stop shortly after input stops.</p>
+      <hr>
+      <div class="row"><b>Gripper</b><label class="muted" for="m-gripper-slider">Opening (mm)</label><div class="gripper-control"><input id="m-gripper-slider" type="range" value="0" min="-70" max="70" step="1" oninput="gripperControlChanged('m-gripper-slider','m-gripper-mm')"><input id="m-gripper-mm" type="number" value="0" min="-70" max="70" step="1" oninput="gripperControlChanged('m-gripper-mm','m-gripper-slider')"></div><label class="muted" for="m-gripper-effort">Effort</label><input id="m-gripper-effort" type="number" value="1000" min="0" max="5000" step="100" style="width:70px"><button onclick="sendGripper()">Set gripper</button></div>
+      <p class="muted" style="margin-top:5px">When continuous sliders are engaged, changing gripper target sends a bounded command.</p>
+      <div class="row" style="margin-top:9px"><input id="mark-name" type="text" placeholder="Mark name" style="width:110px"><button onclick="markPose()">Mark current</button><button class="warn" onclick="runTrajectory()">Run all in order</button></div>
+      <div class="muted" id="manual-marks" style="margin-top:7px">No marked poses.</div>
     </div>
+  </details>
 
-    <div class="card">
-      <h2>Status</h2>
-      <div class="kv"><span class="k">feedback</span><b id="s-feedback">—</b></div>
-      <div class="kv"><span class="k">control mode</span><b id="s-mode">—</b></div>
-      <div class="kv"><span class="k">arm state</span><b id="s-arm">—</b></div>
-      <div class="kv"><span class="k">teach state</span><b id="s-teach">—</b></div>
-      <div class="kv"><span class="k">motion</span><b id="s-motion">—</b></div>
-      <div class="kv"><span class="k">error code</span><b id="s-err">—</b></div>
-      <div class="kv"><span class="k">drivers</span><b id="s-drivers">—</b></div>
-      <div class="kv"><span class="k">joints (deg)</span><b id="s-joints" style="font-size:11px">—</b></div>
-    </div>
-
-    <div class="card">
-      <h2>Runtime Settings</h2>
+  <details class="card fold settings-card">
+    <summary>Runtime settings</summary>
+    <div class="fold-body">
       <div class="row" style="margin-bottom:9px">
-        <label class="muted">Replay speed (%)</label><input type="number" id="cfg-speed" min="1" max="100" style="width:75px">
-        <button onclick="saveSettings()">Save settings</button>
-        <button onclick="loadSettings()">Reload</button>
+        <label class="muted" for="cfg-speed">Replay speed (%)</label><input type="number" id="cfg-speed" min="1" max="100" style="width:72px">
+        <button class="primary" onclick="saveSettings()">Save</button><button onclick="loadSettings()">Reload</button>
       </div>
       <div class="grid2">
         <div>
-          <div class="muted" style="margin-bottom:5px">Global camera</div>
-          <input type="text" id="cfg-global-device" placeholder="/dev/video14" style="width:100%;margin-bottom:5px">
-          <div class="row"><input type="number" id="cfg-global-width" placeholder="width" style="width:78px"><input type="number" id="cfg-global-height" placeholder="height" style="width:78px"><input type="number" id="cfg-global-fps" placeholder="fps" style="width:62px"></div>
+          <label class="muted" for="cfg-global-device">Global camera</label>
+          <input type="text" id="cfg-global-device" placeholder="/dev/video14" style="width:100%;margin:4px 0">
+          <div class="row"><input type="number" id="cfg-global-width" placeholder="width" style="width:70px"><input type="number" id="cfg-global-height" placeholder="height" style="width:70px"><input type="number" id="cfg-global-fps" placeholder="fps" style="width:60px"></div>
         </div>
         <div>
-          <div class="muted" style="margin-bottom:5px">Wrist camera</div>
-          <input type="text" id="cfg-wrist-device" placeholder="/dev/video8" style="width:100%;margin-bottom:5px">
-          <div class="row"><input type="number" id="cfg-wrist-width" placeholder="width" style="width:78px"><input type="number" id="cfg-wrist-height" placeholder="height" style="width:78px"><input type="number" id="cfg-wrist-fps" placeholder="fps" style="width:62px"></div>
+          <label class="muted" for="cfg-wrist-device">Wrist camera</label>
+          <input type="text" id="cfg-wrist-device" placeholder="/dev/video8" style="width:100%;margin:4px 0">
+          <div class="row"><input type="number" id="cfg-wrist-width" placeholder="width" style="width:70px"><input type="number" id="cfg-wrist-height" placeholder="height" style="width:70px"><input type="number" id="cfg-wrist-fps" placeholder="fps" style="width:60px"></div>
         </div>
       </div>
       <div class="muted" style="margin-top:8px" id="cfg-note">Loading settings…</div>
     </div>
+  </details>
 
-    <div class="card">
-      <h2>Arm Control</h2>
-      <div class="row" style="margin-bottom:8px">
-        <button class="primary" data-needs-feedback onclick="replay('start')">▶ Replay</button>
-        <button data-needs-feedback onclick="replay('pause')">⏸ Pause</button>
-        <button data-needs-feedback onclick="replay('move_start')">→ Move to start</button>
-      </div>
-      <div class="row">
-        <button data-needs-feedback onclick="arm('enable')">Enable</button>
-        <button data-needs-feedback onclick="arm('disable')">Disable</button>
-        <button data-needs-feedback onclick="setMode('standby')">Mode: Standby</button>
-        <button data-needs-feedback onclick="setMode('can')">Mode: CAN control</button>
-        <button data-needs-feedback onclick="arm('reset')">Reset</button>
-        <button class="danger" onclick="estop()">⛔ E-STOP</button>
-      </div>
-      <div class="muted" style="margin-top:8px">Replay/offline mode is pendant-owned; host mode controls only Standby and CAN control.</div>
-    </div>
-
-    <div class="card">
-      <h2>Collect Episode</h2>
-      <div class="row" style="margin-bottom:8px">
-        <input type="text" id="task" placeholder="task description, e.g. put cube in basket" style="flex:1; min-width:180px">
-        <button onclick="saveTask()">Set task</button>
-      </div>
-      <div class="row" style="margin-bottom:10px">
-        <label class="muted">window cap (s)</label>
-        <input type="number" id="window" value="40" min="5" max="300" style="width:80px">
-        <button class="primary" id="btn-collect-start" onclick="startCollect()">● Start collect</button>
-        <button class="danger" id="btn-collect-stop" onclick="stopCollect()" disabled>Stop</button>
-      </div>
-      <div class="muted" style="margin-top:8px">Start collect only records camera + measured arm state. When you are ready, press Replay separately; stop collection manually after the motion finishes.</div>
-      <div class="kv"><span class="k">state</span><b id="c-state">idle</b></div>
-      <div class="kv"><span class="k">frames</span><b id="c-frames">0</b></div>
-      <div class="bar"><div id="c-bar"></div></div>
-      <div class="log" id="c-log"></div>
-    </div>
+  <section class="card dataset-card">
+    <div class="card-head"><h2>Episodes</h2><span class="spacer"></span><span class="muted" id="ds-summary">—</span><button onclick="loadDataset()">↻ Refresh</button></div>
+    <table id="ep-table">
+      <thead><tr><th>#</th><th>Frames</th><th>Dur</th><th>Task</th><th>Video</th><th></th></tr></thead>
+      <tbody id="ep-body"><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
+    </table>
   </section>
 
-  <!-- RIGHT: dataset + review -->
-  <section class="col">
-    <div class="card">
-      <div class="row" style="margin-bottom:10px">
-        <h2 style="margin:0">Dataset</h2>
-        <span class="spacer"></span>
-        <span class="muted" id="ds-summary">—</span>
-        <button onclick="loadDataset()">↻ Refresh</button>
-      </div>
-      <table id="ep-table">
-        <thead><tr><th>#</th><th>Frames</th><th>Dur</th><th>Task</th><th>Video</th><th></th></tr></thead>
-        <tbody id="ep-body"><tr><td colspan="6" class="muted">loading…</td></tr></tbody>
-      </table>
+  <section class="card detail-card" id="detail-card" style="display:none">
+    <div class="card-head"><h2 id="detail-title">Episode detail</h2></div>
+    <div class="thumbs" id="detail-thumbs"></div>
+    <div class="grid2" style="margin-top:12px">
+      <div><div class="muted" style="margin-bottom:5px">observation.state (10-D)</div><canvas class="chart" id="chart-state" width="520" height="180"></canvas></div>
+      <div><div class="muted" style="margin-bottom:5px">action = next measured state (10-D)</div><canvas class="chart" id="chart-action" width="520" height="180"></canvas></div>
     </div>
+    <div class="legend" id="chart-legend"></div>
+  </section>
 
-    <div class="card" id="detail-card" style="display:none">
-      <h2 id="detail-title">Episode detail</h2>
-      <div class="thumbs" id="detail-thumbs"></div>
-      <div class="grid2" style="margin-top:14px">
-        <div>
-          <div class="muted" style="margin-bottom:6px">observation.state (10-D)</div>
-          <canvas class="chart" id="chart-state" width="520" height="180"></canvas>
-        </div>
-        <div>
-          <div class="muted" style="margin-bottom:6px">action = next measured state (10-D)</div>
-          <canvas class="chart" id="chart-action" width="520" height="180"></canvas>
-        </div>
-      </div>
-      <div class="legend" id="chart-legend"></div>
-    </div>
-
-    <div class="card">
-      <div class="row" style="margin-bottom:10px"><h2 style="margin:0">Review Video</h2><span class="spacer"></span><button onclick="migrateVideos()">Convert legacy videos to H.264</button><button onclick="loadVideos()">↻ Refresh</button></div>
-      <div class="row" style="margin-bottom:10px">
-        <select id="video-select" style="flex:1; background:var(--panel2); color:var(--fg); border:1px solid var(--border); border-radius:7px; padding:8px;"></select>
-        <a id="video-download" class="badge" download>Download</a>
-      </div>
-      <video id="player" controls playsinline></video>
-      <div class="muted" id="video-note" style="margin-top:8px">Browser-ready H.264 videos are written to images/review/. Legacy mp4v videos can be converted with the button above.</div>
-    </div>
+  <section class="card video-card">
+    <div class="card-head"><h2>Review video</h2><span class="spacer"></span><button onclick="migrateVideos()">Convert legacy videos</button><button onclick="loadVideos()">↻ Refresh</button></div>
+    <div class="row" style="margin-bottom:9px"><select id="video-select" style="flex:1"></select><a id="video-download" class="badge" download>Download</a></div>
+    <video id="player" controls playsinline></video>
+    <div class="muted" id="video-note" style="margin-top:7px">Browser-ready H.264 videos are written to images/review/.</div>
   </section>
 </main>
 
 <script>
 const API = "";
 let statusTimer=null, camTimer=null, collectTimer=null;
+let currentManualPose=null, currentJoints=null, latestXvla=null, manualControlEnabled=false, jogHeld=null, jogBusy=false, jogTimer=null;
+let xvlaHoldActive=false, xvlaHoldBusy=false, xvlaHoldTimer=null, xvlaHoldPollTimer=null, xvlaHoldNewSession=false, xvlaHoldSession=null;
+let xvlaGuardLoaded=false;
+let jointEngageEnabled=false, jointEngageBusy=false, jointEngagePending=false, jointEngageTimer=null;
+let gripperEngageBusy=false, gripperEngagePending=false, gripperEngageTimer=null;
+// Exact gripper normalization range from xvla_training_manifest.json.
+const XVLA_GRIPPER_MIN_M=-0.042399998754262924, XVLA_GRIPPER_MAX_M=0.0478999987244606;
 
 async function j(url, opts){
   const r = await fetch(API+url, opts);
   let body={}; try{ body=await r.json(); }catch(_){ body={detail:await r.text()}; }
   if(!r.ok) throw new Error(body.detail || body.error || r.statusText);
+  if(body && body.ok === false) throw new Error(body.error || 'controller rejected the request');
   return body;
 }
 async function jp(url, body){ return j(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}); }
 async function report(label, work){ try{return await work();}catch(e){ const m=`${label}: ${e.message}`; log(m); alert(m); return null; } }
 
-function log(msg){ const el=document.getElementById('c-log'); el.textContent += msg+"\n"; el.scrollTop=el.scrollHeight; }
+function log(msg){
+  for(const id of ['c-log','status-log']){
+    const el=document.getElementById(id);
+    const lines=(el.textContent+msg+"\n").split('\n').filter(Boolean).slice(-80);
+    el.textContent=lines.join('\n')+(lines.length?'\n':'');
+    el.scrollTop=el.scrollHeight;
+  }
+}
 
 // ---- status -------------------------------------------------------------
 async function pollStatus(){
@@ -237,9 +384,11 @@ async function pollStatus(){
     const source=s.feedback_state||'UNKNOWN';
     const usable=!!s.feedback_ok;
     const detail=s.feedback_reason||'';
+    const commandDetail=s.command_reason||'';
+    const commandOk=!!s.command_ok;
     const rates=s.feedback_hz||{};
-    document.getElementById('conn-sub').textContent = `can=${s.can} · ${source} · ${detail}${source==='LIVE'?` · status ${rates.status||0} Hz`:''} · speed ${s.speed}%`;
-    document.getElementById('s-feedback').textContent = `${source}${detail?` — ${detail}`:''}`;
+    document.getElementById('conn-sub').textContent = `can=${s.can} · ${source} · ${detail}${source==='LIVE'?` · status ${rates.status||0} Hz`:''} · command: ${commandDetail} · speed ${s.speed}%`;
+    document.getElementById('s-feedback').textContent = `${source}${detail?` — ${detail}`:''}${commandOk?'':` · COMMAND BLOCKED: ${commandDetail}`}`;
     document.querySelectorAll('[data-needs-feedback]').forEach(b=>{ b.disabled=!usable; b.title=usable?'':'Disabled: live Piper feedback is unavailable'; });
     const resumeButton=document.getElementById('btn-replay-resume');
     resumeButton.title=usable?'Continue taught trajectory reproduction':'Disabled: live Piper feedback is unavailable';
@@ -257,12 +406,192 @@ async function pollStatus(){
     document.getElementById('s-motion').textContent = usable && s.motion_status>=0?('0x'+(s.motion_status>>>0).toString(16)):'—';
     document.getElementById('s-err').textContent = usable?('0x'+(s.err_code>>>0).toString(16)):'—';
     document.getElementById('s-drivers').textContent = usable?(s.drivers||[]).map(d=>d===1?'●':(d===0?'○':'?')).join(' '):'—';
+    currentJoints=usable?(s.joints_deg||null):null;
     document.getElementById('s-joints').textContent = usable?(s.joints_deg||[]).map(v=>v==null?'—':v.toFixed(2)).join('  '):'—';
+    const statusPose=usable?s.end_pose:null;
+    const formatStatusVector=(values,labels,digits)=>Array.isArray(values)&&values.length===3&&values.every(Number.isFinite)?values.map((v,i)=>`${labels[i]} ${v.toFixed(digits)}`).join(' · '):'—';
+    document.getElementById('s-eef-xyz').textContent=formatStatusVector(statusPose&&statusPose.xyz_m,['X','Y','Z'],4);
+    document.getElementById('s-eef-euler').textContent=formatStatusVector(statusPose&&statusPose.euler_xyz_deg,['RX','RY','RZ'],1);
+    document.getElementById('s-gripper').textContent=statusPose&&Number.isFinite(statusPose.gripper_m)?(statusPose.gripper_m*1000).toFixed(1):'—';
+    currentManualPose=s.end_pose||null;
+    document.getElementById('manual-live-xyz').textContent=currentManualPose?currentManualPose.xyz_m.map(v=>v.toFixed(4)).join('  '):'—';
+    document.getElementById('manual-live-euler').textContent=currentManualPose?currentManualPose.euler_xyz_deg.map(v=>v.toFixed(1)+'°').join('  '):'—';
+    document.getElementById('manual-live-gripper').textContent=currentManualPose?(currentManualPose.gripper_m*1000).toFixed(1)+' mm':'—';
+    const note=document.getElementById('manual-note'); note.textContent=s.manual_control_enabled?'CONTROL ON':'CONTROL OFF'; note.className='badge '+(s.manual_control_enabled?'ok':'no');
+    manualControlEnabled=!!s.manual_control_enabled;
     if(!document.getElementById('task').value) document.getElementById('task').value = s.task||'';
-  }catch(e){ document.getElementById('conn-sub').textContent = 'connection lost: '+e.message; }
+  }catch(e){
+    document.getElementById('conn-sub').textContent = 'connection lost: '+e.message;
+    for(const id of ['s-eef-xyz','s-eef-euler','s-gripper']) document.getElementById(id).textContent='—';
+  }
 }
 function setPill(id, text, ok){ const el=document.getElementById('p-'+id); if(el) el.textContent=text; }
 function setDot(id, cls){ const el=document.getElementById(id); if(el){ el.className='dot '+(cls||''); } }
+
+async function pollXvla(){
+  try{
+    const s=await j('/api/xvla/status');
+    updateXvlaGuardApply();
+    if(s.log_lines) for(const line of s.log_lines) log(`[X-VLA] ${line}`);
+    document.getElementById('xvla-status').textContent=s.status;
+    const summary=s.summary, latest=s.latest;
+    const recording=s.recording;
+    document.getElementById('xvla-recording').textContent=recording?`${recording.saved} pairs saved · ${recording.dropped} dropped · ${recording.queued} queued${recording.error?' · ERROR: '+recording.error:''}`:(s.recording_dir?'Starting…':'Off');
+    document.getElementById('xvla-recording-path').textContent=s.recording_dir||'';
+    document.getElementById('xvla-record-images').disabled=['running','stopping'].includes(s.status);
+    latestXvla=latest?{...latest,inference_status:s.status,received_performance_ms:performance.now()}:null;
+    const sendButton=document.getElementById('btn-send-xvla');
+    const fresh=isFreshXvlaPrediction(latestXvla);
+    const canSend=!!(latest && s.status==='running' && fresh && latest.guard_allowed && latest.predicted_pose && manualControlEnabled);
+    sendButton.disabled=!canSend;
+    sendButton.title=canSend?'Hold to stream each new guard-approved prediction':'Start inference and wait for a guard-approved prediction';
+    if(xvlaHoldActive && !canSend){
+      const reason=s.status!=='running'?'inference stopped':(!fresh?'prediction became stale':'action guard rejected the latest prediction');
+      stopXvlaHold(reason);
+    }
+    document.getElementById('xvla-result').textContent=latest?`${Number.isFinite(latest.loop_hz)?latest.loop_hz.toFixed(1):'—'} / 20 Hz · ${Number.isFinite(latest.inference_ms)?latest.inference_ms.toFixed(0):'—'} ms inference · ${latest.deadline_missed||0} misses${latest.control_active?` · ${Number.isFinite(latest.control_hz)?latest.control_hz.toFixed(1):'—'} Hz control`:''}`:(summary?`${summary.allowed}/${summary.frames} guard-allowed`:'—');
+    const formatPose=pose=>pose?`XYZ ${pose.xyz_m.map(v=>v.toFixed(3)).join(', ')} m · Euler ${pose.euler_xyz_deg.map(v=>v.toFixed(1)+'°').join(', ')}`:'—';
+    document.getElementById('xvla-predicted').textContent=formatPose(latest&&latest.predicted_pose);
+    const normalized=latest&&latest.predicted_pose&&latest.predicted_pose.gripper_normalized&&latest.predicted_pose.gripper_normalized[0];
+    const gripperM=gripperNormalizedToMeters(normalized);
+    document.getElementById('xvla-predicted-gripper').textContent=gripperM===null?'—':`${(gripperM*1000).toFixed(1)} mm (normalized ${normalized.toFixed(3)})`;
+    document.getElementById('xvla-measured').textContent=formatPose(latest&&latest.measured_pose);
+    document.getElementById('xvla-note').textContent=latest&&latest.alerts.length?`guard alerts: ${(latest.alert_messages||latest.alerts).join('; ')}`:(!fresh&&s.status==='running'?'waiting for a fresh inference result':(s.message||''));
+  }catch(e){ document.getElementById('xvla-note').textContent='X-VLA status error: '+e.message; }
+}
+async function startXvlaDiagnostic(){ return report('start X-VLA camera-only diagnostic',async()=>{ const frames=+document.getElementById('xvla-frames').value; const record_images=document.getElementById('xvla-record-images').checked; const r=await jp('/api/xvla/diagnostic',{frames,record_images}); log(`X-VLA diagnostic started: ${r.frames===0?'continuous':r.frames+' frames'}; hold the send button to stream guarded actions`); if(r.recording_dir) log(`Recording inference images: ${r.recording_dir}`); await pollXvla(); return r; }); }
+async function stopXvlaDiagnostic(){ return report('stop X-VLA camera-only diagnostic',async()=>{ const r=await jp('/api/xvla/stop',{}); log('X-VLA camera-only diagnostic stop requested'); await pollXvla(); return r; }); }
+const XVLA_GUARD_FIELDS=[
+  ['max_position_step_m','Position step (mm)',1000,0.1],
+  ['max_rotation_step_deg','Rotation step (degrees)',1,0.1],
+  ['max_gripper_step_normalized','Gripper step (normalized)',1,0.01],
+  ['max_inactive_arm_l2','Inactive arm L2 tolerance',1,0.001],
+  ['max_camera_age_s','Camera age (ms)',1000,1],
+  ['max_feedback_age_s','Feedback age (ms)',1000,1],
+];
+function buildXvlaGuardForm(){
+  const fields=document.getElementById('xvla-guard-fields');
+  if(fields.children.length) return;
+  for(const [key,title,scale,step] of XVLA_GUARD_FIELDS){
+    const label=document.createElement('label');label.className='muted';label.textContent=title;
+    const input=document.createElement('input');input.type='number';input.id='guard-'+key;input.min='0.000001';input.step='any';input.required=true;input.style.width='100%';input.style.marginTop='4px';
+    label.appendChild(input);fields.appendChild(label);
+  }
+  const workspace=document.getElementById('xvla-guard-workspace');
+  for(const [index,axis] of ['X','Y','Z'].entries()){
+    const row=document.createElement('div');row.className='row';row.style.marginTop='4px';
+    const name=document.createElement('b');name.textContent=axis;name.style.width='16px';row.appendChild(name);
+    for(const bound of ['min','max']){
+      const label=document.createElement('label');label.className='muted';label.style.flex='1';label.textContent=bound==='min'?'Min':'Max';
+      const input=document.createElement('input');input.type='number';input.id=`guard-${bound}-${index}`;input.step='any';input.required=true;input.style.width='100%';input.setAttribute('aria-label',`${axis} workspace ${bound} in metres`);
+      label.appendChild(input);row.appendChild(label);
+    }
+    workspace.appendChild(row);
+  }
+  document.getElementById('xvla-guard-form').addEventListener('input',()=>{document.getElementById('xvla-guard-note').textContent='Unsaved changes';updateXvlaGuardApply();});
+}
+function updateXvlaGuardApply(){
+  document.getElementById('xvla-guard-apply').disabled=!xvlaGuardLoaded || !document.getElementById('xvla-guard-form').checkValidity();
+}
+async function loadXvlaGuard(){
+  buildXvlaGuardForm();
+  try{
+    const {limits}=await j('/api/xvla/guard');
+    for(const [key,title,scale] of XVLA_GUARD_FIELDS) document.getElementById('guard-'+key).value=Number((limits[key]*scale).toPrecision(12));
+    for(const bound of ['min','max']) for(let i=0;i<3;i++) document.getElementById(`guard-${bound}-${i}`).value=limits[`workspace_${bound}_m`][i];
+    xvlaGuardLoaded=true;
+    updateXvlaGuardApply();
+    document.getElementById('xvla-guard-note').textContent='Loaded saved limits';
+  }catch(e){document.getElementById('xvla-guard-note').textContent='Could not load guard limits: '+e.message+'; restart the WebUI server and reload this page.';}
+}
+async function saveXvlaGuard(){
+  if(!document.getElementById('xvla-guard-form').reportValidity()) return;
+  const limits={};
+  for(const [key,title,scale] of XVLA_GUARD_FIELDS) limits[key]=Number(document.getElementById('guard-'+key).value)/scale;
+  for(const bound of ['min','max']) limits[`workspace_${bound}_m`]=[0,1,2].map(i=>Number(document.getElementById(`guard-${bound}-${i}`).value));
+  try{
+    stopXvlaHold('stopped to apply guard limits');
+    const r=await j('/api/xvla/guard',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(limits)});
+    document.getElementById('xvla-guard-note').textContent=r.message;
+    log('X-VLA guard limits applied; held control stopped');
+  }catch(e){document.getElementById('xvla-guard-note').textContent='Guard limits not saved: '+e.message;}
+}
+function gripperNormalizedToMeters(normalized){
+  if(!Number.isFinite(normalized) || normalized<0 || normalized>1) return null;
+  return XVLA_GRIPPER_MIN_M+normalized*(XVLA_GRIPPER_MAX_M-XVLA_GRIPPER_MIN_M);
+}
+function isFreshXvlaPrediction(sample){
+  return !!(sample && Number.isFinite(sample.prediction_age_s) && Number.isFinite(sample.received_performance_ms) &&
+    sample.prediction_age_s*1000+performance.now()-sample.received_performance_ms<=500);
+}
+async function sendXvlaPrediction(sample, held){
+  if(!sample || sample.inference_status!=='running' || !sample.guard_allowed) throw new Error('inference stopped or the latest action was rejected by the guard');
+  if(!isFreshXvlaPrediction(sample)) throw new Error('latest inference result is stale');
+  const pose=sample.predicted_pose;
+  if(!pose || ![...pose.xyz_m,...pose.euler_xyz_deg].every(Number.isFinite)) throw new Error('no finite X-VLA pose is available');
+  const gripperM=gripperNormalizedToMeters(pose.gripper_normalized&&pose.gripper_normalized[0]);
+  if(gripperM===null) throw new Error('predicted gripper is outside the normalized [0, 1] range');
+  if(!speedOk()) throw new Error('manual speed must be 1–10%');
+  if(held) throw new Error('held control is owned by the fixed-rate inference runner');
+  const body={x_m:pose.xyz_m[0],y_m:pose.xyz_m[1],z_m:pose.xyz_m[2],rx_deg:pose.euler_xyz_deg[0],ry_deg:pose.euler_xyz_deg[1],rz_deg:pose.euler_xyz_deg[2],speed_percent:mv('m-speed'),duration_s:mv('m-duration'),stream_hz:20};
+  const r=await jp('/api/manual/endpose',body);
+  const g=await jp('/api/manual/gripper',{position_m:gripperM,effort:mv('m-gripper-effort'),duration_s:mv('m-duration'),stream_hz:10});
+  log(`X-VLA frame ${sample.frame}: ${r.simulated?'simulated':`${r.sent} end-pose + ${g.sent} gripper updates sent; verify measured feedback`}`);
+  await pollStatus();
+  return {pose:r,gripper:g};
+}
+async function sendLatestXvlaPose(){
+  if(!latestXvla || latestXvla.inference_status!=='running' || !latestXvla.guard_allowed || !isFreshXvlaPrediction(latestXvla)){ alert('Start inference and wait for a fresh, guard-approved prediction.'); return; }
+  return report('send latest X-VLA pose and gripper',()=>sendXvlaPrediction(latestXvla,false));
+}
+function startXvlaHold(event){
+  event.preventDefault();
+  if(!latestXvla || latestXvla.inference_status!=='running' || !latestXvla.guard_allowed || !isFreshXvlaPrediction(latestXvla) || xvlaHoldActive) return;
+  xvlaHoldActive=true;
+  xvlaHoldNewSession=true;
+  xvlaHoldSession=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():`${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const button=document.getElementById('btn-send-xvla');
+  button.classList.add('holding');
+  button.textContent='Release to stop';
+  document.getElementById('xvla-hold-status').textContent='SENDING';
+  try{ button.setPointerCapture(event.pointerId); }catch(_){ }
+  xvlaHoldPollTimer=setInterval(pollXvla,120);
+  tickXvlaHold();
+}
+function startXvlaKeyHold(event){
+  if(event.key!==' ' && event.key!=='Enter') return;
+  event.preventDefault();
+  if(!event.repeat) startXvlaHold(event);
+}
+function stopXvlaHold(reason='stopped'){
+  if(!xvlaHoldActive) return;
+  xvlaHoldActive=false;
+  if(xvlaHoldTimer){clearTimeout(xvlaHoldTimer);xvlaHoldTimer=null;}
+  if(xvlaHoldPollTimer){clearInterval(xvlaHoldPollTimer);xvlaHoldPollTimer=null;}
+  const button=document.getElementById('btn-send-xvla');
+  button.classList.remove('holding');
+  button.textContent='Hold to send controls';
+  document.getElementById('xvla-hold-status').textContent='READY';
+  const session=xvlaHoldSession;
+  xvlaHoldSession=null;
+  jp('/api/xvla/control/stop',{session_id:session}).catch(()=>{});
+  log(`X-VLA held control ${reason}`);
+}
+async function tickXvlaHold(){
+  if(!xvlaHoldActive || xvlaHoldBusy) return;
+  const sample=latestXvla;
+  if(!sample || sample.inference_status!=='running' || !sample.guard_allowed){ stopXvlaHold('stopped by inference or action guard'); return; }
+  xvlaHoldBusy=true;
+  try{
+    await jp('/api/xvla/control/heartbeat',{speed_percent:mv('m-speed'),new_session:xvlaHoldNewSession,session_id:xvlaHoldSession});
+    xvlaHoldNewSession=false;
+  }catch(e){ stopXvlaHold(`stopped after lease error: ${e.message}`); }
+  finally{ xvlaHoldBusy=false; }
+  if(xvlaHoldActive) xvlaHoldTimer=setTimeout(tickXvlaHold,100);
+}
+window.addEventListener('blur',()=>stopXvlaHold('stopped when the window lost focus'));
+document.addEventListener('pointerup',()=>stopXvlaHold('released'));
+document.addEventListener('visibilitychange',()=>{if(document.hidden) stopXvlaHold('stopped when the page was hidden');});
 
 // ---- persistent runtime settings ----------------------------------------
 function cameraForm(role, c){
@@ -304,6 +633,7 @@ async function pollCameras(){
     }
   }catch(e){
     if(String(e.message).includes('suspended while collection')) document.getElementById('cam-note').textContent='Preview suspended: collection owns both cameras.';
+    else if(String(e.message).includes('X-VLA diagnostic owns')) document.getElementById('cam-note').textContent='Preview suspended: X-VLA diagnostic owns both cameras.';
     else document.getElementById('cam-note').textContent='Camera preview: '+e.message;
   }
 }
@@ -316,7 +646,134 @@ async function setMode(mode){
   if(!confirm(`Switch Piper to ${label} mode?`)) return;
   return report(`mode ${mode}`,async()=>{ const r=await jp('/api/mode',{mode}); log(`mode ${mode}: ${r.ok?(r.message||'ok'):r.error}`); await pollStatus(); return r; });
 }
-async function estop(){ return report('E-STOP',async()=>{ const r=await jp('/api/estop',{}); log(`estop: ${r.ok?'sent':r.error}`); await pollStatus(); return r; }); }
+async function estop(){ disableJointEngage('E-stop'); return report('E-STOP',async()=>{ const r=await jp('/api/estop',{}); log(`estop: ${r.ok?'sent':r.error}`); await pollStatus(); return r; }); }
+
+// ---- manual Cartesian and jog control -----------------------------------
+const mv=id=>parseFloat(document.getElementById(id).value);
+async function setManualControl(enabled){
+  stopJog();
+  if(!enabled) disableJointEngage('Manual Control OFF');
+  return report(enabled?'enable manual control':'disable manual control',async()=>{
+    const r=await jp('/api/manual/control',{enabled,confirm:enabled?document.getElementById('manual-arm-confirm').value:''});
+    document.getElementById('manual-arm-confirm').value=''; await pollStatus(); log(`manual control ${enabled?'ON':'OFF'}`); return r;
+  });
+}
+function syncControlValue(sourceId, targetId){
+  const source=document.getElementById(sourceId), target=document.getElementById(targetId);
+  if(!source || !target) return;
+  target.value=source.value;
+}
+function jointControlChanged(sourceId, targetId){
+  syncControlValue(sourceId,targetId);
+  queueEngagedJointTarget();
+}
+function setJointEngage(enabled){
+  jointEngageEnabled=Boolean(enabled);
+  if(!jointEngageEnabled){
+    jointEngagePending=false;
+    gripperEngagePending=false;
+    if(jointEngageTimer){ clearTimeout(jointEngageTimer); jointEngageTimer=null; }
+    if(gripperEngageTimer){ clearTimeout(gripperEngageTimer); gripperEngageTimer=null; }
+  }
+  document.getElementById('joint-engage').checked=jointEngageEnabled;
+  log(`continuous sliders ${jointEngageEnabled?'ENGAGED — move a joint or gripper slider to command':'OFF'}`);
+}
+function disableJointEngage(reason){
+  if(jointEngageEnabled || jointEngagePending || gripperEngagePending) log(`continuous sliders OFF: ${reason}`);
+  setJointEngage(false);
+}
+function queueEngagedJointTarget(){
+  if(!jointEngageEnabled) return;
+  if(!speedOk()) { disableJointEngage('manual speed outside 1–10%'); alert('Continuous joint control stopped: manual speed must be 1–10%.'); return; }
+  jointEngagePending=true;
+  if(!jointEngageTimer) jointEngageTimer=setTimeout(flushEngagedJointTarget,80);
+}
+async function flushEngagedJointTarget(){
+  jointEngageTimer=null;
+  if(!jointEngageEnabled || !jointEngagePending || jointEngageBusy) return;
+  const joints=[1,2,3,4,5,6].map(i=>mv(`j-${i}`));
+  if(!joints.every(Number.isFinite)){ disableJointEngage('non-finite joint target'); alert('Continuous joint control stopped: all six joint values must be finite.'); return; }
+  jointEngagePending=false;
+  jointEngageBusy=true;
+  try{
+    const r=await jp('/api/manual/joints',{joints_deg:joints,speed_percent:mv('m-speed'),duration_s:0.15,stream_hz:20});
+    log(`continuous joints: ${r.simulated?'simulated':'latest target sent'}`);
+  }catch(e){
+    disableJointEngage(`command failed: ${e.message}`);
+    alert(`Continuous joint control stopped: ${e.message}`);
+  }finally{
+    jointEngageBusy=false;
+    if(jointEngageEnabled && jointEngagePending && !jointEngageTimer) jointEngageTimer=setTimeout(flushEngagedJointTarget,0);
+  }
+}
+function gripperControlChanged(sourceId,targetId){
+  syncControlValue(sourceId,targetId);
+  queueEngagedGripperTarget();
+}
+function queueEngagedGripperTarget(){
+  if(!jointEngageEnabled) return;
+  gripperEngagePending=true;
+  if(!gripperEngageTimer) gripperEngageTimer=setTimeout(flushEngagedGripperTarget,80);
+}
+async function flushEngagedGripperTarget(){
+  gripperEngageTimer=null;
+  if(!jointEngageEnabled || !gripperEngagePending || gripperEngageBusy) return;
+  const positionM=mv('m-gripper-mm')/1000, effort=mv('m-gripper-effort');
+  if(!Number.isFinite(positionM) || !Number.isFinite(effort)){ disableJointEngage('non-finite gripper target'); alert('Continuous gripper control stopped: position and effort must be finite.'); return; }
+  gripperEngagePending=false;
+  gripperEngageBusy=true;
+  try{
+    const r=await jp('/api/manual/gripper',{position_m:positionM,effort,duration_s:0.15,stream_hz:20});
+    log(`continuous gripper: ${r.simulated?'simulated':'latest target sent'}`);
+  }catch(e){
+    disableJointEngage(`gripper command failed: ${e.message}`);
+    alert(`Continuous gripper control stopped: ${e.message}`);
+  }finally{
+    gripperEngageBusy=false;
+    if(jointEngageEnabled && gripperEngagePending && !gripperEngageTimer) gripperEngageTimer=setTimeout(flushEngagedGripperTarget,0);
+  }
+}
+function loadCurrentPose(){
+  if(!currentManualPose){ alert('No live pose feedback is available.'); return; }
+  ['m-x','m-y','m-z'].forEach((id,i)=>document.getElementById(id).value=currentManualPose.xyz_m[i]);
+  ['m-rx','m-ry','m-rz'].forEach((id,i)=>document.getElementById(id).value=currentManualPose.euler_xyz_deg[i]);
+}
+function loadCurrentJoints(){
+  if(!currentJoints || currentJoints.length!==6){ alert('No six-joint live feedback is available.'); return; }
+  currentJoints.forEach((value,i)=>{ const rounded=Math.round(value); document.getElementById(`j-${i+1}`).value=rounded; document.getElementById(`js-${i+1}`).value=rounded; });
+}
+function markButtons(label, onClick){ const b=document.createElement('button'); b.textContent=label; b.onclick=onClick; return b; }
+function renderMarks(marks){
+  const el=document.getElementById('manual-marks'); el.replaceChildren();
+  if(!marks.length){ el.textContent='No marked poses.'; return; }
+  marks.forEach((mark,index)=>{
+    const row=document.createElement('div'); row.className='row'; row.style.marginTop='5px';
+    const label=document.createElement('span'); label.textContent=`${index+1}. ${mark.name}  [${mark.pose.xyz_m.map(v=>v.toFixed(3)).join(', ')}]`;
+    row.append(label, markButtons('Go',()=>runTrajectory([mark.name])), markButtons('↑',()=>moveMark(index,-1)), markButtons('↓',()=>moveMark(index,1)), markButtons('Remove',()=>deleteMark(mark.name)));
+    el.appendChild(row);
+  });
+}
+async function loadMarks(){ const r=await j('/api/manual/marks'); renderMarks(r.marks); return r.marks; }
+async function markPose(){ return report('mark pose',async()=>{ const r=await jp('/api/manual/mark',{name:document.getElementById('mark-name').value}); document.getElementById('mark-name').value=''; log(`marked ${r.mark.name}`); await loadMarks(); return r; }); }
+async function moveMark(index, direction){ return report('reorder marks',async()=>{ const marks=await loadMarks(); const to=index+direction; if(to<0 || to>=marks.length) return; [marks[index],marks[to]]=[marks[to],marks[index]]; await jp('/api/manual/marks/reorder',{names:marks.map(m=>m.name)}); await loadMarks(); }); }
+async function deleteMark(name){ return report('remove mark',async()=>{ await jp('/api/manual/marks/delete',{name}); await loadMarks(); }); }
+function speedOk(){ const s=mv('m-speed'); return Number.isFinite(s) && s>=1 && s<=10; }
+async function sendEndPose(){ if(!speedOk()) return alert('Manual speed must be 1–10%.'); return report('send end pose',async()=>{ const body={x_m:mv('m-x'),y_m:mv('m-y'),z_m:mv('m-z'),rx_deg:mv('m-rx'),ry_deg:mv('m-ry'),rz_deg:mv('m-rz'),speed_percent:mv('m-speed'),duration_s:mv('m-duration'),stream_hz:20}; const r=await jp('/api/manual/endpose',body); log(`end pose: ${r.simulated?'simulated':`${r.sent} updates sent; verify measured feedback`}`); await pollStatus(); return r; }); }
+async function sendJoints(){ if(!speedOk()) return alert('Manual speed must be 1–10%.'); return report('send joints',async()=>{ const r=await jp('/api/manual/joints',{joints_deg:[1,2,3,4,5,6].map(i=>mv(`j-${i}`)),speed_percent:mv('m-speed'),duration_s:mv('m-duration'),stream_hz:20}); log(`joint target: ${r.simulated?'simulated':`${r.sent} MOVE-J updates sent; verify measured joints`}`); await pollStatus(); return r; }); }
+async function sendGripper(){ return report('set gripper',async()=>{ const r=await jp('/api/manual/gripper',{position_m:mv('m-gripper-mm')/1000,effort:mv('m-gripper-effort'),duration_s:1,stream_hz:10}); log(`gripper: ${r.simulated?'simulated':`${r.sent} updates to ${(r.position_m*1000).toFixed(1)} mm; verify measured feedback`}`); await pollStatus(); return r; }); }
+async function jogOnce(){
+  if(!jogHeld || jogBusy) return;
+  const held = jogHeld;
+  jogBusy=true;
+  try{ const body={axis:held.axis,direction:held.direction,speed_percent:mv('m-speed')}; if(held.axis.startsWith('r')) body.step_deg=mv('jog-step-deg'); else body.step_m=mv('jog-step-mm')/1000; const r=await jp('/api/manual/jog',body); log(`jog ${held.direction>0?'+':'−'}${held.axis.toUpperCase()}: ${r.simulated?'simulated':'sent'}`); }
+  catch(e){ stopJog(); alert(`jog: ${e.message}`); log(`jog: ${e.message}`); }
+  finally{ jogBusy=false; }
+}
+function startJog(button, event){ event.preventDefault(); if(!speedOk()){ alert('Manual speed must be 1–10%.'); return; } jogHeld={axis:button.dataset.axis,direction:+button.dataset.direction}; button.setPointerCapture?.(event.pointerId); jogOnce(); jogTimer=setInterval(jogOnce,220); }
+function stopJog(){ jogHeld=null; if(jogTimer){clearInterval(jogTimer);jogTimer=null;} }
+document.querySelectorAll('[data-jog]').forEach(b=>{ b.addEventListener('pointerdown',e=>startJog(b,e)); b.addEventListener('pointerup',stopJog); b.addEventListener('pointercancel',stopJog); b.addEventListener('lostpointercapture',stopJog); });
+window.addEventListener('blur',stopJog); document.addEventListener('pointerup',stopJog);
+async function runTrajectory(names=null){ if(!speedOk()) return alert('Manual speed must be 1–10%.'); const label=names?names.join(' → '):'all marked poses in order'; if(!confirm(`Run ${label}? The arm will move.`)) return; return report('run marked trajectory',async()=>{ const r=await jp('/api/manual/trajectory/run',{names,speed_percent:mv('m-speed'),duration_s:mv('m-duration'),stream_hz:20}); log(`trajectory: ${r.marks.join(' → ')}`); await pollStatus(); return r; }); }
 
 // ---- task ---------------------------------------------------------------
 async function saveTask(){ const t=document.getElementById('task').value.trim(); if(!t){ alert('Task cannot be empty'); return; } return report('set task',async()=>{ const r=await j('/api/task',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:t})}); log('task set: '+t); return r; }); }
@@ -331,7 +788,7 @@ async function startCollect(){
   });
 }
 async function stopCollect(){ return report('stop collect',async()=>{ await jp('/api/collect/stop',{}); log('stop requested'); }); }
-function startCollectPoll(){ if(collectTimer) return; collectTimer=setInterval(pollCollect, 400); }
+function startCollectPoll(){ if(collectTimer) return; collectTimer=setInterval(pollCollect, 100); }
 async function pollCollect(){
   try{
     const s=await j('/api/collect/status');
@@ -441,7 +898,32 @@ async function migrateVideos(){
 document.getElementById('player').addEventListener('error',()=>{ document.getElementById('video-note').textContent='The browser could not play this video. Convert it to H.264, then refresh the list.'; });
 
 // ---- boot ---------------------------------------------------------------
-function boot(){ pollStatus(); camTimer=setInterval(pollCameras,1500); statusTimer=setInterval(pollStatus,2000); loadSettings(); loadDataset(); loadVideos(); startCollectPoll(); pollCameras(); }
+function boot(){ pollStatus(); pollXvla(); loadXvlaGuard(); camTimer=setInterval(pollCameras,1500); statusTimer=setInterval(pollStatus,100); setInterval(pollXvla,1000); loadSettings(); loadDataset(); loadVideos(); loadMarks(); startCollectPoll(); pollCameras(); }
+let floatingStatusFrame=null;
+function updateFloatingStatus(){
+  floatingStatusFrame=null;
+  const slot=document.getElementById('status-slot');
+  const card=document.getElementById('status-card');
+  const header=document.querySelector('header');
+  if(!slot || !card || !header) return;
+  const headerIsPinned=['sticky','fixed'].includes(getComputedStyle(header).position);
+  const top=headerIsPinned?Math.max(12,header.getBoundingClientRect().bottom+10):12;
+  document.documentElement.style.setProperty('--status-float-top',`${top}px`);
+  const passed=slot.getBoundingClientRect().top < top;
+  if(passed && !card.classList.contains('is-floating')){
+    slot.style.minHeight=`${card.offsetHeight}px`;
+    card.classList.add('is-floating');
+  }else if(!passed && card.classList.contains('is-floating')){
+    card.classList.remove('is-floating');
+    slot.style.minHeight='';
+  }
+}
+function scheduleFloatingStatus(){
+  if(floatingStatusFrame===null) floatingStatusFrame=requestAnimationFrame(updateFloatingStatus);
+}
+window.addEventListener('scroll',scheduleFloatingStatus,{passive:true});
+window.addEventListener('resize',scheduleFloatingStatus);
+scheduleFloatingStatus();
 boot();
 </script>
 </body>

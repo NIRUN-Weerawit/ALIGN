@@ -232,6 +232,10 @@ class DryRunPiper:
         print(f"DRY-RUN GripperCtrl(angle={gripper_angle}, effort={gripper_effort}, code=0x{gripper_code:02x})")
         self.calls.append(("gripper_ctrl", gripper_angle, gripper_effort, gripper_code))
 
+    def JointCtrl(self, joint_1, joint_2, joint_3, joint_4, joint_5, joint_6):
+        print(f"DRY-RUN JointCtrl({joint_1}, {joint_2}, {joint_3}, {joint_4}, {joint_5}, {joint_6})")
+        self.calls.append(("joint_ctrl", joint_1, joint_2, joint_3, joint_4, joint_5, joint_6))
+
     def GetArmLowSpdInfoMsgs(self):
         return _FakeLowSpdInfo(self._enabled)
 
