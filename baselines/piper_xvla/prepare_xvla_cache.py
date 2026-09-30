@@ -15,7 +15,12 @@ import pyarrow.parquet as pq
 import torch
 
 from piper_xvla.train_xvla_piper import load_config
-from piper_xvla.xvla_dataset import PiperXVLAConversion, build_prepared_numeric_cache
+from piper_xvla.xvla_dataset import (
+    PiperXVLAConversion,
+    build_prepared_numeric_cache,
+    discover_intact_replay_episodes,
+    write_xvla_training_manifest,
+)
 
 
 def status(stage: int, total: int, message: str) -> None:
@@ -46,6 +51,10 @@ def _read_numeric_source(root: Path, episode_ids: set[int]) -> tuple[np.ndarray,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="piper_xvla/config/piper_xvla_single_task.json")
+    parser.add_argument(
+        "--source-root",
+        help="LeRobot replay dataset directory (defaults to <manifest directory>/dataset if present)",
+    )
     parser.add_argument("--force", action="store_true", help="replace an existing prepared cache")
     args = parser.parse_args()
     total = 5
@@ -53,14 +62,38 @@ def main() -> None:
     status(1, total, "loading training config and manifest")
     config = load_config(args.config)
     import json
-    manifest = json.loads(Path(config["manifest"]).read_text())
+    manifest_path = Path(config["manifest"])
+    preloaded_numeric = None
+    if not manifest_path.exists():
+        candidates = [Path(args.source_root)] if args.source_root else [manifest_path.parent / "dataset", manifest_path.parent]
+        root = next((candidate.resolve() for candidate in candidates
+                     if (candidate / "meta" / "episodes").is_dir() and (candidate / "data").is_dir()), None)
+        if root is None:
+            raise FileNotFoundError(
+                f"training manifest not found at {manifest_path}; set --source-root to a LeRobot dataset directory"
+            )
+        status(1, total, f"manifest missing; discovering retained episodes under {root}")
+        episode_ids = discover_intact_replay_episodes(root)
+        preloaded_numeric = _read_numeric_source(root, set(episode_ids))
+        states, actions, _, _ = preloaded_numeric
+        gripper_min = float(min(states[:, 9].min(), actions[:, 9].min()))
+        gripper_max = float(max(states[:, 9].max(), actions[:, 9].max()))
+        write_xvla_training_manifest(
+            root, manifest_path, episode_ids=episode_ids, frame_count=len(states),
+            gripper_min_m=gripper_min, gripper_max_m=gripper_max,
+        )
+        print(f"  wrote training manifest: {manifest_path}", flush=True)
+    manifest = json.loads(manifest_path.read_text())
     cache_path = Path(config["prepared_cache"])
     if cache_path.exists() and not args.force:
         raise FileExistsError(f"prepared cache already exists: {cache_path}; use --force to rebuild")
 
     status(2, total, "reading numeric source columns without decoding camera images")
     root = Path(manifest["source_dataset"]).resolve()
-    states, actions, indices, episodes = _read_numeric_source(root, set(manifest["source_episode_ids"]))
+    if preloaded_numeric is not None:
+        states, actions, indices, episodes = preloaded_numeric
+    else:
+        states, actions, indices, episodes = _read_numeric_source(root, set(manifest["source_episode_ids"]))
     if len(states) != manifest["frame_count"]:
         raise ValueError(f"manifest expects {manifest['frame_count']} frames, found {len(states)}")
 

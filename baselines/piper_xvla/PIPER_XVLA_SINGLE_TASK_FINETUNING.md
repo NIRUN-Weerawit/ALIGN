@@ -92,7 +92,7 @@ PYTHONPATH=. ~/miniconda3/envs/lerobot/bin/python \
   --config piper_xvla/config/piper_xvla_single_task.json
 ```
 
-The configured artifact is:
+If the configured manifest does not exist, this command now discovers intact replay episodes under `data/piper_replay/dataset`, derives the frame count and gripper limits from their numeric labels, and writes the manifest before preparing the cache. For a dataset stored elsewhere, pass `--source-root /path/to/lerobot/dataset`. The configured artifacts are:
 
 ```text
 data/piper_replay/piper_xvla_prepared_cache.pt
