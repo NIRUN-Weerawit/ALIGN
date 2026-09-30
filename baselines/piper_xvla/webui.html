@@ -27,7 +27,7 @@
   .pill b { color:var(--fg); font-weight:650; }
   .dot { width:7px; height:7px; border-radius:50%; background:#74818e; }
   .dot.ok { background:var(--ok); box-shadow:0 0 9px #63c98a66; } .dot.warn { background:var(--warn); } .dot.err { background:var(--err); }
-  main { width:min(1720px,100%); margin:0 auto; padding:16px clamp(12px,2vw,28px) 32px; display:grid; grid-template-columns:minmax(280px,350px) minmax(0,1fr) minmax(0,1fr); grid-template-areas:"status cameras cameras" "arm collect xvla" "manual dataset dataset" "settings detail detail" "settings video video"; gap:12px; align-items:start; }
+  main { width:min(1720px,100%); margin:0 auto; padding:16px clamp(12px,2vw,28px) 32px; display:grid; grid-template-columns:minmax(280px,350px) minmax(0,1fr) minmax(0,1fr); grid-template-areas:"status cameras cameras" "arm collect xvla" "master-slave master-slave master-slave" "manual dataset dataset" "settings detail detail" "settings video video"; gap:12px; align-items:start; }
   .card { min-width:0; padding:14px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); }
   .card-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
   .card-head .spacer { flex:1; }
@@ -47,6 +47,7 @@
   .arm-card { grid-area:arm; }
   .collect-card { grid-area:collect; }
   .xvla-card { grid-area:xvla; }
+  .master-slave-card { grid-area:master-slave; }
   .manual-card { grid-area:manual; }
   .settings-card { grid-area:settings; }
   .dataset-card { grid-area:dataset; }
@@ -73,6 +74,7 @@
   .status-tile { min-width:0; padding:8px 9px; border:1px solid var(--border); border-radius:8px; background:#14191f; }
   .status-tile .k { display:block; color:var(--muted); font-size:10px; text-transform:uppercase; letter-spacing:.06em; }
   .status-tile b { display:block; margin-top:2px; overflow-wrap:anywhere; font-size:12px; }
+  .temp-hot { color:var(--err); font-weight:800; }
   .status-wide { grid-column:1/-1; }
   .kv { display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px solid #2d3740; font-size:12px; }
   .kv:last-child { border-bottom:0; } .kv .k { color:var(--muted); }
@@ -106,14 +108,17 @@
   .jog-grid { display:grid; grid-template-columns:repeat(3,minmax(46px,62px)); gap:5px; align-items:center; }
   .jog-grid button { min-height:36px; font-family:ui-monospace,monospace; font-weight:700; }
   .joint-controls { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:7px 12px; margin-top:8px; }
+  .master-slave-card #ms-offsets { grid-template-columns:repeat(auto-fit,minmax(125px,1fr)); }
+  .master-slave-card .joint-control { grid-template-columns:24px minmax(0,1fr); }
+  .master-slave-card .joint-control input[type=number] { width:100%; }
   .joint-control { display:grid; grid-template-columns:24px minmax(60px,1fr) 58px; gap:6px; align-items:center; }
   .joint-control label { color:var(--muted); font:11px ui-monospace,monospace; }
   .joint-control input[type=number] { width:58px; padding:5px; }
   input[type=range] { width:100%; accent-color:var(--accent); cursor:pointer; }
   .gripper-control { display:grid; grid-template-columns:minmax(70px,1fr) 64px; gap:6px; align-items:center; }
   .danger-action { min-width:84px; min-height:38px; font-weight:800; letter-spacing:.02em; }
-  @media (max-width:1120px) { main { grid-template-columns:minmax(260px,320px) minmax(0,1fr); grid-template-areas:"status cameras" "arm collect" "manual xvla" "settings dataset" "settings detail" "settings video"; } }
-  @media (max-width:760px) { header { position:static; align-items:flex-start; flex-wrap:wrap; } .brand { min-width:0; } .pills { margin-left:0; order:3; width:100%; } main { grid-template-columns:minmax(0,1fr); grid-template-areas:"status" "cameras" "arm" "collect" "xvla" "manual" "dataset" "detail" "video" "settings"; padding:10px; gap:9px; } .grid2,.joint-controls { grid-template-columns:1fr; } .cam-grid { gap:6px; } .card { padding:11px; } .status-card { position:static; } }
+  @media (max-width:1120px) { main { grid-template-columns:minmax(260px,320px) minmax(0,1fr); grid-template-areas:"status cameras" "arm collect" "master-slave master-slave" "manual xvla" "settings dataset" "settings detail" "settings video"; } }
+  @media (max-width:760px) { header { position:static; align-items:flex-start; flex-wrap:wrap; } .brand { min-width:0; } .pills { margin-left:0; order:3; width:100%; } main { grid-template-columns:minmax(0,1fr); grid-template-areas:"status" "cameras" "arm" "collect" "xvla" "master-slave" "manual" "dataset" "detail" "video" "settings"; padding:10px; gap:9px; } .grid2,.joint-controls { grid-template-columns:1fr; } .cam-grid { gap:6px; } .card { padding:11px; } .status-card { position:static; } }
 </style>
 </head>
 <body>
@@ -135,7 +140,7 @@
 <main>
   <div class="status-slot" id="status-slot">
     <section class="card status-card" id="status-card">
-      <div class="card-head"><h2>Robot status</h2><span class="spacer"></span><span class="badge" id="s-feedback">—</span></div>
+      <div class="card-head"><h2>Primary Piper status</h2><span class="spacer"></span><span class="badge" id="s-feedback">—</span></div>
       <div class="status-grid">
         <div class="status-tile"><span class="k">Control mode</span><b id="s-mode">—</b></div>
         <div class="status-tile"><span class="k">Arm state</span><b id="s-arm">—</b></div>
@@ -144,6 +149,8 @@
         <div class="status-tile"><span class="k">Motion</span><b id="s-motion">—</b></div>
       <div class="status-tile"><span class="k">Error code</span><b id="s-err">—</b></div>
       <div class="status-tile status-wide"><span class="k">Joints (degrees)</span><b id="s-joints">—</b></div>
+      <div class="status-tile status-wide"><span class="k">Joint motor temperatures (°C)</span><b id="s-motor-temps">—</b></div>
+      <div class="status-tile status-wide"><span class="k">Joint driver temperatures (°C)</span><b id="s-driver-temps">—</b></div>
       <div class="status-tile status-wide"><span class="k">EEF position (metres)</span><b id="s-eef-xyz">—</b></div>
       <div class="status-tile status-wide"><span class="k">EEF orientation (Euler degrees)</span><b id="s-eef-euler">—</b></div>
       <div class="status-tile status-wide"><span class="k">Gripper opening (mm)</span><b id="s-gripper">—</b></div>
@@ -189,6 +196,11 @@
       <input type="text" id="task" placeholder="Task, e.g. put cube in cup" style="flex:1">
       <button onclick="saveTask()">Set task</button>
     </div>
+    <div class="row" style="margin-bottom:8px">
+      <label class="muted" for="dataset-path">Dataset path</label>
+      <input type="text" id="dataset-path" placeholder="/absolute/path/to/dataset" style="flex:1" spellcheck="false" autocomplete="off">
+    </div>
+    <p class="muted" style="margin:-3px 0 8px">Folder on this computer; collection creates or resumes a dataset there.</p>
     <div class="row">
       <label class="muted" for="window">Cap (s)</label>
       <input type="number" id="window" value="40" min="5" max="300" style="width:72px">
@@ -197,22 +209,33 @@
     </div>
     <div class="row" style="justify-content:space-between;margin-top:9px"><span class="muted">Frames captured</span><b id="c-frames">0</b></div>
     <div class="bar"><div id="c-bar"></div></div>
-    <p class="muted" style="margin:8px 0">Collection records camera and measured state. Start or stop replay separately.</p>
+    <p class="muted" style="margin:8px 0">Collection records camera and measured state. Manual controls remain available while recording; start or stop replay separately.</p>
     <div class="log" id="c-log" aria-live="polite"></div>
   </section>
 
   <section class="card xvla-card">
     <div class="card-head"><h2>X-VLA inference</h2><span class="spacer"></span><span class="badge warn">Operator-gated</span></div>
-    <p class="muted" style="margin-bottom:9px">Inference is idle until held control is pressed. While held, the runner sends only fresh guard-approved actions at its 20 Hz target.</p>
+    <p class="muted" style="margin-bottom:9px">Run starts predictions with the selected checkpoint. Hold to send controls streams only fresh guard-approved actions at its 20 Hz target.</p>
+    <div class="row" style="margin-bottom:8px">
+      <label class="muted" for="xvla-checkpoint">Checkpoint</label>
+      <select id="xvla-checkpoint" style="flex:1;min-width:180px" aria-label="X-VLA inference checkpoint" onchange="document.getElementById('xvla-checkpoint-path').value='';updateXvlaRunButton()"><option value="">Loading checkpoints…</option></select>
+      <button type="button" onclick="loadXvlaCheckpoints()" title="Scan outputs for checkpoints">Refresh</button>
+    </div>
+    <div class="row" style="margin-bottom:6px">
+      <label class="muted" for="xvla-checkpoint-path">Or path</label>
+      <input id="xvla-checkpoint-path" type="text" placeholder="/absolute/path/to/best.pt" style="flex:1;min-width:180px" oninput="updateXvlaRunButton()" spellcheck="false">
+    </div>
+    <div class="muted" id="xvla-checkpoint-note" style="margin-bottom:8px;overflow-wrap:anywhere"></div>
     <div class="row">
       <label class="muted" for="xvla-frames">Frames</label>
       <input id="xvla-frames" type="number" value="0" min="0" max="100" style="width:65px" title="0 runs until stopped">
       <label class="muted"><input id="xvla-record-images" type="checkbox" checked> Record images</label>
-      <button class="warn" onclick="startXvlaDiagnostic()">Run diagnostic</button>
+      <button class="warn" id="btn-run-xvla" onclick="startXvlaDiagnostic()" disabled>Run diagnostic</button>
       <button class="danger" onclick="stopXvlaDiagnostic()">Stop</button>
     </div>
     <p class="muted" style="margin:6px 0 9px">Use 0 frames for continuous inference.</p>
     <div class="kv"><span class="k">Status / guard</span><b id="xvla-status">idle</b></div>
+    <div class="kv"><span class="k">Active model</span><b id="xvla-active-checkpoint" style="overflow-wrap:anywhere;text-align:right">—</b></div>
     <div class="kv"><span class="k">Loop / control</span><b id="xvla-result">—</b></div>
     <div class="kv"><span class="k">Image recording</span><b id="xvla-recording">Off</b></div>
     <div class="muted" id="xvla-recording-path" style="overflow-wrap:anywhere"></div>
@@ -233,6 +256,34 @@
         <div class="muted" id="xvla-guard-note" aria-live="polite"></div>
       </form>
     </details>
+  </section>
+
+  <section class="card master-slave-card" id="master-slave-card">
+    <div class="card-head"><h2>Master–slave control</h2><span class="spacer"></span><button type="button" onclick="loadMasterSlaveDevices()">↻ Detect CAN devices</button><span class="badge" id="ms-state">idle</span></div>
+    <p class="muted">Mirrors the master's outgoing joints and gripper at 20 Hz. Each joint maps proportionally between the measured master and slave ranges; out-of-range master commands and offset targets are capped to the slave's range without stopping the mirror. Gripper positions are mapped too, with at most 5 mm lead over slave feedback. Connect the arms on separate CAN buses. Stop holds the slave near its measured joint pose; hiding or closing this page stops the stream.</p>
+    <div class="grid2" style="margin-top:9px">
+      <label class="muted">Master CAN<select id="ms-master-can" onchange="pollDeviceStatus()" style="display:block;width:100%;margin-top:4px"></select></label>
+      <label class="muted">Slave CAN<select id="ms-slave-can" onchange="pollDeviceStatus()" style="display:block;width:100%;margin-top:4px"></select></label>
+    </div>
+    <div class="grid2" style="margin-top:9px">
+      <div class="status-tile"><span class="k">Master status</span><b id="ms-master-status">Select a CAN device</b><div class="muted">Motor °C: <span id="ms-master-motor-temps">—</span></div><div class="muted">Driver °C: <span id="ms-master-driver-temps">—</span></div></div>
+      <div class="status-tile"><span class="k">Slave status</span><b id="ms-slave-status">Select a CAN device</b><div class="muted">Motor °C: <span id="ms-slave-motor-temps">—</span></div><div class="muted">Driver °C: <span id="ms-slave-driver-temps">—</span></div></div>
+    </div>
+    <div class="row" style="margin-top:9px"><b>Joint offsets (degrees)</b><button type="button" onclick="alignMasterSlaveOffsets()">Align offsets to current pose</button><span class="badge" id="ms-align-state">Checking alignment…</span></div>
+    <p class="muted" id="ms-calibration">Loading joint range calibration…</p>
+    <p class="muted">Offsets are additive trims after scaling. Set them to 0° for endpoint alignment; Align offsets to current pose chooses trims for the current measured pose. Max joint gap applies to J1–J5 at startup and all joints while tracking; J6 is exempt at startup and catches up gradually.</p>
+    <div class="joint-controls" id="ms-offsets"></div>
+    <div class="row" style="margin-top:9px">
+      <input id="ms-arm-confirm" type="text" placeholder="Type ARM" style="width:100px">
+      <button type="button" onclick="setManualControl(true,'ms-arm-confirm')">Enable manual control</button>
+      <button type="button" onclick="setManualControl(false)">Turn off</button>
+      <span class="badge no" id="ms-manual-state">CONTROL OFF</span>
+      <label class="muted" for="ms-speed">Speed %</label><input id="ms-speed" type="number" value="5" min="1" max="30" style="width:60px">
+      <label class="muted" for="ms-max-gap">Max joint gap °</label><input id="ms-max-gap" type="number" value="20" min="5" max="60" step="0.5" onchange="pollDeviceStatus()" style="width:65px">
+      <button class="warn" id="ms-start" onclick="startMasterSlave()" disabled>Start mirroring</button>
+      <button class="danger" id="ms-stop" onclick="stopMasterSlave()" disabled>Stop mirroring</button>
+    </div>
+    <div class="muted" id="ms-note" aria-live="polite" style="margin-top:6px">Detect CAN devices to select the master and slave.</div>
   </section>
 
   <details class="card fold manual-card">
@@ -349,10 +400,12 @@
 
 <script>
 const API = "";
-let statusTimer=null, camTimer=null, collectTimer=null;
+let statusTimer=null, camTimer=null, collectTimer=null, masterSlaveTimer=null;
 let currentManualPose=null, currentJoints=null, latestXvla=null, manualControlEnabled=false, jogHeld=null, jogBusy=false, jogTimer=null;
 let xvlaHoldActive=false, xvlaHoldBusy=false, xvlaHoldTimer=null, xvlaHoldPollTimer=null, xvlaHoldNewSession=false, xvlaHoldSession=null;
 let xvlaGuardLoaded=false;
+let msSessionId=null;
+let jointCalibration=null;
 let jointEngageEnabled=false, jointEngageBusy=false, jointEngagePending=false, jointEngageTimer=null;
 let gripperEngageBusy=false, gripperEngagePending=false, gripperEngageTimer=null;
 // Exact gripper normalization range from xvla_training_manifest.json.
@@ -375,6 +428,19 @@ function log(msg){
     el.textContent=lines.join('\n')+(lines.length?'\n':'');
     el.scrollTop=el.scrollHeight;
   }
+}
+
+function renderJointTemps(id, values){
+  const el=document.getElementById(id);
+  el.replaceChildren();
+  if(!Array.isArray(values)||!values.some(Number.isFinite)){el.textContent='—';return;}
+  values.forEach((value,index)=>{
+    if(index)el.append(document.createTextNode(' · '));
+    const reading=document.createElement('span');
+    reading.textContent=`J${index+1} ${Number.isFinite(value)?value+'°C':'—'}`;
+    if(Number.isFinite(value)&&value>80)reading.classList.add('temp-hot');
+    el.append(reading);
+  });
 }
 
 // ---- status -------------------------------------------------------------
@@ -408,6 +474,8 @@ async function pollStatus(){
     document.getElementById('s-drivers').textContent = usable?(s.drivers||[]).map(d=>d===1?'●':(d===0?'○':'?')).join(' '):'—';
     currentJoints=usable?(s.joints_deg||null):null;
     document.getElementById('s-joints').textContent = usable?(s.joints_deg||[]).map(v=>v==null?'—':v.toFixed(2)).join('  '):'—';
+    renderJointTemps('s-motor-temps',usable?s.motor_temperatures_c:null);
+    renderJointTemps('s-driver-temps',usable?s.driver_temperatures_c:null);
     const statusPose=usable?s.end_pose:null;
     const formatStatusVector=(values,labels,digits)=>Array.isArray(values)&&values.length===3&&values.every(Number.isFinite)?values.map((v,i)=>`${labels[i]} ${v.toFixed(digits)}`).join(' · '):'—';
     document.getElementById('s-eef-xyz').textContent=formatStatusVector(statusPose&&statusPose.xyz_m,['X','Y','Z'],4);
@@ -418,12 +486,135 @@ async function pollStatus(){
     document.getElementById('manual-live-euler').textContent=currentManualPose?currentManualPose.euler_xyz_deg.map(v=>v.toFixed(1)+'°').join('  '):'—';
     document.getElementById('manual-live-gripper').textContent=currentManualPose?(currentManualPose.gripper_m*1000).toFixed(1)+' mm':'—';
     const note=document.getElementById('manual-note'); note.textContent=s.manual_control_enabled?'CONTROL ON':'CONTROL OFF'; note.className='badge '+(s.manual_control_enabled?'ok':'no');
+    const msManual=document.getElementById('ms-manual-state'); msManual.textContent=note.textContent; msManual.className=note.className;
     manualControlEnabled=!!s.manual_control_enabled;
     if(!document.getElementById('task').value) document.getElementById('task').value = s.task||'';
   }catch(e){
     document.getElementById('conn-sub').textContent = 'connection lost: '+e.message;
     for(const id of ['s-eef-xyz','s-eef-euler','s-gripper']) document.getElementById(id).textContent='—';
+    renderJointTemps('s-motor-temps',null);
+    renderJointTemps('s-driver-temps',null);
   }
+}
+
+async function loadMasterSlaveDevices(){
+  const note=document.getElementById('ms-note');
+  try{
+    const {devices}=await j('/api/master-slave/devices');
+    for(const id of ['ms-master-can','ms-slave-can']){
+      const select=document.getElementById(id), previous=select.value;
+      select.replaceChildren();
+      for(const d of devices){const option=document.createElement('option');option.value=d.name;option.textContent=`${d.name}${d.usb_port?` · USB ${d.usb_port}`:''} · ${d.state}`;select.append(option);}
+      if(devices.some(d=>d.name===previous))select.value=previous;
+    }
+    const slave=document.getElementById('ms-slave-can');
+    if(slave.value===document.getElementById('ms-master-can').value && devices.length>1)slave.selectedIndex=1;
+    note.textContent=devices.length?`${devices.length} CAN interface(s) detected. Both must be distinct and connected to the intended arms.`:'No SocketCAN interfaces detected.';
+    await pollDeviceStatus();
+  }catch(e){note.textContent='CAN detection failed: '+e.message;}
+}
+async function loadMasterSlaveCalibration(){
+  try{
+    jointCalibration=await j('/api/master-slave/calibration');
+    const m=jointCalibration.joint_master_limits_deg, s=jointCalibration.joint_slave_limits_deg;
+    const gm=jointCalibration.gripper_master_limits_mm, gs=jointCalibration.gripper_slave_limits_mm;
+    const joints=m.map((range,i)=>`J${i+1} [${range.join(', ')}] → [${s[i].join(', ')}]°`).join(' · ');
+    document.getElementById('ms-calibration').textContent=`Joint ranges (master → slave): ${joints}. Gripper [${gm.join(', ')}] → [${gs.join(', ')}] mm.`;
+    await pollDeviceStatus();
+  }catch(e){document.getElementById('ms-calibration').textContent='Joint calibration unavailable: '+e.message;}
+}
+function boundedSlaveJoint(value,index){const [lo,hi]=jointCalibration.joint_slave_limits_deg[index];return Math.min(Math.max(value,lo),hi);}
+function mappedMasterJoint(value,index){
+  const [masterLo,masterHi]=jointCalibration.joint_master_limits_deg[index];
+  const [slaveLo,slaveHi]=jointCalibration.joint_slave_limits_deg[index];
+  const bounded=Math.min(Math.max(value,masterLo),masterHi);
+  return slaveLo+(bounded-masterLo)*(slaveHi-slaveLo)/(masterHi-masterLo);
+}
+async function pollDeviceStatus(){
+  const statuses={};
+  for(const role of ['master','slave']){
+    const name=document.getElementById(`ms-${role}-can`).value;
+    const target=document.getElementById(`ms-${role}-status`);
+    if(!name){target.textContent='Select a CAN device';renderJointTemps(`ms-${role}-motor-temps`,null);renderJointTemps(`ms-${role}-driver-temps`,null);continue;}
+    try{
+      const s=await j(`/api/master-slave/device-status?can=${encodeURIComponent(name)}`);
+      statuses[role]=s;
+      if(s.feedback_state!=='LIVE'){target.textContent=`${name}: ${s.feedback_reason||s.interface_state}`;renderJointTemps(`ms-${role}-motor-temps`,null);renderJointTemps(`ms-${role}-driver-temps`,null);continue;}
+      const joints=(s.joints_deg||[]).map(v=>Number(v).toFixed(1)).join('°, ');
+      const xyz=s.xyz_m?` · XYZ ${s.xyz_m.join(', ')} m`:'';
+      const gripper=s.gripper_mm!=null?` · ${s.gripper_source||'grip'} grip ${s.gripper_mm} mm`:'';
+      target.textContent=`${name}: LIVE · ${s.ctrl_mode_name||'n/a'} · ${s.arm_status_name||'n/a'} · ${s.joint_source||'joint'} joints ${joints}°${xyz}${gripper}`;
+      renderJointTemps(`ms-${role}-motor-temps`,s.motor_temperatures_c);
+      renderJointTemps(`ms-${role}-driver-temps`,s.driver_temperatures_c);
+    }catch(e){target.textContent=`${name}: ${e.message}`;renderJointTemps(`ms-${role}-motor-temps`,null);renderJointTemps(`ms-${role}-driver-temps`,null);}
+  }
+  const master=statuses.master, slave=statuses.slave, alignment=document.getElementById('ms-align-state');
+  const maxGap=Number(document.getElementById('ms-max-gap').value);
+  if(!Number.isFinite(maxGap)||maxGap<5||maxGap>60){alignment.textContent='Max joint gap must be 5–60°';alignment.className='badge no';return;}
+  if(jointCalibration && master?.feedback_state==='LIVE' && master.joint_source==='commanded' && slave?.feedback_state==='LIVE' && slave.joint_source==='measured'){
+    const offsets=[1,2,3,4,5,6].map(i=>Number(document.getElementById(`ms-offset-${i}`).value));
+    const gaps=master.joints_deg.map((v,i)=>Math.abs(boundedSlaveJoint(mappedMasterJoint(v,i)+offsets[i],i)-slave.joints_deg[i]));
+    const far=gaps.slice(0,5).map((v,i)=>v>maxGap?`J${i+1} ${v.toFixed(1)}°`:null).filter(Boolean);
+    alignment.textContent=far.length?`Start blocked: ${far.join(', ')} gap > ${maxGap}° (J1–J5)`:`Start gap J1–J5 ${Math.max(...gaps.slice(0,5)).toFixed(1)}° / ${maxGap}° · J6 catch-up ${gaps[5].toFixed(1)}°`;
+    alignment.className='badge '+(far.length?'no':'ok');
+  }else{
+    alignment.textContent='Waiting for joint calibration, master commands and slave measured joints';
+    alignment.className='badge no';
+  }
+}
+async function alignMasterSlaveOffsets(){
+  try{
+    if(!jointCalibration)throw new Error('Wait for joint calibration to load');
+    const master=document.getElementById('ms-master-can').value, slave=document.getElementById('ms-slave-can').value;
+    if(!master||!slave||master===slave)throw new Error('Select two different CAN devices first');
+    const [m,s]=await Promise.all([j(`/api/master-slave/device-status?can=${encodeURIComponent(master)}`),j(`/api/master-slave/device-status?can=${encodeURIComponent(slave)}`)]);
+    if(m.feedback_state!=='LIVE'||m.joint_source!=='commanded')throw new Error('Master joint-command stream is not live');
+    if(s.feedback_state!=='LIVE'||s.joint_source!=='measured')throw new Error('Slave measured-joint stream is not live');
+    const offsets=s.joints_deg.map((value,i)=>boundedSlaveJoint(value,i)-mappedMasterJoint(m.joints_deg[i],i));
+    if(offsets.some(value=>!Number.isFinite(value)||Math.abs(value)>180))throw new Error('Calculated offset is outside ±180°');
+    offsets.forEach((value,i)=>{document.getElementById(`ms-offset-${i+1}`).value=value.toFixed(2);});
+    log(`Master–slave offsets aligned after range scaling: ${offsets.map(v=>v.toFixed(2)).join(', ')}°`);
+    await pollDeviceStatus();
+  }catch(e){document.getElementById('ms-align-state').textContent='Alignment failed: '+e.message;}
+}
+async function pollMasterSlave(){
+  try{
+    const s=await j('/api/master-slave/status');
+    const active=['starting','running','stopping'].includes(s.status);
+    if(['starting','running'].includes(s.status) && msSessionId && document.visibilityState==='visible'){
+      try{await jp('/api/master-slave/heartbeat',{session_id:msSessionId});}
+      catch(e){msSessionId=null;document.getElementById('ms-note').textContent='Control heartbeat failed: '+e.message;return;}
+    }
+    if(!active)msSessionId=null;
+    document.getElementById('ms-state').textContent=s.status||'idle';
+    document.getElementById('ms-start').disabled=active||!manualControlEnabled;
+    document.getElementById('ms-stop').disabled=!active;
+    const joints=(s.target_joints_deg||[]).map(v=>Number(v).toFixed(1)).join('°, ');
+    const route=s.master_can?` ${s.master_can} → ${s.slave_can}`:'';
+    const grip=Number.isFinite(s.gripper_target_mm)?` · grip master ${s.master_gripper_mm.toFixed(1)}${s.gripper_input_clamped?` capped to ${s.bounded_master_gripper_mm.toFixed(1)}`:''} mm → mapped slave ${s.mapped_gripper_mm.toFixed(1)} mm → sent ${s.gripper_target_mm.toFixed(1)} mm (measured ${s.slave_gripper_mm.toFixed(1)} mm)`:'';
+    const capped=(s.clamped_master_joints||[]).map(label=>{const i=Number(label.slice(1))-1;return `${label} ${s.master_joints_deg[i].toFixed(1)}→${s.bounded_master_joints_deg[i].toFixed(1)}°`;}).join(', ');
+    document.getElementById('ms-note').textContent=`${s.message||'Idle. Detect CAN devices and choose both arms.'}${route}${s.sdk_joint_limits==='SDK limit API unavailable'?' · SDK joint limit API unavailable':''}${Number.isFinite(s.max_joint_gap_deg)?` · max gap ${s.max_joint_gap_deg}°`:''}${s.sent?` · ${s.sent} updates sent`:''}${s.control_hz?` · ${s.control_hz} Hz`:''}${capped?` · master capped ${capped}`:''}${joints?` · target [${joints}°]`:''}${Number.isFinite(s.j6_remaining_deg)?` · J6 remaining ${Math.abs(s.j6_remaining_deg).toFixed(1)}°`:''}${grip}`;
+  }catch(e){document.getElementById('ms-note').textContent='Master–slave status unavailable: '+e.message;}
+}
+async function startMasterSlave(){
+  if(!manualControlEnabled)return alert('Turn Manual Control on first (type ARM).');
+  if(!jointCalibration)return alert('Wait for joint calibration to load.');
+  const master=document.getElementById('ms-master-can').value, slave=document.getElementById('ms-slave-can').value;
+  if(!master||!slave||master===slave)return alert('Select different CAN interfaces for master and slave.');
+  const offsets=[1,2,3,4,5,6].map(i=>+document.getElementById(`ms-offset-${i}`).value);
+  if(offsets.some(v=>!Number.isFinite(v)||Math.abs(v)>180))return alert('Each offset must be between −180 and 180 degrees.');
+  const speed=Number(document.getElementById('ms-speed').value);
+  if(!Number.isInteger(speed)||speed<1||speed>30)return alert('Master–slave speed must be 1–30%.');
+  const maxGap=Number(document.getElementById('ms-max-gap').value);
+  if(!Number.isFinite(maxGap)||maxGap<5||maxGap>60)return alert('Max joint gap must be 5–60°.');
+  if(!confirm(`Start 20 Hz joint and gripper mirroring from ${master} to ${slave} with a ${maxGap}° max joint gap? This enables the slave drivers and moves the slave arm and gripper.`))return;
+  try{const s=await jp('/api/master-slave/start',{master_can:master,slave_can:slave,offsets_deg:offsets,speed_percent:speed,max_joint_gap_deg:maxGap});msSessionId=s.session_id;log(`master–slave started: ${master} → ${slave}, max gap ${maxGap}°, offsets ${offsets.map(v=>v.toFixed(1)).join(', ')}°`);await pollMasterSlave();return s;}
+  catch(e){document.getElementById('ms-note').textContent='Could not start: '+e.message;log('master–slave start failed: '+e.message);}
+}
+async function stopMasterSlave(){msSessionId=null;try{await jp('/api/master-slave/stop',{});log('master–slave command stream stopped');await pollMasterSlave();}catch(e){document.getElementById('ms-note').textContent='Stop failed: '+e.message;}}
+function initMasterSlaveOffsets(){
+  const root=document.getElementById('ms-offsets');
+  root.innerHTML=Array.from({length:6},(_,i)=>`<div class="joint-control"><label for="ms-offset-${i+1}">J${i+1}</label><input id="ms-offset-${i+1}" type="number" value="0" min="-180" max="180" step="0.01"></div>`).join('');
 }
 function setPill(id, text, ok){ const el=document.getElementById('p-'+id); if(el) el.textContent=text; }
 function setDot(id, cls){ const el=document.getElementById(id); if(el){ el.className='dot '+(cls||''); } }
@@ -434,6 +625,11 @@ async function pollXvla(){
     updateXvlaGuardApply();
     if(s.log_lines) for(const line of s.log_lines) log(`[X-VLA] ${line}`);
     document.getElementById('xvla-status').textContent=s.status;
+    document.getElementById('xvla-active-checkpoint').textContent=s.checkpoint||'—';
+    const busy=['running','stopping'].includes(s.status);
+    document.getElementById('xvla-checkpoint').disabled=busy;
+    document.getElementById('xvla-checkpoint-path').disabled=busy;
+    updateXvlaRunButton();
     const summary=s.summary, latest=s.latest;
     const recording=s.recording;
     document.getElementById('xvla-recording').textContent=recording?`${recording.saved} pairs saved · ${recording.dropped} dropped · ${recording.queued} queued${recording.error?' · ERROR: '+recording.error:''}`:(s.recording_dir?'Starting…':'Off');
@@ -459,7 +655,34 @@ async function pollXvla(){
     document.getElementById('xvla-note').textContent=latest&&latest.alerts.length?`guard alerts: ${(latest.alert_messages||latest.alerts).join('; ')}`:(!fresh&&s.status==='running'?'waiting for a fresh inference result':(s.message||''));
   }catch(e){ document.getElementById('xvla-note').textContent='X-VLA status error: '+e.message; }
 }
-async function startXvlaDiagnostic(){ return report('start X-VLA camera-only diagnostic',async()=>{ const frames=+document.getElementById('xvla-frames').value; const record_images=document.getElementById('xvla-record-images').checked; const r=await jp('/api/xvla/diagnostic',{frames,record_images}); log(`X-VLA diagnostic started: ${r.frames===0?'continuous':r.frames+' frames'}; hold the send button to stream guarded actions`); if(r.recording_dir) log(`Recording inference images: ${r.recording_dir}`); await pollXvla(); return r; }); }
+function updateXvlaRunButton(){
+  const busy=['running','stopping'].includes(document.getElementById('xvla-status').textContent);
+  const selected=document.getElementById('xvla-checkpoint').value;
+  const manual=document.getElementById('xvla-checkpoint-path').value.trim();
+  document.getElementById('btn-run-xvla').disabled=busy||!(manual||selected);
+}
+async function loadXvlaCheckpoints(){
+  const select=document.getElementById('xvla-checkpoint');
+  const note=document.getElementById('xvla-checkpoint-note');
+  const previous=select.value;
+  try{
+    const catalog=await j('/api/xvla/checkpoints');
+    select.replaceChildren();
+    for(const item of catalog.checkpoints){
+      const size=(item.size_bytes/1073741824).toFixed(1);
+      select.add(new Option(`${item.path} · ${size} GiB`,item.path));
+    }
+    if(catalog.checkpoints.length){
+      select.value=catalog.checkpoints.some(item=>item.path===previous)?previous:catalog.default;
+      note.textContent=`${catalog.checkpoints.length} checkpoint${catalog.checkpoints.length===1?'':'s'} in ${catalog.root}`;
+    }else{
+      select.add(new Option('No checkpoints found',''));
+      note.textContent=`No checkpoints found in ${catalog.root}. Enter a checkpoint file path below.`;
+    }
+    updateXvlaRunButton();
+  }catch(e){ note.textContent='Could not list checkpoints: '+e.message+'. You can still enter a file path.'; updateXvlaRunButton(); }
+}
+async function startXvlaDiagnostic(){ return report('start X-VLA camera-only diagnostic',async()=>{ const frames=+document.getElementById('xvla-frames').value; const record_images=document.getElementById('xvla-record-images').checked; const checkpoint=document.getElementById('xvla-checkpoint-path').value.trim()||document.getElementById('xvla-checkpoint').value; const r=await jp('/api/xvla/diagnostic',{frames,record_images,checkpoint}); log(`X-VLA diagnostic started with ${r.checkpoint}: ${r.frames===0?'continuous':r.frames+' frames'}; hold the send button to stream guarded actions`); if(r.recording_dir) log(`Recording inference images: ${r.recording_dir}`); await pollXvla(); return r; }); }
 async function stopXvlaDiagnostic(){ return report('stop X-VLA camera-only diagnostic',async()=>{ const r=await jp('/api/xvla/stop',{}); log('X-VLA camera-only diagnostic stop requested'); await pollXvla(); return r; }); }
 const XVLA_GUARD_FIELDS=[
   ['max_position_step_m','Position step (mm)',1000,0.1],
@@ -650,12 +873,12 @@ async function estop(){ disableJointEngage('E-stop'); return report('E-STOP',asy
 
 // ---- manual Cartesian and jog control -----------------------------------
 const mv=id=>parseFloat(document.getElementById(id).value);
-async function setManualControl(enabled){
+async function setManualControl(enabled, confirmInputId='manual-arm-confirm'){
   stopJog();
   if(!enabled) disableJointEngage('Manual Control OFF');
   return report(enabled?'enable manual control':'disable manual control',async()=>{
-    const r=await jp('/api/manual/control',{enabled,confirm:enabled?document.getElementById('manual-arm-confirm').value:''});
-    document.getElementById('manual-arm-confirm').value=''; await pollStatus(); log(`manual control ${enabled?'ON':'OFF'}`); return r;
+    const r=await jp('/api/manual/control',{enabled,confirm:enabled?document.getElementById(confirmInputId).value:''});
+    document.getElementById('manual-arm-confirm').value=''; document.getElementById('ms-arm-confirm').value=''; await pollStatus(); log(`manual control ${enabled?'ON':'OFF'}`); return r;
   });
 }
 function syncControlValue(sourceId, targetId){
@@ -781,13 +1004,17 @@ async function saveTask(){ const t=document.getElementById('task').value.trim();
 // ---- collect ------------------------------------------------------------
 async function startCollect(){
   const t=document.getElementById('task').value.trim(); if(!t){ alert('Set a task first'); return; }
+  const datasetPath=document.getElementById('dataset-path').value.trim();
+  if(!datasetPath || !datasetPath.startsWith('/')){ alert('Enter an absolute dataset path on the Web UI host.'); return; }
   return report('start collect',async()=>{
     await j('/api/task',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:t})});
     const w=parseFloat(document.getElementById('window').value)||40;
-    await jp('/api/collect/start',{window_s:w}); log(`collect started (cap ${w}s)`); startCollectPoll(); await pollCollect();
+    const r=await jp('/api/collect/start',{window_s:w,dataset_path:datasetPath});
+    document.getElementById('dataset-path').value=r.state.dataset_path;
+    log(`collect started at ${r.state.dataset_path} (cap ${w}s)`); startCollectPoll(); await pollCollect();
   });
 }
-async function stopCollect(){ return report('stop collect',async()=>{ await jp('/api/collect/stop',{}); log('stop requested'); }); }
+async function stopCollect(){ return report('stop collect',async()=>{ await jp('/api/collect/stop',{}); log('stop requested; waiting for episode to finish'); await pollCollect(); }); }
 function startCollectPoll(){ if(collectTimer) return; collectTimer=setInterval(pollCollect, 100); }
 async function pollCollect(){
   try{
@@ -796,9 +1023,10 @@ async function pollCollect(){
     document.getElementById('c-frames').textContent=s.frames;
     const pct=Math.min(100, (s.elapsed_s/s.window_s)*100)||0;
     document.getElementById('c-bar').style.width=pct.toFixed(0)+'%';
-    const busy=['opening','recording','finalizing'].includes(s.status);
+    const busy=['opening','recording','stopping','finalizing'].includes(s.status);
     document.getElementById('btn-collect-start').disabled=busy;
-    document.getElementById('btn-collect-stop').disabled=!busy;
+    document.getElementById('btn-collect-stop').disabled=!['opening','recording'].includes(s.status);
+    document.getElementById('dataset-path').disabled=busy;
     if(busy){ document.getElementById('cam-note').textContent='Preview suspended: collection owns both cameras.'; }
     if(!busy){ clearInterval(collectTimer); collectTimer=null; loadDataset(); loadVideos(); pollCameras(); }
   }catch(e){ document.getElementById('c-state').textContent='status error: '+e.message; }
@@ -808,6 +1036,8 @@ async function pollCollect(){
 async function loadDataset(){
   try{
     const d=await j('/api/dataset');
+    const pathInput=document.getElementById('dataset-path');
+    if(!pathInput.value) pathInput.value=d.root;
     if(!d.exists){ document.getElementById('ds-summary').textContent='no dataset yet'; document.getElementById('ep-body').innerHTML='<tr><td colspan="6" class="muted">No dataset. Run a collect to create one.</td></tr>'; return; }
     document.getElementById('ds-summary').textContent=`${d.num_episodes} episodes · ${d.num_frames} frames · ${d.fps} Hz`;
     const e=await j('/api/episodes');
@@ -898,7 +1128,8 @@ async function migrateVideos(){
 document.getElementById('player').addEventListener('error',()=>{ document.getElementById('video-note').textContent='The browser could not play this video. Convert it to H.264, then refresh the list.'; });
 
 // ---- boot ---------------------------------------------------------------
-function boot(){ pollStatus(); pollXvla(); loadXvlaGuard(); camTimer=setInterval(pollCameras,1500); statusTimer=setInterval(pollStatus,100); setInterval(pollXvla,1000); loadSettings(); loadDataset(); loadVideos(); loadMarks(); startCollectPoll(); pollCameras(); }
+function boot(){ initMasterSlaveOffsets(); loadMasterSlaveCalibration(); loadMasterSlaveDevices(); pollMasterSlave(); masterSlaveTimer=setInterval(pollMasterSlave,500); setInterval(pollDeviceStatus,1000); pollStatus(); pollXvla(); loadXvlaCheckpoints(); loadXvlaGuard(); camTimer=setInterval(pollCameras,1500); statusTimer=setInterval(pollStatus,100); setInterval(pollXvla,1000); loadSettings(); loadDataset(); loadVideos(); loadMarks(); startCollectPoll(); pollCameras(); }
+window.addEventListener('pagehide',()=>{if(['starting','running'].includes(document.getElementById('ms-state').textContent))fetch(API+'/api/master-slave/stop',{method:'POST',keepalive:true}).catch(()=>{});});
 let floatingStatusFrame=null;
 function updateFloatingStatus(){
   floatingStatusFrame=null;

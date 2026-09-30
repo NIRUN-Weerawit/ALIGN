@@ -12,6 +12,7 @@ Endpoints (all JSON unless noted):
   GET  /api/joints             live joint positions (deg)
   GET  /api/cameras            one-frame preflight of both cameras (base64 JPEGs)
   GET  /api/camera-stream      MJPEG multipart stream of global|wrist (live preview)
+  GET  /api/xvla/checkpoints    discover local X-VLA checkpoints for inference
   POST /api/replay             {action: start|pause|resume|stop|move_start}
   POST /api/enable             energize drivers
   POST /api/disable            de-energize drivers
@@ -33,15 +34,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import inspect
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import numpy as np
@@ -59,11 +63,51 @@ from piper_xvla.snapshot_adapter import DEFAULT_CAMERA_CONFIG
 from piper_xvla.action_guard import guard_limits_from_config
 from piper_xvla.endpose_control import EndPoseTarget, _stream_endpose, _wait_for_can_mode, _wait_until_enabled, prepare_can_cartesian_control
 from piper_xvla.review_video import ensure_h264, probe_codec
+from piper_xvla.master_slave_control import (
+    DEFAULT_MAX_JOINT_GAP_DEG, GRIPPER_BIAS_MM, GRIPPER_SCALE, J6_BIAS_DEG, J6_SCALE, MAX_MIRROR_SPEED_PERCENT,
+    JOINT_BIASES_DEG, JOINT_SCALES, MASTER_GRIPPER_PHYSICAL_LIMITS_MM,
+    MASTER_JOINT_PHYSICAL_LIMITS_DEG, MASTER_J6_PHYSICAL_LIMITS_DEG,
+    SLAVE_GRIPPER_PHYSICAL_LIMITS_MM, SLAVE_JOINT_PHYSICAL_LIMITS_DEG, SLAVE_J6_PHYSICAL_LIMITS_DEG,
+    hold_slave_position, run_joint_mirror, validate_joint_gap,
+)
 
 MODULE_DIR = Path(__file__).resolve().parent
 FRONTEND_HTML = MODULE_DIR / "webui.html"
+CAN_SYSFS_ROOT = Path("/sys/class/net")
+
+
+def _connect_piper_observer(piper: Any) -> None:
+    """Start receiving CAN on SDKs with or without the piper_init option."""
+    connect = piper.ConnectPort
+    try:
+        parameters = inspect.signature(connect).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    if "piper_init" in parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        connect(piper_init=False)
+    else:
+        connect()
+
+
+def _joint_temperatures(info: Any) -> dict[str, list[Optional[int]]]:
+    """Copy per-joint motor and driver temperatures from low-speed feedback (°C)."""
+    def values(field: str) -> list[Optional[int]]:
+        result: list[Optional[int]] = []
+        for index in range(1, 7):
+            raw = getattr(getattr(info, f"motor_{index}", None), field, None)
+            try:
+                result.append(int(raw) if raw is not None else None)
+            except (TypeError, ValueError):
+                result.append(None)
+        return result
+    return {"motor_temperatures_c": values("motor_temp"),
+            "driver_temperatures_c": values("foc_temp")}
+
+
 DEFAULT_DATA_DIR = Path.home() / "ALIGN" / "baselines" / "data" / "piper_replay"
 XVLA_GUARD_CONFIG = MODULE_DIR / "config" / "piper_action_guard.camera_only.json"
+XVLA_OUTPUTS_ROOT = MODULE_DIR.parent / "outputs"
+XVLA_DEFAULT_CHECKPOINT = "piper_xvla_single_task/best.pt"
 # Piper gripper commands are signed strokes in metres at the WebUI boundary.
 # Keep the pre-existing 70 mm positive envelope and permit the matching negative
 # direction rather than silently applying abs() to an operator command.
@@ -128,7 +172,8 @@ class PiperWebUI:
     def __init__(self, can: str = "can0", dry_run: bool = False, data_dir: Path = DEFAULT_DATA_DIR):
         self.can = can
         self.dry_run = dry_run
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir).expanduser().resolve()
+        self.dataset_root = self.data_dir / "dataset"
         if dry_run:
             self.piper = DryRunPiper()
         else:
@@ -145,6 +190,18 @@ class PiperWebUI:
         self._manual_enabled = False
         self._manual_motion_active = False
         self._manual_marks: list[dict[str, Any]] = []
+
+        # Explicitly started master-to-slave joint mirroring. The selected master
+        # is read-only; only the selected slave receives commands.
+        self._master_slave_lock = threading.Lock()
+        self._master_slave_command_lock = threading.Lock()
+        self._master_slave_stop = threading.Event()
+        self._master_slave_thread: Optional[threading.Thread] = None
+        self._master_slave_slave_piper: Optional[Any] = None
+        self._master_slave_lease_expires = 0.0
+        self._master_slave_state: dict[str, Any] = {"status": "idle", "sent": 0, "message": ""}
+        self._status_pipers: dict[str, Any] = {}
+        self._status_pipers_lock = threading.Lock()
 
         # Serialize one-frame preview acquisition with collection camera ownership.
         # Collection holds this lock until it releases both V4L2 devices.
@@ -178,6 +235,7 @@ class PiperWebUI:
             "window_s": 0.0,
             "episode_index": None,
             "video_path": None,
+            "dataset_path": str(self.dataset_root),
             "message": "",
         }
 
@@ -240,8 +298,10 @@ class PiperWebUI:
         try:
             info = self.piper.GetArmLowSpdInfoMsgs()
             drivers = [int(getattr(info, f"motor_{i}").foc_status.driver_enable_status) for i in range(1, 7)]
+            temperatures = _joint_temperatures(info)
         except Exception:  # noqa: BLE001
             drivers = [None] * 6
+            temperatures = _joint_temperatures(None)
         try:
             pose = self._manual_pose()
         except Exception:  # noqa: BLE001
@@ -270,6 +330,7 @@ class PiperWebUI:
             "motion_status": int(getattr(s, "motion_status", -1)),
             "err_code": int(getattr(s, "err_code", -1)),
             "drivers": drivers,
+            **temperatures,
             "joints_deg": joints,
             "end_pose": pose,
             "manual_control_enabled": manual_enabled,
@@ -279,7 +340,7 @@ class PiperWebUI:
 
     def collection_active(self) -> bool:
         with self._collect_lock:
-            return self._collect_state["status"] in {"opening", "recording", "finalizing"}
+            return self._collect_state["status"] in {"opening", "recording", "stopping", "finalizing"}
 
     def get_runtime_config(self) -> dict:
         """Return the editable collection settings plus immutable launch facts."""
@@ -421,6 +482,7 @@ class PiperWebUI:
         return False, f"refusing command: {reason}"
 
     def do_replay(self, action: str) -> dict:
+        self._assert_no_manual_motion("starting or changing pendant replay")
         self._reject_during_xvla_control()
         ready, reason = self._verified_live_feedback()
         if not ready:
@@ -454,6 +516,7 @@ class PiperWebUI:
         return result
 
     def do_enable(self) -> dict:
+        self._assert_no_manual_motion("enabling drivers")
         self._reject_during_xvla_control()
         ready, reason = self._verified_live_feedback()
         if not ready:
@@ -472,6 +535,7 @@ class PiperWebUI:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def do_disable(self) -> dict:
+        self._assert_no_manual_motion("disabling drivers")
         self._reject_during_xvla_control()
         ready, reason = self._verified_live_feedback()
         if not ready:
@@ -490,6 +554,7 @@ class PiperWebUI:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def do_mode(self, mode: str) -> dict:
+        self._assert_no_manual_motion("changing control mode")
         self._reject_during_xvla_control()
         """Switch a host-owned Piper control mode.
 
@@ -534,6 +599,7 @@ class PiperWebUI:
         }
 
     def do_reset(self) -> dict:
+        self._assert_no_manual_motion("resetting the arm")
         self._reject_during_xvla_control()
         ready, reason = self._verified_live_feedback()
         if not ready:
@@ -555,9 +621,10 @@ class PiperWebUI:
         with self._manual_lock:
             self._manual_enabled = False
             self._manual_stop_event.set()
+        mirror_stop = self.stop_master_slave_control(emergency=True)
         try:
             self.ctrl.emergency_stop()
-            return {"ok": True}
+            return mirror_stop if not mirror_stop["ok"] else {"ok": True}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -592,6 +659,8 @@ class PiperWebUI:
                 self._manual_stop_event.clear()
             else:
                 self._manual_stop_event.set()
+        if not enabled:
+            self.stop_master_slave_control()
         return {"ok": True, "enabled": bool(enabled)}
 
     def arm_manual_control(self, confirm: str) -> dict:
@@ -616,6 +685,302 @@ class PiperWebUI:
                 raise RuntimeError("another manual motion command is still running")
             self._manual_motion_active = True
             self._manual_stop_event.clear()
+
+    def _assert_no_manual_motion(self, action: str) -> None:
+        with self._manual_lock:
+            active = self._manual_motion_active
+        if active:
+            raise HTTPException(409, f"cannot continue master-slave/manual motion while {action}; stop motion first")
+
+    @staticmethod
+    def discover_can_devices() -> list[dict[str, str]]:
+        """Read SocketCAN interfaces from sysfs without requiring netlink or sudo."""
+        try:
+            interfaces = sorted(CAN_SYSFS_ROOT.iterdir(), key=lambda path: path.name)
+        except OSError as exc:
+            raise RuntimeError(f"could not enumerate network interfaces from {CAN_SYSFS_ROOT}: {exc}") from exc
+        devices: list[dict[str, str]] = []
+        for interface in interfaces:
+            try:
+                # Linux ARPHRD_CAN is 280. IFF_UP is bit 0 of sysfs flags.
+                if int((interface / "type").read_text().strip()) != 280:
+                    continue
+                flags = int((interface / "flags").read_text().strip(), 16)
+                resolved = interface.resolve()
+            except (OSError, ValueError):
+                continue
+            usb_candidate = resolved.parent.parent.name if resolved.parent.name == "net" else ""
+            usb_port = usb_candidate if re.fullmatch(r"\d+-[\d.]+:\d+\.\d+", usb_candidate) else ""
+            devices.append({"name": interface.name, "state": "UP" if flags & 0x1 else "DOWN", "usb_port": usb_port})
+        return devices
+
+    def device_status(self, can_name: str) -> dict[str, Any]:
+        """Read one CAN arm without sending Piper initialization or motion commands."""
+        devices = {device["name"]: device for device in self.discover_can_devices()}
+        if can_name not in devices:
+            raise ValueError(f"CAN interface {can_name!r} is unavailable")
+        result: dict[str, Any] = {"can": can_name, "interface_state": devices[can_name]["state"],
+                                  "feedback_state": "UNAVAILABLE", "feedback_reason": "", "rates_hz": {}}
+        if devices[can_name]["state"] != "UP":
+            result["feedback_reason"] = "CAN interface is DOWN"
+            return result
+        try:
+            if can_name == self.can:
+                piper = self.piper
+            else:
+                with self._status_pipers_lock:
+                    piper = self._status_pipers.get(can_name)
+                    if piper is None:
+                        from piper_sdk import C_PiperInterface_V2
+                        piper = C_PiperInterface_V2(can_name)
+                        _connect_piper_observer(piper)
+                        self._status_pipers[can_name] = piper
+            status_msg = piper.GetArmStatus()
+            joint_msg = piper.GetArmJointMsgs()
+            control_msg = piper.GetArmJointCtrl()
+            rates = {"status": float(getattr(status_msg, "Hz", 0) or 0),
+                     "joint": float(getattr(joint_msg, "Hz", 0) or 0),
+                     "joint_control": float(getattr(control_msg, "Hz", 0) or 0)}
+            result["rates_hz"] = rates
+            joint_source = "measured" if rates["joint"] >= 1 else "commanded" if rates["joint_control"] >= 1 else None
+            if not piper.isOk() or joint_source is None:
+                result["feedback_reason"] = "no live joint feedback or command stream" if joint_source is None else "SDK CAN monitor is unhealthy"
+                return result
+            status = getattr(status_msg, "arm_status", status_msg)
+            from piper_xvla.motion_watch import joint_positions_deg
+            result.update(feedback_state="LIVE", feedback_reason="live joint feedback",
+                          joint_source=joint_source,
+                          joints_deg=list(joint_positions_deg(joint_msg)) if joint_source == "measured" else
+                          [round(float(getattr(control_msg.joint_ctrl, f"joint_{index}")) * 1e-3, 3) for index in range(1, 7)],
+                          ctrl_mode_name=_name(MODE_NAMES, int(getattr(status, "ctrl_mode", -1))) if rates["status"] >= 1 else "n/a",
+                          arm_status_name=_name(ARM_STATUS_NAMES, int(getattr(status, "arm_status", -1))) if rates["status"] >= 1 else "n/a")
+            try:
+                pose_msg = piper.GetArmEndPoseMsgs()
+                gripper_msg = piper.GetArmGripperMsgs()
+                gripper_ctrl_msg = piper.GetArmGripperCtrl()
+                result["rates_hz"].update(end_pose=float(getattr(pose_msg, "Hz", 0) or 0),
+                                          gripper=float(getattr(gripper_msg, "Hz", 0) or 0),
+                                          gripper_control=float(getattr(gripper_ctrl_msg, "Hz", 0) or 0))
+                if result["rates_hz"]["end_pose"] >= 1:
+                    pose = pose_msg.end_pose
+                    result["xyz_m"] = [round(float(getattr(pose, axis)) * 1e-6, 4) for axis in ("X_axis", "Y_axis", "Z_axis")]
+                if result["rates_hz"]["gripper"] >= 1:
+                    result["gripper_mm"] = round(float(gripper_msg.gripper_state.grippers_angle) * 1e-3, 1)
+                    result["gripper_source"] = "measured"
+                elif result["rates_hz"]["gripper_control"] >= 1:
+                    result["gripper_mm"] = round(float(gripper_ctrl_msg.gripper_ctrl.grippers_angle) * 1e-3, 1)
+                    result["gripper_source"] = "commanded"
+            except (AttributeError, TypeError, ValueError):
+                pass
+            try:
+                low_msg = piper.GetArmLowSpdInfoMsgs()
+                result["rates_hz"]["low_speed"] = float(getattr(low_msg, "Hz", 0) or 0)
+                if result["rates_hz"]["low_speed"] >= 1:
+                    result.update(_joint_temperatures(low_msg))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        except Exception as exc:  # noqa: BLE001
+            result["feedback_reason"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    def master_slave_status(self) -> dict[str, Any]:
+        with self._master_slave_lock:
+            return dict(self._master_slave_state)
+
+    def _master_slave_lease_valid(self) -> bool:
+        with self._master_slave_lock:
+            return time.monotonic() < self._master_slave_lease_expires
+
+    def renew_master_slave_control(self, session_id: str) -> dict[str, Any]:
+        with self._master_slave_lock:
+            if self._master_slave_state.get("status") not in {"starting", "running"}:
+                raise RuntimeError("master-slave control is not active")
+            if session_id != self._master_slave_state.get("session_id"):
+                raise PermissionError("master-slave session does not match")
+            if time.monotonic() >= self._master_slave_lease_expires:
+                raise RuntimeError("master-slave control lease has expired")
+            self._master_slave_lease_expires = time.monotonic() + 2.0
+            return {"ok": True, "lease_ms": 2000}
+
+    def start_master_slave_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self._require_manual_arm()
+        if self.collection_active() or self.xvla_status()["status"] == "running":
+            raise RuntimeError("master-slave control is blocked while collection or X-VLA inference is active")
+        master_can, slave_can = str(payload.get("master_can", "")).strip(), str(payload.get("slave_can", "")).strip()
+        if not master_can or not slave_can or master_can == slave_can:
+            raise ValueError("choose two different CAN interfaces for master and slave")
+        devices = {item["name"]: item for item in self.discover_can_devices()}
+        if master_can not in devices or slave_can not in devices:
+            raise ValueError("selected CAN interface is no longer available; refresh the device list")
+        down = [name for name in (master_can, slave_can) if devices[name]["state"].upper() != "UP"]
+        if down:
+            raise ValueError("bring CAN interface(s) UP before starting: " + ", ".join(down))
+        try:
+            offsets = np.asarray(payload.get("offsets_deg", [0] * 6), dtype=float)
+            speed_value = float(payload.get("speed_percent", 5))
+            speed = int(speed_value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"provide six joint offsets and a speed from 1 to {MAX_MIRROR_SPEED_PERCENT} percent") from exc
+        if offsets.shape != (6,) or not np.isfinite(offsets).all():
+            raise ValueError("provide six finite joint offsets in degrees")
+        if np.any(np.abs(offsets) > 180.0):
+            raise ValueError("each joint offset must be between −180 and 180 degrees")
+        if speed_value != speed or not 1 <= speed <= MAX_MIRROR_SPEED_PERCENT:
+            raise ValueError(f"master-slave speed must be 1–{MAX_MIRROR_SPEED_PERCENT} percent")
+        max_joint_gap_deg = validate_joint_gap(payload.get("max_joint_gap_deg", DEFAULT_MAX_JOINT_GAP_DEG))
+        with self._master_slave_lock:
+            if self._master_slave_state.get("status") in {"starting", "running", "stopping"}:
+                raise RuntimeError("master-slave control is already active")
+            self._begin_manual_motion()
+            self._master_slave_stop.clear()
+            self._master_slave_lease_expires = time.monotonic() + 2.0
+            self._master_slave_state = {"status": "starting", "master_can": master_can,
+                                        "slave_can": slave_can, "offsets_deg": offsets.tolist(),
+                                        "j6_calibrated": True,
+                                        "speed_percent": speed, "max_joint_gap_deg": max_joint_gap_deg,
+                                        "sent": 0, "session_id": uuid.uuid4().hex,
+                                        "message": "connecting to both arms"}
+            self._master_slave_thread = threading.Thread(
+                target=self._master_slave_worker, args=(master_can, slave_can, offsets.tolist(), speed, max_joint_gap_deg),
+                name="piper-master-slave", daemon=True)
+            self._master_slave_thread.start()
+            return dict(self._master_slave_state)
+
+    def _master_slave_worker(self, master_can: str, slave_can: str, offsets: list[float], speed: int,
+                             max_joint_gap_deg: float = DEFAULT_MAX_JOINT_GAP_DEG) -> None:
+        handles: dict[str, Any] = {}
+        original_sdk_limits: dict[str, tuple[float, float]] = {}
+        sdk_limit_owner: Optional[Any] = None
+        try:
+            for name in (master_can, slave_can):
+                if name == self.can:
+                    handles[name] = self.piper
+                else:
+                    with self._status_pipers_lock:
+                        cached = self._status_pipers.get(name)
+                        if cached is not None:
+                            handles[name] = cached
+                        elif name == master_can:
+                            from piper_sdk import C_PiperInterface_V2
+                            handles[name] = C_PiperInterface_V2(name)
+                            _connect_piper_observer(handles[name])
+                        else:
+                            handles[name] = connect_live_piper(name)
+            master, slave = handles[master_can], handles[slave_can]
+            if master is slave:
+                raise RuntimeError("master and slave must use separate Piper connections")
+            # SDK releases may silently clamp outgoing targets to their
+            # generic ranges. Match all six software limits to the measured
+            # slave ranges for this session, then restore them on exit.
+            get_sdk_limit = getattr(slave, "GetSDKJointLimitParam", None)
+            set_sdk_limit = getattr(slave, "SetSDKJointLimitParam", None)
+            if callable(get_sdk_limit) and callable(set_sdk_limit):
+                sdk_limit_owner = slave
+                for index, limits in enumerate(SLAVE_JOINT_PHYSICAL_LIMITS_DEG, 1):
+                    name = f"j{index}"
+                    original_sdk_limits[name] = tuple(get_sdk_limit(name))
+                    set_sdk_limit(name, *np.deg2rad(limits))
+                sdk_joint_limits = "calibrated"
+            else:
+                # The installed legacy SDK sends raw joint values and has no
+                # limit API. Keep the outgoing physical-range clamp active.
+                sdk_joint_limits = "SDK limit API unavailable"
+            with self._master_slave_command_lock:
+                self._master_slave_slave_piper = slave
+            with self._master_slave_lock:
+                self._master_slave_state.update(message="checking master joints, grippers and slave alignment",
+                                                sdk_joint_limits=sdk_joint_limits,
+                                                sdk_j6_limit=sdk_joint_limits)
+
+            def update(sample: dict[str, Any]) -> None:
+                with self._master_slave_lock:
+                    self._master_slave_state.update(sample, status="running", message="mirroring master joints and gripper at 20 Hz")
+
+            run_joint_mirror(master, slave, offsets, speed, self._master_slave_stop, update,
+                             command_lock=self._master_slave_command_lock,
+                             lease_ok=self._master_slave_lease_valid, mirror_gripper=True,
+                             max_joint_gap_deg=max_joint_gap_deg)
+            with self._master_slave_lock:
+                if self._master_slave_state.get("status") != "error":
+                    sent = int(self._master_slave_state.get("sent", 0))
+                    self._master_slave_state.update(
+                        status="stopped",
+                        message="mirror stopped; slave holds its measured pose" if sent else "mirror stopped before motion",
+                    )
+        except Exception as exc:  # noqa: BLE001
+            if self._master_slave_stop.is_set():
+                with self._master_slave_lock:
+                    if self._master_slave_state.get("status") != "error":
+                        self._master_slave_state.update(status="stopped", message="mirror stopped")
+                return
+            detail = f"{type(exc).__name__}: {exc}"
+            with self._master_slave_command_lock:
+                with self._master_slave_lock:
+                    sent = int(self._master_slave_state.get("sent", 0))
+                slave = handles.get(slave_can)
+                if sent and slave is not None and not self._master_slave_stop.is_set():
+                    try:
+                        hold_slave_position(slave)
+                    except Exception as hold_exc:  # noqa: BLE001
+                        detail += f"; could not hold slave ({hold_exc}); requesting E-stop"
+                        try:
+                            slave.EmergencyStop(0x01)
+                        except Exception as estop_exc:  # noqa: BLE001
+                            detail += f"; E-stop failed: {estop_exc}"
+            with self._master_slave_lock:
+                self._master_slave_state.update(status="error", message=detail)
+        finally:
+            with self._master_slave_command_lock:
+                self._master_slave_slave_piper = None
+                if sdk_limit_owner is not None:
+                    restore_errors = []
+                    for name, limits in original_sdk_limits.items():
+                        try:
+                            sdk_limit_owner.SetSDKJointLimitParam(name, *limits)
+                        except Exception as exc:  # noqa: BLE001
+                            restore_errors.append(f"{name}: {type(exc).__name__}: {exc}")
+                    if restore_errors:
+                        with self._master_slave_lock:
+                            self._master_slave_state.update(
+                                status="error", message="could not restore SDK joint limits: " + "; ".join(restore_errors))
+                with self._status_pipers_lock:
+                    for name, handle in handles.items():
+                        if name != self.can and name not in self._status_pipers:
+                            try:
+                                handle.DisconnectPort()
+                            except Exception:  # noqa: BLE001
+                                pass
+            self._finish_manual_motion()
+
+    def stop_master_slave_control(self, *, emergency: bool = False) -> dict[str, Any]:
+        failure = None
+        with self._master_slave_command_lock:
+            self._master_slave_stop.set()
+            with self._master_slave_lock:
+                active = self._master_slave_state.get("status") in {"starting", "running"}
+                sent = int(self._master_slave_state.get("sent", 0))
+            slave = self._master_slave_slave_piper
+            if slave is not None and (active or emergency):
+                try:
+                    if emergency:
+                        if slave is not self.piper:
+                            slave.EmergencyStop(0x01)
+                    elif sent:
+                        hold_slave_position(slave)
+                except Exception as exc:  # noqa: BLE001
+                    failure = f"could not stop slave: {type(exc).__name__}: {exc}"
+                    if not emergency:
+                        try:
+                            slave.EmergencyStop(0x01)
+                            failure += "; requested slave E-stop"
+                        except Exception as estop_exc:  # noqa: BLE001
+                            failure += f"; slave E-stop failed: {estop_exc}"
+        with self._master_slave_lock:
+            if failure:
+                self._master_slave_state.update(status="error", message=failure)
+            elif self._master_slave_state.get("status") in {"starting", "running"}:
+                self._master_slave_state.update(status="stopping", message="stopping mirror stream")
+            return {"ok": not bool(failure), **self._master_slave_state, **({"error": failure} if failure else {})}
 
     def xvla_control_active(self) -> bool:
         with self._xvla_lease_lock:
@@ -729,8 +1094,6 @@ class PiperWebUI:
     def send_manual_endpose(self, payload: dict, *, _operation_owned: bool = False) -> dict:
         """Bounded operator target stream; requires the manual-control latch."""
         self._require_manual_arm()
-        if self.collection_active():
-            raise RuntimeError("manual motion is blocked while camera collection is active")
         try:
             target = EndPoseTarget(
                 xyz_m=np.asarray([payload[key] for key in ("x_m", "y_m", "z_m")], dtype=float),
@@ -837,8 +1200,6 @@ class PiperWebUI:
     def send_manual_joints(self, payload: dict) -> dict:
         """Bounded operator-selected MOVE-J target using documented SDK limits."""
         self._require_manual_arm()
-        if self.collection_active():
-            raise RuntimeError("manual motion is blocked while camera collection is active")
         try:
             joints = np.asarray(payload["joints_deg"], dtype=float)
             speed = int(payload.get("speed_percent", 10))
@@ -889,8 +1250,6 @@ class PiperWebUI:
             raise ValueError("names must be a non-empty duplicate-free list of marked-pose names")
         if not marks:
             raise ValueError("mark at least one pose before running a trajectory")
-        if self.collection_active():
-            raise RuntimeError("manual motion is blocked while camera collection is active")
         shared = {key: payload[key] for key in ("speed_percent", "duration_s", "stream_hz") if key in payload}
         results = []
         if not self.dry_run:
@@ -912,6 +1271,58 @@ class PiperWebUI:
         return {"ok": True, "marks": [mark["name"] for mark in marks], "results": results}
 
     # -- X-VLA inference and guard configuration ---------------------------
+
+    def xvla_checkpoints(self) -> dict:
+        """List local torch checkpoints without loading their multi-GB weights."""
+        root = XVLA_OUTPUTS_ROOT.resolve()
+        checkpoints = []
+        if root.is_dir():
+            # rglob(root) does not descend into symlinked output directories.
+            # Inspect each top-level entry so mounted checkpoint folders appear.
+            for entry in root.iterdir():
+                candidates = entry.rglob("*") if entry.is_dir() else (entry,)
+                linked_directory = entry.is_symlink() and entry.is_dir()
+                for path in candidates:
+                    if path.suffix.lower() not in {".pt", ".pth", ".ckpt"} or not path.is_file():
+                        continue
+                    if not linked_directory and not path.resolve().is_relative_to(root):
+                        continue
+                    try:
+                        stat = path.stat()
+                    except OSError:
+                        continue
+                    checkpoints.append({
+                        "path": path.relative_to(root).as_posix(),
+                        "size_bytes": stat.st_size,
+                        "modified_at": stat.st_mtime,
+                    })
+        checkpoints.sort(key=lambda item: (-item["modified_at"], item["path"]))
+        names = {item["path"] for item in checkpoints}
+        default = XVLA_DEFAULT_CHECKPOINT if XVLA_DEFAULT_CHECKPOINT in names else (checkpoints[0]["path"] if checkpoints else None)
+        return {"root": str(root), "checkpoints": checkpoints, "default": default}
+
+    def _resolve_xvla_checkpoint(self, selected: Optional[str]) -> tuple[str, Path]:
+        choice = selected.strip() if isinstance(selected, str) else None
+        if not choice:
+            choice = self.xvla_checkpoints()["default"]
+        if not choice:
+            raise ValueError("No X-VLA checkpoint found; enter an absolute path to a .pt, .pth or .ckpt file")
+        candidate = Path(choice).expanduser()
+        if not candidate.is_absolute():
+            if ".." in candidate.parts:
+                raise ValueError("relative checkpoint paths must stay within the outputs folder; use an absolute path")
+            candidate = XVLA_OUTPUTS_ROOT / candidate
+        path = candidate.resolve()
+        if path.suffix.lower() not in {".pt", ".pth", ".ckpt"}:
+            raise ValueError(f"X-VLA checkpoint must be a .pt, .pth or .ckpt file: {choice}")
+        if not path.is_file():
+            raise ValueError(f"X-VLA checkpoint file not found: {choice}")
+        try:
+            with path.open("rb"):
+                pass
+        except OSError as exc:
+            raise ValueError(f"X-VLA checkpoint cannot be read: {path}: {exc}") from exc
+        return choice, path
 
     def xvla_guard_config(self) -> dict:
         payload = json.loads(XVLA_GUARD_CONFIG.read_text())
@@ -994,15 +1405,16 @@ class PiperWebUI:
                 pass
         return state
 
-    def start_xvla_diagnostic(self, frames: int = 25, record_images: bool = False) -> dict:
+    def start_xvla_diagnostic(self, frames: int = 25, record_images: bool = False, checkpoint: Optional[str] = None) -> dict:
         if not 0 <= frames <= 100:
             raise ValueError("X-VLA diagnostic frames must be in [0, 100]; 0 means continuous until Stop")
         if self.dry_run:
             raise RuntimeError("X-VLA diagnostic requires real camera and CAN feedback; WebUI is in --dry-run mode")
         if self.collection_active():
             raise RuntimeError("X-VLA diagnostic is blocked while collection owns the cameras")
+        checkpoint_name, checkpoint_path = self._resolve_xvla_checkpoint(checkpoint)
         with self._xvla_lock:
-            if self._xvla_state["status"] == "running":
+            if self._xvla_state["status"] in {"running", "stopping"}:
                 raise RuntimeError("X-VLA diagnostic is already running")
             # Clear the previous run before starting so hold-to-control cannot
             # send its last allowed prediction while this run is initializing.
@@ -1017,8 +1429,8 @@ class PiperWebUI:
             if record_images:
                 recording_dir = output.parent / "inference_recordings" / f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
             self._xvla_stop_event.clear()
-            self._xvla_state = {"status": "running", "frames": frames, "output": str(output), "message": f"opening cameras and reading CAN feedback ({mode_label})...", "summary": None, "motion_capability": "none", "recording_dir": str(recording_dir) if recording_dir else None}
-        threading.Thread(target=self._xvla_worker, args=(frames, output, recording_dir), daemon=True).start()
+            self._xvla_state = {"status": "running", "frames": frames, "output": str(output), "checkpoint": checkpoint_name, "message": f"loading {checkpoint_name}; opening cameras and reading CAN feedback ({mode_label})...", "summary": None, "motion_capability": "none", "recording_dir": str(recording_dir) if recording_dir else None}
+        threading.Thread(target=self._xvla_worker, args=(frames, output, recording_dir, checkpoint_path), daemon=True).start()
         return self.xvla_status()
 
     def stop_xvla_diagnostic(self) -> dict:
@@ -1033,14 +1445,14 @@ class PiperWebUI:
                 process.terminate()
             return dict(self._xvla_state, ok=True)
 
-    def _xvla_worker(self, frames: int, output: Path, recording_dir: Optional[Path] = None) -> None:
+    def _xvla_worker(self, frames: int, output: Path, recording_dir: Optional[Path], checkpoint_path: Path) -> None:
         try:
             # Prevent collection/preview from opening the cameras at the same time.
             with self._camera_lock:
                 command = [
                     sys.executable, "-m", "piper_xvla.live_inference",
                     "--config", "piper_xvla/config/piper_xvla_single_task.json",
-                    "--checkpoint", "outputs/piper_xvla_single_task/best.pt",
+                    "--checkpoint", str(checkpoint_path),
                     "--guard-config", str(XVLA_GUARD_CONFIG),
                     "--can", self.can, "--device", "cuda", "--frames", str(frames), "--output", str(output),
                     "--enable-held-control", "--hold-lease", str(output.with_suffix(".lease.json")),
@@ -1089,26 +1501,39 @@ class PiperWebUI:
 
     # -- background collect --------------------------------------------------
 
-    def start_collect(self, window_s: float = 40.0) -> dict:
+    def start_collect(self, window_s: float = 40.0, dataset_path: str | None = None) -> dict:
         if not self.task.strip():
             raise HTTPException(400, "task must be set before starting collect (PUT /api/task)")
-        with self._manual_lock:
-            if self._manual_motion_active:
-                raise HTTPException(409, "collection is blocked while a manual command is still running")
         with self._collect_lock:
-            if self._collect_state["status"] in ("opening", "recording", "finalizing"):
+            if self._collect_state["status"] in ("opening", "recording", "stopping", "finalizing"):
                 raise HTTPException(409, "a collect is already running")
+            if dataset_path is None:
+                root = self.dataset_root
+            else:
+                if not isinstance(dataset_path, str) or not dataset_path.strip():
+                    raise ValueError("dataset_path must be a non-empty absolute folder path")
+                root = Path(dataset_path.strip()).expanduser()
+                if not root.is_absolute():
+                    raise ValueError("dataset_path must be an absolute folder path on the Web UI host")
+                root = root.resolve()
+            if root.exists():
+                if not root.is_dir():
+                    raise ValueError(f"dataset path is not a folder: {root}")
+                if any(root.iterdir()) and not (root / "meta" / "info.json").is_file():
+                    raise ValueError(f"dataset folder is not empty or a valid LeRobot dataset: {root}")
+            self.dataset_root = root
             self._collect_stop.clear()
             self._collect_state = {
                 "status": "opening", "frames": 0, "elapsed_s": 0.0,
                 "window_s": window_s, "episode_index": None,
-                "video_path": None, "message": "opening cameras + dataset...",
+                "video_path": None, "dataset_path": str(root),
+                "message": "opening cameras + dataset...",
             }
-            self._collect_thread = threading.Thread(target=self._collect_worker, args=(window_s,), daemon=True)
+            self._collect_thread = threading.Thread(target=self._collect_worker, args=(window_s, root, self.task), daemon=True)
             self._collect_thread.start()
         return {"ok": True, "state": dict(self._collect_state)}
 
-    def _collect_worker(self, window_s: float) -> None:
+    def _collect_worker(self, window_s: float, dataset_root: Path, task: str) -> None:
         from piper_xvla.collect_session import CollectSession
         period = 0.05
         if not self._camera_lock.acquire(timeout=5.0):
@@ -1116,7 +1541,7 @@ class PiperWebUI:
                 self._collect_state.update(status="error", message="camera preview did not release devices within 5 s")
             return
         try:
-            session = CollectSession.open(self.piper, self.task, self.data_dir)
+            session = CollectSession.open(self.piper, task, self.data_dir, dataset_root=dataset_root)
         except Exception as exc:  # noqa: BLE001
             self._camera_lock.release()
             with self._collect_lock:
@@ -1124,25 +1549,31 @@ class PiperWebUI:
             return
 
         with self._collect_lock:
-            self._collect_state["status"] = "recording"
+            stopping = self._collect_stop.is_set()
+            self._collect_state["status"] = "stopping" if stopping else "recording"
             self._collect_state["episode_index"] = session.episode_index
             self._collect_state["video_path"] = str(session.video_path) if session.video_ok else None
-            self._collect_state["message"] = f"recording episode {session.episode_index}..."
+            self._collect_state["message"] = (
+                f"stop requested; capturing first frame of episode {session.episode_index}..."
+                if stopping else f"recording episode {session.episode_index}..."
+            )
 
         start = time.monotonic()
+        observations = 0
+        capture_error = None
         try:
             while True:
                 now = time.monotonic()
                 elapsed = now - start
-                if elapsed >= window_s or self._collect_stop.is_set():
+                if observations and (elapsed >= window_s or self._collect_stop.is_set()):
                     break
                 try:
                     obs = session.snapshot()
                     session.write_frame(obs)
                 except Exception as exc:  # noqa: BLE001
-                    with self._collect_lock:
-                        self._collect_state.update(status="error", message=f"capture failed: {exc}")
+                    capture_error = f"capture failed: {exc}"
                     break
+                observations += 1
                 with self._collect_lock:
                     self._collect_state["frames"] = session.frames_written
                     self._collect_state["elapsed_s"] = round(elapsed, 2)
@@ -1152,20 +1583,33 @@ class PiperWebUI:
                 if sleep_for > 0:
                     time.sleep(sleep_for)
         except Exception as exc:  # noqa: BLE001
-            with self._collect_lock:
-                self._collect_state.update(status="error", message=f"unexpected: {exc}")
+            capture_error = f"unexpected: {exc}"
+
+        if capture_error and not observations:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001 - preserve the capture error for the operator
+                pass
+            finally:
+                with self._collect_lock:
+                    self._collect_state.update(status="error", message=capture_error)
+                self._camera_lock.release()
+            return
 
         with self._collect_lock:
             self._collect_state["status"] = "finalizing"
-            self._collect_state["message"] = "finalizing episode..."
+            self._collect_state["message"] = "finalizing episode; this can take a moment..."
         try:
             total = session.finalize()
             reason = "stopped by user" if self._collect_stop.is_set() else "window ended"
             with self._collect_lock:
-                self._collect_state.update(
-                    status="done", frames=total,
-                    message=f"episode written ({reason}): {total} frames @20 Hz",
-                )
+                if capture_error:
+                    self._collect_state.update(status="error", frames=total, message=f"{capture_error}; partial episode saved: {total} frames")
+                else:
+                    self._collect_state.update(
+                        status="done", frames=total,
+                        message=f"episode written ({reason}): {total} frames @20 Hz",
+                    )
         except Exception as exc:  # noqa: BLE001
             with self._collect_lock:
                 self._collect_state.update(status="error", message=f"finalize failed: {exc}")
@@ -1174,74 +1618,108 @@ class PiperWebUI:
 
     def stop_collect(self) -> dict:
         with self._collect_lock:
-            if self._collect_state["status"] not in ("recording", "opening"):
+            status = self._collect_state["status"]
+            if status in ("stopping", "finalizing"):
+                return {"ok": True, "state": dict(self._collect_state)}
+            if status not in ("recording", "opening"):
                 return {"ok": False, "error": f"no active collect (status={self._collect_state['status']})"}
-        self._collect_stop.set()
-        return {"ok": True}
+            self._collect_stop.set()
+            self._collect_state.update(
+                status="stopping",
+                message="stop requested; waiting for dataset to open..." if status == "opening"
+                else "stop requested; finishing current episode...",
+            )
+            return {"ok": True, "state": dict(self._collect_state)}
 
     def collect_status(self) -> dict:
         with self._collect_lock:
             return dict(self._collect_state)
 
 
-def _load_dataset_cached(app_state: dict, data_dir: Path):
-    """Return a LeRobotDataset for the given root, or None if absent/corrupt."""
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    root = Path(data_dir) / "dataset"
-    if not (root / "meta" / "info.json").is_file():
+def _load_dataset_cached(app_state: dict, root: Path):
+    """Return dataset metadata without generating a full Arrow frame cache."""
+    root = Path(root)
+    info_path = root / "meta" / "info.json"
+    if not info_path.is_file():
         return None
+    from piper_xvla.collect_session import ensure_writable_datasets_cache
+    ensure_writable_datasets_cache()
+    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
     key = str(root.resolve())
     cached = app_state.get("dataset")
-    if cached is not None and app_state.get("dataset_root") == key:
+    stamp = info_path.stat().st_mtime_ns
+    if cached is not None and app_state.get("dataset_root") == key and app_state.get("dataset_stamp") == stamp:
         return cached
     try:
-        ds = LeRobotDataset(key)
+        meta = LeRobotDatasetMetadata("local/piper-replay", root=key)
+        ds = SimpleNamespace(meta=meta, root=meta.root, num_episodes=meta.total_episodes,
+                             num_frames=meta.total_frames, fps=meta.fps)
         app_state["dataset"] = ds
         app_state["dataset_root"] = key
+        app_state["dataset_stamp"] = stamp
         return ds
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(500, f"could not open dataset at {root}: {type(exc).__name__}: {exc}")
 
 
+def _episode_table(ds, episode_index: int, columns: list[str]):
+    """Read only requested columns for an episode directly from its Parquet file."""
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    row = ds.meta.episodes[episode_index]
+    rel_path = ds.meta.data_path.format(
+        chunk_index=int(row["data/chunk_index"]), file_index=int(row["data/file_index"])
+    )
+    table = pq.read_table(Path(ds.root) / rel_path, columns=[*columns, "episode_index"])
+    return table.filter(pc.equal(table["episode_index"], episode_index))
+
+
 def _episode_thumbnails(ds, episode_index: int, max_frames: int = 3) -> list[str]:
     """Return base64 JPEG thumbnails sampled across one episode."""
     import cv2
-    meta_row = ds.meta.episodes[episode_index]
-    from_idx = int(meta_row["dataset_from_index"])
-    to_idx = int(meta_row["dataset_to_index"]) - 1
-    length = max(1, to_idx - from_idx + 1)
-    picks = sorted({from_idx, from_idx + length // 2, to_idx})[:max_frames]
+    table = _episode_table(ds, episode_index, ["observation.images.global_rgb"])
+    length = table.num_rows
+    if not length:
+        return []
+    picks = sorted({0, length // 2, length - 1})[:max_frames]
     out: list[str] = []
     for idx in picks:
         try:
-            sample = ds[idx]
+            image = table["observation.images.global_rgb"][idx].as_py()
+            raw = image.get("bytes")
+            if raw is not None:
+                g = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+            else:
+                image_path = Path(image["path"])
+                if not image_path.is_absolute():
+                    image_path = Path(ds.root) / image_path
+                g = cv2.imread(str(image_path))
+            if g is None:
+                continue
+            g = cv2.resize(g, (320, 240))
+            _, jpg = cv2.imencode(".jpg", g, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+            out.append(base64.b64encode(jpg.tobytes()).decode())
         except Exception:  # noqa: BLE001
             continue
-        g = np.asarray(sample["observation.images.global_rgb"])
-        if g.ndim == 3 and g.shape[0] == 3:  # LeRobot returns CHW float [0,1]
-            g = (g * 255).clip(0, 255).astype(np.uint8).transpose(1, 2, 0)
-        g = cv2.resize(g, (320, 240))
-        _, jpg = cv2.imencode(".jpg", g[..., ::-1], [int(cv2.IMWRITE_JPEG_QUALITY), 60])
-        out.append(base64.b64encode(jpg.tobytes()).decode())
     return out
 
 
 def _episode_state_action(ds, episode_index: int, max_points: int = 300) -> dict:
     """Downsample state/action vectors across one episode for charting."""
+    table = _episode_table(ds, episode_index, ["observation.state", "action"])
     meta_row = ds.meta.episodes[episode_index]
     from_idx = int(meta_row["dataset_from_index"])
-    to_idx = int(meta_row["dataset_to_index"]) - 1
-    n = max(1, to_idx - from_idx + 1)
+    n = table.num_rows
+    if not n:
+        return {"indices": [], "states": [], "actions": []}
     step = max(1, n // max_points)
-    idxs = list(range(from_idx, to_idx + 1, step))
-    if idxs[-1] != to_idx:
-        idxs.append(to_idx)
-    states: list[list[float]] = []
-    actions: list[list[float]] = []
-    for i in idxs:
-        s = ds[i]
-        states.append([float(x) for x in np.asarray(s["observation.state"]).ravel()])
-        actions.append([float(x) for x in np.asarray(s["action"]).ravel()])
+    offsets = list(range(0, n, step))
+    if offsets[-1] != n - 1:
+        offsets.append(n - 1)
+    idxs = [from_idx + i for i in offsets]
+    states = [table["observation.state"][i].as_py() for i in offsets]
+    actions = [table["action"][i].as_py() for i in offsets]
     return {"indices": idxs, "states": states, "actions": actions}
 
 
@@ -1263,6 +1741,10 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
     def api_xvla_status() -> dict:
         return piper_ui.xvla_status()
 
+    @app.get("/api/xvla/checkpoints")
+    def api_xvla_checkpoints() -> dict:
+        return piper_ui.xvla_checkpoints()
+
     @app.get("/api/xvla/guard")
     def api_xvla_guard() -> dict:
         return {"limits": piper_ui.xvla_guard_config()}
@@ -1283,7 +1765,7 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
         except Exception:  # noqa: BLE001
             body = {}
         try:
-            return piper_ui.start_xvla_diagnostic(int(body.get("frames", 25)), bool(body.get("record_images", False)))
+            return piper_ui.start_xvla_diagnostic(int(body.get("frames", 25)), bool(body.get("record_images", False)), body.get("checkpoint"))
         except (TypeError, ValueError, RuntimeError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
@@ -1482,6 +1964,62 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
         except (ValueError, RuntimeError) as exc:
             raise HTTPException(400, str(exc)) from exc
 
+    @app.get("/api/master-slave/devices")
+    def api_master_slave_devices() -> dict:
+        try:
+            return {"devices": piper_ui.discover_can_devices()}
+        except RuntimeError as exc:
+            raise HTTPException(500, str(exc)) from exc
+
+    @app.get("/api/master-slave/device-status")
+    def api_master_slave_device_status(can: str) -> dict:
+        try:
+            return piper_ui.device_status(can)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/master-slave/status")
+    def api_master_slave_status() -> dict:
+        return piper_ui.master_slave_status()
+
+    @app.get("/api/master-slave/calibration")
+    def api_master_slave_calibration() -> dict:
+        return {"joint_master_limits_deg": MASTER_JOINT_PHYSICAL_LIMITS_DEG,
+                "joint_slave_limits_deg": SLAVE_JOINT_PHYSICAL_LIMITS_DEG,
+                "joint_scales": JOINT_SCALES, "joint_biases_deg": JOINT_BIASES_DEG,
+                "j6_master_limits_deg": MASTER_J6_PHYSICAL_LIMITS_DEG,
+                "j6_slave_limits_deg": SLAVE_J6_PHYSICAL_LIMITS_DEG,
+                "j6_scale": J6_SCALE, "j6_bias_deg": J6_BIAS_DEG,
+                "gripper_master_limits_mm": MASTER_GRIPPER_PHYSICAL_LIMITS_MM,
+                "gripper_slave_limits_mm": SLAVE_GRIPPER_PHYSICAL_LIMITS_MM,
+                "gripper_scale": GRIPPER_SCALE, "gripper_bias_mm": GRIPPER_BIAS_MM}
+
+    @app.post("/api/master-slave/heartbeat")
+    async def api_master_slave_heartbeat(req: Request) -> dict:
+        try:
+            body = await req.json()
+            return piper_ui.renew_master_slave_control(str(body.get("session_id", "")))
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except (AttributeError, ValueError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/master-slave/start")
+    async def api_master_slave_start(req: Request) -> dict:
+        try:
+            body = await req.json()
+            if not isinstance(body, dict):
+                raise ValueError("request body must be a JSON object")
+            return piper_ui.start_master_slave_control(body)
+        except PermissionError as exc:
+            raise HTTPException(403, str(exc)) from exc
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(409 if "active" in str(exc) or "blocked" in str(exc) else 400, str(exc)) from exc
+
+    @app.post("/api/master-slave/stop")
+    def api_master_slave_stop() -> dict:
+        return piper_ui.stop_master_slave_control()
+
     @app.get("/api/task")
     def api_task_get() -> dict:
         return {"task": piper_ui.task}
@@ -1513,7 +2051,12 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
             raise HTTPException(400, "window_s must be a number")
         if not 5.0 <= window_s <= 300.0:
             raise HTTPException(400, "window_s must be in [5, 300]")
-        return piper_ui.start_collect(window_s)
+        try:
+            result = piper_ui.start_collect(window_s, body.get("dataset_path"))
+        except (OSError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        state.pop("dataset", None)
+        return result
 
     @app.post("/api/collect/stop")
     def api_collect_stop() -> dict:
@@ -1521,9 +2064,9 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
 
     @app.get("/api/dataset")
     def api_dataset() -> dict:
-        ds = _load_dataset_cached(state, data_dir)
+        ds = _load_dataset_cached(state, piper_ui.dataset_root)
         if ds is None:
-            return {"exists": False, "root": str(data_dir / "dataset")}
+            return {"exists": False, "root": str(piper_ui.dataset_root)}
         try:
             info = json.loads((Path(str(ds.root)) / "meta" / "info.json").read_text())
         except Exception:  # noqa: BLE001
@@ -1540,7 +2083,7 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
 
     @app.get("/api/episodes")
     def api_episodes() -> dict:
-        ds = _load_dataset_cached(state, data_dir)
+        ds = _load_dataset_cached(state, piper_ui.dataset_root)
         if ds is None:
             return {"exists": False, "episodes": []}
         episodes = []
@@ -1562,7 +2105,7 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
 
     @app.get("/api/episode/{index}")
     def api_episode_detail(index: int) -> dict:
-        ds = _load_dataset_cached(state, data_dir)
+        ds = _load_dataset_cached(state, piper_ui.dataset_root)
         if ds is None or index < 0 or index >= ds.num_episodes:
             raise HTTPException(404, "episode not found")
         thumbnails = _episode_thumbnails(ds, index)
@@ -1571,7 +2114,7 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
 
     @app.get("/api/videos")
     def api_videos() -> dict:
-        review_dir = Path(data_dir) / "dataset" / "images" / "review"
+        review_dir = piper_ui.dataset_root / "images" / "review"
         if not review_dir.is_dir():
             return {"videos": []}
         videos = []
@@ -1590,7 +2133,7 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
     @app.post("/api/videos/migrate")
     def api_videos_migrate() -> dict:
         """Convert legacy mp4v review files to browser-compatible H.264."""
-        review_dir = Path(data_dir) / "dataset" / "images" / "review"
+        review_dir = piper_ui.dataset_root / "images" / "review"
         results = []
         for p in sorted(review_dir.glob("episode-*.mp4")) if review_dir.is_dir() else []:
             before = probe_codec(p)
@@ -1600,7 +2143,7 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
 
     @app.get("/api/video/{name}")
     def api_video(name: str) -> FileResponse:
-        review_dir = Path(data_dir) / "dataset" / "images" / "review"
+        review_dir = piper_ui.dataset_root / "images" / "review"
         path = (review_dir / name).resolve()
         if not str(path).startswith(str(review_dir.resolve())) or not path.is_file():
             raise HTTPException(404, "video not found")
@@ -1614,7 +2157,7 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--can", default="can0")
+    parser.add_argument("--can", default="auto", help="primary Piper CAN interface (default: auto-detect)")
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR))
@@ -1622,6 +2165,11 @@ def main() -> int:
     args = parser.parse_args()
 
     import uvicorn
+    if args.can == "auto" and not args.dry_run:
+        devices = [item["name"] for item in PiperWebUI.discover_can_devices() if item["state"] == "UP"]
+        if not devices:
+            raise RuntimeError("no UP SocketCAN interface found; bring a Piper CAN interface up or use --dry-run")
+        args.can = "can0" if "can0" in devices else "can_slave" if "can_slave" in devices else devices[0]
     piper_ui = PiperWebUI(can=args.can, dry_run=args.dry_run, data_dir=Path(args.data_dir))
     app = build_app(piper_ui, Path(args.data_dir))
     print(f"Piper X-VLA Web UI: http://{args.host}:{args.port}  (dry_run={args.dry_run}, can={args.can})")

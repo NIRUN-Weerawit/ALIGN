@@ -15,11 +15,82 @@ error paths).
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+
+
+def ensure_writable_datasets_cache() -> Path:
+    """Keep LeRobot's local Parquet cache off an unavailable HF_HOME mount."""
+    from datasets import config
+
+    configured = Path(config.HF_DATASETS_CACHE).expanduser()
+    try:
+        configured.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=configured):
+            pass
+        return configured
+    except OSError:
+        fallback = Path(os.environ.get(
+            "PIPER_XVLA_DATASETS_CACHE", Path.home() / ".cache" / "piper_xvla" / "datasets"
+        )).expanduser()
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=fallback):
+                pass
+        except OSError as exc:
+            raise RuntimeError(f"no writable Hugging Face datasets cache at {configured} or {fallback}: {exc}") from exc
+        os.environ["HF_DATASETS_CACHE"] = str(fallback)
+        config.HF_DATASETS_CACHE = fallback
+        if "HF_DATASETS_DOWNLOADED_DATASETS_PATH" not in os.environ:
+            config.DOWNLOADED_DATASETS_PATH = fallback / "downloads"
+        if "HF_DATASETS_EXTRACTED_DATASETS_PATH" not in os.environ:
+            config.EXTRACTED_DATASETS_PATH = fallback / "downloads" / "extracted"
+        print(f"Hugging Face datasets cache unavailable at {configured}; using {fallback}")
+        return fallback
+
+
+def _resume_legacy_dataset(repo_id: str, root: Path):
+    """Open older LeRobot datasets for writing without loading every frame.
+
+    Older LeRobot has no ``resume`` method: its constructor reads the complete
+    dataset into a Hugging Face Arrow cache. Build the same writer state as its
+    ``create`` method, using the existing on-disk metadata instead.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+
+    meta = LeRobotDatasetMetadata(repo_id, root)
+    obj = LeRobotDataset.__new__(LeRobotDataset)
+    obj.meta = meta
+    obj.repo_id = repo_id
+    obj.root = meta.root
+    obj.revision = None
+    obj.tolerance_s = 1e-4
+    obj.image_writer = None
+    obj.batch_encoding_size = 1
+    obj.episodes_since_last_encoding = 0
+    obj.vcodec = "libsvtav1"
+    obj._encoder_threads = None
+    obj.episode_buffer = obj.create_episode_buffer()
+    obj.episodes = None
+    obj.hf_dataset = None
+    obj.image_transforms = None
+    obj.delta_timestamps = None
+    obj.delta_indices = None
+    obj._absolute_to_relative_idx = None
+    obj.video_backend = None
+    obj.writer = None
+    obj.latest_episode = None
+    obj._current_file_start_frame = None
+    obj._lazy_loading = False
+    obj._recorded_frames = meta.total_frames
+    obj._writer_closed_for_reading = False
+    obj._streaming_encoder = None
+    return obj
 
 
 @dataclass
@@ -49,6 +120,7 @@ class CollectSession:
         task: str,
         data_dir: str | Path,
         camera_config: str | Path | None = None,
+        dataset_root: str | Path | None = None,
     ) -> "CollectSession":
         """Open cameras + (create-or-resume) dataset + review-video writer.
 
@@ -62,6 +134,7 @@ class CollectSession:
 
         cfg_path = Path(camera_config) if camera_config else DEFAULT_CAMERA_CONFIG
         data_dir = Path(data_dir)
+        ensure_writable_datasets_cache()
 
         adapter = None
         try:
@@ -74,21 +147,29 @@ class CollectSession:
         height, width = int(gcfg.get("height", 480)), int(gcfg.get("width", 640))
 
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        episode_dir = data_dir / "dataset"
+        episode_dir = Path(dataset_root) if dataset_root is not None else data_dir / "dataset"
         meta_info = episode_dir / "meta" / "info.json"
         if meta_info.is_file():
             print(f"resuming existing dataset at {episode_dir} (appending a new episode)")
             try:
-                dataset = LeRobotDataset.resume(repo_id="local/piper-replay", root=episode_dir)
+                resume = getattr(LeRobotDataset, "resume", None)
+                if callable(resume):
+                    dataset = resume(repo_id="local/piper-replay", root=episode_dir)
+                else:
+                    dataset = _resume_legacy_dataset("local/piper-replay", episode_dir)
             except Exception as exc:  # noqa: BLE001
                 adapter.close()
                 raise RuntimeError(
-                    f"existing dataset at {episode_dir} could not be opened ({type(exc).__name__}: {exc}). "
-                    "It is probably a half-written episode. Delete it and re-collect:\n"
-                    f"  rm -rf {episode_dir}"
+                    f"existing dataset at {episode_dir} could not be opened "
+                    f"({type(exc).__name__}: {exc}). The dataset was left untouched; "
+                    "check its metadata and data files before retrying."
                 ) from exc
         else:
             try:
+                # LeRobotDataset.create requires a nonexistent root, but an
+                # operator may have already created the empty destination.
+                if episode_dir.is_dir() and not any(episode_dir.iterdir()):
+                    episode_dir.rmdir()
                 dataset = LeRobotDataset.create(
                     repo_id="local/piper-replay",
                     root=episode_dir,
@@ -104,7 +185,7 @@ class CollectSession:
         recorder = ReplayEpisodeRecorder(PiperLeRobotEpisode(dataset))
 
         import cv2
-        episode_index = int(getattr(dataset, "num_episodes", 0))
+        episode_index = int(dataset.meta.total_episodes)
         review_dir = episode_dir / "images" / "review"
         review_dir.mkdir(parents=True, exist_ok=True)
         video_path = review_dir / f"episode-{episode_index:06d}_review.mp4"
