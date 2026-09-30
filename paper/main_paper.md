@@ -137,7 +137,7 @@ none caches episodic memory.
 
 ## 2.3 Episodic memory for policy learning
 
-MemoryVLA [Shi et al., ICLR 2026 — CITATION NEEDED] introduces a perceptual-cognitive
+MemoryVLA [Shi et al., ICLR 2026] introduces a perceptual-cognitive
 episodic memory bank for autonomous manipulation; ALIGN's bank is conceptually
 similar but applied to a shared-autonomy policy and includes a *state* stream that
 MemoryVLA lacks. Other recent episodic-memory work for robot policies includes
@@ -902,8 +902,9 @@ Ability of Decision Transformer." 2024.
 [CITATION NEEDED] Zheng, Shen, Luo, Liu. "Decomposed Prompt Decision Transformer for
 Efficient Unseen Task Generalization." NeurIPS 2024.
 
-[CITATION NEEDED] Shi et al. "MemoryVLA: Perceptual-Cognitive Memory in Vision-Language-Action
-Models." ICLR 2026.
+Shi, H., Xie, B., Liu, Y., Sun, L., Liu, F., Wang, T., Zhou, E., Fan, H., Zhang, X.,
+& Huang, G. "MemoryVLA: Perceptual-Cognitive Memory in Vision-Language-Action Models
+for Robotic Manipulation." ICLR 2026. arXiv:2508.19236.
 
 [CITATION NEEDED] Chi et al. "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion."
 RSS 2023.

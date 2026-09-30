@@ -515,7 +515,7 @@ def run_replay_in_sim(
         action = actions[step].copy()
         # Clamp gripper to {-1, +1}
         if action.shape[0] >= 7:
-            action[6] = 1.0 if action[6] <= 0.5 else -1.0
+            action[6] = 1.0 if action[6] <= 0.1 else -1.0
         obs, reward, done, info = env.step(action)
         # Get sim_eef AFTER step
         sim_eef_after = get_sim_eef_pose(obs)
@@ -1111,7 +1111,7 @@ def main():
                         help="Path to HDF5 dataset.")
     parser.add_argument("--checkpoint", required=True,
                         help="Path to intention_best.pt")
-    parser.add_argument("--cameras", nargs="+", default=["wrist_image"],
+    parser.add_argument("--cameras", nargs="+", default=["image","wrist_image"],
                         help="Camera names (default: wrist_image). "
                              "MUST match the cameras used during training "
                              "(e.g. 'image wrist_image' for 2-cam checkpoints).")
