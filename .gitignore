@@ -21,6 +21,7 @@ optuna_trials/
 optuna_smoke/
 
 # Python
+.venv/
 __pycache__/
 *.pyc
 

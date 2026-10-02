@@ -239,16 +239,38 @@ ALIGN/
 
 ## Installation
 
-```bash
-git clone https://github.com/NIRUN-Weerawit/ALIGN.git && cd ALIGN
+Clone the repository first:
 
-# Conda (recommended)
+```bash
+git clone https://github.com/NIRUN-Weerawit/ALIGN.git
+cd ALIGN
+```
+
+### Conda (recommended)
+
+```bash
 conda env create -f environment.yml
 conda activate align
-
-# Verify
 python scripts/check_deps.py
 ```
+
+### uv
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run:
+
+```bash
+./setup.sh uv
+source .venv/bin/activate
+python scripts/check_deps.py
+```
+
+The uv option creates a Python 3.12 `.venv` for current LeRobot releases and
+installs the CUDA 12.8 PyTorch wheels, `requirements.txt`, and the Mamba CUDA
+extensions. Use `./setup.sh uv --minimal` to skip optional data collection
+dependencies. Run installation from a machine with a compatible NVIDIA CUDA
+driver, CUDA toolkit (`nvcc`), and C++ build tools for the Mamba extensions.
+For a different CUDA version, adjust the PyTorch index and matching wheel
+versions in `setup.sh` before installing.
 
 Requires PyTorch 2.x, DINOv2, Mamba SSM, and LIBERO (for sim evaluation).
 
