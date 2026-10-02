@@ -5,13 +5,16 @@
 # Supports:
 #   1. Conda (recommended)  — ./setup.sh conda
 #   2. pip / venv            — ./setup.sh pip
+#   3. uv / venv             — ./setup.sh uv
 #
-# Environment is created as 'align' for conda, or uses the active venv for pip.
+# Environment is created as 'align' for conda, uses the active venv for pip,
+# or is created at .venv for uv.
 #
 # Usage:
 #   ./setup.sh                     # auto-detect (conda preferred)
 #   ./setup.sh conda               # force conda
 #   ./setup.sh pip                 # force pip into current env
+#   ./setup.sh uv                  # create/use .venv with Python 3.12
 #   ./setup.sh -y                  # non-interactive (auto-confirm)
 #   ./setup.sh --minimal           # training/inference only (no Isaac Sim)
 # =============================================================================
@@ -30,17 +33,15 @@ err()   { echo -e "${RED}[ALIGN] ERROR:${NC} $*" >&2; }
 # ── Parse flags ──
 AUTO_CONFIRM=false
 MINIMAL=false
-METHOD="${1:-auto}"
-
-case "$METHOD" in
-    -y|--yes) AUTO_CONFIRM=true; METHOD=auto ;;
-    --minimal) MINIMAL=true; METHOD=auto ;;
-    conda|pip|auto) ;;
-    *) err "Unknown method: $METHOD. Use 'conda', 'pip', or 'auto'."; exit 1 ;;
-esac
-
-if [ "$METHOD" = "auto" ] && [ "${1:-}" = "--minimal" ]; then MINIMAL=true; fi
-if [ "$METHOD" = "auto" ] && ([ "${1:-}" = "-y" ] || [ "${1:-}" = "--yes" ]); then AUTO_CONFIRM=true; fi
+METHOD=auto
+for arg in "$@"; do
+    case "$arg" in
+        -y|--yes) AUTO_CONFIRM=true ;;
+        --minimal) MINIMAL=true ;;
+        conda|pip|uv|auto) METHOD="$arg" ;;
+        *) err "Unknown option: $arg. Use 'conda', 'pip', 'uv', or 'auto' with optional -y and --minimal."; exit 1 ;;
+    esac
+done
 
 # ── Detect available package managers ──
 HAS_CONDA=false
@@ -212,15 +213,71 @@ install_pip() {
     echo ""
 }
 
+install_uv() {
+    if ! command -v uv &>/dev/null; then
+        err "uv is required for this method. Install it from https://docs.astral.sh/uv/getting-started/installation/."
+        exit 1
+    fi
+
+    local venv_dir="$SCRIPT_DIR/.venv"
+    local venv_python="$venv_dir/bin/python"
+    if [ ! -e "$venv_python" ]; then
+        if [ -e "$venv_dir" ]; then
+            err "$venv_dir exists but is not a usable virtual environment. Move it aside before retrying."
+            exit 1
+        fi
+        info "Creating Python 3.12 virtual environment at .venv..."
+        uv venv --python 3.12 "$venv_dir"
+    fi
+
+    if ! "$venv_python" -c 'import sys; assert sys.version_info[:2] == (3, 12)' 2>/dev/null; then
+        err ".venv must use Python 3.12. Move the existing environment aside before retrying."
+        exit 1
+    fi
+
+    local torch_packages=(torch==2.10.0 torchvision==0.25.0 torchcodec==0.10.0)
+    info "Installing PyTorch + CUDA..."
+    uv pip install --python "$venv_python" "${torch_packages[@]}" \
+        --index-url https://download.pytorch.org/whl/cu128
+
+    info "Installing xformers..."
+    uv pip install --python "$venv_python" xformers "${torch_packages[@]}" \
+        --index-url https://download.pytorch.org/whl/cu128
+
+    info "Installing core dependencies from requirements.txt..."
+    uv pip install --python "$venv_python" --torch-backend cu128 \
+        -r requirements.txt "${torch_packages[@]}"
+
+    info "Installing Mamba build requirements and CUDA extensions..."
+    uv pip install --python "$venv_python" 'setuptools<82' wheel packaging ninja
+    MAMBA_KEEP_CUDA_BUILD=TRUE uv pip install --python "$venv_python" \
+        --no-build-isolation --no-deps --no-binary mamba-ssm \
+        "${MAMBA_PIP[@]}"
+
+    if ! $MINIMAL; then
+        info "Installing optional dependencies..."
+        uv pip install --python "$venv_python" --torch-backend cu128 \
+            "${OPTIONAL_PIP[@]}" "${torch_packages[@]}"
+    fi
+
+    ok "uv environment ready at .venv"
+    echo "  Activate:  source .venv/bin/activate"
+    echo "  Verify:    .venv/bin/python scripts/check_deps.py"
+}
+
 # ── Execute ──
 case "$METHOD" in
     conda) install_conda "align" ;;
     pip) install_pip ;;
+    uv) install_uv ;;
 esac
 
 ok "Done!"
 echo ""
-echo "  Activate:  conda activate align  (or: source align-env/bin/activate)"
+case "$METHOD" in
+    uv) echo "  Activate:  source .venv/bin/activate" ;;
+    *)  echo "  Activate:  conda activate align  (or: source align-env/bin/activate)" ;;
+esac
 echo "  Run:       python training/pretrain_streaming.py --epochs 10"
 echo ""
 if $MINIMAL; then
