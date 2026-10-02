@@ -117,7 +117,6 @@ def main():
             if child.is_file():
                 child.unlink()
             elif child.is_dir():
-                import shutil
                 shutil.rmtree(child)
     dst_dir.mkdir(parents=True, exist_ok=True)
 

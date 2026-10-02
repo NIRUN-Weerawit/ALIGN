@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -27,6 +28,9 @@ class MarkerEncoder:
         marker = images[:, 0, 0, 0].float().view(-1, 1, 1)
         return marker.expand(-1, 257, 768).clone()
 
+    def parameters(self):
+        return iter(())
+
 
 def test_encode_frames_keeps_time_camera_patch_order():
     images = np.zeros((2, 2, 2, 2, 3), dtype=np.uint8)
@@ -41,6 +45,27 @@ def test_encode_frames_keeps_time_camera_patch_order():
     np.testing.assert_array_equal(features[:, 256, 0], [1, 3])
     np.testing.assert_array_equal(features[:, 257, 0], [2, 4])
     np.testing.assert_array_equal(features[:, 513, 0], [2, 4])
+
+
+def test_main_reaches_disk_check_and_writes_cache(tmp_path, monkeypatch):
+    source = tmp_path / "sample.h5"
+    with h5py.File(source, "w") as h5:
+        ep = h5.create_group("ep_000000")
+        ep.create_dataset("frames/image", data=np.ones((1, 2, 2, 3), dtype=np.uint8))
+
+    output = tmp_path / "cache"
+    monkeypatch.setattr(_module, "build_encoder", lambda _: MarkerEncoder())
+    monkeypatch.setattr(_module.shutil, "disk_usage",
+                        lambda _: SimpleNamespace(free=10 * 1024**3))
+    monkeypatch.setattr(_module.sys, "argv", [
+        "precompute_dinov2.py", "--data", str(source), "--cameras", "image",
+        "--output", str(output), "--device", "cpu",
+    ])
+
+    _module.main()
+
+    assert (output / "ep_000000.npy").exists()
+    assert json.loads((output / "index.json").read_text())["ep_000000"]["length"] == 1
 
 
 def test_dataset_rejects_legacy_cache_that_could_change_features(tmp_path):
