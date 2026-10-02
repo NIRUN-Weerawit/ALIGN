@@ -345,7 +345,10 @@ class VisionEncoder(nn.Module):
         std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x - mean) / std
 
-        with torch.no_grad():
+        # The backbone is frozen. Keep its features in FP32 even when the
+        # trainable head runs under BF16 autocast, so precomputed FP32 features
+        # and on-the-fly features follow the same numerical path.
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=False):
             if self.use_patch_tokens:
                 # v2: get all patch tokens (no CLS) — preserves spatial info
                 features_dict   = self.backbone.forward_features(x)

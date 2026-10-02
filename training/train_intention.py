@@ -151,6 +151,7 @@ def build_datasets(args):
 
 def build_loaders(train_ds, val_ds, args):
     """Build train and val dataloaders."""
+    pin_memory = torch.device(args.device).type == "cuda"
     # Match the training loop's is_v4 detection logic
     is_v4 = (
         getattr(args, "use_intent_tokens", False)
@@ -168,15 +169,27 @@ def build_loaders(train_ds, val_ds, args):
         collate_fn = lambda b: head_collate(
             b, chunk_size=args.chunk_size, vision_window_size=args.chunk_size,
         )
+    if pin_memory:
+        # The ALIGN collators return NumPy arrays. DataLoader only pins torch
+        # tensors, so convert them here before its pin-memory thread runs.
+        numpy_collate_fn = collate_fn
+        transfer_keys = ({"frames_segment", "states_segment", "actions_segment"}
+                         if is_v4 else {"frames_window", "robot_state_window", "actions_window"})
+        def collate_fn(batch):
+            result = numpy_collate_fn(batch)
+            return {
+                key: torch.from_numpy(value) if key in transfer_keys else value
+                for key, value in result.items()
+            }
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
         drop_last=True, collate_fn=collate_fn,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         drop_last=False, collate_fn=collate_fn,
-        num_workers=args.num_workers, pin_memory=True,
+        num_workers=args.num_workers, pin_memory=pin_memory,
     )
     return train_loader, val_loader
 
@@ -264,9 +277,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         if args.action_dim >= 7:
             dim_weights[6] = 0.01  # gripper: binary 0/1, scale down 100×
 
-        frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
-        states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
-        actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
+        frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
+        states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
+        actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
         # print(f"seg_lens: {seg_lens}")
@@ -485,9 +498,9 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
         except StopIteration:
             break
 
-        frames = torch.from_numpy(batch["frames_window"]).to(device)  # (B, K, H, W, 3) or (B, K, V, H, W, 3)
-        state = torch.from_numpy(batch["robot_state_window"]).float().to(device)  # (B, K, 7)
-        target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, 7)
+        frames = torch.as_tensor(batch["frames_window"]).to(device, non_blocking=True)  # (B, K, H, W, 3) or (B, K, V, H, W, 3)
+        state = torch.as_tensor(batch["robot_state_window"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, K, 7)
+        target = torch.as_tensor(batch["actions_window"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, K, 7)
 
         # Per-dimension loss weights: down-weight gripper (dim 6) so it doesn't dominate
         dim_weights = torch.ones(args.action_dim, device=device)
@@ -594,9 +607,9 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
         except StopIteration:
             break
 
-        frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
-        states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
-        actions_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
+        frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
+        states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
+        actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)  # (B,)
         Hs = args.history_size
         chunk_size = args.chunk_size
@@ -736,9 +749,9 @@ def validate(model, loader, device, args):
         if args.action_dim >= 7:
             dim_weights[6] = 0.01  # gripper: binary 0/1, scale down 100×
 
-        frames_seg = torch.from_numpy(batch["frames_segment"]).to(device)  # (B, S, V, H, W, 3)
-        states_seg = torch.from_numpy(batch["states_segment"]).float().to(device)  # (B, S, 7)
-        target_seg = torch.from_numpy(batch["actions_segment"]).float().to(device)  # (B, S, 7)
+        frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
+        states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
+        target_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
        
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
         
@@ -1039,7 +1052,7 @@ def parse_args():
                         help="Skip DDIM sampling for action mean during training (5-10x faster).")
     parser.set_defaults(no_sample_during_train=True)  # Default: skip for speed
     parser.add_argument("--torch-compile", action="store_true", default=False,
-                        help="Use torch.compile to speed up model (1.5-2x faster, may have issues).")
+                        help="Reserved; currently reports that compilation is not wired into this trainer.")
 
     # V4: Segment training
     parser.add_argument("--history-size", type=int, default=20,
@@ -1114,6 +1127,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.torch_compile:
+        print("  NOTE: --torch-compile is not implemented in train_intention.py; running eager mode.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

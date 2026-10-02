@@ -3,12 +3,13 @@
 
 Encodes every (episode, camera, frame) once with VisionEncoder and writes
 the raw features to a directory of per-episode .npy files + an index.json.
-Layout matches VisionEncoder.forward output for B=1 exactly (same numerical
-result as the in-training forward — no autocast, FP32 weights and activations).
+Layout matches train_intention.py's per-camera _vision_forward calls. The
+training path flattens cameras into the batch before calling VisionEncoder,
+so cross-camera attention is not applied to these frozen backbone features.
 
 Output structure:
     <output_dir>/
-        index.json                       -- {ep_name: {"length": N, "shape": [...]}, ...}
+        index.json                       -- cache metadata + per-episode lengths
         ep_000000.npy                    -- (N, V*257, 768) float32
         ep_000001.npy
         ...
@@ -28,15 +29,16 @@ Usage:
         --device cuda
 
 Notes:
-- FP32 storage is ~3x larger than fp16 but guarantees zero precision drift.
-- Pre-encode uses no_grad + FP32 (no autocast) to match training exactly.
-- Per-frame processing (B_eff=1) keeps pre-encode VRAM trivial.
-- Cross-camera attention is applied per-frame (B=1, V*P=512), matching training.
+- FP32 storage is 2x larger than fp16 but avoids precision reduction.
+- Pre-encode uses no_grad + FP32 (no autocast) to match training precision.
+- `--batch-size` controls the number of image frames per backbone call.
+- Camera order is preserved as [cam0 patches, cam0 CLS, cam1 patches, cam1 CLS].
 """
 from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -50,41 +52,38 @@ from tqdm import tqdm
 from models.align_model import VisionEncoder
 
 
-def build_encoder(device: torch.device, num_cameras: int) -> VisionEncoder:
-    """Build VisionEncoder matching ALIGNIntentionModel defaults.
-
-    Default: dinov2_vitb14, use_patch_tokens=True, fusion_type="transformer".
-    `num_cameras` must match the V dimension of the input (set to len(--cameras)).
-    """
+def build_encoder(device: torch.device) -> VisionEncoder:
+    """Build the single-camera encoder used by the training forward path."""
     return VisionEncoder(
         backbone="dinov2_vitb14",
         embed_dim=256,           # unused for v2 patch mode, kept for API compat
-        num_cameras=num_cameras,
+        num_cameras=1,
         use_patch_tokens=True,
         fusion_type="transformer",
     ).to(device).eval()
 
 
-def encode_frame(encoder: VisionEncoder, frame: np.ndarray,
-                 device: torch.device) -> np.ndarray:
-    """Encode one frame with all cameras through VisionEncoder.
+def encode_frames(encoder: VisionEncoder, frames: np.ndarray,
+                  device: torch.device, batch_size: int) -> np.ndarray:
+    """Encode (time, camera) frames exactly as training flattens them.
 
     Args:
         encoder: VisionEncoder (frozen, eval mode)
-        frame:   (V, H, W, 3) uint8 — all cameras for one timestep
+        frames:  (T, V, H, W, 3) uint8
         device:  torch device
+        batch_size: number of camera images per backbone call
 
     Returns:
-        (V*257, 768) float32 numpy — same layout as VisionEncoder.forward(B=1, V, ...)
+        (T, V*257, 768) float32 numpy
     """
-    # (V, H, W, 3) uint8 → (1, V, H, W, 3) float on device
-    x = torch.from_numpy(frame).unsqueeze(0).to(device)
+    T, V, H, W, C = frames.shape
+    flat = frames.reshape(T * V, H, W, C)
+    features = np.empty((T * V, 257, 768), dtype=np.float32)
     with torch.no_grad():
-        # VisionEncoder handles resize to 224, normalize, backbone forward,
-        # and cross-camera attention internally. No autocast — FP32 to match
-        # the in-training pre-encode path exactly.
-        features = encoder(x)  # (1, V*257, 768)
-    return features.squeeze(0).cpu().numpy().astype(np.float32)
+        for start in range(0, len(flat), batch_size):
+            x = torch.from_numpy(flat[start:start + batch_size]).to(device)
+            features[start:start + len(x)] = encoder(x).cpu().numpy()
+    return features.reshape(T, V * 257, 768)
 
 
 def main():
@@ -98,9 +97,13 @@ def main():
     parser.add_argument("--output", required=True,
                         help="Output DIRECTORY for per-episode .npy files + index.json")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="Camera images per DINOv2 call (default: 16)")
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing output directory")
     args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be positive")
 
     src_path = Path(args.data)
     dst_dir = Path(args.output)
@@ -126,23 +129,39 @@ def main():
 
     device = torch.device(args.device)
     V = len(args.cameras)
-    encoder = build_encoder(device, num_cameras=V)
-    # Freeze all params (already in eval mode, but make requires_grad explicit)
-    for p in encoder.parameters():
-        p.requires_grad = False
+    # Match train_intention.py's vision settings. Precision is kept at FP32.
+    torch.backends.cudnn.enabled = False
+    torch.backends.cuda.matmul.allow_tf32 = True
 
-    # Discover episodes and probe shape
+    # Discover episodes and check capacity before writing a large FP32 cache.
     with h5py.File(src_path, "r") as src:
         episodes = sorted(k for k in src.keys() if k.startswith("ep_"))
+        if not episodes:
+            raise ValueError(f"No episodes in {src_path}")
         sample_ep = src[episodes[0]]
         sample_frames = sample_ep["frames"][args.cameras[0]]
         H, W = sample_frames.shape[1:3]
+        total_frames = sum(src[ep]["frames"][args.cameras[0]].shape[0]
+                           for ep in episodes)
         print(f"  Episodes: {len(episodes)}")
         print(f"  Frame size: {H}x{W}")
         print(f"  Camera shape (per frame): ({V}, {H}, {W}, 3)")
 
     out_tokens = V * 257
     out_dim = 768
+    expected_bytes = total_frames * out_tokens * out_dim * np.dtype(np.float32).itemsize
+    available_bytes = shutil.disk_usage(dst_dir).free
+    print(f"  Expected cache size: {expected_bytes / 1e9:.2f} GB")
+    if expected_bytes + 2 * 1024**3 > available_bytes:
+        raise OSError(
+            f"Insufficient free space at {dst_dir}: need about "
+            f"{(expected_bytes + 2 * 1024**3) / 1e9:.2f} GB including "
+            f"safety margin, have {available_bytes / 1e9:.2f} GB"
+        )
+    encoder = build_encoder(device)
+    # Freeze all params (already in eval mode, but make requires_grad explicit)
+    for p in encoder.parameters():
+        p.requires_grad = False
 
     # Build index as we go (don't hold all episodes in memory)
     index = {}
@@ -153,17 +172,12 @@ def main():
             ep_src = src[ep_name]
             n_frames = ep_src["frames"][args.cameras[0]].shape[0]
 
-            # Allocate in-memory buffer for this episode and encode all frames
-            ep_features = np.empty(
-                (n_frames, out_tokens, out_dim), dtype=np.float32,
-            )
             # Load all frames for this episode (per camera) into memory once
             frames_all = np.stack([
                 ep_src["frames"][cam][:] for cam in args.cameras
             ], axis=1)  # (N, V, H, W, 3) uint8
 
-            for t in range(n_frames):
-                ep_features[t] = encode_frame(encoder, frames_all[t], device)
+            ep_features = encode_frames(encoder, frames_all, device, args.batch_size)
 
             # Save as per-episode .npy
             npy_path = dst_dir / f"{ep_name}.npy"
@@ -176,6 +190,14 @@ def main():
                 "dim": out_dim,
             }
 
+    # Metadata lets ALIGNDataset reject legacy multi-camera caches that were
+    # produced with cross-camera attention and do not match training inputs.
+    index["__meta__"] = {
+        "format": "align-dinov2-per-camera-v2",
+        "cameras": args.cameras,
+        "source": str(src_path.resolve()),
+        "dtype": "float32",
+    }
     # Write index.json
     index_path = dst_dir / "index.json"
     with open(index_path, "w") as f:

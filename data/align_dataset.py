@@ -335,6 +335,23 @@ class ALIGNDataset(Dataset):
                 )
             with open(index_path) as f:
                 self._dinov2_index = json.load(f)
+            cache_meta = self._dinov2_index.get("__meta__")
+            if cache_meta is None or cache_meta.get("format") != "align-dinov2-per-camera-v2":
+                raise ValueError(
+                    f"Legacy DINOv2 cache at {self.dinov2_path} may not match "
+                    "the training vision path. Regenerate it with "
+                    "scripts/precompute_dinov2.py."
+                )
+            if cache_meta.get("cameras") != self.cameras:
+                raise ValueError(
+                    f"DINOv2 cache cameras {cache_meta.get('cameras')} do not "
+                    f"match requested cameras {self.cameras}"
+                )
+            if cache_meta.get("source") != str(self.h5_path.resolve()):
+                raise ValueError(
+                    f"DINOv2 cache source {cache_meta.get('source')} does not "
+                    f"match dataset {self.h5_path.resolve()}"
+                )
             self._dinov2_memmaps = {}
 
         ep_name = self._episode_keys[ep_idx]
