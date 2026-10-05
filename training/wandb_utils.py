@@ -31,9 +31,13 @@ except ImportError:
 class WandBTrainer:
     """Wrapper around wandb that gracefully handles disabled mode."""
 
-    def __init__(self, project: str, name: Optional[str] = None, config: Optional[Dict] = None):
+    def __init__(self, project: str, name: Optional[str] = None,
+                 config: Optional[Dict] = None, enabled: bool = True):
         self._enabled = False
         self._run = None
+
+        if not enabled:
+            return
 
         if not _WANDB_AVAILABLE:
             return
@@ -123,12 +127,13 @@ def init_wandb(
     project: str = "align",
     name: Optional[str] = None,
     config: Optional[Dict] = None,
+    enabled: bool = True,
 ) -> WandBTrainer:
     """Initialize W&B trainer with project, name, and config.
 
-    Returns dummy trainer if W&B is disabled / not installed.
+    Returns dummy trainer when explicitly disabled, unavailable, or unauthenticated.
     """
-    return WandBTrainer(project=project, name=name, config=config)
+    return WandBTrainer(project=project, name=name, config=config, enabled=enabled)
 
 
 def log_metrics(trainer: WandBTrainer, metrics: Dict[str, Any], step: Optional[int] = None):

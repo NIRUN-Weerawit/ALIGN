@@ -185,11 +185,15 @@ def build_loaders(train_ds, val_ds, args):
         train_ds, batch_size=args.batch_size, shuffle=True,
         drop_last=True, collate_fn=collate_fn,
         num_workers=args.num_workers, pin_memory=pin_memory,
+        persistent_workers=args.persistent_workers and args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
         drop_last=False, collate_fn=collate_fn,
         num_workers=args.num_workers, pin_memory=pin_memory,
+        persistent_workers=args.persistent_workers and args.num_workers > 0,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
     return train_loader, val_loader
 
@@ -339,7 +343,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # print(f"reshapedshapes: z_v_all: {z_v_all_stacked.shape}")
 
         total_loss = torch.tensor(0.0, device=device)
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         # Sequential T-loop
         last_actions_pred = None
@@ -555,10 +559,10 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
             actions_pred_list.append(0.0 if not torch.isfinite(actions_pred).all()
                                       else actions_pred.detach().abs().mean().item())
             pbar.set_postfix(mse=f"NAN", warn="skip")
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             continue
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad],
@@ -699,13 +703,17 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
             total_loss = torch.stack(loss_accum).sum()
 
         # Backward
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad],
             args.grad_clip,
         )
         optimizer.step()
+
+        profiler = getattr(args, "_profiler", None)
+        if profiler is not None:
+            profiler.step()
 
         losses.append(total_loss.item() / max(len(loss_accum), 1))
         if actions_pred is not None:
@@ -1094,12 +1102,20 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Use PyTorch fused AdamW on CUDA; keeps FP32 parameters and optimizer state (default: off for reproducibility).")
     parser.add_argument("--skip-nan", dest="skip_nan", action="store_true",
                         default=True,
                         help="Skip batches with NaN/Inf loss (default on).")
     parser.add_argument("--no-skip-nan", dest="skip_nan", action="store_false",
                         help="Disable NaN skipping (will NaN out the run).")
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Keep DataLoader workers alive between epochs (default: on when workers > 0).")
+    parser.add_argument("--prefetch-factor", type=int, default=2,
+                        help="Batches prefetched by each DataLoader worker (default: 2; ignored for workers=0).")
     # NOTE: --loss-mode removed; always 'action' for v3.
     # NOTE: --bf16 / --no-bf16 removed; BF16 is always on for speed.
     # Pre-computed DINOv2 features (skips DINOv2 forward during training).
@@ -1114,6 +1130,10 @@ def parse_args():
                              "<data path stem>.dinov2/ in the same directory.")
     parser.add_argument("--max-steps-per-epoch", type=int, default=0,
                         help="Cap steps per epoch (0 = use full loader).")
+    parser.add_argument("--profile-steps", type=int, default=0,
+                        help="Profile V4-batched CUDA steps after one wait and one warmup step; 0 disables profiling.")
+    parser.add_argument("--profile-dir", default="profiles",
+                        help="Directory for Chrome/TensorBoard profiler traces when --profile-steps > 0.")
     # Wandb
     parser.add_argument("--wandb", action="store_true",
                         help="Enable W&B logging.")
@@ -1185,6 +1205,7 @@ def main():
         project=args.wandb_project,
         name=args.wandb_run,
         config=vars(args),
+        enabled=args.wandb,
     )
     print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
@@ -1318,11 +1339,17 @@ def main():
         print("  Training: vision projection + state encoder + head (no Mamba history)")
         print("  (DINOv2 backbone frozen)")
 
-    # Optimizer — single LR group (only trainable params receive gradients)
-    optimizer = torch.optim.AdamW(
-        trainable, lr=args.lr, weight_decay=args.weight_decay,
-    )
-    print(f"  Optimizer: 1 LR group (lr={args.lr:.2e}, {n_trainable:,} trainable params)")
+    # Optimizer — single LR group (only trainable params receive gradients).
+    # Fused AdamW keeps parameters and optimizer state in FP32; it changes only
+    # kernel fusion/order, so it is opt-in for checkpoint-comparison reproducibility.
+    adamw_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
+    if args.fused_adamw:
+        if device.type != "cuda":
+            raise ValueError("--fused-adamw requires --device cuda")
+        adamw_kwargs["fused"] = True
+    optimizer = torch.optim.AdamW(trainable, **adamw_kwargs)
+    print(f"  Optimizer: 1 LR group (lr={args.lr:.2e}, {n_trainable:,} trainable params; "
+          f"fused={args.fused_adamw})")
 
     # Save config snapshot
     config_snapshot = vars(args).copy()
@@ -1362,12 +1389,48 @@ def main():
         mode_str = "(V3 mode)"
     print(f"  Training for {args.epochs} epochs... {mode_str}")
     best_val_loss = float("inf")
+    profiler = None
+    profile_dir = None
+    if args.profile_steps:
+        if train_fn is not train_v4_batched_epoch:
+            raise ValueError("--profile-steps currently supports V4-batched mode only "+
+                             "(requires --no-history and no memory bank).")
+        if args.max_steps_per_epoch and args.max_steps_per_epoch < args.profile_steps + 2:
+            raise ValueError("--max-steps-per-epoch must be at least --profile-steps + 2 "+
+                             "for profiler wait and warmup steps.")
+        profile_dir = Path(args.profile_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        profiler = torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(wait=1, warmup=1,
+                                             active=args.profile_steps, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir)),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,
+        )
+        profiler.__enter__()
+        args._profiler = profiler
+        print(f"  CUDA profiler: {args.profile_steps} active steps → {profile_dir}")
+    else:
+        args._profiler = None
     for epoch in range(1, args.epochs + 1):
         t_start = time.time()
         train_loss, train_action = train_fn(
             model, train_loader, optimizer, device, args,
             max_steps=args.max_steps_per_epoch,
         )
+        if profiler is not None:
+            assert profile_dir is not None
+            profiler.__exit__(None, None, None)
+            summary_path = profile_dir / "operator_summary.txt"
+            summary_path.write_text(
+                profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=80)
+            )
+            print(f"  CUDA profiler summary: {summary_path}")
+            args._profiler = None
+            profiler = None
         val_loss, val_action, val_per_dim = validate(model, val_loader, device, args)
         elapsed = time.time() - t_start
 
