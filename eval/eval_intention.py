@@ -195,6 +195,17 @@ def load_intention_model(
     return model, cfg
 
 
+def _predict_action_chunk(model: ALIGNIntentionModel, out: dict) -> torch.Tensor:
+    """Use the checkpoint's head type and the model's current call signature."""
+    intent_emb = out.get("intent_emb")
+    if intent_emb is not None and intent_emb.ndim != 3:
+        intent_emb = None
+    args = (out["z_v_pooled_seq"], out["z_s_seq"], intent_emb)
+    if model.head_type in ("flow_matching", "diffusion"):
+        return model.sample_actions(*args)
+    return model.predict_actions(*args)
+
+
 # ================================================================
 # Evaluation
 # ================================================================
@@ -281,32 +292,10 @@ def evaluate(
             # Always use 'actions_window' (target) for error computation
             target = torch.from_numpy(batch["actions_window"]).float().to(device)  # (B, K, action_dim)
 
-            # Optional text encoding (only if model has text encoder)
-            z_sext = None
-            if getattr(model, "text_encoder", None) is not None:
-                B_size = frames.shape[0]
-                if "texts" in batch and batch["texts"]:
-                    texts = batch["texts"]
-                elif task_text:
-                    texts = [task_text] * B_size
-                else:
-                    texts = ["default task"] * B_size
-                z_sext = model.text_encoder(texts)
-
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
                 out = model(frames, state)
-                h_current = out["h_seq"][:, -1]
-                if model.head_type in ("flow", "diffusion_policy"):
-                    # Flow head: use sample_actions (ODE integration)
-                    actions_pred = model.sample_actions(
-                        out["z_v_pooled_seq"], out["z_s_seq"], h_current, z_sext=z_sext,
-                    )
-                else:
-                    # Direct regression head
-                    actions_pred = model.predict_actions(
-                        out["z_v_pooled_seq"], out["z_s_seq"], h_current, z_sext=z_sext,
-                    )
+                actions_pred = _predict_action_chunk(model, out)
                 # (B, K, action_dim)
 
             actions_pred_f = actions_pred.float()
