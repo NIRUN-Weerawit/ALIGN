@@ -1,0 +1,246 @@
+"""Regression coverage for causal state, padded loss, and optional memory."""
+
+import json
+
+import h5py
+import numpy as np
+import pytest
+import torch
+from torch import nn
+
+from data.align_dataset import ALIGNDataset, v4_segment_collate
+from data.gripper_state import previous_gripper_commands, carry_gripper_state
+from models.align_intention import ALIGNIntentionModel
+from models.intention_head import DiffusionPolicyHead, FlowMatchingPolicyHead
+from models.memory_bank import MemoryRetrieval, PerceptualCognitiveMemoryModule
+
+
+def write_dataset(path, measured=False):
+    actions = np.zeros((12, 7), dtype=np.float32)
+    actions[:, 6] = np.arange(12) % 2
+    with h5py.File(path, "w") as f:
+        ep = f.create_group("ep_000")
+        ep.create_dataset("frames/wrist_image", data=np.zeros((12, 8, 8, 3), np.uint8))
+        ep.create_dataset("poses", data=np.zeros((12, 6), np.float32))
+        ep.create_dataset("actions", data=actions)
+        ep.create_dataset("texts", data=json.dumps(["task"]))
+        ep.attrs["initial_gripper"] = -0.25
+        if measured:
+            ep.create_dataset("gripper", data=np.full(12, 0.3, np.float32))
+    return actions
+
+
+def test_gripper_fallback_is_causal_across_cropped_windows(tmp_path):
+    path = tmp_path / "sample.h5"
+    actions = write_dataset(path)
+    with ALIGNDataset(str(path), cameras=["wrist_image"], frames_per_ep=2, traj_window=2) as ds:
+        np.testing.assert_array_equal(ds[0]["grippers"], [-0.25, 0, 1, 0])
+        np.testing.assert_array_equal(ds[1]["grippers"], actions[1:5, 6])
+        assert ds._read_robot_state(0, 3)[6] == actions[2, 6]
+        batch = v4_segment_collate([ds[0]], history_size=1, chunk_size=2,
+                                   segment_min_mult=4, segment_max_mult=4)
+        np.testing.assert_array_equal(batch["states_segment"][0, :, 6], [-0.25, 0, 1, 0])
+        np.testing.assert_array_equal(batch["actions_segment"][0], actions[:4])
+
+
+def test_measured_gripper_takes_precedence_and_padding_carries_state(tmp_path):
+    path = tmp_path / "sample.h5"
+    write_dataset(path, measured=True)
+    with ALIGNDataset(str(path), cameras=["wrist_image"], frames_per_ep=2, traj_window=2) as ds:
+        np.testing.assert_allclose(ds[0]["grippers"], 0.3)
+        np.testing.assert_allclose(ds._read_poses_gripper(0, 10, 4), 0.3)
+
+
+def test_causal_gripper_never_reads_previous_episode_or_mutates_last_state():
+    actions = np.zeros((8, 7), np.float32)
+    actions[:, 6] = np.arange(8)
+    np.testing.assert_array_equal(previous_gripper_commands(actions, count=3, episode_start=4), [0, 4, 5])
+    last = np.array([0, 0, 0, 0, 0, 0, 1], np.float32)
+    next_state = carry_gripper_state(last, np.ones(6))
+    np.testing.assert_array_equal(next_state, np.ones(7))
+    np.testing.assert_array_equal(last[:6], np.zeros(6))
+
+
+@pytest.mark.parametrize("head_cls", [DiffusionPolicyHead, FlowMatchingPolicyHead])
+def test_invalid_generative_samples_do_not_change_loss_or_gradients(head_cls):
+    head = head_cls(cond_dim=4, hidden_dim=8, chunk_size=4)
+    # A simple predictor exposes conditioning gradients without U-Net zero init.
+    predictor = lambda x, t, cond: cond[:, :, :1].expand_as(x) + 0.1 * x
+    if head_cls is DiffusionPolicyHead:
+        head.predict_noise = predictor
+    else:
+        head.predict_velocity = predictor
+    target = torch.randn(2, 4, 7, requires_grad=True)
+    cond = torch.randn(2, 1, 4, requires_grad=True)
+    with torch.no_grad():
+        target[1] = float("nan")
+        cond[1] = float("nan")
+    weights = torch.tensor([1., 1., 1., 1., 1., 1., .01])
+    torch.manual_seed(17)
+    masked = head.loss(target, cond, dim_weights=weights, sample_mask=torch.tensor([True, False]))
+    torch.manual_seed(17)
+    reference = head.loss(target[:1], cond[:1], dim_weights=weights)
+    torch.testing.assert_close(masked, reference)
+    masked.backward()
+    assert torch.isfinite(masked)
+    assert torch.count_nonzero(cond.grad[1]) == 0
+    assert torch.count_nonzero(target.grad[1]) == 0
+    assert torch.count_nonzero(cond.grad[0]) > 0
+
+
+def test_mixed_empty_memory_rows_are_finite_and_preserve_empty_query():
+    retrieval = MemoryRetrieval(4, num_heads=2)
+    query = torch.randn(2, 4, requires_grad=True)
+    output = retrieval(query, torch.randn(2, 3, 4),
+                       torch.tensor([[True, False, False], [False, False, False]]))
+    assert torch.isfinite(output).all()
+    torch.testing.assert_close(output[1], query[1])
+    output.square().sum().backward()
+    assert torch.isfinite(query.grad).all()
+
+
+class FakeVision(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.fusion_type = kwargs.get("fusion_type", "transformer")
+        self.backbone = nn.Linear(1, 1)
+
+    def forward(self, frames):
+        tokens = frames.float().reshape(frames.shape[0], -1).mean(-1)
+        return tokens[:, None, None].expand(-1, 3, 768)
+
+
+def test_disabled_intent_ablation_omits_encoder_and_retrieves_memory(monkeypatch):
+    import models.align_intention as module
+    monkeypatch.setattr(module, "VisionEncoder", FakeVision)
+    monkeypatch.setattr(module, "IntentionEncoder", lambda **kwargs: pytest.fail("Ablation constructed Mamba"))
+    model = ALIGNIntentionModel(state_dim=4, compressed_dim=4,
+                                use_intent_tokens=False, use_memory_bank=True,
+                                head_type="flow_matching", head_d_model=8,
+                                memory_bank_len=2)
+    assert model.use_history  # Observation history is still available.
+    assert model.intention_encoder is None
+    assert not any(name.startswith("intention_encoder.") for name in model.state_dict())
+    model._build_head_and_bank(8)
+    model.memory_module.reset(2, torch.device("cpu"))
+    history = model.forward_intent(torch.randn(2, 3, 1, 768), torch.randn(2, 3, 4))
+    assert history["intent_emb"] is None
+    calls = []
+    handle = model.memory_module.perceptual_retrieval.register_forward_hook(lambda *args: calls.append(True))
+    losses = []
+    for _ in range(4):
+        v, s, intent = model.condition_actions(torch.randn(2, 3, 8), torch.randn(2, 3, 4),
+                                              observed_mask=torch.tensor([True, False]))
+        assert v.shape == (2, 1, 8) and s.shape == (2, 1, 4)
+        assert intent is None
+        losses.append(v.square().sum() + s.square().sum())
+    handle.remove()
+    assert len(calls) == 4
+    assert model.memory_module._count.tolist() == [2, 0]
+    sum(losses).backward()
+    grad = model.memory_module.perceptual_retrieval.retrieval_attn.in_proj_weight.grad
+    assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
+def test_memory_with_intent_still_fuses_all_three_streams():
+    memory = PerceptualCognitiveMemoryModule(8, 4, 4, bank_len=2, num_heads=2)
+    memory.reset(1, torch.device("cpu"))
+    p, s, c = memory(torch.randn(1, 8), torch.randn(1, 4), torch.randn(1, 2, 2))
+    p, s, c = memory(torch.randn(1, 8), torch.randn(1, 4), torch.randn(1, 2, 2))
+    assert (p.shape, s.shape, c.shape) == (torch.Size([1, 8]), torch.Size([1, 4]), torch.Size([1, 2, 2]))
+    assert torch.isfinite(c).all()
+    (p.square().sum() + s.square().sum() + c.square().sum()).backward()
+    assert memory.cognitive_retrieval.retrieval_attn.in_proj_weight.grad is not None
+
+
+def test_memory_observed_mask_preserves_real_samples_only():
+    memory = PerceptualCognitiveMemoryModule(8, 0, 4, bank_len=2, num_heads=2)
+    memory.reset(2, torch.device("cpu"))
+    memory(torch.randn(2, 8), torch.randn(2, 4), observed_mask=torch.tensor([False, True]))
+    assert memory._count.tolist() == [0, 1]
+
+
+@pytest.mark.parametrize("use_memory", [False, True])
+def test_real_trainer_and_validation_ignore_padded_targets(monkeypatch, use_memory):
+    from types import SimpleNamespace
+    from training.train_intention import train_v4_epoch, train_v4_batched_epoch, validate
+    import models.align_intention as module
+    monkeypatch.setattr(module, "VisionEncoder", FakeVision)
+    model = ALIGNIntentionModel(state_dim=4, compressed_dim=4,
+                                mamba_output_dim=0, use_memory_bank=use_memory,
+                                head_type="flow_matching", head_d_model=8,
+                                chunk_size=2, memory_bank_len=2)
+    model._build_head_and_bank(8)
+    # Fast differentiable head objective isolates the trainer's masking/reduction.
+    calls = []
+    def loss(target, cond, dim_weights=None, sample_mask=None):
+        calls.append(sample_mask.tolist())
+        valid_cond = cond[sample_mask]
+        return target[sample_mask].square().mean() + valid_cond.square().mean() * .001
+    model.intention_head.loss = loss
+    model.intention_head.sample = lambda cond, num_steps=None: cond.new_zeros(cond.shape[0], 2, 7)
+    actions = np.ones((2, 5, 7), np.float32)
+    actions[1, 3:] = 1000.0  # Replicated padding must not enter loss or metrics.
+    batch = {"frames_segment": np.zeros((2, 5, 1, 4, 4, 3), np.uint8),
+             "states_segment": np.zeros((2, 5, 7), np.float32),
+             "actions_segment": actions, "segment_len": np.array([5, 3])}
+    args = SimpleNamespace(history_size=2, chunk_size=2, action_dim=7,
+                           head_type="flow_matching", no_sample_during_train=True,
+                           skip_nan=True, grad_clip=1.0)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    train_fn = train_v4_epoch if use_memory else train_v4_batched_epoch
+    train_loss, _ = train_fn(model, [batch], optimizer, torch.device("cpu"), args)
+    assert 1.0 <= train_loss < 1.1
+    assert calls == [[True, True], [True, True], [True, False], [True, False]]
+    _, _, metrics = validate(model, [batch], torch.device("cpu"), args)
+    assert metrics["pos_mse"] == 1.0
+    assert metrics["rot_mse"] == 1.0
+    assert metrics["grip_mse"] == 1.0
+    assert metrics["gripper_genuine_batches"] == 4
+
+
+@pytest.mark.parametrize("commands", [[1., 0., 1.], [1., -1., 1.]])
+def test_rollout_carries_executed_gripper_without_rewriting_history(monkeypatch, commands):
+    import eval.eval_libero_v4_trajectory as evaluator
+    monkeypatch.setattr(evaluator, "get_sim_eef_pose", lambda obs: np.zeros(6, np.float32))
+    monkeypatch.setattr(evaluator, "get_sim_frame", lambda *args, **kwargs: np.zeros((4, 4, 3), np.uint8))
+    class Env:
+        def reset(self):
+            return {}
+        def step(self, action):
+            return {}, 0.0, False, {}
+    class Model:
+        head_type = "flow_matching"
+        use_memory_bank = False
+        def __init__(self):
+            self.states = []
+        def __call__(self, frames, states):
+            self.states.append(states.clone())
+            return {"h_seq": states.new_zeros(1, 2, 1), "intent_emb": None,
+                    "z_v_pooled_seq": states.new_zeros(1, 2, 4), "z_s_seq": states}
+        def condition_actions(self, vision, states, intent):
+            return vision, states, intent
+        def sample_actions(self, *args):
+            action = torch.zeros(1, 2, 7)
+            action[:, :, 6] = commands[len(self.states) - 1]
+            return action
+    model = Model()
+    evaluator.run_model_in_sim(Env(), model, torch.device("cpu"), np.zeros((3, 7), np.float32),
+                               chunk_size=2, max_steps=3, switch_at=0.0,
+                               use_camera=["wrist_image"], initial_gripper=0.25)
+    np.testing.assert_array_equal([x[0, :, 6].numpy() for x in model.states],
+                                  [[0.25, 0.25], [0.25, commands[0]], [commands[0], commands[1]]])
+
+
+@pytest.mark.parametrize("head_type", ["transformer", "mamba", "hybrid"])
+def test_future_heads_fail_before_model_download(head_type):
+    from types import SimpleNamespace
+    from training.train_intention import build_model
+    with pytest.raises(ValueError, match="future work"):
+        build_model(SimpleNamespace(head_type=head_type), 1, torch.device("cpu"))
+
+
+def test_cli_defaults_to_supported_diffusion_head(monkeypatch):
+    from training.train_intention import parse_args
+    monkeypatch.setattr("sys.argv", ["train_intention.py", "--data", "sample.h5", "--output-dir", "unused"])
+    assert parse_args().head_type == "diffusion"

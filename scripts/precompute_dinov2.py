@@ -59,7 +59,7 @@ def build_encoder(device: torch.device) -> VisionEncoder:
         embed_dim=256,           # unused for v2 patch mode, kept for API compat
         num_cameras=1,
         use_patch_tokens=True,
-        fusion_type="transformer",
+        fusion_type="linear",
     ).to(device).eval()
 
 

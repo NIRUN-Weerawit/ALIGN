@@ -61,6 +61,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 
 from data.align_dataset import ALIGNDataset, head_collate
 from eval.eval_intention import load_intention_model
+from data.gripper_state import previous_gripper_commands, carry_gripper_state
 
 # MuJoCo / LIBERO imports (optional — only needed for --use-mujoco)
 try:
@@ -158,7 +159,9 @@ def load_trajectory(h5_path: str, episode_key: str,
         # matches the v4 model's expected state format:
         # [pos_x, pos_y, pos_z, roll, pitch, yaw, gripper]
         if poses is not None:
-            gripper = actions[:, -1:]  # (N, 1)
+            gripper = (group["gripper"][:] if "gripper" in group else
+                       previous_gripper_commands(actions, initial_gripper=float(group.attrs.get("initial_gripper", 0.0))))
+            gripper = np.asarray(gripper, dtype=np.float32).reshape(-1, 1)
             states = np.concatenate([poses, gripper], axis=1).astype(np.float32)  # (N, 7)
         else:
             return None
@@ -572,6 +575,7 @@ def run_model_in_sim(
     debug: bool = False,
     timing_log: Optional[List[Dict]] = None,
     live_view: bool = False,
+    initial_gripper: float = 0.0,
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
 
@@ -670,7 +674,8 @@ def run_model_in_sim(
 
     # Get initial sim state to populate buffer
     init_eef = get_sim_eef_pose(obs)
-    init_state = np.concatenate([init_eef, [0.0]]).astype(np.float32)  # (7,)
+    init_state = np.concatenate([init_eef, [initial_gripper]]).astype(np.float32)  # (7,)
+    last_state = init_state.copy()
     init_frame_stack = _render_all_cameras()  # (V, H, W, 3)
 
     # Pad initial buffers with K copies of the initial state/frame
@@ -732,7 +737,7 @@ def run_model_in_sim(
         sim_positions.append(sim_eef)
 
         # 2. Update sliding windows: pop oldest, push newest
-        sim_state = np.concatenate([sim_eef, [0.0]]).astype(np.float32)
+        sim_state = carry_gripper_state(last_state, sim_eef)
         pose_buffer.append(sim_state)
         pose_buffer.pop(0)
         frame_buffer.append(current_frame_stack)
@@ -763,22 +768,11 @@ def run_model_in_sim(
                         h_current = out["h_seq"][:, -1]
                         intent_emb = out.get("intent_emb", None)
                         # intent_emb = torch.zeros_like(intent_emb)
-                        # Memory bank step (if enabled)
-                        if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
-                            z_v_current = out["z_v_pooled_seq"][:, -1]
-                            z_s_current = out["z_s_seq"][:, -1]
-                            z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                                z_v_current, z_s_current, intent_emb,
-                            )
-                            h_for_head = intent_fused
-                        else:
-                            h_for_head = intent_emb if intent_emb is not None else None
-
+                        z_v_for_head, z_s_for_head, h_for_head = model.condition_actions(
+                            out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
+                        )
                         a_model_full = _predict_action_chunk(
-                            model,
-                            out["z_v_pooled_seq"],
-                            out["z_s_seq"],
-                            h_for_head,
+                            model, z_v_for_head, z_s_for_head, h_for_head,
                         )
             inference_t1 = time.perf_counter()
 
@@ -894,6 +888,14 @@ def run_model_in_sim(
             # Phase 2: model controls
             final_action = a_model_scaled.copy()
         
+        # Carry the executed command in dataset/model units into the next state.
+        # Simulator polarity conversion below must not overwrite this value.
+        if final_action.shape[0] < 7:
+            final_action = np.pad(final_action, (0, 7 - final_action.shape[0]))
+            final_action[6] = last_state[6]
+        last_state = sim_state.copy()
+        last_state[6] = float(final_action[6])
+
         # Gripper:
         if final_action.shape[0] >= 7:
             final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
@@ -1359,6 +1361,7 @@ def main():
             model=model,
             device=device,
             expert_actions=traj["actions"],
+            initial_gripper=float(traj["states"][0, 6]),
             expert_poses=traj["poses"] if traj["poses"] is not None else None,
             chunk_size=chunk_size,
             max_steps=args.max_steps,

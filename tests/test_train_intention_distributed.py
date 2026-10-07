@@ -87,6 +87,9 @@ def test_two_process_training_keeps_models_in_sync(tmp_path):
             def predict_actions(self, vision, state, intent):
                 return self.head(state[:, -1:].expand(-1, 2, -1))
 
+            def condition_actions(self, vision, state, intent=None, observed_mask=None):
+                return vision, state, intent
+
         val_samples = [
             {"frames_segment": torch.zeros(3, 257, 768),
              "states_segment": torch.full((3, 7), float(i + 1)),
@@ -99,7 +102,7 @@ def test_two_process_training_keeps_models_in_sync(tmp_path):
         gathered_val = [None, None]
         dist.all_gather_object(gathered_val, (val_loss, val_metrics))
         assert gathered_val[0] == gathered_val[1]
-        assert val_metrics["gripper_genuine_batches"] == 2
+        assert val_metrics["gripper_genuine_batches"] == 4
 
         for train_epoch in (train_v4_epoch, train_v4_batched_epoch):
             torch.manual_seed(21)
@@ -118,7 +121,9 @@ def test_two_process_training_keeps_models_in_sync(tmp_path):
     """))
     project_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(project_root)
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (str(project_root), env.get("PYTHONPATH")) if path
+    )
     subprocess.run(
         [sys.executable, "-m", "torch.distributed.run", "--standalone",
          "--nproc-per-node=2", str(worker)],

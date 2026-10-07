@@ -4,6 +4,17 @@
 
 The core idea: a human leads, the model observes. Over time, the model builds an understanding of the task through temporal context (Mamba), explicit intent tokens, and an episodic memory bank. It then generates smooth, task-appropriate actions via a diffusion policy head.
 
+### V4 implementation status
+
+- Historical V4 docs specify active cross-camera attention. This update preserves the existing camera-fusion configuration; reconciling training, cached features, and inference fusion is separate work.
+- Diffusion and flow matching are the supported V4 action heads. Transformer, Mamba, and hybrid action heads are future work; their legacy implementations are retained for research.
+- When `use_intent_tokens=False` (the CLI default; omit `--use-intent-tokens`), the model does not construct the intention Mamba encoder. Its implementation remains in the codebase and is constructed when intent tokens and history are enabled. Observation history can still condition the action head. Visual/state memory retrieval remains active when `--use-memory-bank` is enabled without intent tokens.
+- Semantic labels and semantic hysteresis are WIP. Labels can be loaded by the dataset, but semantic supervision and inference hysteresis are not connected to the policy. `--anchor-weight` and `--use-text` do not currently add semantic supervision.
+- State inputs use measured gripper observations when available. Otherwise they carry the previous executed command, never the current target command. Episode initialization uses the `initial_gripper` HDF5 attribute, defaulting to a neutral 0.0 only when no initial state is recorded. Rollouts carry the last executed command instead of resetting gripper state to zero every step.
+- Diffusion/flow losses exclude padded samples before reduction. Validation accumulates errors across all valid prediction windows.
+
+Legacy feature caches must be regenerated with the versioned per-camera precompute path. Existing checkpoints may contain unused cross-camera or disabled-intent encoder weights; checkpoint loading must report those differences explicitly.
+
 ---
 
 ## Architecture
@@ -29,7 +40,7 @@ z_v_pooled (B, T, pool_out_dim)
 
 ### Temporal Encoding (Mamba, optional)
 
-When `--use-history` is enabled, CLS tokens and states are fed through a Mamba SSM for temporal recurrence:
+When `--use-history` and `--use-intent-tokens` are enabled, CLS tokens and states are fed through a Mamba SSM for temporal recurrence:
 
 ```
 z_v_CLS (B, T, V, 768) + z_s (B, T, 256)
@@ -135,7 +146,7 @@ Each batch samples a variable-length segment (2-5× history_size) from each epis
 |------|---------|-------------|
 | `--data` | required | Path to HDF5 dataset |
 | `--cameras` | `["wrist_image"]` | Camera names to use |
-| `--head-type` | `diffusion` | Head architecture |
+| `--head-type` | `diffusion` | Supported V4 heads: diffusion, flow_matching; regression heads are future work |
 | `--action-dim` | 7 | Action dimensions (6 pose + 1 gripper) |
 | `--chunk-size` | 10 | Future action prediction horizon (K) |
 | `--history-size` | 1 | Mamba temporal window (H) |

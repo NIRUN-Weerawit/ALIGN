@@ -28,6 +28,7 @@ import h5py
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
+from data.gripper_state import previous_gripper_commands
 
 
 # ================================================================
@@ -405,8 +406,8 @@ class ALIGNDataset(Dataset):
     def _read_gripper(self, ep_idx: int, t: int = -1) -> float:
         """Read the gripper value for a given episode and (absolute) timestep.
 
-        Looks up `ep_XXX/gripper` first; falls back to the last column of
-        `ep_XXX/actions` if the dedicated field is absent.  Returns 0.0
+        Looks up `ep_XXX/gripper` first; otherwise carries the previous
+        executed command if the dedicated field is absent. Returns 0.0
         when no gripper source is available.
         """
         if not getattr(self, "_has_gripper", False):
@@ -423,15 +424,8 @@ class ALIGNDataset(Dataset):
                 idx = max(0, min(idx, len(arr) - 1))
                 return float(arr[idx])
             elif gk == "__actions_last__":
-                if self._single_episode:
-                    arr = self._h5["actions"]
-                else:
-                    arr = self._h5[f"{key}/actions"]
-                    # For the actions-array fallback the caller is expected
-                    # to pass a LOCAL timestep (t = len(poses) - 1, no offset).
-                idx = t if t >= 0 else (len(arr) - 1)
-                idx = max(0, min(idx, len(arr) - 1))
-                return float(arr[idx, -1])
+                idx = t if t >= 0 else self._get_episode_length(ep_idx) - 1
+                return float(self._read_actions_gripper_col(ep_idx, idx, 1)[0])
         except Exception:
             return 0.0
         return 0.0
@@ -459,7 +453,7 @@ class ALIGNDataset(Dataset):
         """Read a (count,) gripper array from a dedicated /ep_XXX/gripper field.
 
         Handles the same cumulative-poses offset as `_read_poses` and pads
-        with zeros at episode boundaries.
+        with the last known state at episode boundaries.
         """
         key = self._episode_keys[ep_idx]
         try:
@@ -475,12 +469,12 @@ class ALIGNDataset(Dataset):
         chunk = np.asarray(arr[abs_start:abs_start + count], dtype=np.float32).reshape(-1)
         if len(chunk) < count:
             chunk = np.concatenate(
-                [chunk, np.zeros(count - len(chunk), dtype=np.float32)]
+                [chunk, np.full(count - len(chunk), chunk[-1] if len(chunk) else 0.0, dtype=np.float32)]
             )
         return chunk
 
     def _read_actions_gripper_col(self, ep_idx: int, start: int, count: int) -> np.ndarray:
-        """Read a (count,) gripper array from the last column of /ep_XXX/actions.
+        """Read last executed gripper commands as a causal state fallback.
 
         Returns zeros if the actions array has fewer than 7 columns.
         """
@@ -488,21 +482,18 @@ class ALIGNDataset(Dataset):
         try:
             if self._single_episode:
                 arr = self._h5["actions"]
-                abs_start = start
+                offset = 0
+                group = self._h5
             else:
                 offset = self._ep_pose_offsets[ep_idx]
-                abs_start = offset + start
                 arr = self._h5[f"{key}/actions"]
+                group = self._h5[key]
         except Exception:
             return np.zeros(count, dtype=np.float32)
-        if arr.ndim < 2 or arr.shape[1] < 7:
-            return np.zeros(count, dtype=np.float32)
-        chunk = np.asarray(arr[abs_start:abs_start + count, -1], dtype=np.float32).reshape(-1)
-        if len(chunk) < count:
-            chunk = np.concatenate(
-                [chunk, np.zeros(count - len(chunk), dtype=np.float32)]
-            )
-        return chunk
+        return previous_gripper_commands(
+            arr, start=start, count=count, episode_start=offset,
+            initial_gripper=float(group.attrs.get("initial_gripper", 0.0)),
+        )
 
     def _read_text(self, ep_idx: int) -> str:
         key = self._episode_keys[ep_idx]
@@ -983,7 +974,7 @@ def head_collate(batch: list, chunk_size: int = 5,
             gripper_t = float(item_grippers[t])
         elif item_actions is not None and t < len(item_actions) and item_actions.shape[1] >= 7:
             # Backward-compat fallback (older datasets without grippers field)
-            gripper_t = float(item_actions[t, 6])
+            gripper_t = float(previous_gripper_commands(item_actions, t, 1)[0])
         else:
             gripper_t = 0.0
         robot_state_t = np.concatenate(
@@ -1082,7 +1073,7 @@ def head_collate(batch: list, chunk_size: int = 5,
             if item_grippers_all is not None and k_t < len(item_grippers_all):
                 gk_t = float(item_grippers_all[k_t])
             elif item_actions is not None and k_t < len(item_actions) and item_actions.shape[1] >= 7:
-                gk_t = float(item_actions[k_t, 6])
+                gk_t = float(previous_gripper_commands(item_actions, k_t, 1)[0])
             else:
                 gk_t = 0.0
             state_t_k = np.concatenate(
@@ -1226,7 +1217,7 @@ def v4_segment_collate(batch: list, history_size: int = 20,
             if item_grippers is not None and abs_t < len(item_grippers):
                 gk_t = float(item_grippers[abs_t])
             elif actions is not None and abs_t < len(actions) and actions.shape[1] >= 7:
-                gk_t = float(actions[abs_t, 6])
+                gk_t = float(previous_gripper_commands(actions, abs_t, 1)[0])
             else:
                 gk_t = 0.0
             state_t = np.concatenate([

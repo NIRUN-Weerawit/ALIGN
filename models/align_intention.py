@@ -59,7 +59,7 @@ class ALIGNIntentionModel(nn.Module):
         mamba_d_state: int = 16,
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
-        head_type: str = "mamba",
+        head_type: str = "diffusion",
         head_d_model: int = 384,
         head_nhead: int = 4,
         head_num_layers: int = 2,
@@ -89,6 +89,8 @@ class ALIGNIntentionModel(nn.Module):
         self.raw_dim = raw_dim
         # V4 flags
         self.use_intent_tokens = use_intent_tokens
+        if use_intent_tokens and mamba_output_dim <= 0:
+            raise ValueError("Intent tokens require the Mamba history encoder")
         self.num_intent_tokens = num_intent_tokens
         self.intent_dim = intent_dim
         self.use_memory_bank = use_memory_bank
@@ -114,7 +116,8 @@ class ALIGNIntentionModel(nn.Module):
             input_dim=7,
             state_dim=state_dim,
         )
-        # Intention encoder (patch encoder + Mamba)
+        # History controls the observation window. The Mamba encoder exists
+        # only with intent tokens; the disabled-token ablation omits it entirely.
         self.use_history = mamba_output_dim > 0
 
         # Vision patch encoder: always needed (SE compress + state modulate)
@@ -125,7 +128,7 @@ class ALIGNIntentionModel(nn.Module):
             num_cameras=num_cameras, raw_dim=raw_dim, se_reduction=8,
         )
 
-        if self.use_history:
+        if self.use_history and self.use_intent_tokens:
             self.intention_encoder = IntentionEncoder(
                 state_dim=state_dim,
                 mamba_output_dim=mamba_output_dim,
@@ -264,14 +267,14 @@ class ALIGNIntentionModel(nn.Module):
         """
         # Forward through intention encoder
         intent_emb = None
-        if self.use_history:
+        if self.intention_encoder is not None:
             result = self.intention_encoder(z_v_cls_seq, z_s_seq)
             if self.use_intent_tokens:
                 h_seq, intent_emb = result
             else:
                 h_seq = result
         else:
-            h_seq = torch.zeros(z_s_seq.shape[0], z_s_seq.shape[1], 1, device=z_s_seq.device)
+            h_seq = z_s_seq.new_zeros(z_s_seq.shape[0], z_s_seq.shape[1], 1)
 
         return {
             "h_seq": h_seq,
@@ -398,7 +401,7 @@ class ALIGNIntentionModel(nn.Module):
             B, N_tok, comp_dim = z_v_pooled.shape
             self._build_head_and_bank(N_tok * comp_dim)
 
-        if self.use_history:
+        if self.intention_encoder is not None:
             result = self.intention_encoder.forward_step(
                 z_v_cls, z_s, h_states, produce_intent=produce_intent,
             )
@@ -416,6 +419,23 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     # Predict actions from window
     # ----------------------------------------------------------------
+    def condition_actions(self, z_v_window: torch.Tensor,
+                          z_s_window: torch.Tensor,
+                          intent_emb: Optional[torch.Tensor] = None,
+                          observed_mask: Optional[torch.Tensor] = None):
+        """Use the same memory conditioning in training and deployment.
+
+        Visual/state retrieval remains active without cognitive intent tokens.
+        observed_mask excludes padded observations from memory storage.
+        """
+        if not self.use_memory_bank:
+            return z_v_window, z_s_window, intent_emb
+        z_v, z_s, intent = self.memory_module(
+            z_v_window[:, -1], z_s_window[:, -1], intent_emb,
+            observed_mask=observed_mask,
+        )
+        return z_v.unsqueeze(1), z_s.unsqueeze(1), intent
+
     def predict_actions(self, z_v_pooled_window: torch.Tensor,
                         z_s_window: torch.Tensor,
                         intent_emb: torch.Tensor = None) -> torch.Tensor:

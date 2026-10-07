@@ -220,6 +220,13 @@ z_v_CLS  (B, T, V, 768)         z_s (B, T, 256)
 
 ## 3.3 State-conditioned patch encoder
 
+**Implementation status (2026-10-08):** V4 disables cross-camera attention by
+design and keeps per-camera DINOv2 features separate. The cross-camera
+transformer description below is a legacy architecture description, not the
+current V4 execution path. With intent tokens disabled, V4 omits the intention
+Mamba encoder while retaining observation-window conditioning and optional
+perceptual/state memory retrieval.
+
 The **VisionEncoder** wraps a frozen DINOv2 ViT-B/14 (loaded via
 `torch.hub`) and returns per-frame patch tokens
 $z_{v,\text{patches}} \in \mathbb{R}^{B \times V \times P \times 768}$ plus
@@ -267,8 +274,14 @@ The intent tokens are parameterized as a learnable tensor
 $\mathcal{I} = \mathrm{nn.Parameter}(\mathcal{N}(0, 0.02))$ and broadcast across
 the batch.
 
-**Text anchoring loss (train-only).** At training time, when the dataset
-provides a task description string $s$ (e.g., "pick up the black bowl..."), we
+**WIP correction:** The following anchoring objective is a proposed design.
+The current trainer does not compute it, and `anchor_weight` has no effect.
+Semantic sidecar loading is implemented, but per-anchor semantic supervision
+and inference intent hysteresis remain unconnected. Claims of semantic
+grounding require implementing and evaluating that supervision first.
+
+**Proposed text anchoring loss (train-only).** When the dataset provides a task
+description string $s$ (e.g., "pick up the black bowl..."), we would
 encode it with a *frozen* CLIP ViT-B/32 text encoder and project to
 `intent_dim`. We add the loss
 
@@ -350,8 +363,10 @@ similarity matrix is $16 \times 16 = 256$ entries on a $(B, \cdot, 4096)$
 tensor, costing $\sim 0.05$ ms per step on H100 — negligible relative to
 the Mamba forward ($\sim 5$ ms per step).
 
-The head is *replaceable*: `IntentionTransformerHead` and `MambaActionHead` are
-also implemented and selectable via `--head-type`. We use the diffusion head
+The supported V4 heads are diffusion and flow matching. The legacy
+`IntentionTransformerHead` and `MambaActionHead` implementations are future
+work and are not supported replacements in the current V4 training contract.
+We use the diffusion head
 throughout the experiments in Section 5 because diffusion heads have been shown
 empirically to outperform regression heads on multimodal action distributions.
 

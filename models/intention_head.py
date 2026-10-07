@@ -5,9 +5,10 @@
 V4: All heads consume intent tokens (B, N, intent_dim) instead of
 h_current (B, mamba_output_dim). Text conditioning removed.
 
-Two head architectures:
+Supported V4 heads: DiffusionPolicyHead and FlowMatchingPolicyHead.
+Legacy regression heads are future work for the V4 training contract:
   - IntentionTransformerHead: standard transformer (K+N tokens)
-  - MambaActionHead: Mamba recurrent head (O(1) inference)
+  - MambaActionHead: Mamba recurrent head
   - DiffusionPolicyHead: 1D U-Net (Chi et al. 2023)
 
 All consume:
@@ -25,6 +26,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+
+
+def _valid_loss_samples(actions_target, cond, sample_mask):
+    """Exclude padded samples before noise generation and loss reduction."""
+    if sample_mask is None:
+        return actions_target, cond
+    sample_mask = sample_mask.to(device=actions_target.device, dtype=torch.bool)
+    if sample_mask.shape != (actions_target.shape[0],):
+        raise ValueError("sample_mask must have shape (batch_size,)")
+    if not sample_mask.any():
+        raise ValueError("loss requires at least one valid sample")
+    return actions_target[sample_mask], cond[sample_mask]
 
 
 # ================================================================
@@ -523,7 +536,8 @@ class DiffusionPolicyHead(nn.Module):
 
     def loss(self, actions_target: torch.Tensor,
              cond: torch.Tensor,
-             dim_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+             dim_weights: Optional[torch.Tensor] = None,
+             sample_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """DDPM noise-prediction training loss.
 
         Args:
@@ -532,6 +546,7 @@ class DiffusionPolicyHead(nn.Module):
             dim_weights: (action_dim,) optional per-dimension loss weights.
                          Use to down-weight gripper (e.g. [1,1,1,1,1,1,0.01]).
         """
+        actions_target, cond = _valid_loss_samples(actions_target, cond, sample_mask)
         B, K = actions_target.shape[:2]
         device = actions_target.device
 
@@ -678,7 +693,8 @@ class FlowMatchingPolicyHead(nn.Module):
 
     def loss(self, actions_target: torch.Tensor,
              cond: torch.Tensor,
-             dim_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+             dim_weights: Optional[torch.Tensor] = None,
+             sample_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Flow-matching velocity-prediction training loss.
 
         For each sample:
@@ -697,6 +713,7 @@ class FlowMatchingPolicyHead(nn.Module):
             cond: (B, K, cond_dim)
             dim_weights: (action_dim,) optional per-dimension loss weights.
         """
+        actions_target, cond = _valid_loss_samples(actions_target, cond, sample_mask)
         B, K, D = actions_target.shape
         device = actions_target.device
 

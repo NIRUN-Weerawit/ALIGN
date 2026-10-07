@@ -73,6 +73,16 @@ class MemoryRetrieval(nn.Module):
         if bank_mask is not None and not bank_mask.any():
             return query
 
+        if bank_mask is not None:
+            nonempty = bank_mask.any(dim=1)
+            if not nonempty.all():
+                # An empty sample must not enter an all-masked softmax.
+                out = query.clone()
+                out[nonempty] = self.forward(
+                    query[nonempty], bank_kv[nonempty], bank_mask[nonempty],
+                )
+                return out
+
         # Attention mask: True = attend, False = don't attend
         # nn.MultiheadAttention expects key_padding_mask where True = masked
         if bank_mask is not None:
@@ -289,7 +299,8 @@ class PerceptualCognitiveMemoryModule(nn.Module):
 
     def forward(self, z_v_pooled: torch.Tensor,
                       z_s: torch.Tensor, 
-                      intent_emb: torch.Tensor
+                      intent_emb: Optional[torch.Tensor] = None,
+                      observed_mask: Optional[torch.Tensor] = None,
                       ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Retrieve, fuse, and store.
 
@@ -345,21 +356,22 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         # --- 3. Store current triplet into bank (with consolidation when full) ---
         if self._has_cognitive and intent_emb is not None:
             intent_query = intent_emb.reshape(intent_emb.shape[0], -1)
-            self._store(z_v_pooled_fused, z_s_fused, intent_query)
+            self._store(z_v_pooled_fused, z_s_fused, intent_query, observed_mask)
         else:
-            self._store(z_v_pooled_fused, z_s_fused, None)
+            self._store(z_v_pooled_fused, z_s_fused, None, observed_mask)
         
         return z_v_pooled_fused, z_s_fused, intent_emb_fused
 
     def _store(self, z_v_pooled: torch.Tensor,
                      z_s: torch.Tensor, 
-                     intent_query: Optional[torch.Tensor] = None):
+                     intent_query: Optional[torch.Tensor] = None,
+                     observed_mask: Optional[torch.Tensor] = None):
         """Store triplet entry with consolidation.
 
         When the bank is full, run _token_merge first to make room by
         merging the most similar pair. The bank stays fixed at bank_len
-        size; counts never exceed bank_len. All samples in the batch
-        are stored (the past observations are always valid).
+        size; counts never exceed bank_len. observed_mask prevents storing
+        replicated padding for samples whose observed segment has ended.
 
         Args:
             z_v_pooled:     (B, perceptual_dim)
@@ -370,6 +382,8 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         device = z_v_pooled.device
 
         for b in range(B):
+            if observed_mask is not None and not bool(observed_mask[b]):
+                continue
             # If bank is full, consolidate first to free a slot
             if self._count[b] >= self.bank_len:
                 # _token_merge reduces count by 1
@@ -455,4 +469,3 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         c_padded = F.pad(c_out, (0, 0, 0, L - c_out.shape[1]))
         s_padded = F.pad(s_out, (0, 0, 0, L - s_out.shape[1]))
         return p_padded, c_padded, s_padded, count - 1
-

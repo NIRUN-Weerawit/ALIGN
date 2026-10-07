@@ -49,6 +49,7 @@ torch.backends.cudnn.enabled = False
 from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 
 from eval.eval_intention import load_intention_model
+from data.gripper_state import previous_gripper_commands, carry_gripper_state
 
 # MuJoCo / LIBERO imports
 try:
@@ -171,7 +172,9 @@ def load_trajectory(h5_path: str, episode_key: str,
             poses = group["noisy_poses"][:]
         actions = group["actions"][:]
         if poses is not None:
-            gripper = actions[:, -1:]
+            gripper = (group["gripper"][:] if "gripper" in group else
+                       previous_gripper_commands(actions, initial_gripper=float(group.attrs.get("initial_gripper", 0.0))))
+            gripper = np.asarray(gripper, dtype=np.float32).reshape(-1, 1)
             states = np.concatenate([poses, gripper], axis=1).astype(np.float32)
         else:
             return None
@@ -258,23 +261,16 @@ class InferenceWorker(threading.Thread):
                         h_current = out["h_seq"][:, -1]
                         intent_emb = out.get("intent_emb", None)
 
-                        if getattr(self.model, 'use_memory_bank', False) and intent_emb is not None:
-                            z_v_current = out["z_v_pooled_seq"][:, -1]
-                            z_s_current = out["z_s_seq"][:, -1]
-                            z_v_fused, z_s_fused, intent_fused = self.model.memory_module(
-                                z_v_current, z_s_current, intent_emb,
-                            )
-                            h_for_head = intent_fused
-                        else:
-                            h_for_head = intent_emb if intent_emb is not None else None
-
-                        if self.model.head_type == "diffusion":
+                        z_v_for_head, z_s_for_head, h_for_head = self.model.condition_actions(
+                            out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
+                        )
+                        if self.model.head_type in ("diffusion", "flow_matching"):
                             a_model_full = self.model.sample_actions(
-                                out["z_v_pooled_seq"], out["z_s_seq"], h_for_head,
+                                z_v_for_head, z_s_for_head, h_for_head,
                             )
                         else:
                             a_model_full = self.model.predict_actions(
-                                out["z_v_pooled_seq"], out["z_s_seq"], h_for_head,
+                                z_v_for_head, z_s_for_head, h_for_head,
                             )
 
             inference_ms = (time.perf_counter() - t0) * 1000.0
@@ -318,6 +314,7 @@ def run_async_episode(
     action_horizon: int = 1,
     ensemble: str = "none",
     ensemble_decay: float = 0.9,
+    initial_gripper: float = 0.0,
 ) -> Dict:
     """Run one episode with async inference and constant-FPS rendering.
 
@@ -389,7 +386,8 @@ def run_async_episode(
 
     # Initial state
     init_eef = get_sim_eef_pose(obs)
-    init_state = np.concatenate([init_eef, [0.0]]).astype(np.float32)
+    init_state = np.concatenate([init_eef, [initial_gripper]]).astype(np.float32)
+    last_state = init_state.copy()
     init_frame_stack = _render_all_cameras()
 
     for k in range(chunk_size):
@@ -469,7 +467,7 @@ def run_async_episode(
         sim_positions.append(sim_eef)
 
         # 3. Update sliding windows
-        sim_state = np.concatenate([sim_eef, [0.0]]).astype(np.float32)
+        sim_state = carry_gripper_state(last_state, sim_eef)
         pose_buffer.append(sim_state)
         pose_buffer.pop(0)
         frame_buffer.append(current_frame_stack)
@@ -605,6 +603,14 @@ def run_async_episode(
             final_action = a_model_scaled.copy()
             stored_actions.append(a_model_scaled.copy())
             stored_inference_flags.append(got_fresh)
+
+        # Carry the executed command in dataset/model units into the next state.
+        # Simulator polarity conversion below must not overwrite this value.
+        if final_action.shape[0] < 7:
+            final_action = np.pad(final_action, (0, 7 - final_action.shape[0]))
+            final_action[6] = last_state[6]
+        last_state = sim_state.copy()
+        last_state[6] = float(final_action[6])
 
         # Gripper
         if final_action.shape[0] >= 7:
@@ -895,6 +901,7 @@ def main():
             model=model,
             device=device,
             expert_actions=traj["actions"],
+            initial_gripper=float(traj["states"][0, 6]),
             expert_poses=traj["poses"] if traj["poses"] is not None else None,
             chunk_size=chunk_size,
             max_steps=args.max_steps,

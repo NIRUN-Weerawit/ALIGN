@@ -317,6 +317,8 @@ def build_loaders(train_ds, val_ds, args):
 
 def build_model(args, num_cameras, device):
     """Build ALIGNIntentionModel. All dimensions come from `args`."""
+    if args.head_type not in ("diffusion", "flow_matching"):
+        raise ValueError("Transformer/Mamba/hybrid action heads are future work; use diffusion or flow_matching for V4.")
     model = ALIGNIntentionModel(
         state_dim=args.state_dim,
         mamba_output_dim=args.mamba_output_dim if args.use_history else 0,
@@ -448,9 +450,10 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         last_actions_pred = None
         actions_pred = None
         loss_accum = []
+        valid_counts = []
         max_seg_len = S
         if model.use_history:
-            num_windows = max_seg_len - Hs - chunk_size + 1
+            num_windows = max_seg_len - Hs - chunk_size + 2
         else:
             # No history: each timestep is independent
             num_windows = max_seg_len - chunk_size + 1
@@ -489,38 +492,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     # No history: no Mamba forward, no intent tokens
                     intent_emb = None
                     h_current = torch.zeros(z_s_win.shape[0], 1, device=device)
-                # Memory bank (3-stream: perceptual, cognitive, state)
-                if model.use_memory_bank:
-                    # Flatten patch axis into feature dim for head consumption (3D expected)
-                    B_seg, H_actual, VP, comp_dim = z_v_win.shape
-                    z_v_win = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, S, V*P*comp_dim)
-                    z_v_current = z_v_win[:, -1]  # (B, pool_out_dim)
-                    z_s_current = z_s_win[:, -1]  # (B, state_dim)
-                    if intent_emb is not None:
-                        # Active phase: retrieve + fuse + store
-                        z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                            z_v_current, z_s_current, intent_emb
-                        )
-                        # Memory bank returns 2D (B, dim). Unsqueeze to (B, 1, dim)
-                        # so the head can apply per-step mean-pool (K=1).
-                        z_v_win_for_head = z_v_fused.unsqueeze(1)  # (B, 1, pool_out_dim)
-                        z_s_win_for_head = z_s_fused.unsqueeze(1)  # (B, 1, state_dim)
-                        h_for_head = intent_fused  # (B, N, intent_dim) — already 3D
-                    else:
-                        # Warmup: store perceptual + state, no retrieval
-                        model.memory_module.store_perceptual_only(
-                            z_v_current, z_s_current
-                        )
-                        z_v_win_for_head = z_v_win[:, -1:]  # (B, 1, pool_out_dim)
-                        z_s_win_for_head = z_s_win[:, -1:]  # (B, 1, state_dim)
-                        h_for_head = intent_emb
-                else:
-                    # No memory bank: pass raw features directly to head
-                    B_seg, H_actual, VP, comp_dim = z_v_win.shape
-                    z_v_win_for_head = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, Hs, pool_out_dim)
-                    z_s_win_for_head = z_s_win  # (B, Hs, state_dim) — already 3D
-                    # Only pass intent_emb if it exists (from Mamba with intent tokens)
-                    h_for_head = intent_emb if intent_emb is not None else None
+                B_seg, H_actual, VP, comp_dim = z_v_win.shape
+                z_v_win_for_head, z_s_win_for_head, h_for_head = model.condition_actions(
+                    z_v_win.reshape(B_seg, H_actual, VP * comp_dim),
+                    z_s_win, intent_emb, observed_mask=current_t < seg_lens,
+                )
 
                 # Loss
                 if args.head_type in ("diffusion", "flow_matching"):
@@ -546,12 +522,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                                   f"finite: {torch.isfinite(actions_pred).all().item()}, "
                                   f"abs.mean: {actions_pred.detach().abs().mean().item()}")
                         assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
-                    loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
+                    loss = model.intention_head.loss(
+                        target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
+                    )
                     if getattr(args, "debug", False):
                         print(f"[DEBUG] loss: {loss.item()}")
-                    # Mask loss: only valid samples contribute
-                    if not valid_mask.all():
-                        loss = loss * valid_mask.float().mean()
                 else:
                     actions_pred = model.predict_actions(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
@@ -563,15 +538,16 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 continue
 
             loss_accum.append(loss)
+            valid_counts.append(int(valid_mask.sum().item()))
             last_actions_pred = actions_pred
 
-        # One optimizer step per segment: sum all losses and backward
+        # One optimizer step per segment, averaged over valid sample/windows.
         if loss_accum:
-            total_loss = torch.stack(loss_accum).sum()
+            total_loss = sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / sum(valid_counts)
             total_loss.backward()
         sync_and_step(model, optimizer, device, args.grad_clip)
 
-        avg_step_loss = float(total_loss.item() / max(len(loss_accum), 1)) if loss_accum else 0.0
+        avg_step_loss = float(total_loss.item()) if loss_accum else 0.0
         losses.append(avg_step_loss)
         actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
 
@@ -707,7 +683,7 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
         # Segment lengths arrive on the CPU. Checking them there avoids a
         # device-to-host synchronization for every action window.
         seg_lens_cpu = torch.as_tensor(batch["segment_len"])  # (B,)
-        Hs = args.history_size
+        Hs = args.history_size if model.use_history else 1
         chunk_size = args.chunk_size
         # Pre-computed features arrive as (B, S, V*257, 768); raw frames as
         # (B, S, V, H, W, 3). The model.forward path handles both via the
@@ -751,9 +727,10 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
 
             # Slide a window of size Hs ending at each timestep t, predict
             # the next chunk_size actions.
-            num_windows = S - Hs - chunk_size + 1
+            num_windows = S - Hs - chunk_size + 2
             loss_accum = []
             logged_loss_sum = 0.0
+            valid_counts = []
             actions_pred = None
             target = None
 
@@ -762,6 +739,9 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                 valid_mask_cpu = seg_lens_cpu >= (current_t + chunk_size)
                 if not bool(valid_mask_cpu.any()):
                     continue
+
+                valid_mask = valid_mask_cpu.to(device, non_blocking=True)
+                valid_count = int(valid_mask_cpu.sum().item())
 
                 # Extract window from the batched outputs (no Python loop over
                 # vision encoding — already done in forward())
@@ -779,7 +759,12 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                         )
                     else:
                         actions_pred = None
-                    loss = model.intention_head.loss(target, cond)
+                    dim_weights = torch.ones(args.action_dim, device=device)
+                    if args.action_dim >= 7:
+                        dim_weights[6] = 0.01
+                    loss = model.intention_head.loss(
+                        target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
+                    )
                 else:
                     actions_pred = model.predict_actions(z_v_win, z_s_win, intent_emb)
                     loss = F.mse_loss(actions_pred, target, reduction='none')
@@ -793,10 +778,12 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                     loss_value = loss.detach().item()
                     if not math.isfinite(loss_value):
                         continue
-                    logged_loss_sum += loss_value
+                    logged_loss_sum += loss_value * valid_count
                 loss_accum.append(loss)
+                valid_counts.append(valid_count)
 
-            total_loss = torch.stack(loss_accum).sum() if loss_accum else None
+            total_loss = (sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / sum(valid_counts)
+                          if loss_accum else None)
 
         # Backward
         optimizer.zero_grad(set_to_none=True)
@@ -811,9 +798,9 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
             profiler.step()
 
         if getattr(args, "skip_nan", True):
-            losses.append(logged_loss_sum / len(loss_accum))
+            losses.append(logged_loss_sum / sum(valid_counts))
         else:
-            losses.append(total_loss.item() / len(loss_accum))
+            losses.append(total_loss.item())
         if actions_pred is not None:
             actions_pred_list.append(actions_pred.detach().abs().mean().item())
         else:
@@ -911,9 +898,10 @@ def validate(model, loader, device, args):
         last_actions_pred = None
         actions_pred = None
         loss_accum = []
+        valid_counts = []
         max_seg_len = S
         if model.use_history:
-            num_windows = max_seg_len - Hs - chunk_size + 1
+            num_windows = max_seg_len - Hs - chunk_size + 2
         else:
             num_windows = max_seg_len - chunk_size + 1
 
@@ -944,36 +932,11 @@ def validate(model, loader, device, args):
                     intent_emb = None
                     h_current = torch.zeros(z_s_win.shape[0], 1, device=device)
 
-                # Memory bank (3-stream: perceptual, cognitive, state)
-                if model.use_memory_bank:
-                    # Flatten patch axis into feature dim for head consumption (3D expected)
-                    B_seg, H_actual, VP, comp_dim = z_v_win.shape
-                    z_v_win_stacked = z_v_win.reshape(B_seg, H_actual, VP * comp_dim)  # (B, S, V*P*comp_dim)
-                    z_v_current = z_v_win_stacked[:, -1]  # (B, pool_out_dim)
-                    z_s_current = z_s_win[:, -1]  # (B, state_dim)
-                    if intent_emb is not None:
-                        # Active phase: retrieve + fuse + store
-                        z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                            z_v_current, z_s_current, intent_emb
-                        )
-                        # Memory bank returns 2D (B, dim). Unsqueeze to (B, 1, dim)
-                        # so the head can apply per-step mean-pool (K=1).
-                        z_v_win_for_head = z_v_fused.unsqueeze(1)  # (B, 1, pool_out_dim)
-                        z_s_win_for_head = z_s_fused.unsqueeze(1)  # (B, 1, state_dim)
-                        h_for_head = intent_fused  # (B, N, intent_dim) — already 3D
-                    else:
-                        # Warmup: store perceptual + state, no retrieval
-                        model.memory_module.store_perceptual_only(z_v_current, z_s_current)
-                        z_v_win_for_head = z_v_win_stacked
-                        z_s_win_for_head = z_s_win
-                        h_for_head = intent_emb
-                else:
-                    # No memory bank: pass raw features directly to head
-                    B_seg_v, H_actual_v, VP_v, comp_dim_v = z_v_win.shape
-                    z_v_win_for_head = z_v_win.reshape(B_seg_v, H_actual_v, VP_v * comp_dim_v)  # (B, Hs, pool_out_dim)
-                    z_s_win_for_head = z_s_win  # (B, Hs, state_dim) — already 3D
-                    # Only pass intent_emb if it exists (from Mamba with intent tokens)
-                    h_for_head = intent_emb if intent_emb is not None else None
+                B_seg, H_actual, VP, comp_dim = z_v_win.shape
+                z_v_win_for_head, z_s_win_for_head, h_for_head = model.condition_actions(
+                    z_v_win.reshape(B_seg, H_actual, VP * comp_dim),
+                    z_s_win, intent_emb, observed_mask=current_t < seg_lens,
+                )
 
                 # Target: chunk_size future actions from current time
                 target = target_seg[:, current_t:current_t + chunk_size]
@@ -986,9 +949,9 @@ def validate(model, loader, device, args):
                     actions_pred = model.sample_actions(
                         z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
                     )
-                    loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
-                    if not valid_mask.all():
-                        loss = loss * valid_mask.float().mean()
+                    loss = model.intention_head.loss(
+                        target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
+                    )
                 else:
                     actions_pred = model.predict_actions(
                         z_v_win_for_head, z_s_win_for_head, h_for_head,
@@ -1000,17 +963,12 @@ def validate(model, loader, device, args):
                 continue
 
             loss_accum.append(loss)
+            valid_counts.append(int(valid_mask.sum().item()))
             last_actions_pred = actions_pred
 
-        # Accumulate metrics across all windows in this segment
-        if loss_accum:
-            avg_window_loss = torch.stack(loss_accum).mean().item()
-            losses.append(avg_window_loss)
-            actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
-            pbar.set_postfix(mse=f"{avg_window_loss:.5f}")
-
-            # Per-dim error accumulation (across batch and time)
-            # Use the last window's predictions for per-dim metrics
+            # Accumulate every valid prediction window, excluding padded samples.
+            actions_pred = actions_pred[valid_mask]
+            target = target[valid_mask]
             if actions_pred.shape[-1] < target.shape[-1]:
                 pad = target[..., actions_pred.shape[-1]:].detach().float().cpu().numpy()
                 actions_pred_for_metric = np.concatenate(
@@ -1041,6 +999,14 @@ def validate(model, loader, device, args):
                 grip_total = B_win * T
                 grip_correct_total += grip_correct
                 grip_total_total += grip_total
+
+        # Accumulate metrics across all windows in this segment
+        if loss_accum:
+            avg_window_loss = (sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / sum(valid_counts)).item()
+            losses.append(avg_window_loss)
+            actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
+            pbar.set_postfix(mse=f"{avg_window_loss:.5f}")
+
 
     avg_loss = global_mean(losses, device)
     avg_action = global_mean(actions_pred_list, device, empty=0.0)
@@ -1126,11 +1092,11 @@ def parse_args():
     
     # Head selection
     parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion", "flow_matching"],
-                        default="mamba",
-                        help="Which head architecture: transformer, mamba, hybrid, "
+                        default="diffusion",
+                        help="V4 supports diffusion and flow_matching; transformer/mamba/hybrid are future work. Which head architecture: transformer, mamba, hybrid, "
                              "diffusion (DDPM), or flow_matching (CFM with Euler ODE).")
     parser.add_argument("--use-history", action="store_true", default=True,
-                        help="Include Mamba history component (h) in head input.")
+                        help="Use observation history; Mamba is constructed only with intent tokens.")
     parser.add_argument("--no-history", dest="use_history", action="store_false",
                         help="Disable Mamba history component.")
     
@@ -1191,11 +1157,11 @@ def parse_args():
     
     # V4: Semantic anchoring
     parser.add_argument("--anchor-weight", type=float, default=0.0,
-                        help="Weight for semantic anchoring loss (0 = disabled).")
+                        help="WIP: reserved for semantic anchoring; currently not connected to training.")
     
     # Text modality (optional)
     parser.add_argument("--use-text", action="store_true", default=False,
-                        help="Enable text encoder + text-conditioned head.")
+                        help="WIP: constructs a text encoder, but semantic supervision is not connected.")
     parser.add_argument("--text-dim", type=int, default=256,
                         help="Text encoder output dim (default 256).")
     parser.add_argument("--task-text", type=str, default=None,
