@@ -74,6 +74,8 @@ BEST CHECKPOINT:
 
 import argparse
 import json
+import math
+import os
 from pyexpat import model
 import sys
 import time
@@ -85,6 +87,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 # Disable cuDNN — needed when DINOv2 (with torch.no_grad) and Mamba's CUDA
 # kernel interact badly. Without this, you get CUDNN_STATUS_NOT_INITIALIZED
@@ -94,12 +97,102 @@ torch.backends.cudnn.enabled = False
 # Enable TF32 for faster matmuls on Ampere+ GPUs (slight precision loss)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from data.align_dataset import ALIGNDataset, MultiALIGNDataset, head_collate, v4_segment_collate
 from models.align_intention import ALIGNIntentionModel
 from training.wandb_utils import init_wandb
+
+
+def distributed_enabled():
+    return dist.is_available() and dist.is_initialized()
+
+
+def is_primary():
+    return not distributed_enabled() or dist.get_rank() == 0
+
+
+def setup_distributed(args):
+    """Use one process per GPU when launched with torchrun."""
+    if int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        return torch.device(args.device)
+    local_rank = int(os.environ["LOCAL_RANK"])
+    requested = torch.device(args.device)
+    if requested.type == "cuda":
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        backend = "nccl"
+    elif requested.type == "cpu":
+        device = torch.device("cpu")
+        backend = "gloo"
+    else:
+        raise ValueError("Distributed training supports CUDA or CPU devices")
+    dist.init_process_group(backend=backend, init_method="env://")
+    args.device = str(device)
+    return device
+
+
+def global_mean(values, device, empty=float("inf")):
+    """Average batch metrics across all processes."""
+    totals = torch.tensor([sum(values), len(values)], dtype=torch.float64, device=device)
+    if distributed_enabled():
+        dist.all_reduce(totals)
+    return (totals[0] / totals[1]).item() if totals[1].item() else empty
+
+
+def sync_and_step(model, optimizer, device, grad_clip):
+    """Average gradients, including parameters unused on some ranks.
+
+    Training uses model submodules and helper methods outside model.forward(),
+    so a DDP wrapper around forward alone would miss those gradients.
+    """
+    params = [p for p in model.parameters() if p.requires_grad]
+    if distributed_enabled():
+        used = torch.tensor([p.grad is not None for p in params], dtype=torch.int32, device=device)
+        dist.all_reduce(used)
+        if not torch.any(used):
+            return False
+        # Group by dtype so each group needs only one gradient collective.
+        groups = {}
+        for p, count in zip(params, used.tolist()):
+            if count:
+                groups.setdefault(p.dtype, []).append(p)
+        world_size = dist.get_world_size()
+
+        def reduce_bucket(bucket):
+            flat = torch.cat([
+                (p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1)
+                for p in bucket
+            ])
+            dist.all_reduce(flat)
+            flat.div_(world_size)
+            offset = 0
+            for p in bucket:
+                p.grad = flat.narrow(0, offset, p.numel()).view_as(p)
+                offset += p.numel()
+
+        # Bound the temporary communication buffer for large models.
+        bucket_limit = 25 * 1024 * 1024
+        for group in groups.values():
+            bucket = []
+            bucket_bytes = 0
+            for p in group:
+                size = p.numel() * p.element_size()
+                if bucket and bucket_bytes + size > bucket_limit:
+                    reduce_bucket(bucket)
+                    bucket = []
+                    bucket_bytes = 0
+                bucket.append(p)
+                bucket_bytes += size
+            if bucket:
+                reduce_bucket(bucket)
+    elif not any(p.grad is not None for p in params):
+        return False
+    torch.nn.utils.clip_grad_norm_(params, grad_clip)
+    optimizer.step()
+    return True
 
 
 # ================================================================
@@ -181,8 +274,13 @@ def build_loaders(train_ds, val_ds, args):
                 key: torch.from_numpy(value) if key in transfer_keys else value
                 for key, value in result.items()
             }
+    train_sampler = (DistributedSampler(train_ds, shuffle=True, seed=args.seed)
+                     if distributed_enabled() else None)
+    if distributed_enabled():
+        val_ds = Subset(val_ds, range(dist.get_rank(), len(val_ds), dist.get_world_size()))
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
+        train_ds, batch_size=args.batch_size, shuffle=train_sampler is None,
+        sampler=train_sampler,
         drop_last=True, collate_fn=collate_fn,
         num_workers=args.num_workers, pin_memory=pin_memory,
         persistent_workers=args.persistent_workers and args.num_workers > 0,
@@ -265,7 +363,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
     model.train()
     losses, actions_pred_list = [], []
     n_steps = min(max_steps, len(loader)) if max_steps else len(loader)
-    pbar = tqdm(range(n_steps), total=n_steps, desc="  [train V4]", unit="batch", leave=False)
+    pbar = tqdm(range(n_steps), total=n_steps, desc="  [train V4]", unit="batch",
+                leave=False, disable=not is_primary())
     step_iter = iter(loader)
 
     for _ in pbar:
@@ -470,11 +569,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         if loss_accum:
             total_loss = torch.stack(loss_accum).sum()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                args.grad_clip,
-            )
-            optimizer.step()
+        sync_and_step(model, optimizer, device, args.grad_clip)
 
         avg_step_loss = float(total_loss.item() / max(len(loss_accum), 1)) if loss_accum else 0.0
         losses.append(avg_step_loss)
@@ -482,8 +577,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         pbar.set_postfix(mse=f"{avg_step_loss:.5f}")
 
-    avg_loss = float(np.mean(losses)) if losses else float("inf")
-    avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
+    avg_loss = global_mean(losses, device)
+    avg_action = global_mean(actions_pred_list, device, empty=0.0)
     return avg_loss, avg_action
 
 def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
@@ -493,7 +588,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
     n_steps = min(max_steps, len(loader)) if max_steps else len(loader)
     pbar = tqdm(
         range(n_steps), total=n_steps,
-        desc=f"  [train]", unit="step", leave=False,
+        desc=f"  [train]", unit="step", leave=False, disable=not is_primary(),
     )
     step_iter = iter(loader)
     for _ in pbar:
@@ -555,20 +650,14 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         if args.skip_nan and not torch.isfinite(loss):
             # Skip NaN/Inf batch — common with high LR + Mamba + BF16
-            losses.append(loss.item())
-            actions_pred_list.append(0.0 if not torch.isfinite(actions_pred).all()
-                                      else actions_pred.detach().abs().mean().item())
             pbar.set_postfix(mse=f"NAN", warn="skip")
             optimizer.zero_grad(set_to_none=True)
+            sync_and_step(model, optimizer, device, args.grad_clip)
             continue
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad],
-            args.grad_clip,
-        )
-        optimizer.step()
+        sync_and_step(model, optimizer, device, args.grad_clip)
 
         losses.append(loss.item())
         actions_pred_list.append(actions_pred.detach().abs().mean().item())
@@ -578,8 +667,8 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
             a_mean=f"{actions_pred.detach().abs().mean().item():.4f}",
         )
 
-    avg_loss = float(np.mean(losses)) if losses else float("inf")
-    avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
+    avg_loss = global_mean(losses, device)
+    avg_action = global_mean(actions_pred_list, device, empty=0.0)
     return avg_loss, avg_action
 
 
@@ -602,7 +691,8 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
     losses, actions_pred_list = [], []
     n_steps = min(max_steps, len(loader)) if max_steps else len(loader)
     pbar = tqdm(range(n_steps), total=n_steps,
-                desc="  [train V4-batched]", unit="batch", leave=False)
+                desc="  [train V4-batched]", unit="batch", leave=False,
+                disable=not is_primary())
     step_iter = iter(loader)
 
     for _ in pbar:
@@ -614,7 +704,9 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
-        seg_lens = torch.as_tensor(batch["segment_len"], device=device)  # (B,)
+        # Segment lengths arrive on the CPU. Checking them there avoids a
+        # device-to-host synchronization for every action window.
+        seg_lens_cpu = torch.as_tensor(batch["segment_len"])  # (B,)
         Hs = args.history_size
         chunk_size = args.chunk_size
         # Pre-computed features arrive as (B, S, V*257, 768); raw frames as
@@ -661,13 +753,14 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
             # the next chunk_size actions.
             num_windows = S - Hs - chunk_size + 1
             loss_accum = []
+            logged_loss_sum = 0.0
             actions_pred = None
             target = None
 
             for n in range(num_windows):
                 current_t = n + Hs - 1
-                valid_mask = seg_lens >= (current_t + chunk_size)
-                if not valid_mask.any():
+                valid_mask_cpu = seg_lens_cpu >= (current_t + chunk_size)
+                if not bool(valid_mask_cpu.any()):
                     continue
 
                 # Extract window from the batched outputs (no Python loop over
@@ -690,40 +783,45 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                 else:
                     actions_pred = model.predict_actions(z_v_win, z_s_win, intent_emb)
                     loss = F.mse_loss(actions_pred, target, reduction='none')
-                    loss = loss[valid_mask].mean() if valid_mask.any() else loss.mean()
+                    valid_mask = valid_mask_cpu.to(device, non_blocking=True)
+                    loss = loss[valid_mask].mean()
 
-                if getattr(args, "skip_nan", True) and not torch.isfinite(loss):
-                    continue
+                if getattr(args, "skip_nan", True):
+                    # Reuse this scalar for logging below. The finite-loss
+                    # decision already waits for CUDA, so a second .item()
+                    # after the optimizer step would be an extra sync.
+                    loss_value = loss.detach().item()
+                    if not math.isfinite(loss_value):
+                        continue
+                    logged_loss_sum += loss_value
                 loss_accum.append(loss)
 
-            if not loss_accum:
-                # All windows were NaN, skip
-                continue
-
-            total_loss = torch.stack(loss_accum).sum()
+            total_loss = torch.stack(loss_accum).sum() if loss_accum else None
 
         # Backward
         optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad],
-            args.grad_clip,
-        )
-        optimizer.step()
+        if total_loss is not None:
+            total_loss.backward()
+        sync_and_step(model, optimizer, device, args.grad_clip)
+        if total_loss is None:
+            continue
 
         profiler = getattr(args, "_profiler", None)
         if profiler is not None:
             profiler.step()
 
-        losses.append(total_loss.item() / max(len(loss_accum), 1))
+        if getattr(args, "skip_nan", True):
+            losses.append(logged_loss_sum / len(loss_accum))
+        else:
+            losses.append(total_loss.item() / len(loss_accum))
         if actions_pred is not None:
             actions_pred_list.append(actions_pred.detach().abs().mean().item())
         else:
             actions_pred_list.append(0.0)
         pbar.set_postfix(mse=f"{losses[-1]:.5f}")
 
-    avg_loss = float(np.mean(losses)) if losses else float("inf")
-    avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
+    avg_loss = global_mean(losses, device)
+    avg_action = global_mean(actions_pred_list, device, empty=0.0)
     return avg_loss, avg_action
 
 
@@ -745,7 +843,8 @@ def validate(model, loader, device, args):
     genuine_gripper_batches = 0   # batches where model predicted gripper
     grip_correct_total = 0.0      # # of correct gripper open/close
     grip_total_total = 0          # # of gripper predictions
-    pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False)
+    pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False,
+                disable=not is_primary())
     for batch in pbar:
         
         Hs = args.history_size
@@ -943,8 +1042,26 @@ def validate(model, loader, device, args):
                 grip_correct_total += grip_correct
                 grip_total_total += grip_total
 
-    avg_loss = float(np.mean(losses)) if losses else float("inf")
-    avg_action = float(np.mean(actions_pred_list)) if actions_pred_list else 0.0
+    avg_loss = global_mean(losses, device)
+    avg_action = global_mean(actions_pred_list, device, empty=0.0)
+
+    if distributed_enabled():
+        local_stats = (
+            per_dim_squared, per_dim_abs, n_samples,
+            padded_gripper_batches, genuine_gripper_batches,
+            grip_correct_total, grip_total_total,
+        )
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, local_stats)
+        squared = [stats[0] for stats in gathered if stats[0] is not None]
+        absolute = [stats[1] for stats in gathered if stats[1] is not None]
+        per_dim_squared = sum(squared) if squared else None
+        per_dim_abs = sum(absolute) if absolute else None
+        n_samples = sum(stats[2] for stats in gathered)
+        padded_gripper_batches = sum(stats[3] for stats in gathered)
+        genuine_gripper_batches = sum(stats[4] for stats in gathered)
+        grip_correct_total = sum(stats[5] for stats in gathered)
+        grip_total_total = sum(stats[6] for stats in gathered)
 
     # Per-dim metrics (assumes 7 dims: x, y, z, rx, ry, rz, gripper)
     per_dim_metrics = {}
@@ -1103,8 +1220,8 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--fused-adamw", action=argparse.BooleanOptionalAction,
-                        default=False,
-                        help="Use PyTorch fused AdamW on CUDA; keeps FP32 parameters and optimizer state (default: off for reproducibility).")
+                        default=None,
+                        help="Use PyTorch fused AdamW (default: on for CUDA, off for CPU).")
     parser.add_argument("--skip-nan", dest="skip_nan", action="store_true",
                         default=True,
                         help="Skip batches with NaN/Inf loss (default on).")
@@ -1147,14 +1264,23 @@ def parse_args():
 
 def main():
     args = parse_args()
+    device = setup_distributed(args)
+    if not is_primary():
+        # Only rank zero reports progress; worker errors still reach stderr.
+        sys.stdout = open(os.devnull, "w")
     if args.torch_compile:
         print("  NOTE: --torch-compile is not implemented in train_intention.py; running eager mode.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device(args.device)
+    if args.fused_adamw is None:
+        args.fused_adamw = device.type == "cuda"
+    elif args.fused_adamw and device.type != "cuda":
+        raise ValueError("--fused-adamw requires --device cuda")
     print(f"\n=== ALIGN Intention (Mamba) Training ===")
     print(f"  Device:     {device}")
+    if distributed_enabled():
+        print(f"  Processes:  {dist.get_world_size()} (batch size is per process)")
     print(f"  Head Type:  {args.head_type} head")
     print(f"  Chunk (K):  {args.chunk_size}")
     # Determine num_cameras from --cameras argument (auto-derived)
@@ -1182,22 +1308,24 @@ def main():
     else:
         ds_name = "+".join(Path(p).stem for p in args.data)
     out_dir = out_dir / ds_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if args.run_name:
-        # Custom name provided
-        out_dir = out_dir / args.run_name
+    if is_primary():
         out_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        # Auto-create a new run_N subfolder to avoid overwriting previous runs.
-        # e.g. checkpoints/v3/libero_object/run_1, run_2, ...
-        existing_runs = sorted(
-            int(p.name.split("_")[1])
-            for p in out_dir.glob("run_*")
-            if p.is_dir() and p.name.split("_")[1].isdigit()
-        )
-        next_run = (existing_runs[-1] + 1) if existing_runs else 1
-        out_dir = out_dir / f"run_{next_run}"
+        if args.run_name:
+            out_dir = out_dir / args.run_name
+        else:
+            # Select a run folder once, then share it with all workers.
+            existing_runs = sorted(
+                int(p.name.split("_")[1])
+                for p in out_dir.glob("run_*")
+                if p.is_dir() and p.name.split("_")[1].isdigit()
+            )
+            next_run = (existing_runs[-1] + 1) if existing_runs else 1
+            out_dir = out_dir / f"run_{next_run}"
         out_dir.mkdir(parents=True, exist_ok=True)
+    if distributed_enabled():
+        selected_dir = [str(out_dir) if is_primary() else None]
+        dist.broadcast_object_list(selected_dir, src=0)
+        out_dir = Path(selected_dir[0])
     print(f"  Output dir: {out_dir}")
 
     # Wandb
@@ -1205,7 +1333,7 @@ def main():
         project=args.wandb_project,
         name=args.wandb_run,
         config=vars(args),
-        enabled=args.wandb,
+        enabled=args.wandb and is_primary(),
     )
     print(f"  W&B:        {'enabled' if wandb_trainer.enabled else 'disabled'}")
 
@@ -1213,6 +1341,8 @@ def main():
     print("\n  Loading data...")
     full_ds, train_ds, val_ds = build_datasets(args)
     train_loader, val_loader = build_loaders(train_ds, val_ds, args)
+    if not len(train_loader):
+        raise ValueError("Training set is too small for the per-process batch size")
 
     # Model
     print("\n  Building model...")
@@ -1282,6 +1412,12 @@ def main():
     pool_out_dim = (N_tok_actual - num_cameras) * args.compressed_dim 
     print(f"  Pool out dim: {pool_out_dim} (N_tok_actual={N_tok_actual}, compressed_dim={args.compressed_dim})")
     model._build_head_and_bank(pool_out_dim)
+    if distributed_enabled():
+        for tensor in model.state_dict().values():
+            dist.broadcast(tensor, src=0)
+        # Keep initialization identical, then vary training-time randomness.
+        torch.manual_seed(args.seed + dist.get_rank())
+        np.random.seed(args.seed + dist.get_rank())
     print(f"  Head built: pool_out_dim={pool_out_dim} (VP_tokens={N_tok_actual})")
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
@@ -1341,11 +1477,9 @@ def main():
 
     # Optimizer — single LR group (only trainable params receive gradients).
     # Fused AdamW keeps parameters and optimizer state in FP32; it changes only
-    # kernel fusion/order, so it is opt-in for checkpoint-comparison reproducibility.
+    # kernel fusion/order. The resolved setting is recorded in config.json.
     adamw_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
     if args.fused_adamw:
-        if device.type != "cuda":
-            raise ValueError("--fused-adamw requires --device cuda")
         adamw_kwargs["fused"] = True
     optimizer = torch.optim.AdamW(trainable, **adamw_kwargs)
     print(f"  Optimizer: 1 LR group (lr={args.lr:.2e}, {n_trainable:,} trainable params; "
@@ -1357,12 +1491,13 @@ def main():
     config_snapshot["n_trainable_params"] = n_trainable
     config_snapshot["n_total_params"] = n_total
     config_snapshot["model_class"] = "ALIGNIntentionModel"
-    with open(out_dir / "config.json", "w") as f:
-        json.dump(config_snapshot, f, indent=2)
+    if is_primary():
+        with open(out_dir / "config.json", "w") as f:
+            json.dump(config_snapshot, f, indent=2)
 
     # Log file
     log_path = out_dir / "intention_log.jsonl"
-    log_fp = open(log_path, "w")
+    log_fp = open(log_path, "w") if is_primary() else None
 
     # Training loop
     # is_v4 is auto-detected: V4 features on OR any segment-* arg is set
@@ -1398,24 +1533,27 @@ def main():
         if args.max_steps_per_epoch and args.max_steps_per_epoch < args.profile_steps + 2:
             raise ValueError("--max-steps-per-epoch must be at least --profile-steps + 2 "+
                              "for profiler wait and warmup steps.")
-        profile_dir = Path(args.profile_dir)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        profiler = torch.profiler.profile(
-            activities=[torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA],
-            schedule=torch.profiler.schedule(wait=1, warmup=1,
-                                             active=args.profile_steps, repeat=1),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir)),
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=False,
-        )
-        profiler.__enter__()
-        args._profiler = profiler
-        print(f"  CUDA profiler: {args.profile_steps} active steps → {profile_dir}")
+        if is_primary():
+            profile_dir = Path(args.profile_dir)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            profiler = torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU,
+                            torch.profiler.ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=1, warmup=1,
+                                                 active=args.profile_steps, repeat=1),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(str(profile_dir)),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+            )
+            profiler.__enter__()
+            args._profiler = profiler
+            print(f"  CUDA profiler: {args.profile_steps} active steps → {profile_dir}")
     else:
         args._profiler = None
     for epoch in range(1, args.epochs + 1):
+        if isinstance(train_loader.sampler, DistributedSampler):
+            train_loader.sampler.set_epoch(epoch)
         t_start = time.time()
         train_loss, train_action = train_fn(
             model, train_loader, optimizer, device, args,
@@ -1476,11 +1614,12 @@ def main():
         # Add per-dim to JSONL log
         for k, v in val_per_dim.items():
             log_record[f"val/{k}"] = v
-        log_fp.write(json.dumps(log_record) + "\n")
-        log_fp.flush()
+        if log_fp is not None:
+            log_fp.write(json.dumps(log_record) + "\n")
+            log_fp.flush()
 
         # Save best (based on val_loss)
-        if val_loss < best_val_loss:
+        if is_primary() and val_loss < best_val_loss:
             best_val_loss = val_loss
             ckpt = {
                 "model_state_dict": model.state_dict(),
@@ -1495,11 +1634,15 @@ def main():
             print(f"    ↳ new best (val_loss={val_loss:.5f}), "
                   f"saved to intention_best.pt")
 
-    log_fp.close()
+    if log_fp is not None:
+        log_fp.close()
     wandb_trainer.finish()
     print(f"\n  Done. Best val_loss={best_val_loss:.5f}")
     print(f"  Best checkpoint: {out_dir / 'intention_best.pt'}")
     print(f"  Logs:            {log_path}")
+    if distributed_enabled():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

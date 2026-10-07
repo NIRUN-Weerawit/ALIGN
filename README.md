@@ -172,8 +172,26 @@ python training/train_intention.py \
     --action-dim 7 \
     --head-type diffusion \
     --batch-size 16 \
-    --no-use-history
+    --no-history
 ```
+
+### Multiple GPUs
+
+Launch one intention training process per GPU with `torchrun`:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc-per-node=2 training/train_intention.py \
+    --data data/libero_spatial.h5 \
+    --cameras image wrist_image \
+    --output-dir checkpoints/v4 \
+    --epochs 100 \
+    --batch-size 16
+```
+
+`--batch-size` is per GPU, so this example uses a global batch of 32.
+Training samples are split across processes, validation metrics are combined,
+and only the main process writes logs and checkpoints. Use
+`CUDA_VISIBLE_DEVICES` to choose which GPUs participate.
 
 ---
 
