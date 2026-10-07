@@ -111,7 +111,7 @@ train_policy_transformer = true
 train_soft_prompts = true
 ```
 
-It also uses X-VLA's official optimizer preset: differential AdamW learning rates (VLM at 1/10 the base rate) and a 1,000-step warmup followed by cosine decay across the 20,000-step run. The Piper target remains `action_mode = ee6d`, not generic `auto`, because the data has a defined EE6D layout and binary gripper targets.
+It also uses X-VLA's official optimizer preset: differential AdamW learning rates (VLM at 1/10 the base rate) and a 1,000-step warmup followed by cosine decay across the 20,000-step run. AdamW uses PyTorch's fused implementation automatically on CUDA, including every distributed worker; CPU runs use the standard implementation. The Piper target remains `action_mode = ee6d`, not generic `auto`, because the data has a defined EE6D layout and binary gripper targets.
 
 It also disables only PyTorch's **cuDNN SDPA** backend before model loading. This works around the `No valid execution plans built` error observed on the training GPU while leaving Flash and efficient SDPA kernels enabled.
 
@@ -123,6 +123,18 @@ PYTHONPATH=. ~/miniconda3/envs/lerobot/bin/python \
   -m piper_xvla.train_xvla_piper \
   --config piper_xvla/config/piper_xvla_single_task.json
 ```
+
+For multiple GPUs on one machine, launch one worker per GPU with `torchrun`:
+
+```bash
+cd ~/ALIGN/baselines
+PYTHONPATH=. ~/miniconda3/envs/lerobot/bin/torchrun \
+  --standalone --nproc-per-node=2 \
+  -m piper_xvla.train_xvla_piper \
+  --config piper_xvla/config/piper_xvla_single_task.json
+```
+
+`batch_size` is per GPU, so the example uses 4 frames on each GPU (8 frames per optimizer step). `steps` still counts synchronized optimizer updates; with two GPUs, the run sees roughly twice as many training frames per step. Training samples are sharded and reshuffled each epoch. Validation is split without repeated frames, then losses are combined across GPUs. Rank 0 writes logs and checkpoints. DistributedDataParallel keeps a full model replica on each GPU, so every GPU must have enough memory for its own batch and optimizer state.
 
 Artifacts:
 

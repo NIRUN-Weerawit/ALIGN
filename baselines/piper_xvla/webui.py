@@ -41,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 import uuid
@@ -61,6 +62,8 @@ from piper_xvla.replay_control import (
 )
 from piper_xvla.snapshot_adapter import DEFAULT_CAMERA_CONFIG
 from piper_xvla.action_guard import guard_limits_from_config
+from piper_xvla.align_control import ALIGNInferenceSettings, camera_stale_pause_allowed
+from piper_xvla.gripper_binary import BinaryGripperConfig, DEFAULT_CONFIG_PATH as XVLA_GRIPPER_CONFIG, load_binary_gripper_config
 from piper_xvla.endpose_control import EndPoseTarget, _stream_endpose, _wait_for_can_mode, _wait_until_enabled, prepare_can_cartesian_control
 from piper_xvla.review_video import ensure_h264, probe_codec
 from piper_xvla.master_slave_control import (
@@ -108,6 +111,17 @@ DEFAULT_DATA_DIR = Path.home() / "ALIGN" / "baselines" / "data" / "piper_replay"
 XVLA_GUARD_CONFIG = MODULE_DIR / "config" / "piper_action_guard.camera_only.json"
 XVLA_OUTPUTS_ROOT = MODULE_DIR.parent / "outputs"
 XVLA_DEFAULT_CHECKPOINT = "piper_xvla_single_task/best.pt"
+ALIGN_DEFAULT_CHECKPOINT = MODULE_DIR.parents[1] / "checkpoints" / "piper_replay_new" / "run_2" / "intention_best.pt"
+ALIGN_CALIBRATION_MANIFEST = MODULE_DIR.parent / "data" / "piper_replay_new" / "xvla_training_manifest.json"
+
+
+def _xvla_subprocess_env() -> dict[str, str]:
+    """Prefer this interpreter's packages, then allow user-installed Piper SDK."""
+    env = os.environ.copy()
+    env.pop("PYTHONNOUSERSITE", None)
+    env["PYTHONPATH"] = os.pathsep.join((sysconfig.get_paths()["purelib"], str(MODULE_DIR.parent)))
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
 # Piper gripper commands are signed strokes in metres at the WebUI boundary.
 # Keep the pre-existing 70 mm positive envelope and permit the matching negative
 # direction rather than silently applying abs() to an operator command.
@@ -222,6 +236,11 @@ class PiperWebUI:
             "status": "idle", "frames": 0, "output": None, "message": "",
             "summary": None, "motion_capability": "none",
         }
+        self._align_lock = threading.Lock()
+        self._align_stop_event = threading.Event()
+        self._align_process: Optional[subprocess.Popen[str]] = None
+        self._align_log_offset = 0
+        self._align_state: dict[str, Any] = {"status": "idle", "output": None, "message": ""}
 
         # Background collect state.
         self._collect_lock = threading.Lock()
@@ -617,6 +636,8 @@ class PiperWebUI:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
     def do_estop(self) -> dict:
+        if self.align_status()["status"] == "running":
+            self.stop_align_inference(emergency=True)
         self.revoke_xvla_control()
         with self._manual_lock:
             self._manual_enabled = False
@@ -660,6 +681,7 @@ class PiperWebUI:
             else:
                 self._manual_stop_event.set()
         if not enabled:
+            self.revoke_xvla_control()
             self.stop_master_slave_control()
         return {"ok": True, "enabled": bool(enabled)}
 
@@ -804,8 +826,8 @@ class PiperWebUI:
 
     def start_master_slave_control(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._require_manual_arm()
-        if self.collection_active() or self.xvla_status()["status"] == "running":
-            raise RuntimeError("master-slave control is blocked while collection or X-VLA inference is active")
+        if self.collection_active() or self.xvla_status()["status"] in {"running", "stopping"} or self.align_status()["status"] in {"running", "stopping"}:
+            raise RuntimeError("master-slave control is blocked while collection or policy inference is active")
         master_can, slave_can = str(payload.get("master_can", "")).strip(), str(payload.get("slave_can", "")).strip()
         if not master_can or not slave_can or master_can == slave_can:
             raise ValueError("choose two different CAN interfaces for master and slave")
@@ -988,7 +1010,7 @@ class PiperWebUI:
 
     def _reject_during_xvla_control(self) -> None:
         if self.xvla_control_active():
-            raise HTTPException(409, "X-VLA held control is active; release it before using another motion control")
+            raise HTTPException(409, "policy held control is active; release it before using another motion control")
 
     def _write_xvla_lease(self, expires: float, speed_percent: int = 1, blocked: bool = False, expected_session: Optional[str] = None, session_id: Optional[str] = None) -> bool:
         with self._xvla_lease_lock:
@@ -1005,6 +1027,11 @@ class PiperWebUI:
 
     def revoke_xvla_control(self, session_id: Optional[str] = None) -> dict:
         with self._xvla_lease_lock:
+            if session_id is not None and session_id != self._xvla_control_session:
+                # A stop can overtake the first heartbeat. Remember that
+                # pending session so its late request cannot start control.
+                self._xvla_revoked_sessions.add(session_id)
+                return {"ok": True, "active": time.monotonic() < self._xvla_lease_expires}
             revoked = session_id or self._xvla_control_session
             if revoked:
                 self._xvla_revoked_sessions.add(revoked)
@@ -1344,6 +1371,27 @@ class PiperWebUI:
             os.replace(temp, XVLA_GUARD_CONFIG)
         return {"ok": True, "limits": canonical, "message": "Guard limits saved. Held control stopped; new limits apply on the next prediction."}
 
+    def xvla_gripper_config(self) -> dict:
+        return load_binary_gripper_config(XVLA_GRIPPER_CONFIG).as_dict()
+
+    def xvla_gripper_calibration(self) -> dict:
+        inference_config = json.loads((MODULE_DIR / "config" / "piper_xvla_single_task.json").read_text())
+        manifest_path = Path(inference_config["manifest"])
+        if not manifest_path.is_absolute():
+            manifest_path = MODULE_DIR.parent / manifest_path
+        return json.loads(manifest_path.read_text())["gripper_normalization"]
+
+    def save_xvla_gripper_config(self, payload: dict) -> dict:
+        config = BinaryGripperConfig.from_dict(payload)
+        calibration = self.xvla_gripper_calibration()
+        config.validate_calibration(calibration["raw_meters_min"], calibration["raw_meters_max"])
+        self.revoke_xvla_control()
+        with self._xvla_lock:
+            temp = XVLA_GRIPPER_CONFIG.with_suffix(".json.tmp")
+            temp.write_text(json.dumps(config.as_dict(), indent=2, allow_nan=False) + "\n")
+            os.replace(temp, XVLA_GRIPPER_CONFIG)
+        return {"ok": True, "mapping": config.as_dict(), "message": "Gripper mapping saved. Held control stopped; new values apply on the next prediction."}
+
     def xvla_status(self) -> dict:
         with self._xvla_lock:
             state = dict(self._xvla_state)
@@ -1383,7 +1431,10 @@ class PiperWebUI:
                     "frame": int(row.get("frame", 0)),
                     "guard_allowed": bool(row.get("guard_allowed")),
                     "prediction_age_s": prediction_age,
-                    "predicted_pose": _active10_pose(row.get("predicted_action20")),
+                    "predicted_pose": _active10_pose(row.get("guarded_action20", row.get("predicted_action20"))),
+                    "predicted_gripper_mm": row.get("predicted_gripper_mm"),
+                    "gripper_target_mm": row.get("gripper_target_mm"),
+                    "gripper_mapping_mm": row.get("gripper_mapping_mm"),
                     "measured_pose": _active10_pose(row.get("current_active10")),
                     "alerts": [str(alert.get("code", "UNKNOWN")) for alert in row.get("alerts", []) if isinstance(alert, dict)],
                     "alert_messages": [f"{alert.get('code', 'UNKNOWN')}: {alert.get('message', '')}" for alert in row.get("alerts", []) if isinstance(alert, dict)],
@@ -1412,6 +1463,8 @@ class PiperWebUI:
             raise RuntimeError("X-VLA diagnostic requires real camera and CAN feedback; WebUI is in --dry-run mode")
         if self.collection_active():
             raise RuntimeError("X-VLA diagnostic is blocked while collection owns the cameras")
+        if self.align_status()["status"] in {"running", "stopping"}:
+            raise RuntimeError("stop ALIGN inference before starting X-VLA")
         checkpoint_name, checkpoint_path = self._resolve_xvla_checkpoint(checkpoint)
         with self._xvla_lock:
             if self._xvla_state["status"] in {"running", "stopping"}:
@@ -1434,11 +1487,11 @@ class PiperWebUI:
         return self.xvla_status()
 
     def stop_xvla_diagnostic(self) -> dict:
-        self.revoke_xvla_control()
         with self._xvla_lock:
             process = self._xvla_process
             if self._xvla_state["status"] != "running":
                 return {"ok": False, "error": "no running X-VLA diagnostic"}
+            self.revoke_xvla_control()
             self._xvla_stop_event.set()
             self._xvla_state.update(status="stopping", message="stopping camera-only diagnostic; waiting for camera release...")
             if process is not None:
@@ -1454,6 +1507,7 @@ class PiperWebUI:
                     "--config", "piper_xvla/config/piper_xvla_single_task.json",
                     "--checkpoint", str(checkpoint_path),
                     "--guard-config", str(XVLA_GUARD_CONFIG),
+                    "--binary-gripper-config", str(XVLA_GRIPPER_CONFIG),
                     "--can", self.can, "--device", "cuda", "--frames", str(frames), "--output", str(output),
                     "--enable-held-control", "--hold-lease", str(output.with_suffix(".lease.json")),
                 ]
@@ -1461,7 +1515,7 @@ class PiperWebUI:
                     command.extend(["--record-images-dir", str(recording_dir)])
                 log_path = output.with_suffix(".log")
                 with log_path.open("w") as log_stream:
-                    process = subprocess.Popen(command, cwd=MODULE_DIR.parent, env={**os.environ, "PYTHONPATH": str(MODULE_DIR.parent), "PYTHONUNBUFFERED": "1"}, text=True, stdout=log_stream, stderr=subprocess.STDOUT)
+                    process = subprocess.Popen(command, cwd=MODULE_DIR.parent, env=_xvla_subprocess_env(), text=True, stdout=log_stream, stderr=subprocess.STDOUT)
                     with self._xvla_lock:
                         self._xvla_process = process
                         if self._xvla_stop_event.is_set():
@@ -1499,9 +1553,193 @@ class PiperWebUI:
                 self._xvla_state.update(status="error", message=f"{type(exc).__name__}: {exc}")
             self.revoke_xvla_control()
 
+    # -- ALIGN intention-model inference ----------------------------------
+
+    def align_status(self) -> dict:
+        with self._align_lock:
+            state = dict(self._align_state)
+            state["max_camera_age_s"] = self.xvla_guard_config()["max_camera_age_s"]
+            offset = self._align_log_offset
+            output = state.get("output")
+            if not output:
+                return state
+            log_path = Path(output).with_suffix(".log")
+            if log_path.is_file():
+                with log_path.open("rb") as stream:
+                    stream.seek(offset)
+                    state["log_lines"] = [line.decode("utf-8", "replace") for line in stream.read().splitlines() if line.strip()]
+                    self._align_log_offset = stream.tell()
+        try:
+            with Path(output).open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                end = stream.tell()
+                stream.seek(max(0, end - 16384))
+                lines = stream.read().splitlines()
+            if lines:
+                row = json.loads(lines[-1])
+                state["latest"] = row
+                sampled_age = row.get("prediction_age_s")
+                timestamp = row.get("timestamp_monotonic_s")
+                state["latest"]["prediction_age_s"] = (
+                    max(0.0, float(sampled_age) + time.monotonic() - float(timestamp))
+                    if isinstance(sampled_age, (int, float)) and isinstance(timestamp, (int, float)) else None
+                )
+        except (OSError, ValueError, TypeError):
+            pass
+        return state
+
+    def start_align_inference(self, payload: dict) -> dict:
+        if self.dry_run:
+            raise RuntimeError("ALIGN inference needs live Piper and cameras")
+        if self.collection_active() or self.xvla_status()["status"] in {"running", "stopping"}:
+            raise RuntimeError("stop collection or X-VLA inference before starting ALIGN")
+        with self._master_slave_lock:
+            if self._master_slave_state.get("status") in {"starting", "running", "stopping"}:
+                raise RuntimeError("stop master-slave mirroring before starting ALIGN")
+        checkpoint_value = payload.get("checkpoint") or str(ALIGN_DEFAULT_CHECKPOINT)
+        checkpoint = Path(str(checkpoint_value)).expanduser()
+        if not checkpoint.is_absolute():
+            checkpoint = MODULE_DIR.parents[1] / checkpoint
+        checkpoint = checkpoint.resolve()
+        if checkpoint.suffix != ".pt" or not checkpoint.is_file():
+            raise ValueError(f"ALIGN checkpoint must be an existing .pt file: {checkpoint}")
+        settings = ALIGNInferenceSettings.from_dict(payload.get("settings", {}))
+        if not ALIGN_CALIBRATION_MANIFEST.is_file():
+            raise ValueError(f"ALIGN gripper calibration manifest is missing: {ALIGN_CALIBRATION_MANIFEST}")
+        with self._align_lock:
+            if self._align_state["status"] in {"running", "stopping"}:
+                raise RuntimeError("ALIGN inference is already running")
+            output = MODULE_DIR.parent / "outputs" / "piper_align" / "webui_live.jsonl"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.unlink(missing_ok=True)
+            output.with_suffix(".log").unlink(missing_ok=True)
+            self.revoke_xvla_control()
+            self._xvla_lease_path = output.with_suffix(".lease.json")
+            self._write_xvla_lease(0.0)
+            self._align_log_offset = 0
+            self._align_stop_event.clear()
+            self._align_state = {"status": "running", "output": str(output), "checkpoint": str(checkpoint),
+                                 "settings": settings.as_dict(), "message": "loading ALIGN checkpoint and cameras"}
+        threading.Thread(target=self._align_worker, args=(checkpoint, settings, output), daemon=True).start()
+        return self.align_status()
+
+    def _align_worker(self, checkpoint: Path, settings: ALIGNInferenceSettings, output: Path) -> None:
+        log_path = output.with_suffix(".log")
+        final_status, final_message = "error", "ALIGN inference did not start"
+        try:
+            align_python = Path(os.environ.get("ALIGN_PYTHON", "/home/ucluser/miniconda3/envs/align/bin/python"))
+            if not align_python.is_file():
+                raise RuntimeError(f"ALIGN Python interpreter not found: {align_python}; set ALIGN_PYTHON")
+            env = os.environ.copy()
+            env.pop("PYTHONNOUSERSITE", None)
+            env["PYTHONPATH"] = os.pathsep.join((str(align_python.parent.parent / "lib" / "python3.10" / "site-packages"),
+                                                  str(MODULE_DIR.parents[1].parent), str(MODULE_DIR.parents[1]), str(MODULE_DIR.parent)))
+            env["PYTHONUNBUFFERED"] = "1"
+            command = [str(align_python), "-m", "piper_xvla.align_live_inference",
+                       "--checkpoint", str(checkpoint), "--can", self.can,
+                       "--camera-config", str(DEFAULT_CAMERA_CONFIG),
+                       "--calibration-manifest", str(ALIGN_CALIBRATION_MANIFEST),
+                       "--guard-config", str(XVLA_GUARD_CONFIG),
+                       "--settings", json.dumps(settings.as_dict()),
+                       "--lease", str(output.with_suffix(".lease.json")), "--output", str(output)]
+            with self._camera_lock, log_path.open("w") as log_stream:
+                process = subprocess.Popen(command, cwd=MODULE_DIR.parent, env=env, text=True,
+                                           stdout=log_stream, stderr=subprocess.STDOUT)
+                with self._align_lock:
+                    self._align_process = process
+                    if self._align_stop_event.is_set():
+                        process.terminate()
+                process.wait()
+            stopping = self._align_stop_event.is_set()
+            final_status = "stopped" if stopping else "done" if process.returncode == 0 else "error"
+            final_message = ("ALIGN inference stopped" if stopping else "ALIGN inference ended" if process.returncode == 0
+                             else log_path.read_text(errors="replace")[-1600:])
+        except Exception as exc:  # noqa: BLE001
+            final_message = f"{type(exc).__name__}: {exc}"
+        finally:
+            if self._xvla_lease_path == output.with_suffix(".lease.json"):
+                self.revoke_xvla_control()
+            with self._align_lock:
+                self._align_process = None
+                self._align_state.update(status=final_status, message=final_message)
+
+    def stop_align_inference(self, *, emergency: bool = False) -> dict:
+        with self._align_lock:
+            if self._align_state["status"] != "running":
+                return {"ok": False, "error": "ALIGN inference is not running"}
+            self._align_state.update(status="stopping", message="stopping ALIGN inference")
+        if not emergency:
+            # Wait briefly for the 20 Hz sender to replace the last future
+            # target with the measured pose before terminating the process.
+            self.revoke_xvla_control()
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                row = self.align_status().get("latest") or {}
+                if row.get("control_release_hold_sent") or (row and not row.get("control_active") and not row.get("control_sent")):
+                    break
+                time.sleep(0.02)
+        with self._align_lock:
+            self._align_stop_event.set()
+            if self._align_process is not None:
+                self._align_process.terminate()
+            if emergency:
+                self.revoke_xvla_control()
+            return {"ok": True, **self._align_state}
+
+    def renew_align_control(self, speed_percent: int, session_id: str, new_session: bool) -> dict:
+        status = self.align_status()
+        if status["status"] != "running":
+            raise RuntimeError("start ALIGN inference before holding control")
+        if not 1 <= speed_percent <= 10 or not session_id or len(session_id) > 80:
+            raise ValueError("control needs a session ID and speed from 1 to 10%")
+        self._require_manual_arm(check_motion_owner=False)
+        if self.collection_active():
+            raise RuntimeError("collection owns the cameras")
+        with self._manual_lock:
+            if self._manual_motion_active:
+                raise RuntimeError("a manual motion is running")
+        latest = status.get("latest") or {}
+        if not new_session and latest.get("control_blocked") and latest.get("control_block_session") == session_id:
+            raise RuntimeError(f"the action guard stopped control: {latest.get('control_block_reason') or 'a command was rejected'}")
+        max_age_s = self.xvla_guard_config()["max_camera_age_s"]
+        age_s = latest.get("prediction_age_s")
+        fresh_approved = (bool(latest.get("guard_allowed")) and isinstance(age_s, (int, float))
+                          and np.isfinite(age_s) and age_s <= max_age_s)
+        if latest.get("guard_allowed"):
+            rejection_codes = ["STALE_CAMERA"] if isinstance(age_s, (int, float)) and age_s > max_age_s else []
+        else:
+            rejection_codes = [str(alert.get("code")) for alert in latest.get("alerts", [])
+                               if alert.get("severity") == "REJECT"]
+        camera_pause = (not new_session and camera_stale_pause_allowed(rejection_codes, age_s, max_age_s))
+        if not fresh_approved and not camera_pause:
+            raise RuntimeError(f"ALIGN prediction is stale or rejected by the action guard (age={age_s!r} s; max={max_age_s:g} s)")
+        try:
+            lease = json.loads(self._xvla_lease_path.read_text())
+            if not isinstance(lease, dict):
+                lease = {}
+            blocked = bool(lease.get("blocked"))
+        except (OSError, ValueError, TypeError):
+            blocked = False
+            lease = {}
+        if blocked and not new_session:
+            reason = lease.get("reason") or "the action guard rejected a command"
+            raise RuntimeError(f"the action guard stopped control: {reason}")
+        with self._xvla_lease_lock:
+            if session_id in self._xvla_revoked_sessions:
+                raise RuntimeError("held-control session was released")
+            if new_session:
+                self._xvla_control_session = session_id
+            elif self._xvla_control_session != session_id:
+                raise RuntimeError("held-control session expired; release and press again")
+        if not self._write_xvla_lease(time.monotonic() + 0.35, speed_percent, expected_session=session_id, session_id=session_id):
+            raise RuntimeError("held-control session expired")
+        return {"ok": True, "active": True, "lease_ms": 350}
+
     # -- background collect --------------------------------------------------
 
     def start_collect(self, window_s: float = 40.0, dataset_path: str | None = None) -> dict:
+        if self.align_status()["status"] in {"running", "stopping"} or self.xvla_status()["status"] in {"running", "stopping"}:
+            raise HTTPException(409, "stop policy inference before starting collection")
         if not self.task.strip():
             raise HTTPException(400, "task must be set before starting collect (PUT /api/task)")
         with self._collect_lock:
@@ -1741,6 +1979,41 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
     def api_xvla_status() -> dict:
         return piper_ui.xvla_status()
 
+    @app.get("/api/align/status")
+    def api_align_status() -> dict:
+        return piper_ui.align_status()
+
+    @app.post("/api/align/start")
+    async def api_align_start(req: Request) -> dict:
+        try:
+            return piper_ui.start_align_inference(await req.json())
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+    @app.post("/api/align/stop")
+    def api_align_stop() -> dict:
+        result = piper_ui.stop_align_inference()
+        if not result["ok"]:
+            raise HTTPException(409, result["error"])
+        return result
+
+    @app.post("/api/align/control/heartbeat")
+    async def api_align_control_heartbeat(req: Request) -> dict:
+        try:
+            body = await req.json()
+            return piper_ui.renew_align_control(int(body.get("speed_percent", 5)), str(body.get("session_id", "")), bool(body.get("new_session", False)))
+        except (TypeError, ValueError, PermissionError, RuntimeError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/align/control/stop")
+    async def api_align_control_stop(req: Request) -> dict:
+        try:
+            body = await req.json()
+        except Exception:  # noqa: BLE001
+            body = {}
+        session = body.get("session_id") if isinstance(body, dict) else None
+        return piper_ui.revoke_xvla_control(session if isinstance(session, str) and session else None)
+
     @app.get("/api/xvla/checkpoints")
     def api_xvla_checkpoints() -> dict:
         return piper_ui.xvla_checkpoints()
@@ -1757,6 +2030,17 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
             raise HTTPException(400, str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
+
+    @app.get("/api/xvla/gripper")
+    def api_xvla_gripper() -> dict:
+        return {"mapping": piper_ui.xvla_gripper_config(), "calibration": piper_ui.xvla_gripper_calibration()}
+
+    @app.put("/api/xvla/gripper")
+    async def api_xvla_gripper_save(req: Request) -> dict:
+        try:
+            return piper_ui.save_xvla_gripper_config(await req.json())
+        except (TypeError, ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     @app.post("/api/xvla/diagnostic")
     async def api_xvla_diagnostic(req: Request) -> dict:
@@ -1804,6 +2088,8 @@ def build_app(piper_ui: PiperWebUI, data_dir: Path) -> FastAPI:
             raise HTTPException(409, "camera preview is suspended while collection owns the cameras")
         if piper_ui.xvla_status()["status"] == "running":
             raise HTTPException(409, "camera preview is suspended while X-VLA diagnostic owns the cameras")
+        if piper_ui.align_status()["status"] in {"running", "stopping"}:
+            raise HTTPException(409, "camera preview is suspended while ALIGN inference owns the cameras")
         try:
             return piper_ui.camera_preflight()
         except RuntimeError as exc:

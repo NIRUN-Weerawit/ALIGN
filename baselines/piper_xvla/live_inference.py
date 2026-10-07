@@ -20,7 +20,8 @@ from piper_xvla.action_guard import ActionGuard, guard_limits_from_config
 from piper_xvla.replay_control import connect_live_piper
 from piper_xvla.snapshot_adapter import DEFAULT_CAMERA_CONFIG, PiperSnapshotAdapter
 from piper_xvla.inference_recorder import InferenceImageRecorder
-from piper_xvla.train_xvla_piper import load_config
+from piper_xvla.gripper_binary import BinaryGripperConfig, DEFAULT_CONFIG_PATH, load_binary_gripper_config
+from piper_xvla.train_xvla_piper import configure_cuda_attention, load_config
 
 TASK = "grab an object and put in a cup"
 
@@ -92,11 +93,30 @@ def _load_guard(path: str | Path) -> ActionGuard:
     return ActionGuard(guard_limits_from_config(payload))
 
 
+def _predict_action_with_cudnn_fallback(policy: Any, batch: dict[str, torch.Tensor], device: str) -> np.ndarray:
+    """Retry once without cuDNN if this CUDA stack cannot initialize it."""
+    def predict() -> np.ndarray:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.startswith("cuda")):
+            return policy.predict_action_chunk(batch)[0, 0].detach().float().cpu().numpy()
+
+    try:
+        return predict()
+    except RuntimeError as exc:
+        if not device.startswith("cuda") or not torch.backends.cudnn.enabled or "CUDNN_STATUS_NOT_INITIALIZED" not in str(exc):
+            raise
+        torch.backends.cudnn.enabled = False
+        configure_cuda_attention(device)
+        torch.cuda.empty_cache()
+        print("cuDNN failed to initialize; retrying X-VLA prediction without cuDNN (inference may be slower)", flush=True)
+        return predict()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="piper_xvla/config/piper_xvla_single_task.json")
     parser.add_argument("--checkpoint", default="outputs/piper_xvla_single_task/best.pt")
     parser.add_argument("--guard-config", required=True)
+    parser.add_argument("--binary-gripper-config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--camera-config", default=str(DEFAULT_CAMERA_CONFIG))
     parser.add_argument("--can", default="can0")
     parser.add_argument("--device", default="cuda")
@@ -136,6 +156,31 @@ def _target_from_active(active: np.ndarray, gripper_min_m: float, gripper_max_m:
     return EndPoseTarget(np.asarray(active[:3], dtype=float), euler), gripper_m
 
 
+def _binary_gripper_action(
+    predicted_action20: np.ndarray, gripper_min_m: float, gripper_max_m: float,
+    config: BinaryGripperConfig = BinaryGripperConfig(),
+) -> tuple[np.ndarray, float | None, float | None]:
+    """Force predictions below the switch to 0 mm; pass larger values through."""
+    action = np.asarray(predicted_action20, dtype=np.float32).copy()
+    if action.shape != (20,):
+        raise ValueError("X-VLA prediction must have 20 action values")
+    config.validate_calibration(gripper_min_m, gripper_max_m)
+
+    normalized = float(action[9])
+    if not np.isfinite(normalized):
+        # Keep NaN/inf intact so ActionGuard rejects an invalid prediction.
+        return action, None, None
+    span = gripper_max_m - gripper_min_m
+    predicted_m = gripper_min_m + normalized * span
+    threshold_normalized = np.float32((config.threshold_mm / 1000 - gripper_min_m) / span)
+    if action[9] < threshold_normalized:
+        target_m = 0.0
+        action[9] = (target_m - gripper_min_m) / span
+    else:
+        target_m = predicted_m
+    return action, predicted_m, target_m
+
+
 def _prepare_held_control(piper: Any, lease_path: Path, session_id: str, speed: int, stop_event: threading.Event | None = None) -> bool:
     """Cancel normal lease loss without terminating camera/policy inference."""
     class LeaseStop:
@@ -167,6 +212,9 @@ def main(argv: list[str] | None = None) -> None:
     calibration = manifest["gripper_normalization"]
     guard = _load_guard(args.guard_config)
     guard_signature = None
+    gripper_config = load_binary_gripper_config(args.binary_gripper_config)
+    gripper_config.validate_calibration(calibration["raw_meters_min"], calibration["raw_meters_max"])
+    gripper_signature = None
     policy = _load_policy(args.checkpoint, args.device)
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large", local_files_only=True)
@@ -213,8 +261,17 @@ def main(argv: list[str] | None = None) -> None:
                     gripper_max_m=calibration["raw_meters_max"],
                 )
                 batch = _make_batch(observation.global_rgb, observation.wrist_rgb, proprio8, tokens, args.device)
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.device.startswith("cuda")):
-                    predicted = policy.predict_action_chunk(batch)[0, 0].detach().float().cpu().numpy()
+                predicted = _predict_action_with_cudnn_fallback(policy, batch, args.device)
+                gripper_stat = args.binary_gripper_config.stat()
+                current_gripper_signature = (gripper_stat.st_ino, gripper_stat.st_mtime_ns, gripper_stat.st_size)
+                if current_gripper_signature != gripper_signature:
+                    gripper_config = load_binary_gripper_config(args.binary_gripper_config)
+                    gripper_config.validate_calibration(calibration["raw_meters_min"], calibration["raw_meters_max"])
+                    gripper_signature = current_gripper_signature
+                    print("Gripper close threshold loaded: " + json.dumps(gripper_config.as_dict()), flush=True)
+                guarded_action, predicted_gripper_m, gripper_target_m = _binary_gripper_action(
+                    predicted, calibration["raw_meters_min"], calibration["raw_meters_max"], gripper_config
+                )
                 inference_completed_at = time.monotonic()
                 guard_stat = Path(args.guard_config).stat()
                 signature = (guard_stat.st_ino, guard_stat.st_mtime_ns, guard_stat.st_size)
@@ -223,7 +280,7 @@ def main(argv: list[str] | None = None) -> None:
                     guard_signature = signature
                     print("Action guard limits loaded: " + json.dumps(json.loads(Path(args.guard_config).read_text())), flush=True)
                 decision = guard.check(
-                    predicted_action20=predicted,
+                    predicted_action20=guarded_action,
                     current_active10=current_active10,
                     # These are local acquisition ages, not camera-driver/SDK source timestamps.
                     camera_age_s=sampled_at - started,
@@ -302,6 +359,10 @@ def main(argv: list[str] | None = None) -> None:
                     "guard_allowed": decision.allowed,
                     "alerts": [alert.__dict__ for alert in decision.alerts],
                     "predicted_action20": predicted.tolist(),
+                    "guarded_action20": guarded_action.tolist(),
+                    "predicted_gripper_mm": predicted_gripper_m * 1000 if predicted_gripper_m is not None else None,
+                    "gripper_target_mm": gripper_target_m * 1000 if gripper_target_m is not None else None,
+                    "gripper_mapping_mm": gripper_config.as_dict(),
                     "current_active10": current_active10.tolist(),
                 }
                 # Absolute 20 Hz schedule, skipping missed slots instead of bursting.

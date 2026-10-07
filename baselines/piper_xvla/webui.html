@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Piper X-VLA · Operator Console</title>
+<title>Piper · Operator Console</title>
 <style>
   :root {
     color-scheme: dark;
@@ -27,7 +27,7 @@
   .pill b { color:var(--fg); font-weight:650; }
   .dot { width:7px; height:7px; border-radius:50%; background:#74818e; }
   .dot.ok { background:var(--ok); box-shadow:0 0 9px #63c98a66; } .dot.warn { background:var(--warn); } .dot.err { background:var(--err); }
-  main { width:min(1720px,100%); margin:0 auto; padding:16px clamp(12px,2vw,28px) 32px; display:grid; grid-template-columns:minmax(280px,350px) minmax(0,1fr) minmax(0,1fr); grid-template-areas:"status cameras cameras" "arm collect xvla" "master-slave master-slave master-slave" "manual dataset dataset" "settings detail detail" "settings video video"; gap:12px; align-items:start; }
+  main { width:min(1720px,100%); margin:0 auto; padding:16px clamp(12px,2vw,28px) 32px; display:grid; grid-template-columns:minmax(280px,350px) minmax(0,1fr) minmax(0,1fr); grid-template-areas:"status cameras cameras" "arm collect xvla" "align align align" "master-slave master-slave master-slave" "manual dataset dataset" "settings detail detail" "settings video video"; gap:12px; align-items:start; }
   .card { min-width:0; padding:14px; background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); box-shadow:var(--shadow); }
   .card-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
   .card-head .spacer { flex:1; }
@@ -40,6 +40,8 @@
   .status-card.is-floating .status-wide { grid-column:1/-1; }
   #btn-send-xvla.holding { color:#fff; background:#8d3238; border-color:var(--err); box-shadow:0 0 0 3px #f2767630; }
   #btn-send-xvla { touch-action:none; user-select:none; }
+  #btn-send-align { touch-action:none; user-select:none; }
+  #btn-send-align.active { color:#fff; background:#8d3238; border-color:var(--err); box-shadow:0 0 0 3px #f2767630; }
   .status-output { margin-top:9px; border-top:1px solid var(--border); }
   .status-output > summary { padding:8px 1px 2px; color:var(--muted); cursor:pointer; font-size:11px; font-weight:650; }
   .status-output .log { height:96px; margin-top:6px; }
@@ -47,6 +49,10 @@
   .arm-card { grid-area:arm; }
   .collect-card { grid-area:collect; }
   .xvla-card { grid-area:xvla; }
+  .align-card { grid-area:align; }
+  .align-settings { display:grid; grid-template-columns:repeat(auto-fit,minmax(132px,1fr)); gap:7px; margin:9px 0; }
+  .align-settings label { color:var(--muted); font-size:11px; }
+  .align-settings input { display:block; width:100%; margin-top:3px; }
   .master-slave-card { grid-area:master-slave; }
   .manual-card { grid-area:manual; }
   .settings-card { grid-area:settings; }
@@ -117,14 +123,14 @@
   input[type=range] { width:100%; accent-color:var(--accent); cursor:pointer; }
   .gripper-control { display:grid; grid-template-columns:minmax(70px,1fr) 64px; gap:6px; align-items:center; }
   .danger-action { min-width:84px; min-height:38px; font-weight:800; letter-spacing:.02em; }
-  @media (max-width:1120px) { main { grid-template-columns:minmax(260px,320px) minmax(0,1fr); grid-template-areas:"status cameras" "arm collect" "master-slave master-slave" "manual xvla" "settings dataset" "settings detail" "settings video"; } }
-  @media (max-width:760px) { header { position:static; align-items:flex-start; flex-wrap:wrap; } .brand { min-width:0; } .pills { margin-left:0; order:3; width:100%; } main { grid-template-columns:minmax(0,1fr); grid-template-areas:"status" "cameras" "arm" "collect" "xvla" "master-slave" "manual" "dataset" "detail" "video" "settings"; padding:10px; gap:9px; } .grid2,.joint-controls { grid-template-columns:1fr; } .cam-grid { gap:6px; } .card { padding:11px; } .status-card { position:static; } }
+  @media (max-width:1120px) { main { grid-template-columns:minmax(260px,320px) minmax(0,1fr); grid-template-areas:"status cameras" "arm collect" "manual xvla" "align align" "master-slave master-slave" "settings dataset" "settings detail" "settings video"; } }
+  @media (max-width:760px) { header { position:static; align-items:flex-start; flex-wrap:wrap; } .brand { min-width:0; } .pills { margin-left:0; order:3; width:100%; } main { grid-template-columns:minmax(0,1fr); grid-template-areas:"status" "cameras" "arm" "collect" "xvla" "align" "master-slave" "manual" "dataset" "detail" "video" "settings"; padding:10px; gap:9px; } .grid2,.joint-controls { grid-template-columns:1fr; } .cam-grid { gap:6px; } .card { padding:11px; } .status-card { position:static; } }
 </style>
 </head>
 <body>
 <header>
   <div class="brand">
-    <div class="eyebrow">PIPER · X-VLA</div>
+    <div class="eyebrow">PIPER · POLICY CONTROL</div>
     <h1>Operator console</h1>
     <div class="sub" id="conn-sub">connecting…</div>
   </div>
@@ -240,11 +246,24 @@
     <div class="kv"><span class="k">Image recording</span><b id="xvla-recording">Off</b></div>
     <div class="muted" id="xvla-recording-path" style="overflow-wrap:anywhere"></div>
     <div class="kv"><span class="k">Predicted pose</span><b id="xvla-predicted">—</b></div>
-    <div class="kv"><span class="k">Predicted gripper</span><b id="xvla-predicted-gripper">—</b></div>
+    <div class="kv"><span class="k">Gripper raw → target</span><b id="xvla-predicted-gripper">—</b></div>
     <div class="kv"><span class="k">Measured pose</span><b id="xvla-measured">—</b></div>
     <div class="row" style="margin-top:9px"><button id="btn-send-xvla" class="warn" disabled onpointerdown="startXvlaHold(event)" onpointerup="stopXvlaHold('released')" onpointercancel="stopXvlaHold('cancelled')" onlostpointercapture="stopXvlaHold('released')" onkeydown="startXvlaKeyHold(event)" onkeyup="stopXvlaHold('released')">Hold to send controls</button><span class="badge" id="xvla-hold-status">READY</span></div>
     <p class="muted" style="margin-top:6px">Requires continuous inference and Manual Control ON. Release, lose focus, or hide this page to revoke the short control lease.</p>
     <div class="muted" id="xvla-note" style="margin-top:6px"></div>
+    <details style="margin-top:10px">
+      <summary>Gripper close threshold</summary>
+      <form id="xvla-gripper-form" onsubmit="event.preventDefault();saveXvlaGripper()" oninput="updateXvlaGripperApply()" style="margin-top:9px">
+        <div class="row">
+          <label class="muted">Switch at (mm)<input id="xvla-gripper-threshold" type="number" min="-70" max="70" step="any" required style="width:100%"></label>
+          <span class="muted">Below switch → 0.0 mm<br>At or above switch → model value</span>
+        </div>
+        <div class="row" style="margin-top:9px"><button id="xvla-gripper-apply" class="primary" type="submit" disabled>Apply mapping</button><button type="button" onclick="loadXvlaGripper()">Reload saved</button></div>
+        <p class="muted" style="margin-top:6px">Applying stops held control and updates running inference.</p>
+        <div class="muted" id="xvla-gripper-range"></div>
+        <div class="muted" id="xvla-gripper-note" aria-live="polite"></div>
+      </form>
+    </details>
     <details style="margin-top:10px">
       <summary>Guard limits</summary>
       <form id="xvla-guard-form" onsubmit="event.preventDefault();saveXvlaGuard()" style="margin-top:9px">
@@ -256,6 +275,29 @@
         <div class="muted" id="xvla-guard-note" aria-live="polite"></div>
       </form>
     </details>
+  </section>
+
+  <section class="card align-card">
+    <div class="card-head"><h2>ALIGN intention inference</h2><span class="spacer"></span><span class="badge warn">Operator-gated</span></div>
+    <p class="muted">Two cameras and measured 7D state feed the ALIGN checkpoint. Predictions run continuously at the selected rate; press once to start guarded Cartesian and gripper control at up to 20 Hz, and press again to stop.</p>
+    <div class="row" style="margin-top:9px"><label class="muted" for="align-checkpoint">Checkpoint</label><input id="align-checkpoint" type="text" value="/home/ucluser/ALIGN/checkpoints/piper_replay_new/run_2/intention_best.pt" style="flex:1;min-width:220px" spellcheck="false"></div>
+    <div class="align-settings" id="align-settings">
+      <label title="Model predictions per second; slower inference may cause the stale-camera guard to stop control">Inference Hz<input id="align-inference-hz" type="number" value="10" min="1" max="20" step="0.5"></label>
+      <label title="Number of future actions consumed once from each prediction; checkpoint maximum is 10">Action horizon<input id="align-action-horizon" type="number" value="2" min="1" max="10" step="1"></label>
+      <label title="Independent flow samples averaged per prediction; more samples cost inference time">Ensemble samples<input id="align-ensemble-samples" type="number" value="1" min="1" max="8" step="1"></label>
+      <label title="Multiplier for predicted XYZ displacement">Position scale<input id="align-position-scale" type="number" value="1" min="0" max="2" step="0.1"></label>
+      <label title="Multiplier for predicted Euler delta in radians">Rotation scale<input id="align-rotation-scale" type="number" value="1" min="0" max="2" step="0.1"></label>
+      <label title="Blend from measured gripper toward predicted target; 0 holds measured, 1 uses prediction">Gripper scale<input id="align-gripper-scale" type="number" value="1" min="0" max="2" step="0.1"></label>
+      <label title="Predicted gripper targets below this value close to 0 mm; above it keep the model value">Close below (mm)<input id="align-gripper-close-threshold-mm" type="number" value="3" min="-70" max="70" step="0.5"></label>
+    </div>
+    <div class="row"><button class="primary" id="btn-run-align" onclick="startAlign()">Run inference</button><button class="danger" id="btn-stop-align" onclick="stopAlign()" disabled>Stop</button><label class="muted" for="align-control-speed">Control speed %</label><input id="align-control-speed" type="number" value="5" min="1" max="10" step="1" style="width:58px"><button class="warn" id="btn-send-align" disabled onclick="toggleAlignControl()" aria-pressed="false">Press to start control</button><span class="badge" id="align-hold-status">READY</span></div>
+    <p class="muted" style="margin-top:6px">Manual Control must be ON. The same configurable guard limits in the X-VLA panel apply here. A brief stale camera prediction pauses motion; longer staleness stops control. Press again, stop inference, lose focus, or hide the page to stop.</p>
+    <div class="muted" id="align-control-note" aria-live="polite"></div>
+    <div class="kv"><span class="k">Status / guard</span><b id="align-status">idle</b></div>
+    <div class="kv"><span class="k">Prediction / control</span><b id="align-rates">—</b></div>
+    <div class="kv"><span class="k">Raw 7D action</span><b id="align-action" style="text-align:right;overflow-wrap:anywhere">—</b></div>
+    <div class="kv"><span class="k">Target / gripper</span><b id="align-target" style="text-align:right;overflow-wrap:anywhere">—</b></div>
+    <div class="muted" id="align-note" aria-live="polite" style="margin-top:7px"></div>
   </section>
 
   <section class="card master-slave-card" id="master-slave-card">
@@ -403,7 +445,8 @@ const API = "";
 let statusTimer=null, camTimer=null, collectTimer=null, masterSlaveTimer=null;
 let currentManualPose=null, currentJoints=null, latestXvla=null, manualControlEnabled=false, jogHeld=null, jogBusy=false, jogTimer=null;
 let xvlaHoldActive=false, xvlaHoldBusy=false, xvlaHoldTimer=null, xvlaHoldPollTimer=null, xvlaHoldNewSession=false, xvlaHoldSession=null;
-let xvlaGuardLoaded=false;
+let alignControlRequested=false, alignControlBusy=false, alignControlTimer=null, alignControlPollTimer=null, alignControlNewSession=false, alignControlSession=null, alignControlStartedMs=0, alignInferenceStatus='idle', latestAlign=null;
+let xvlaGuardLoaded=false, xvlaGripperLoaded=false;
 let msSessionId=null;
 let jointCalibration=null;
 let jointEngageEnabled=false, jointEngageBusy=false, jointEngagePending=false, jointEngageTimer=null;
@@ -650,7 +693,8 @@ async function pollXvla(){
     document.getElementById('xvla-predicted').textContent=formatPose(latest&&latest.predicted_pose);
     const normalized=latest&&latest.predicted_pose&&latest.predicted_pose.gripper_normalized&&latest.predicted_pose.gripper_normalized[0];
     const gripperM=gripperNormalizedToMeters(normalized);
-    document.getElementById('xvla-predicted-gripper').textContent=gripperM===null?'—':`${(gripperM*1000).toFixed(1)} mm (normalized ${normalized.toFixed(3)})`;
+    const rawGripperMm=latest&&latest.predicted_gripper_mm, targetGripperMm=latest&&latest.gripper_target_mm;
+    document.getElementById('xvla-predicted-gripper').textContent=Number.isFinite(rawGripperMm)&&Number.isFinite(targetGripperMm)?`${rawGripperMm.toFixed(1)} → ${targetGripperMm.toFixed(1)} mm`:(gripperM===null?'—':`${(gripperM*1000).toFixed(1)} mm (normalized ${normalized.toFixed(3)})`);
     document.getElementById('xvla-measured').textContent=formatPose(latest&&latest.measured_pose);
     document.getElementById('xvla-note').textContent=latest&&latest.alerts.length?`guard alerts: ${(latest.alert_messages||latest.alerts).join('; ')}`:(!fresh&&s.status==='running'?'waiting for a fresh inference result':(s.message||''));
   }catch(e){ document.getElementById('xvla-note').textContent='X-VLA status error: '+e.message; }
@@ -684,6 +728,35 @@ async function loadXvlaCheckpoints(){
 }
 async function startXvlaDiagnostic(){ return report('start X-VLA camera-only diagnostic',async()=>{ const frames=+document.getElementById('xvla-frames').value; const record_images=document.getElementById('xvla-record-images').checked; const checkpoint=document.getElementById('xvla-checkpoint-path').value.trim()||document.getElementById('xvla-checkpoint').value; const r=await jp('/api/xvla/diagnostic',{frames,record_images,checkpoint}); log(`X-VLA diagnostic started with ${r.checkpoint}: ${r.frames===0?'continuous':r.frames+' frames'}; hold the send button to stream guarded actions`); if(r.recording_dir) log(`Recording inference images: ${r.recording_dir}`); await pollXvla(); return r; }); }
 async function stopXvlaDiagnostic(){ return report('stop X-VLA camera-only diagnostic',async()=>{ const r=await jp('/api/xvla/stop',{}); log('X-VLA camera-only diagnostic stop requested'); await pollXvla(); return r; }); }
+function updateXvlaGripperApply(){
+  document.getElementById('xvla-gripper-apply').disabled=!xvlaGripperLoaded||!document.getElementById('xvla-gripper-form').checkValidity();
+  if(xvlaGripperLoaded) document.getElementById('xvla-gripper-note').textContent='Unsaved changes';
+}
+async function loadXvlaGripper(){
+  try{
+    const {mapping,calibration}=await j('/api/xvla/gripper');
+    document.getElementById('xvla-gripper-threshold').value=mapping.threshold_mm;
+    const minMm=Math.max(-70,calibration.raw_meters_min*1000), maxMm=Math.min(70,calibration.raw_meters_max*1000);
+    document.getElementById('xvla-gripper-threshold').min=minMm;
+    document.getElementById('xvla-gripper-threshold').max=maxMm;
+    document.getElementById('xvla-gripper-range').textContent=`Switch range: ${minMm.toFixed(1)}–${maxMm.toFixed(1)} mm. Raw values remain subject to the action guard.`;
+    xvlaGripperLoaded=true;
+    updateXvlaGripperApply();
+    document.getElementById('xvla-gripper-note').textContent='Loaded saved mapping';
+  }catch(e){document.getElementById('xvla-gripper-note').textContent='Could not load gripper mapping: '+e.message;}
+}
+async function saveXvlaGripper(){
+  const form=document.getElementById('xvla-gripper-form');
+  updateXvlaGripperApply();
+  if(!form.reportValidity()) return;
+  const mapping={threshold_mm:Number(document.getElementById('xvla-gripper-threshold').value)};
+  try{
+    stopXvlaHold('stopped to apply gripper mapping');
+    const r=await j('/api/xvla/gripper',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(mapping)});
+    document.getElementById('xvla-gripper-note').textContent=r.message;
+    log(`X-VLA gripper close threshold applied: ${mapping.threshold_mm} mm`);
+  }catch(e){document.getElementById('xvla-gripper-note').textContent='Gripper mapping not saved: '+e.message;}
+}
 const XVLA_GUARD_FIELDS=[
   ['max_position_step_m','Position step (mm)',1000,0.1],
   ['max_rotation_step_deg','Rotation step (degrees)',1,0.1],
@@ -816,6 +889,140 @@ window.addEventListener('blur',()=>stopXvlaHold('stopped when the window lost fo
 document.addEventListener('pointerup',()=>stopXvlaHold('released'));
 document.addEventListener('visibilitychange',()=>{if(document.hidden) stopXvlaHold('stopped when the page was hidden');});
 
+// ---- ALIGN inference ----------------------------------------------------
+function alignSettings(){
+  const names=['inference_hz','action_horizon','ensemble_samples','position_scale','rotation_scale','gripper_scale','gripper_close_threshold_mm'];
+  const values={};
+  for(const name of names){
+    const input=document.getElementById('align-'+name.replaceAll('_','-'));
+    if(!input.reportValidity()) throw new Error(`${name} is outside its allowed range`);
+    values[name]=Number(input.value);
+    if(!Number.isFinite(values[name])) throw new Error(`${name} must be a finite number`);
+  }
+  if(!Number.isInteger(values.action_horizon)||!Number.isInteger(values.ensemble_samples))throw new Error('Horizon and ensemble samples must be integers');
+  return values;
+}
+async function startAlign(){
+  try{
+    const checkpoint=document.getElementById('align-checkpoint').value.trim();
+    if(!checkpoint)throw new Error('Choose an ALIGN checkpoint');
+    const settings=alignSettings();
+    latestAlign=null;
+    const s=await jp('/api/align/start',{checkpoint,settings});
+    document.getElementById('align-note').textContent=s.message||'Loading ALIGN checkpoint';
+    log(`ALIGN inference starting: ${checkpoint}`);
+    await pollAlign();
+  }catch(e){document.getElementById('align-note').textContent='Start failed: '+e.message;log('ALIGN start failed: '+e.message);}
+}
+async function stopAlign(){
+  stopAlignControl('inference stopped');
+  try{await jp('/api/align/stop',{});await pollAlign();}catch(e){document.getElementById('align-note').textContent='Stop failed: '+e.message;}
+}
+function freshAlign(sample){return !!(sample&&Number.isFinite(sample.prediction_age_s)&&Number.isFinite(sample.received_ms)&&Number.isFinite(sample.max_camera_age_s)&&sample.prediction_age_s*1000+performance.now()-sample.received_ms<=sample.max_camera_age_s*1000);}
+async function pollAlign(){
+  try{
+    const s=await j('/api/align/status');
+    alignInferenceStatus=s.status;
+    for(const line of s.log_lines||[])log(`[ALIGN] ${line}`);
+    const busy=['running','stopping'].includes(s.status);
+    document.getElementById('btn-run-align').disabled=busy;
+    document.getElementById('btn-stop-align').disabled=!busy;
+    document.getElementById('align-checkpoint').disabled=busy;
+    document.querySelectorAll('#align-settings input').forEach(input=>input.disabled=busy);
+    const row=s.latest;
+    if(!row||!latestAlign||latestAlign.inference_status!=='running'||row.frame>=latestAlign.frame||s.status!=='running'){
+      latestAlign=row?{...row,inference_status:s.status,max_camera_age_s:s.max_camera_age_s,received_ms:performance.now()}:null;
+    }
+    document.getElementById('btn-send-align').disabled=!alignControlRequested&&(s.status!=='running'||!manualControlEnabled);
+    if(alignControlRequested&&(s.status!=='running'||!manualControlEnabled))stopAlignControl('inference stopped or manual control turned off');
+    if(alignControlRequested&&!alignControlNewSession&&row){
+      if(row.control_paused){
+        document.getElementById('align-hold-status').textContent='PAUSED';
+        document.getElementById('align-control-note').textContent='Camera prediction is stale; control is holding the measured pose until a fresh prediction arrives.';
+      }else if(row.control_sent||row.control_active){
+        document.getElementById('align-hold-status').textContent='SENDING';
+        document.getElementById('align-control-note').textContent='Control active. Press again to stop.';
+      }
+    }
+    const alerts=(row?.alerts||[]).map(item=>`${item.severity||'WARN'} ${item.code}: ${item.message}`);
+    document.getElementById('align-status').textContent=`${s.status}${row?row.guard_allowed?' · guard OK':' · guard blocked':''}`;
+    document.getElementById('align-rates').textContent=row?`${Number.isFinite(row.inference_hz_actual)?row.inference_hz_actual.toFixed(1):'—'} / ${s.settings?.inference_hz||'—'} Hz inference · ${Number.isFinite(row.inference_ms)?row.inference_ms.toFixed(0):'—'} ms · ${row.control_hz||0} / 20 Hz control · generation ${row.generation||0}`:'—';
+    document.getElementById('align-action').textContent=Array.isArray(row?.raw_action7)?row.raw_action7.map(v=>Number(v).toFixed(3)).join(', '):'—';
+    const pose=row?.target_pose;
+    const gripperText=row?.gripper_clamped?`${Number(row.gripper_raw_mm).toFixed(1)} → ${Number(row.gripper_target_mm).toFixed(1)} mm (capped)`:`${Number(row?.gripper_target_mm).toFixed(1)} mm`;
+    document.getElementById('align-target').textContent=pose?`XYZ ${pose.xyz_m.map(v=>v.toFixed(3)).join(', ')} m · Euler ${pose.euler_xyz_deg.map(v=>v.toFixed(1)).join(', ')}° · grip ${gripperText}`:'—';
+    document.getElementById('align-note').textContent=alerts.length?alerts.join(' · '):(s.message||'');
+  }catch(e){document.getElementById('align-note').textContent='Status error: '+e.message;}
+}
+function toggleAlignControl(){
+  if(alignControlRequested){stopAlignControl('stopped by operator');return;}
+  if(alignInferenceStatus!=='running'||!manualControlEnabled)return;
+  if(!document.getElementById('align-control-speed').reportValidity())return;
+  alignControlRequested=true;
+  alignControlNewSession=true;
+  alignControlStartedMs=performance.now();
+  alignControlSession=(window.crypto&&crypto.randomUUID)?crypto.randomUUID():`${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const button=document.getElementById('btn-send-align');
+  button.classList.add('active');button.textContent='Press to stop control';button.setAttribute('aria-pressed','true');
+  document.getElementById('align-hold-status').textContent='STARTING';
+  document.getElementById('align-control-note').textContent='Waiting for an approved prediction…';
+  alignControlPollTimer=setInterval(pollAlign,120);
+  tickAlignControl();
+}
+function stopAlignControl(reason='stopped by operator'){
+  if(!alignControlRequested)return;
+  alignControlRequested=false;
+  if(alignControlTimer)clearTimeout(alignControlTimer);
+  if(alignControlPollTimer)clearInterval(alignControlPollTimer);
+  alignControlTimer=alignControlPollTimer=null;
+  const button=document.getElementById('btn-send-align');
+  button.classList.remove('active');button.textContent='Press to start control';button.setAttribute('aria-pressed','false');
+  document.getElementById('align-hold-status').textContent='STOPPED';
+  document.getElementById('align-control-note').textContent=`Control stopped: ${reason}`;
+  const session=alignControlSession;alignControlSession=null;
+  alignControlNewSession=false;
+  if(document.hidden||reason==='page closing')fetch(API+'/api/align/control/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:session}),keepalive:true}).catch(()=>{});
+  else jp('/api/align/control/stop',{session_id:session}).catch(()=>{});
+  log(`ALIGN control ${reason}`);
+}
+async function tickAlignControl(){
+  if(!alignControlRequested||alignControlBusy)return;
+  if(alignInferenceStatus!=='running'||!manualControlEnabled){
+    stopAlignControl('inference stopped or manual control turned off');return;
+  }
+  if(alignControlNewSession){
+    if(performance.now()-alignControlStartedMs>5000){stopAlignControl('no approved prediction within 5 seconds');return;}
+    if(!latestAlign||!latestAlign.guard_allowed||!freshAlign(latestAlign)){
+      alignControlTimer=setTimeout(tickAlignControl,100);return;
+    }
+  }
+  alignControlBusy=true;
+  const session=alignControlSession;
+  const starting=alignControlNewSession;
+  try{
+    const speed=Number(document.getElementById('align-control-speed').value);
+    if(!Number.isInteger(speed)||speed<1||speed>10)throw new Error('control speed must be an integer from 1 to 10%');
+    await jp('/api/align/control/heartbeat',{speed_percent:speed,new_session:starting,session_id:session});
+    if(alignControlRequested&&alignControlSession===session){
+      alignControlNewSession=false;
+      if(starting){
+        document.getElementById('align-hold-status').textContent='ARMED';
+        document.getElementById('align-control-note').textContent='Control lease active; waiting for the 20 Hz sender.';
+      }
+    }
+  }
+  catch(e){
+    if(alignControlRequested&&alignControlSession===session){
+      if(!alignControlNewSession||!e.message.startsWith('ALIGN prediction is stale or rejected by the action guard'))stopAlignControl(`lease error: ${e.message}`);
+    }
+  }
+  finally{alignControlBusy=false;}
+  if(alignControlRequested)alignControlTimer=setTimeout(tickAlignControl,100);
+}
+window.addEventListener('blur',()=>stopAlignControl('window lost focus'));
+document.addEventListener('visibilitychange',()=>{if(document.hidden)stopAlignControl('page hidden');});
+window.addEventListener('pagehide',()=>stopAlignControl('page closing'));
+
 // ---- persistent runtime settings ----------------------------------------
 function cameraForm(role, c){
   const p='cfg-'+role+'-';
@@ -857,6 +1064,7 @@ async function pollCameras(){
   }catch(e){
     if(String(e.message).includes('suspended while collection')) document.getElementById('cam-note').textContent='Preview suspended: collection owns both cameras.';
     else if(String(e.message).includes('X-VLA diagnostic owns')) document.getElementById('cam-note').textContent='Preview suspended: X-VLA diagnostic owns both cameras.';
+    else if(String(e.message).includes('ALIGN inference owns')) document.getElementById('cam-note').textContent='Preview suspended: ALIGN inference owns both cameras.';
     else document.getElementById('cam-note').textContent='Camera preview: '+e.message;
   }
 }
@@ -1128,7 +1336,7 @@ async function migrateVideos(){
 document.getElementById('player').addEventListener('error',()=>{ document.getElementById('video-note').textContent='The browser could not play this video. Convert it to H.264, then refresh the list.'; });
 
 // ---- boot ---------------------------------------------------------------
-function boot(){ initMasterSlaveOffsets(); loadMasterSlaveCalibration(); loadMasterSlaveDevices(); pollMasterSlave(); masterSlaveTimer=setInterval(pollMasterSlave,500); setInterval(pollDeviceStatus,1000); pollStatus(); pollXvla(); loadXvlaCheckpoints(); loadXvlaGuard(); camTimer=setInterval(pollCameras,1500); statusTimer=setInterval(pollStatus,100); setInterval(pollXvla,1000); loadSettings(); loadDataset(); loadVideos(); loadMarks(); startCollectPoll(); pollCameras(); }
+function boot(){ initMasterSlaveOffsets(); loadMasterSlaveCalibration(); loadMasterSlaveDevices(); pollMasterSlave(); masterSlaveTimer=setInterval(pollMasterSlave,500); setInterval(pollDeviceStatus,1000); pollStatus(); pollXvla(); pollAlign(); loadXvlaCheckpoints(); loadXvlaGripper(); loadXvlaGuard(); camTimer=setInterval(pollCameras,1500); statusTimer=setInterval(pollStatus,100); setInterval(pollXvla,1000); setInterval(pollAlign,500); loadSettings(); loadDataset(); loadVideos(); loadMarks(); startCollectPoll(); pollCameras(); }
 window.addEventListener('pagehide',()=>{if(['starting','running'].includes(document.getElementById('ms-state').textContent))fetch(API+'/api/master-slave/stop',{method:'POST',keepalive:true}).catch(()=>{});});
 let floatingStatusFrame=null;
 function updateFloatingStatus(){

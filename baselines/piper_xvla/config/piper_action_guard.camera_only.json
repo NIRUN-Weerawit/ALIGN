@@ -1,16 +1,16 @@
 {
   "workspace_min_m": [
-    -0.05,
-    -0.01,
-    0.069
+    -0.1,
+    -0.1,
+    0.03
   ],
   "workspace_max_m": [
-    0.37,
-    0.33,
+    0.5,
+    0.44,
     0.5
   ],
-  "max_position_step_m": 0.15,
-  "max_rotation_step_deg": 35.0,
+  "max_position_step_m": 0.25,
+  "max_rotation_step_deg": 50.0,
   "max_gripper_step_normalized": 1.0,
   "max_inactive_arm_l2": 0.05,
   "max_camera_age_s": 0.25,

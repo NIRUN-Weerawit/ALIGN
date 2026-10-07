@@ -1,7 +1,9 @@
 import json
+import torch
 
 from piper_xvla.train_xvla_piper import (
     apply_xvla_finetuning_config,
+    build_xvla_optimizer,
     configure_cuda_attention,
     load_config,
     load_xvla_config,
@@ -92,3 +94,23 @@ def test_serialize_policy_config_falls_back_to_dataclass_fields_when_to_dict_is_
         chunk_size: int = 1
 
     assert serialize_policy_config(LegacyXVLAConfig()) == {"action_mode": "ee6d", "chunk_size": 1}
+
+
+def test_fused_xvla_optimizer_keeps_preset_parameter_groups_and_learning_rates():
+    from lerobot.optim.optimizers import XVLAAdamWConfig
+
+    parameters = {
+        "model.vlm.weight": torch.nn.Parameter(torch.ones(1)),
+        "model.soft_prompt.weight": torch.nn.Parameter(torch.ones(1)),
+        "model.head.weight": torch.nn.Parameter(torch.ones(1)),
+    }
+    preset = XVLAAdamWConfig(lr=1e-4, soft_prompt_lr_scale=0.5)
+
+    optimizer = build_xvla_optimizer(preset, parameters, "cuda:0")
+
+    assert isinstance(optimizer, torch.optim.AdamW)
+    assert [(group["name"], group["lr"]) for group in optimizer.param_groups] == [
+        ("vlm", 1e-5), ("soft_prompts", 5e-5), ("other", 1e-4),
+    ]
+    assert all(group["fused"] is True for group in optimizer.param_groups)
+    assert build_xvla_optimizer(preset, parameters, "cpu").defaults["fused"] is None

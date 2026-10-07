@@ -105,6 +105,8 @@ def test_webui_xvla_accepts_manual_checkpoint_when_scan_is_empty(tmp_path, monke
 
 
 def test_webui_xvla_worker_passes_selected_checkpoint_to_inference(tmp_path, monkeypatch):
+    import os
+    import sysconfig
     import piper_xvla.webui as webui
 
     checkpoint = tmp_path / "chosen" / "best.pt"
@@ -112,21 +114,27 @@ def test_webui_xvla_worker_passes_selected_checkpoint_to_inference(tmp_path, mon
     checkpoint.write_bytes(b"test")
     output = tmp_path / "diagnostic.jsonl"
     commands = []
+    environments = []
 
     class FakeProcess:
         returncode = 0
 
         def __init__(self, command, **kwargs):
             commands.append(command)
+            environments.append(kwargs["env"])
 
         def wait(self):
             output.write_text('{"guard_allowed": true, "alerts": []}\n')
 
     monkeypatch.setattr(webui.subprocess, "Popen", FakeProcess)
+    monkeypatch.setenv("PYTHONNOUSERSITE", "1")
     ui = PiperWebUI(can="can0", dry_run=True, data_dir=tmp_path / "data")
     ui._xvla_worker(1, output, None, checkpoint)
 
     assert commands[0][commands[0].index("--checkpoint") + 1] == str(checkpoint)
+    assert commands[0][commands[0].index("--binary-gripper-config") + 1] == str(webui.XVLA_GRIPPER_CONFIG)
+    assert "PYTHONNOUSERSITE" not in environments[0]
+    assert environments[0]["PYTHONPATH"].split(os.pathsep) == [sysconfig.get_paths()["purelib"], str(webui.MODULE_DIR.parent)]
     assert ui.xvla_status()["status"] == "done"
 
 
@@ -146,6 +154,52 @@ def test_webui_xvla_status_exposes_latest_predicted_and_measured_pose(tmp_path):
     assert status.json()["latest"]["predicted_pose"]["xyz_m"] == [0.1, 0.2, 0.3]
     assert status.json()["latest"]["measured_pose"]["xyz_m"] == [0.01, 0.02, 0.03]
     assert status.json()["latest"]["guard_allowed"] is False
+
+
+def test_webui_xvla_status_shows_raw_gripper_target(tmp_path):
+    import json
+
+    ui = PiperWebUI(can="can0", dry_run=True, data_dir=tmp_path / "data")
+    output = tmp_path / "binary_gripper.jsonl"
+    action = [0.1, 0.2, 0.3, 1, 0, 0, 1, 0, 0, 0.7] + [0] * 10
+    guarded = action.copy()
+    guarded[9] = (0.0208 + 0.0424) / (0.0479 + 0.0424)
+    output.write_text(json.dumps({
+        "guard_allowed": True, "predicted_action20": action,
+        "guarded_action20": guarded, "predicted_gripper_mm": 20.8,
+        "gripper_target_mm": 20.8, "alerts": [],
+    }) + "\n")
+    ui._xvla_state.update(status="running", output=str(output))
+
+    latest = ui.xvla_status()["latest"]
+    assert latest["predicted_gripper_mm"] == 20.8
+    assert latest["gripper_target_mm"] == 20.8
+    assert latest["predicted_pose"]["gripper_normalized"] == [round(guarded[9], 4)]
+
+
+def test_webui_gripper_mapping_is_saved_and_rejects_invalid_values(tmp_path, monkeypatch):
+    import json
+    import piper_xvla.webui as webui
+
+    path = tmp_path / "gripper.json"
+    path.write_text(json.dumps({"close_mm": 0, "threshold_mm": 20, "open_mm": 45}))
+    monkeypatch.setattr(webui, "XVLA_GRIPPER_CONFIG", path)
+    ui = PiperWebUI(can="can0", dry_run=True, data_dir=tmp_path / "data")
+    routes = {route.path for route in build_app(ui, tmp_path / "data").routes}
+    assert {"/api/xvla/gripper"}.issubset(routes)
+    assert ui.xvla_gripper_config()["threshold_mm"] == 20
+
+    import pytest
+    with pytest.raises(ValueError, match="model calibration"):
+        ui.save_xvla_gripper_config({"threshold_mm": 50})
+    assert json.loads(path.read_text())["open_mm"] == 45
+
+    ui._xvla_control_session = "session"
+    ui._xvla_lease_expires = float("inf")
+    valid = ui.save_xvla_gripper_config({"threshold_mm": 24})
+    assert valid["mapping"] == {"threshold_mm": 24}
+    assert ui.xvla_gripper_config()["threshold_mm"] == 24
+    assert not ui.xvla_control_active()
 
 
 def test_webui_camera_preview_busy_during_xvla_returns_409_not_asgi_trace(tmp_path):
