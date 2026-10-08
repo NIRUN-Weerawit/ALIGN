@@ -212,7 +212,7 @@ def parse_args(argv=None):
     parser.add_argument("--num-intent-tokens", type=int, default=1)
     parser.add_argument("--intent-dim", type=int, default=128)
     parser.add_argument("--memory-bank-len", type=int, default=8)
-    parser.add_argument("--gripper-loss-weight", type=float, default=0.01)
+    parser.add_argument("--gripper-loss-weight", type=float, default=1.0)
     parser.add_argument("--gripper-threshold", type=float, default=0.5)
     parser.add_argument("--cpu-threads", type=int, default=2)
     parser.add_argument("--history-size", type=int, default=1)

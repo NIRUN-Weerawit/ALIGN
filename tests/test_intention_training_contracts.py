@@ -192,6 +192,7 @@ def test_real_trainer_and_validation_ignore_padded_targets(monkeypatch, use_memo
     calls = []
     def loss(target, cond, dim_weights=None, sample_mask=None):
         calls.append(sample_mask.tolist())
+        torch.testing.assert_close(dim_weights, torch.ones(7))
         valid_cond = cond[sample_mask]
         return target[sample_mask].square().mean() + valid_cond.square().mean() * .001
     model.intention_head.loss = loss
@@ -219,8 +220,9 @@ def test_real_trainer_and_validation_ignore_padded_targets(monkeypatch, use_memo
     assert metrics["gripper_genuine_batches"] == 4
 
 
-@pytest.mark.parametrize("commands", [[1., 0., 1.], [1., -1., 1.]])
-def test_rollout_carries_executed_gripper_without_rewriting_history(monkeypatch, commands):
+@pytest.mark.parametrize("commands", [[1., 0., 1.], [0.8, 0.2, 0.9], [0.5, 0.51, 0.1]])
+@pytest.mark.parametrize("action_scale", [1.0, 10.0])
+def test_rollout_carries_executed_gripper_without_rewriting_history(monkeypatch, commands, action_scale):
     import eval.eval_libero_v4_trajectory as evaluator
     monkeypatch.setattr(evaluator, "get_sim_eef_pose", lambda obs: np.zeros(6, np.float32))
     monkeypatch.setattr(evaluator, "get_sim_frame", lambda *args, **kwargs: np.zeros((4, 4, 3), np.uint8))
@@ -228,6 +230,7 @@ def test_rollout_carries_executed_gripper_without_rewriting_history(monkeypatch,
         def reset(self):
             return {}
         def step(self, action):
+            executed.append(float(action[6]))
             return {}, 0.0, False, {}
     class Model:
         head_type = "flow_matching"
@@ -245,11 +248,15 @@ def test_rollout_carries_executed_gripper_without_rewriting_history(monkeypatch,
             action[:, :, 6] = commands[len(self.states) - 1]
             return action
     model = Model()
+    executed = []
     evaluator.run_model_in_sim(Env(), model, torch.device("cpu"), np.zeros((3, 7), np.float32),
                                chunk_size=2, max_steps=3, switch_at=0.0,
-                               use_camera=["wrist_image"], initial_gripper=0.25)
+                               use_camera=["wrist_image"], initial_gripper=0.25, action_scale=action_scale)
     np.testing.assert_array_equal([x[0, :, 6].numpy() for x in model.states],
-                                  [[0.25, 0.25], [0.25, commands[0]], [commands[0], commands[1]]])
+                                  [[0.25, 0.25], [0.25, float(commands[0] > .5)],
+                                   [float(commands[0] > .5), float(commands[1] > .5)]])
+
+    np.testing.assert_array_equal(executed, [1.0 - 2.0 * (command > .5) for command in commands])
 
 
 @pytest.mark.parametrize("head_type", ["transformer", "mamba", "hybrid"])
@@ -263,4 +270,7 @@ def test_future_heads_fail_before_model_download(head_type):
 def test_cli_defaults_to_supported_diffusion_head(monkeypatch):
     from training.train_intention import parse_args
     monkeypatch.setattr("sys.argv", ["train_intention.py", "--data", "sample.h5", "--output-dir", "unused"])
-    assert parse_args().head_type == "diffusion"
+    args = parse_args()
+    assert args.head_type == "diffusion"
+    assert args.gripper_loss_weight == 1.0
+    assert args.gripper_threshold == 0.5

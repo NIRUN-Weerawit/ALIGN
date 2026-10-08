@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 from models.intention_head import DiffusionPolicyHead
+from data.gripper_state import executed_binary_gripper
 
 @pytest.mark.parametrize('steps', [1, 4, 8, 10])
 def test_ddim_oracle_recovers_clean_actions_at_every_step_budget(steps):
@@ -40,6 +41,11 @@ def test_invalid_step_budget_rejected(steps):
     head = DiffusionPolicyHead(cond_dim=4, hidden_dim=8, time_dim=8)
     with pytest.raises(ValueError):
         head.sample(torch.zeros(1,1,4), steps)
+
+@pytest.mark.parametrize('score,command,sim', [(0.2,0,1),(.5,0,1),(.51,1,-1),(.9,1,-1)])
+def test_gripper_feedback_matches_executed_binary_action(score,command,sim):
+    assert executed_binary_gripper(score) == (command,sim)
+
 
 def test_sampling_disables_autocast_for_epsilon_inversion():
     head = DiffusionPolicyHead(cond_dim=4, hidden_dim=8, time_dim=8, chunk_size=8)

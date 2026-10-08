@@ -34,3 +34,13 @@ def carry_gripper_state(last_state, current_pose):
     state = np.asarray(last_state, dtype=np.float32).copy()
     state[:6] = current_pose
     return state
+
+
+def executed_binary_gripper(prediction, threshold=0.5):
+    """Dataset command (0=open, 1=close) and matching simulator polarity.
+
+    Feed the binary command actually executed back into the next observation,
+    rather than the continuous head score or the simulator's +/-1 polarity.
+    """
+    command = float(prediction > threshold)
+    return command, 1.0 - 2.0 * command

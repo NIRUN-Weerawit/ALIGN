@@ -58,7 +58,7 @@ Run `python scripts/run_intention_ablation.py --help` for every argument.
 | Tokens in intention-enabled variants | `--num-intent-tokens` | 1 |
 | Intent embedding width | `--intent-dim` | 128 |
 | Memory capacity | `--memory-bank-len` | 8 |
-| Gripper loss weight | `--gripper-loss-weight` | 0.01 |
+| Gripper loss weight | `--gripper-loss-weight` | 1.0 |
 | Predicted gripper accuracy cutoff | `--gripper-threshold` | 0.5 for binary 0/1 |
 | Validation fraction per task | `--validation-fraction` | 0.1 |
 | Random seed | `--seed` | 42 |
@@ -83,3 +83,19 @@ For a smoke run, add `--epochs 1 --max-steps 1` and use a new output directory.
 For the four-model sequential workflow, leave `--variants` and
 `--worker-variant` unset. Those options are retained for selected-model and
 parallel-worker workflows.
+
+### Sampling, gripper, and saved-head diagnostics
+
+Action chunk length is independent of denoising steps. Diffusion and flow
+validation use the head's default 10 solver steps, matching deployment. Fresh
+diffusion heads use a normalized cosine schedule with a positive terminal
+signal and train on noisy indices 1..10. The denoiser and DDIM inversion use FP32 even under outer BF16 autocast.
+Legacy checkpoints keep their original
+buffers; sampling skips their singular zero-signal endpoint.
+
+New training gives gripper the same loss weight as each motion dimension,
+rather than 0.01. To resume the old 80-epoch experiment, explicitly use
+`--gripper-loss-weight 0.01` so its saved configuration remains consistent.
+For binary LIBERO actions, both validation and simulator execution use cutoff
+0.5. Simulator feedback carries the last **executed binary command** in dataset
+units, while pose action scaling applies to the first six dimensions.

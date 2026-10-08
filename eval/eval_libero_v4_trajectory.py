@@ -61,7 +61,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 
 from data.align_dataset import ALIGNDataset, head_collate
 from eval.eval_intention import load_intention_model
-from data.gripper_state import previous_gripper_commands, carry_gripper_state
+from data.gripper_state import previous_gripper_commands, carry_gripper_state, executed_binary_gripper
 
 # MuJoCo / LIBERO imports (optional — only needed for --use-mujoco)
 try:
@@ -890,7 +890,8 @@ def run_model_in_sim(
             print(f"Step {step}: model re-inferred (buffer size: {len(pending_actions)})")
 
         # 5. Build the final action
-        a_model_scaled = a_model * action_scale
+        a_model_scaled = a_model.copy()
+        a_model_scaled[:6] *= action_scale
 
         if step < switch_step:
             # Phase 1: expert controls, model observes
@@ -910,14 +911,11 @@ def run_model_in_sim(
         if final_action.shape[0] < 7:
             final_action = np.pad(final_action, (0, 7 - final_action.shape[0]))
             final_action[6] = last_state[6]
+        command, simulator_command = executed_binary_gripper(final_action[6])
         last_state = sim_state.copy()
-        last_state[6] = float(final_action[6])
+        last_state[6] = command
+        final_action[6] = simulator_command
 
-        # Gripper:
-        if final_action.shape[0] >= 7:
-            final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
-        else:
-            final_action[6] = -1.0  # fallback: close gripper
 
         if debug:
             print(f"Step {step}: phase={'expert' if step < switch_step else 'model'} "
@@ -1134,10 +1132,10 @@ def main():
                         help="Camera names (default: wrist_image). "
                              "MUST match the cameras used during training "
                              "(e.g. 'image wrist_image' for 2-cam checkpoints).")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Simulator and policy sampling seed (default 42).")
     parser.add_argument("--n-episodes", type=int, default=1,
                         help="Number of episodes to evaluate.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Simulator and policy sampling seed (default 42).")
     parser.add_argument("--val-episodes", type=str, default=None,
                         help="Path to a text file with episode keys to evaluate "
                              "(one per line, e.g. 'ep_000001'). "
@@ -1315,14 +1313,14 @@ def main():
     print(f"  Flip vertical:   {flip_vertical}  (--no-flip-vertical to disable)")
     print(f"  Flip horizontal: {flip_horizontal}  (--no-flip-horizontal to enable)")
 
+    mujoco_results = []
+    all_timing_logs = []  # collected across episodes for --save-timing
     # Reset after checkpoint construction, which consumes a variant-dependent
     # number of random draws. Compare variants from the same seeded rollout.
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
-    mujoco_results = []
-    all_timing_logs = []  # collected across episodes for --save-timing
     for ep_idx, ep_key in enumerate(episodes):
         traj = load_trajectory(args.data, ep_key, args.cameras)
         if traj is None:
@@ -1508,18 +1506,18 @@ def main():
         # Track aggregate
         mujoco_results.append({
             "episode": ep_key,
-            "reference_steps": min(reference_steps, model_result["n_steps"]),
             "task_name": task_name,
             "n_steps": model_result["n_steps"],
+            "reference_steps": min(reference_steps, model_result["n_steps"]),
             "mean_error_replay": eef_err_replay if args.save_video else 0,
             "mean_error_model": eef_err_model,
+            "success": model_result["success"],
+        })
         progress_path = Path(args.out_dir) / "episode_results.json"
         progress_temporary = progress_path.with_suffix(".json.tmp")
         progress_temporary.write_text(json.dumps({"episodes": mujoco_results,
                                                 "requested_episodes": len(episodes)}, indent=2))
         progress_temporary.replace(progress_path)
-            "success": model_result["success"],
-        })
 
         try:
             if env is not None and hasattr(env, "close"):
@@ -1565,9 +1563,9 @@ def main():
             },
         }
         summary_path = Path(args.checkpoint).with_suffix(f".mujoco_eval_{args.switch_at}.json")
-        (Path(args.out_dir) / "result.json").write_text(json.dumps(summary, indent=2))
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
+        (Path(args.out_dir) / "result.json").write_text(json.dumps(summary, indent=2))
         print(f"\n  Summary written to: {summary_path}")
 
         # Optional: save per-step timing log for action-horizon benchmarks

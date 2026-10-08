@@ -49,7 +49,7 @@ torch.backends.cudnn.enabled = False
 from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 
 from eval.eval_intention import load_intention_model
-from data.gripper_state import previous_gripper_commands, carry_gripper_state
+from data.gripper_state import previous_gripper_commands, carry_gripper_state, executed_binary_gripper
 
 # MuJoCo / LIBERO imports
 try:
@@ -625,7 +625,8 @@ def run_async_episode(
                     a_model = np.zeros(7, dtype=np.float32)
                     stale_repeat_counts.append(0)
 
-            a_model_scaled = a_model * action_scale
+            a_model_scaled = a_model.copy()
+            a_model_scaled[:6] *= action_scale
             final_action = a_model_scaled.copy()
             stored_actions.append(a_model_scaled.copy())
             stored_inference_flags.append(got_fresh)
@@ -635,14 +636,11 @@ def run_async_episode(
         if final_action.shape[0] < 7:
             final_action = np.pad(final_action, (0, 7 - final_action.shape[0]))
             final_action[6] = last_state[6]
+        command, simulator_command = executed_binary_gripper(final_action[6])
         last_state = sim_state.copy()
-        last_state[6] = float(final_action[6])
+        last_state[6] = command
+        final_action[6] = simulator_command
 
-        # Gripper
-        if final_action.shape[0] >= 7:
-            final_action[6] = 1.0 if final_action[6] <= 0.5 else -1.0
-        else:
-            final_action[6] = -1.0
 
         if debug:
             phase = "expert" if step < switch_step else "model"
