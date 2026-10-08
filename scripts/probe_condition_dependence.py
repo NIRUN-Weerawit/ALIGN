@@ -76,7 +76,7 @@ def encode(model, batch):
 
 
 @torch.no_grad()
-def evaluate_variant(model, loader, anchors, seed, episode_anchors=False):
+def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual_occlusion=False):
     totals = defaultdict(lambda: defaultdict(float))
     rows = []
     for batch_index, batch in enumerate(loader):
@@ -110,6 +110,18 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False):
                     restore(model.memory_module,before,permutation)
                     conds['memory_shuffle'] = model.intention_head(*model.condition_actions(p,s,i))
                     restore(model.memory_module,after)
+                if visual_occlusion:
+                    for case in ['last_camera','all_visual']:
+                        missing = p.clone()
+                        start = (p.shape[-1]//model.num_cameras)*(model.num_cameras-1) if case=='last_camera' else 0
+                        missing[:,:,start:] = 0
+                        if before is not None:restore(model.memory_module,before)
+                        conds[case+'_correct'] = model.intention_head(*model.condition_actions(missing,s,i))
+                        conds[case+'_bypass'] = model.intention_head(missing,s,i)
+                        if before is not None:
+                            restore(model.memory_module,before,permutation)
+                            conds[case+'_shuffle'] = model.intention_head(*model.condition_actions(missing,s,i))
+                            restore(model.memory_module,after)
                 conds['visual_zero_control'] = model.intention_head(torch.zeros_like(fused[0]),fused[1],fused[2])
                 conds['state_zero_control'] = model.intention_head(fused[0],torch.zeros_like(fused[1]),fused[2])
                 target = batch['actions_segment'][:,t:t+model.chunk_size].cuda().float()
@@ -174,6 +186,7 @@ def main():
     parser.add_argument('--run',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--batch-size',type=int,default=4)
+    parser.add_argument("--visual-occlusion",action="store_true",help="Paired pre-retrieval latent camera/all-visual dropout, with correct/bypassed/shuffled history")
     parser.add_argument("--episode-anchors",action="store_true",help="Probe beginning, middle, and last valid common prefix timestep")
     parser.add_argument('--anchors',type=int,nargs='+',default=[0,6,12])
     args = parser.parse_args()
@@ -208,7 +221,7 @@ def main():
     torch.cuda.set_per_process_memory_fraction(.3)
     report = dict(protocol=dict(run=str(args.run.resolve()),held_out_episodes=len(episodes),
         episode_keys=[dataset._episode_keys[ep] for ep in episodes],batch_size=args.batch_size,anchors=args.anchors,
-        crops=manifest.get('temporal_sampling','crop'),episode_anchors=args.episode_anchors,seed=manifest['seed']+20000,
+        crops=manifest.get('temporal_sampling','crop'),episode_anchors=args.episode_anchors,visual_occlusion=args.visual_occlusion,seed=manifest['seed']+20000,
         intent_intervention='final head intent; perceptual/state conditioning held fixed; shuffle across distinct tasks',
         memory_shuffle='all bank streams swapped between distinct tasks/episodes, queries held fixed; baseline history restored',
         precision='BF16 conditioning/epsilon probes; FP32 DDIM denoiser and state',
@@ -216,7 +229,7 @@ def main():
     for name in manifest['variants']:
         model,epoch = load_model(args.run/name/'intention_best.pt',cameras)
         print(f'{name} best epoch {epoch}',flush=True)
-        results,rows = evaluate_variant(model,loader,set(args.anchors),manifest['seed']+20000,args.episode_anchors)
+        results,rows = evaluate_variant(model,loader,set(args.anchors),manifest['seed']+20000,args.episode_anchors,args.visual_occlusion)
         report['variants'][name] = dict(epoch=epoch,noise_probe_timesteps=[1,max(1,model.intention_head.num_train_timesteps//2),max(1,round(.9*model.intention_head.num_train_timesteps))],sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
         atomic_json(args.output/(name+'.json'),dict(results=results,rows=rows))
         atomic_json(args.output/'summary.json',report)

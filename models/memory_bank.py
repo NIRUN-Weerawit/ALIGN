@@ -552,7 +552,7 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
                        bank.gather(1,index(pair[:,None]+1))) / 2
             merged = torch.where((positions == pair[:,None]).reshape(B,self.bank_len,*extra),average,shifted)
             retained = torch.where(full.reshape(B,1,*extra),merged,bank)
-            added = retained.scatter(1,index(count.clamp_max(self.bank_len-1)[:,None]),value.unsqueeze(1))
+            added = retained.scatter(1,index(count.clamp_max(self.bank_len-1)[:,None]),value.to(dtype=bank.dtype).unsqueeze(1))
             return torch.where(mask.reshape(B,1,*extra),added,retained)
 
         self.perceptual_bank = merge_and_write(self.perceptual_bank,p)
@@ -588,13 +588,17 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
         query = p.reshape(B,-1,self.patch_dim) if self.patch_dim is not None else p
         pr = self._retrieve(self.perceptual_retrieval,query,self.perceptual_bank,mask,age)
         pf = self.perceptual_gate(query,pr).reshape(B,-1)
+        nonempty = mask.any(1)
+        pf = torch.where(nonempty[:,None],pf,p)
         sr = self._retrieve(self.state_retrieval,s,self.state_bank,mask,age)
         sf = self.state_gate(s,sr)
+        sf = torch.where(nonempty[:,None],sf,s)
         cf = c
         if self._has_cognitive and c is not None:
             cq = c.reshape(B,-1)
             cr = self._retrieve(self.cognitive_retrieval,cq,self.cognitive_bank,mask,age)
             cf = self.cognitive_gate(cq,cr).reshape_as(c)
+            cf = torch.where(nonempty.reshape(B,*([1]*(c.ndim-1))),cf,c)
         self._write(pf if self.write_fused else p,sf if self.write_fused else s,
                     cf if self.write_fused else c,timestamp,observed_mask)
         return pf,sf,cf

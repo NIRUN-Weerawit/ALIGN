@@ -57,11 +57,12 @@ def episode_split(dataset, seed, fraction):
 
 
 class CachedEpisodes(Dataset):
-    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8):
+    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0.):
         self.dataset, self.episodes = dataset, episodes
         self.length, self.seed, self.training = length, seed, training
         self.epoch = 0
         self.temporal_sampling, self.supervision_points, self.chunk_size = temporal_sampling, supervision_points, chunk_size
+        self.observation_dropout_prob = observation_dropout_prob
 
     def __len__(self):
         return len(self.episodes)
@@ -89,6 +90,15 @@ class CachedEpisodes(Dataset):
                     actions_segment=actions.astype(np.float32), segment_len=length)
         if anchors is not None:
             result.update(loss_anchor_mask=anchors,observation_timesteps=np.arange(n,dtype=np.float32))
+        if self.training and self.observation_dropout_prob > 0:
+            cameras = len(self.dataset.cameras)
+            visible = np.ones((length,cameras),dtype=bool)
+            eligible = np.flatnonzero(anchors) if anchors is not None else np.arange(length-self.chunk_size+1)
+            for t in eligible:
+                if t == 0 or rng.random() >= self.observation_dropout_prob:continue
+                if rng.random() < .5:visible[t] = False
+                else:visible[t,int(rng.integers(cameras))] = False
+            result['observation_camera_mask'] = visible
         return result
 
 
@@ -102,9 +112,9 @@ def collate_segments(items):
             pad = [(0, length - len(arr))] + [(0, 0)] * (arr.ndim - 1)
             rows.append(np.pad(arr, pad))
         result[key] = torch.from_numpy(np.stack(rows))
-    for key in ("loss_anchor_mask","observation_timesteps"):
+    for key in ("loss_anchor_mask","observation_timesteps","observation_camera_mask"):
         if key in items[0]:
-            result[key] = torch.from_numpy(np.stack([np.pad(x[key],(0,length-len(x[key]))) for x in items]))
+            result[key] = torch.from_numpy(np.stack([np.pad(x[key],[(0,length-len(x[key]))]+[(0,0)]*(x[key].ndim-1)) for x in items]))
     return result
 
 
@@ -211,6 +221,7 @@ def parse_args(argv=None):
                         help="Continue from epoch checkpoints; preserve/restart attempts without optimizer state.")
     parser.add_argument("--temporal-sampling",choices=["crop","episode"],default="episode")
     parser.add_argument("--supervision-points",type=int,default=16)
+    parser.add_argument("--observation-dropout-prob",type=float,default=0.,help="Training-only camera/all-view feature loss at supervised anchors; same masks across ablations")
     parser.add_argument("--memory-mode",choices=["legacy","episodic"],default="episodic")
     parser.add_argument("--memory-detach-writes",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--memory-write-fused",action=argparse.BooleanOptionalAction,default=False)
@@ -277,6 +288,8 @@ def parse_args(argv=None):
         parser.error("Learning rate must be positive; decay, clipping, loss weight and max steps must be nonnegative")
     if min(args.supervision_points,args.diffusion_train_steps,args.diffusion_loss_repeats)<1 or args.diffusion_train_steps<10:
         parser.error('Supervision points/repeats must be positive; diffusion schedule needs at least 10 steps')
+    if not 0 <= args.observation_dropout_prob <= 1:
+        parser.error("Observation dropout probability must be in [0,1]")
     if args.temporal_sampling=="episode" and args.history_size!=1:
         parser.error('Episode supervision currently requires history size 1')
     if args.memory_patch_retrieval and (args.compressed_dim%2 or args.memory_mode!="episodic"):
@@ -335,21 +348,21 @@ def main(argv=None):
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
                                memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
-                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False)
+                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.)
         for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
-                    "memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample"):
+                    "memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         manifest = dict(manifest, **previous)
     else:
         atomic_json(out / "manifest.json", manifest)
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
-    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size)
+    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob)
     val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size)
     records = (json.loads((out / "summary.json").read_text())
                if args.resume and (out / "summary.json").exists() else {})

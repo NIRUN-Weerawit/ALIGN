@@ -142,3 +142,11 @@ with immutable `--candidates`, a shared `--episodes` file, and
 `--interventions normal bypass empty`. It selects by simulator success. Use
 independent episodes/seeds for final reporting, and keep task and action
 protocols identical between candidates.
+
+`--observation-dropout-prob` is an optional training-only missing-camera
+experiment (default 0). Visibility masks are deterministic per episode/epoch
+and shared across variants; targets stay unchanged and validation stays fully
+observed. Hidden cameras contribute neither current CLS tokens nor encoded
+patches. Use `--visual-occlusion` in the condition probe for paired current-view
+latent dropout with correct, shuffled and bypassed history. Report these
+partial-observation diagnostics separately from unmodified simulator success.

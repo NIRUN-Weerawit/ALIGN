@@ -423,6 +423,10 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         # Extract CLS tokens (last position per camera, NOT the last position overall).
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
+        visibility = None
+        if "observation_camera_mask" in batch:
+            visibility = torch.as_tensor(batch["observation_camera_mask"],device=device,dtype=torch.bool).reshape(B*S,V)
+            z_v_all = torch.where(visibility.reshape(B*S*V,1,1),z_v_all,torch.zeros_like(z_v_all))
         P_plus_1 = z_v_all.shape[1]
         P = P_plus_1 - 1
         z_v_all = z_v_all.reshape(B * S, V, P_plus_1, 768)
@@ -442,6 +446,10 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             z_v_all.reshape(B * S, V * P, 768),
             z_s_all.reshape(B * S, -1),
         ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
+        if visibility is not None:
+            # Missing cameras supply neither CLS to Mamba nor biased patch outputs
+            # to memory/head. Past observed cameras remain available causally.
+            z_v_mod_all = (z_v_mod_all.reshape(B*S,V,P,-1)*visibility[:,:,None,None]).reshape(B,S,V*P,-1)
 
         # Flatten patch axis into feature dim for head consumption (3D expected)
         # B_seg, S, N_tok, comp_dim = z_v_mod_all.shape
@@ -893,6 +901,10 @@ def validate(model, loader, device, args):
         # Extract CLS tokens (last position per camera, NOT the last position overall).
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
         # Total tokens per camera = P + 1
+        visibility = None
+        if "observation_camera_mask" in batch:
+            visibility = torch.as_tensor(batch["observation_camera_mask"],device=device,dtype=torch.bool).reshape(B*S,V)
+            z_v_all = torch.where(visibility.reshape(B*S*V,1,1),z_v_all,torch.zeros_like(z_v_all))
         P_plus_1 = z_v_all.shape[1]
         P = P_plus_1 - 1
         # Reshape to (B*S*V, P+1, 768) then take last per camera
@@ -912,6 +924,10 @@ def validate(model, loader, device, args):
             z_v_all.reshape(B * S, V * P, 768),
             z_s_all.reshape(B * S, -1),
         ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
+        if visibility is not None:
+            # Missing cameras supply neither CLS to Mamba nor biased patch outputs
+            # to memory/head. Past observed cameras remain available causally.
+            z_v_mod_all = (z_v_mod_all.reshape(B*S,V,P,-1)*visibility[:,:,None,None]).reshape(B,S,V*P,-1)
 
         # Build head and memory bank on first segment (lazy build)
         if not model._built:

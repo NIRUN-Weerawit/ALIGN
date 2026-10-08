@@ -171,3 +171,32 @@ def test_batch_consolidation_chooses_each_episodes_pair_and_preserves_padding(pa
     torch.testing.assert_close(m.state_bank,expected*10)
     assert m.timestamps.tolist()==[[.5,2,3],[0,1.5,3],[0,1,-1]]
     assert m._count.tolist()==[3,3,2]
+
+
+@pytest.mark.parametrize('device',['cpu',pytest.param('cuda',marks=pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA unavailable'))])
+@pytest.mark.parametrize('patch_dim',[None,4])
+def test_empty_memory_is_bitwise_identity_under_bfloat16(patch_dim,device):
+    m=EpisodicMemoryModule(8,4,4,bank_len=3,patch_dim=patch_dim).to(device)
+    m.reset(2,torch.device(device))
+    p,s,c=[torch.randn(*shape,device=device).bfloat16() for shape in [(2,8),(2,4),(2,1,4)]]
+    with torch.amp.autocast(device,dtype=torch.bfloat16):
+        result=m(p,s,c)
+        second=m(p,s,c)
+    assert all(torch.isfinite(x).all() for x in second)
+    assert all(torch.equal(a,b) for a,b in zip(result,(p,s,c)))
+
+
+def test_missing_view_training_is_deterministic_causal_and_validation_is_complete():
+    class Episode(FakeEpisode):cameras=['image','wrist_image']
+    data=CachedEpisodes(Episode(),[0],20,42,True,'episode',16,8,1.)
+    sample=data[0];repeat=data[0]
+    np.testing.assert_array_equal(sample['observation_camera_mask'],repeat['observation_camera_mask'])
+    mask=sample['observation_camera_mask']
+    assert mask[0].all()
+    assert mask[~sample['loss_anchor_mask']].all()
+    assert not mask[np.flatnonzero(sample['loss_anchor_mask'])[1:]].all(axis=1).any()
+    np.testing.assert_array_equal(sample['actions_segment'],repeat['actions_segment'])
+    validation=CachedEpisodes(Episode(),[0],20,42,False,'episode',16,8,1.)[0]
+    assert 'observation_camera_mask' not in validation
+    batch=collate_segments([sample,sample])
+    assert batch['observation_camera_mask'].shape==(2,120,2)
