@@ -154,3 +154,20 @@ def test_memory_rejects_replayed_or_future_leaking_timestamps():
     assert m._count.tolist()==[1,2]
     m.reset(2,torch.device('cpu'))
     m.observe_only(p,s,timestamp=torch.zeros(2))
+
+@pytest.mark.parametrize('patch_dim',[None,2])
+def test_batch_consolidation_chooses_each_episodes_pair_and_preserves_padding(patch_dim):
+    m=EpisodicMemoryModule(4,0,4,bank_len=3,patch_dim=patch_dim)
+    m.reset(3,torch.device('cpu'))
+    observations=[[[1,0],[1,0],[1,0]],[[2,0],[0,1],[0,1]],[[0,1],[0,2],[9,9]],[[1,1],[1,1],[9,9]]]
+    for t,values in enumerate(observations):
+        p=torch.tensor([v+[0,0] for v in values],dtype=torch.float32)
+        mask=torch.tensor([True,True,t<2])
+        m.observe_only(p,p*10,observed_mask=mask)
+    expected=torch.tensor([[[1.5,0,0,0],[0,1,0,0],[1,1,0,0]],
+                           [[1,0,0,0],[0,1.5,0,0],[1,1,0,0]],
+                           [[1,0,0,0],[0,1,0,0],[0,0,0,0]]])
+    torch.testing.assert_close(m.perceptual_bank.reshape(3,3,4),expected)
+    torch.testing.assert_close(m.state_bank,expected*10)
+    assert m.timestamps.tolist()==[[.5,2,3],[0,1.5,3],[0,1,-1]]
+    assert m._count.tolist()==[3,3,2]

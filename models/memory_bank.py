@@ -534,22 +534,32 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
         c = p.new_zeros(B,self.cognitive_dim) if c is None else c.reshape(B,-1)
         if self.detach_writes:
             p,s,c = p.detach(),s.detach(),c.detach()
-        pb,sb,cb = self.perceptual_bank.clone(),self.state_bank.clone(),self.cognitive_bank.clone()
-        ts = self.timestamps.clone()
-        for b in range(B):
-            if not bool(mask[b]):continue
-            count = int(self._count[b])
-            if count==self.bank_len:
-                norm = F.normalize(pb[b,:count].flatten(1),dim=-1)
-                j = int((norm[:-1]*norm[1:]).sum(-1).argmax())
-                for bank in [pb,sb,cb,ts]:
-                    row = bank[b,:count].clone()
-                    merged = torch.cat([row[:j],((row[j]+row[j+1])/2).unsqueeze(0),row[j+2:]])
-                    bank[b,:count-1] = merged
-                count -= 1
-            pb[b,count],sb[b,count],cb[b,count],ts[b,count] = p[b],s[b],c[b],timestamp[b]
-            self._count[b] = count+1
-        self.perceptual_bank,self.state_bank,self.cognitive_bank,self.timestamps = pb,sb,cb,ts
+        # Each episode chooses its own adjacent merge, without device-to-host
+        # synchronization for every row and observation.
+        full = (self._count == self.bank_len) & mask
+        normalized = F.normalize(self.perceptual_bank.flatten(2),dim=-1)
+        pair = (normalized[:,:-1]*normalized[:,1:]).sum(-1).argmax(1)
+        positions = torch.arange(self.bank_len,device=p.device)[None].expand(B,-1)
+        shifted_indices = (positions + (positions > pair[:,None])).clamp_max(self.bank_len-1)
+        count = self._count - full.long()
+
+        def merge_and_write(bank,value):
+            extra = (1,) * (bank.ndim-2)
+            def index(column):
+                return column.reshape(B,column.shape[1],*extra).expand(B,column.shape[1],*bank.shape[2:])
+            shifted = bank.gather(1,index(shifted_indices))
+            average = (bank.gather(1,index(pair[:,None])) +
+                       bank.gather(1,index(pair[:,None]+1))) / 2
+            merged = torch.where((positions == pair[:,None]).reshape(B,self.bank_len,*extra),average,shifted)
+            retained = torch.where(full.reshape(B,1,*extra),merged,bank)
+            added = retained.scatter(1,index(count.clamp_max(self.bank_len-1)[:,None]),value.unsqueeze(1))
+            return torch.where(mask.reshape(B,1,*extra),added,retained)
+
+        self.perceptual_bank = merge_and_write(self.perceptual_bank,p)
+        self.state_bank = merge_and_write(self.state_bank,s)
+        self.cognitive_bank = merge_and_write(self.cognitive_bank,c)
+        self.timestamps = merge_and_write(self.timestamps,timestamp)
+        self._count = torch.where(mask,count+1,self._count)
         self._next_timestep = torch.where(mask,timestamp+1,self._next_timestep)
 
     def _resolve_timestamp(self,timestamp,observed_mask):
