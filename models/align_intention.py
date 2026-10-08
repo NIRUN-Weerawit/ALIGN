@@ -34,7 +34,7 @@ from models.intention_head import (
     IntentionTransformerHead, MambaActionHead, DiffusionPolicyHead,
     FlowMatchingPolicyHead,
 )
-from models.memory_bank import PerceptualCognitiveMemoryModule
+from models.memory_bank import PerceptualCognitiveMemoryModule, EpisodicMemoryModule
 
 
 class ALIGNIntentionModel(nn.Module):
@@ -74,6 +74,14 @@ class ALIGNIntentionModel(nn.Module):
         intent_dim: int = 512,
         use_memory_bank: bool = False,
         memory_bank_len: int = 16,
+        memory_mode: str = "episodic",
+        memory_detach_writes: bool = True,
+        memory_write_fused: bool = False,
+        memory_patch_retrieval: bool = False,
+        diffusion_train_steps: int = 100,
+        diffusion_loss_repeats: int = 4,
+        visual_token_attention: bool = False,
+        diffusion_clip_sample: bool = True,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -95,6 +103,14 @@ class ALIGNIntentionModel(nn.Module):
         self.intent_dim = intent_dim
         self.use_memory_bank = use_memory_bank
         self.memory_bank_len = memory_bank_len
+        self.memory_mode = memory_mode
+        self.memory_detach_writes = memory_detach_writes
+        self.memory_write_fused = memory_write_fused
+        self.memory_patch_retrieval = memory_patch_retrieval
+        self.diffusion_train_steps = diffusion_train_steps
+        self.diffusion_loss_repeats = diffusion_loss_repeats
+        self.visual_token_attention = visual_token_attention
+        self.diffusion_clip_sample = diffusion_clip_sample
         self.head_type = head_type
         self.head_d_model = head_d_model
         self.head_nhead = head_nhead
@@ -207,6 +223,9 @@ class ALIGNIntentionModel(nn.Module):
                 action_dim=self.action_dim,
                 hidden_dim=self.head_d_model,
                 num_inference_steps=10,
+                num_train_timesteps=self.diffusion_train_steps,
+                loss_repeats=self.diffusion_loss_repeats,
+                clip_denoised=self.diffusion_clip_sample,
                 time_dim=64,
                 chunk_size=self.chunk_size,
             )
@@ -224,18 +243,24 @@ class ALIGNIntentionModel(nn.Module):
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
 
+        if self.visual_token_attention and hasattr(self.intention_head,"unet"):
+            self.intention_head.unet.configure_visual_attention(pool_out_dim,self.compressed_dim)
+
         # Move head to the same device as the rest of the model
         self.intention_head = self.intention_head.to(device)
 
         # Build memory bank (2-stream: perceptual, state; cognitive optional)
         if self.use_memory_bank:
             cognitive_dim = self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0
-            self.memory_module = PerceptualCognitiveMemoryModule(
+            memory_class = EpisodicMemoryModule if self.memory_mode == "episodic" else PerceptualCognitiveMemoryModule
+            memory_kwargs = dict(detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
+                                 patch_dim=self.compressed_dim if self.memory_patch_retrieval else None) if self.memory_mode == "episodic" else {}
+            self.memory_module = memory_class(
                 perceptual_dim=pool_out_dim,
                 cognitive_dim=cognitive_dim,
                 state_dim=self.state_dim,
                 bank_len=self.memory_bank_len,
-                num_heads=2,
+                num_heads=2, **memory_kwargs,
             ).to(device)
 
     # ----------------------------------------------------------------
@@ -427,10 +452,25 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     # Predict actions from window
     # ----------------------------------------------------------------
+    def encode_patch_sequence(self,patches,states,chunk_size=16):
+        """Bound long-episode feature activations; preserve gradients to encoders."""
+        from torch.utils.checkpoint import checkpoint
+        outputs = []
+        with torch.autocast(device_type=patches.device.type,dtype=torch.bfloat16,
+                            enabled=patches.device.type=="cuda"):
+            for start in range(0,len(patches),chunk_size):
+                p,s = patches[start:start+chunk_size],states[start:start+chunk_size]
+                if self.training and torch.is_grad_enabled():
+                    outputs.append(checkpoint(self.vision_patch_encoder,p,s,use_reentrant=False))
+                else:
+                    outputs.append(self.vision_patch_encoder(p,s))
+        return torch.cat(outputs)
+
     def condition_actions(self, z_v_window: torch.Tensor,
                           z_s_window: torch.Tensor,
                           intent_emb: Optional[torch.Tensor] = None,
-                          observed_mask: Optional[torch.Tensor] = None):
+                          observed_mask: Optional[torch.Tensor] = None,
+                          timestamp: Optional[torch.Tensor] = None):
         """Use the same memory conditioning in training and deployment.
 
         Visual/state retrieval remains active without cognitive intent tokens.
@@ -441,6 +481,7 @@ class ALIGNIntentionModel(nn.Module):
         z_v, z_s, intent = self.memory_module(
             z_v_window[:, -1], z_s_window[:, -1], intent_emb,
             observed_mask=observed_mask,
+            **({"timestamp":timestamp} if self.memory_mode == "episodic" else {}),
         )
         return z_v.unsqueeze(1), z_s.unsqueeze(1), intent
 

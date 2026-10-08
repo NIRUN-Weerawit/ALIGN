@@ -137,7 +137,7 @@ class StateConditionalCrossAttn(nn.Module):
         q = self.q_proj(z_s).unsqueeze(1).expand(-1, N_pos, -1)  # (B, N_pos, D)
         k = v = z_v_comp                                         # patches as KV
 
-        attn_out, _ = self.cross_attn(q, k, v)                   # (B, N_pos, D)
+        attn_out, _ = self.cross_attn(q, k, v, need_weights=False)                   # (B, N_pos, D)
 
         out = z_v_comp + self.attn_scale * attn_out              # residual modulation
         return self.norm(out)

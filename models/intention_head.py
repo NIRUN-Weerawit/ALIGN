@@ -317,6 +317,15 @@ class DiffusionPolicyUNet1D(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
+    def configure_visual_attention(self,pool_dim,token_dim):
+        self.visual_pool_dim,self.visual_token_dim = pool_dim,token_dim
+        width = self.bottleneck.block[0].out_channels
+        self.visual_projection = nn.Linear(token_dim,width)
+        self.visual_attention = nn.MultiheadAttention(width,4,batch_first=True)
+        self.visual_output = nn.Linear(width,width)
+        nn.init.zeros_(self.visual_output.weight)
+        nn.init.zeros_(self.visual_output.bias)
+
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor,
                 t_emb: torch.Tensor) -> torch.Tensor:
         """U-Net forward.
@@ -360,6 +369,12 @@ class DiffusionPolicyUNet1D(nn.Module):
         x = self.enc4(x, cond_global, t_emb)
 
         x = self.bottleneck(x, cond_global, t_emb)
+        if hasattr(self,"visual_attention"):
+            tokens = cond_global[:,:self.visual_pool_dim].reshape(B,-1,self.visual_token_dim)
+            tokens = self.visual_projection(tokens)
+            q = x.transpose(1,2)
+            context,_ = self.visual_attention(q,tokens,tokens,need_weights=False)
+            x = x + self.visual_output(context).transpose(1,2)
 
         x = self.up2(x, target_len=skip2.shape[-1])
         x = torch.cat([x, skip2], dim=1)
@@ -445,10 +460,14 @@ class DiffusionPolicyHead(nn.Module):
     """
     def __init__(self, cond_dim: int = 768, action_dim: int = 7,
                  hidden_dim: int = 128, num_inference_steps: int = 10,
-                 time_dim: int = 64, chunk_size: int = 10):
+                 time_dim: int = 64, chunk_size: int = 10,
+                 num_train_timesteps: int = None, loss_repeats: int = 1, clip_denoised: bool = False):
         super().__init__()
         self.action_dim = action_dim
         self.num_inference_steps = num_inference_steps
+        self.num_train_timesteps = num_train_timesteps or num_inference_steps
+        self.loss_repeats = loss_repeats
+        self.clip_denoised = clip_denoised
         self.time_dim = time_dim
         self.chunk_size = chunk_size
         self.cond_dim = cond_dim
@@ -462,7 +481,7 @@ class DiffusionPolicyHead(nn.Module):
         )
 
         # DDPM noise schedule (cosine)
-        T_steps = num_inference_steps
+        T_steps = self.num_train_timesteps
         s = 0.008
         t_vals = torch.arange(T_steps + 1, dtype=torch.float64)
         theta = torch.tensor(math.pi / 2, dtype=torch.float64) * (
@@ -534,7 +553,7 @@ class DiffusionPolicyHead(nn.Module):
             t:    (B,) — timestep per sample
             cond: (B, K, cond_dim) — per-step condition (preserved for FiLM)
         """
-        t_emb = self.time_emb(t.float() / self.num_inference_steps)  # (B, time_dim)
+        t_emb = self.time_emb(t.float() / self.num_train_timesteps)  # (B, time_dim)
         return self.unet(x_t, cond, t_emb)
 
     def loss(self, actions_target: torch.Tensor,
@@ -550,6 +569,8 @@ class DiffusionPolicyHead(nn.Module):
                          Defaults to equal weights, including gripper.
         """
         actions_target, cond = _valid_loss_samples(actions_target, cond, sample_mask)
+        actions_target = actions_target.repeat(self.loss_repeats,1,1)
+        cond = cond.repeat(self.loss_repeats,1,1)
         B, K = actions_target.shape[:2]
         device = actions_target.device
 
@@ -568,6 +589,17 @@ class DiffusionPolicyHead(nn.Module):
         if dim_weights is not None:
             err = err * dim_weights.unsqueeze(0).unsqueeze(0)  # broadcast
         return err.mean()
+
+    def _load_from_state_dict(self,state_dict,prefix,*args,**kwargs):
+        # Preserve old checkpoints exactly, including their time normalization.
+        key = prefix+'alpha_bar'
+        if key in state_dict:
+            n = len(state_dict[key])-1
+            self.num_train_timesteps = n
+            if self.alpha_bar.shape != state_dict[key].shape:
+                self.alpha_bar = self.alpha_bar.new_empty(n+1)
+                self.sigma = self.sigma.new_empty(n+1)
+        return super()._load_from_state_dict(state_dict,prefix,*args,**kwargs)
 
     def sampling_timesteps(self, num_steps=None):
         """Cover the full usable noise schedule, regardless of action horizon.
@@ -600,6 +632,10 @@ class DiffusionPolicyHead(nn.Module):
             previous = (self.alpha_bar[timesteps[j + 1]].float()
                         if j + 1 < len(timesteps) else alpha.new_tensor(1.0))
             x0 = (x - self.sigma[index].float() * eps) / alpha.sqrt()
+            if self.clip_denoised:
+                x0 = x0.clamp(-1.,1.)
+                if self.action_dim>=7:
+                    x0[...,6] = x0[...,6].clamp(0.,1.)
             x = previous.sqrt() * x0 + (1.0 - previous).sqrt() * eps
         return x
 

@@ -21,10 +21,15 @@ class IntentionStream:
         self.state = deque(maxlen=history_size)
 
     @torch.no_grad()
-    def observe(self, frames, robot_state, produce_intent=False):
+    def observe(self, frames, robot_state, produce_intent=False, store_memory=False):
+        bank = getattr(self.model,"memory_module",None)
+        # Cognitive raw writes need a readout even between action plans.
+        produce_intent = produce_intent or (store_memory and getattr(bank,"_has_cognitive",False))
         result = self.model.encode_step(frames, robot_state, self.cache,
                                         produce_intent=produce_intent)
         visual, state, hidden, self.cache = result[:4]
+        if store_memory and bank is not None and hasattr(bank,"observe_only"):
+            bank.observe_only(visual,state,result[4] if len(result)==5 else None)
         if not self.visual:
             self.visual.extend([visual] * self.history_size)
             self.state.extend([state] * self.history_size)

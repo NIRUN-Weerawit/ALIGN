@@ -49,7 +49,8 @@ class MemoryRetrieval(nn.Module):
         self.out_norm = nn.LayerNorm(dim)
 
     def forward(self, query: torch.Tensor, bank_kv: torch.Tensor,
-                bank_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                bank_mask: Optional[torch.Tensor] = None,
+                bank_values: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Retrieve from memory bank.
 
         Args:
@@ -60,7 +61,7 @@ class MemoryRetrieval(nn.Module):
             (B, dim) — retrieved context with residual
         """
         B = query.shape[0]
-        q = query.unsqueeze(1)  # (B, 1, dim)
+        q = query.unsqueeze(1) if query.ndim == 2 else query
 
         # Handle empty bank: return query directly
         if bank_kv.shape[1] == 0:
@@ -80,6 +81,7 @@ class MemoryRetrieval(nn.Module):
                 out = query.clone()
                 out[nonempty] = self.forward(
                     query[nonempty], bank_kv[nonempty], bank_mask[nonempty],
+                    None if bank_values is None else bank_values[nonempty],
                 )
                 return out
 
@@ -96,20 +98,20 @@ class MemoryRetrieval(nn.Module):
             from torch.nn.attention import sdpa_kernel, SDPBackend
             with sdpa_kernel(backends=[SDPBackend.MATH]):
                 attn_out, _ = self.retrieval_attn(
-                    q, bank_kv, bank_kv,
-                    key_padding_mask=attn_mask,
+                    q, bank_kv, bank_kv if bank_values is None else bank_values,
+                    key_padding_mask=attn_mask, need_weights=False,
                 )
         except ImportError:
             attn_out, _ = self.retrieval_attn(
-                q, bank_kv, bank_kv,
-                key_padding_mask=attn_mask,
+                q, bank_kv, bank_kv if bank_values is None else bank_values,
+                key_padding_mask=attn_mask, need_weights=False,
             )
 
         # FFN with residual
         ffn_in = torch.cat([q, attn_out], dim=-1)  # (B, 1, 2*dim)
         ffn_out = self.ffn(ffn_in)  # (B, 1, dim)
-        out = self.out_norm(ffn_out.squeeze(1) + query)  # (B, dim)
-        return out
+        out = self.out_norm(ffn_out + q)
+        return out.squeeze(1) if query.ndim == 2 else out
 
 
 # ================================================================
@@ -469,3 +471,120 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         c_padded = F.pad(c_out, (0, 0, 0, L - c_out.shape[1]))
         s_padded = F.pad(s_out, (0, 0, 0, L - s_out.shape[1]))
         return p_padded, c_padded, s_padded, count - 1
+
+
+class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
+    """Causal raw/detached memory with real timestamps and key-only age encoding.
+
+    Optional patch retrieval keeps spatial tokens instead of one flattened token.
+    Bank buffers are episode-local state, never checkpoint parameters.
+    """
+    def __init__(self, perceptual_dim, cognitive_dim, state_dim, bank_len=16,
+                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None):
+        if bank_len < 2:
+            raise ValueError('Episodic memory capacity must be at least two for consolidation')
+        super().__init__(perceptual_dim,cognitive_dim,state_dim,bank_len,num_heads)
+        self.detach_writes, self.write_fused = detach_writes,write_fused
+        self.patch_dim = patch_dim
+        if patch_dim is not None:
+            if perceptual_dim % patch_dim or patch_dim % num_heads:
+                raise ValueError('Patch width must divide perceptual width and attention heads')
+            self.perceptual_retrieval = MemoryRetrieval(patch_dim,num_heads)
+            self.perceptual_gate = MemoryGateFusion(patch_dim)
+        # Begin with balanced current/history fusion, rather than suppressing memory.
+        for gate in [self.perceptual_gate,self.state_gate,self.cognitive_gate]:
+            if gate is not None:
+                nn.init.constant_(gate.gate_mlp[-1].bias,0.)
+        self.timestamps = self._next_timestep = None
+
+    def reset(self,batch_size,device):
+        super().reset(batch_size,device)
+        if self.patch_dim is not None:
+            self.perceptual_bank = self.perceptual_bank.reshape(batch_size,self.bank_len,-1,self.patch_dim)
+        self.timestamps = torch.full((batch_size,self.bank_len),-1.,device=device)
+        self._next_timestep = torch.zeros(batch_size,device=device)
+
+    @staticmethod
+    def age_encoding(age,dim):
+        frequency = torch.exp(torch.arange(0,dim,2,device=age.device).float()*(-__import__('math').log(10000.)/dim))
+        phase = age.float().unsqueeze(-1)*frequency
+        out = age.new_zeros(*age.shape,dim,dtype=torch.float32)
+        out[...,0::2] = phase.sin()
+        out[...,1::2] = phase[..., :dim//2].cos()
+        return out
+
+    def _retrieve(self,module,query,bank,mask,age):
+        values = bank.clone()
+        if bank.ndim==4:
+            B,L,N,D = bank.shape
+            keys = values + self.age_encoding(age,D).unsqueeze(2).to(values.dtype)
+            # Spatial position remains separate from the recorded observation age.
+            spatial = self.age_encoding(torch.arange(N,device=bank.device),D).to(values.dtype)
+            keys = keys + spatial[None,None]
+            q = query + spatial[None]
+            result = module(q,keys.reshape(B,L*N,D),mask.repeat_interleave(N,dim=1),values.reshape(B,L*N,D))
+            return torch.where(mask.any(1)[:,None,None],result,query)
+        keys = values + self.age_encoding(age,bank.shape[-1]).to(values.dtype)
+        return module(query,keys,mask,values)
+
+    def _write(self,p,s,c,timestamp,observed_mask):
+        B = p.shape[0]
+        mask = torch.ones(B,device=p.device,dtype=torch.bool) if observed_mask is None else observed_mask
+        p = p.reshape(B,*self.perceptual_bank.shape[2:])
+        c = p.new_zeros(B,self.cognitive_dim) if c is None else c.reshape(B,-1)
+        if self.detach_writes:
+            p,s,c = p.detach(),s.detach(),c.detach()
+        pb,sb,cb = self.perceptual_bank.clone(),self.state_bank.clone(),self.cognitive_bank.clone()
+        ts = self.timestamps.clone()
+        for b in range(B):
+            if not bool(mask[b]):continue
+            count = int(self._count[b])
+            if count==self.bank_len:
+                norm = F.normalize(pb[b,:count].flatten(1),dim=-1)
+                j = int((norm[:-1]*norm[1:]).sum(-1).argmax())
+                for bank in [pb,sb,cb,ts]:
+                    row = bank[b,:count].clone()
+                    merged = torch.cat([row[:j],((row[j]+row[j+1])/2).unsqueeze(0),row[j+2:]])
+                    bank[b,:count-1] = merged
+                count -= 1
+            pb[b,count],sb[b,count],cb[b,count],ts[b,count] = p[b],s[b],c[b],timestamp[b]
+            self._count[b] = count+1
+        self.perceptual_bank,self.state_bank,self.cognitive_bank,self.timestamps = pb,sb,cb,ts
+        self._next_timestep = torch.where(mask,timestamp+1,self._next_timestep)
+
+    def _resolve_timestamp(self,timestamp,observed_mask):
+        if timestamp is None:
+            return self._next_timestep.clone()
+        timestamp = timestamp.to(self._next_timestep.device,dtype=torch.float32)
+        if timestamp.shape != self._next_timestep.shape:
+            raise ValueError('Memory timestamps must have one value per episode row')
+        observed = torch.ones_like(timestamp,dtype=torch.bool) if observed_mask is None else observed_mask.bool()
+        invalid = ~torch.isfinite(timestamp) | (timestamp < self._next_timestep)
+        if bool((observed & invalid).any()):
+            raise ValueError('Memory observations must have finite, strictly increasing timestamps; reset at episode boundaries')
+        return timestamp
+
+    def observe_only(self,p,s,c=None,observed_mask=None,timestamp=None):
+        if self.write_fused:
+            return self.forward(p,s,c,observed_mask,timestamp)
+        timestamp = self._resolve_timestamp(timestamp,observed_mask)
+        self._write(p,s,c,timestamp,observed_mask)
+
+    def forward(self,p,s,c=None,observed_mask=None,timestamp=None):
+        B = p.shape[0]
+        timestamp = self._resolve_timestamp(timestamp,observed_mask)
+        mask = torch.arange(self.bank_len,device=p.device)[None] < self._count[:,None]
+        age = (timestamp[:,None]-self.timestamps).clamp_min(0)
+        query = p.reshape(B,-1,self.patch_dim) if self.patch_dim is not None else p
+        pr = self._retrieve(self.perceptual_retrieval,query,self.perceptual_bank,mask,age)
+        pf = self.perceptual_gate(query,pr).reshape(B,-1)
+        sr = self._retrieve(self.state_retrieval,s,self.state_bank,mask,age)
+        sf = self.state_gate(s,sr)
+        cf = c
+        if self._has_cognitive and c is not None:
+            cq = c.reshape(B,-1)
+            cr = self._retrieve(self.cognitive_retrieval,cq,self.cognitive_bank,mask,age)
+            cf = self.cognitive_gate(cq,cr).reshape_as(c)
+        self._write(pf if self.write_fused else p,sf if self.write_fused else s,
+                    cf if self.write_fused else c,timestamp,observed_mask)
+        return pf,sf,cf
