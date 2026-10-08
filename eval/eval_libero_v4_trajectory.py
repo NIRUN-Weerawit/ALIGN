@@ -1134,6 +1134,8 @@ def main():
                         help="Camera names (default: wrist_image). "
                              "MUST match the cameras used during training "
                              "(e.g. 'image wrist_image' for 2-cam checkpoints).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Simulator and policy sampling seed (default 42).")
     parser.add_argument("--n-episodes", type=int, default=1,
                         help="Number of episodes to evaluate.")
     parser.add_argument("--val-episodes", type=str, default=None,
@@ -1313,6 +1315,12 @@ def main():
     print(f"  Flip vertical:   {flip_vertical}  (--no-flip-vertical to disable)")
     print(f"  Flip horizontal: {flip_horizontal}  (--no-flip-horizontal to enable)")
 
+    # Reset after checkpoint construction, which consumes a variant-dependent
+    # number of random draws. Compare variants from the same seeded rollout.
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
     mujoco_results = []
     all_timing_logs = []  # collected across episodes for --save-timing
     for ep_idx, ep_key in enumerate(episodes):
@@ -1403,9 +1411,12 @@ def main():
 
         # ── Compute metrics ──
         # EEF error for model rollout vs expert
-        eef_err_model = float(np.mean(model_result["errors"])) if len(model_result["errors"]) > 0 else float("nan")
+        reference_steps = len(traj["poses"]) if traj["poses"] is not None else 0
+        model_errors = model_result["errors"][:reference_steps]
+        eef_err_model = float(np.mean(model_errors)) if len(model_errors) else float("nan")
         if args.save_video:
-            eef_err_replay = float(np.mean(replay_result["errors"])) if len(replay_result["errors"]) > 0 else float("nan")
+            replay_errors = replay_result["errors"][:reference_steps]
+            eef_err_replay = float(np.mean(replay_errors)) if len(replay_errors) else float("nan")
 
             print(f"    Replay run:  {replay_result['n_steps']:3d} steps  "
                 f"EEF err: {eef_err_replay:.4f} m  ({t_replay:.1f}s)")
@@ -1497,10 +1508,16 @@ def main():
         # Track aggregate
         mujoco_results.append({
             "episode": ep_key,
+            "reference_steps": min(reference_steps, model_result["n_steps"]),
             "task_name": task_name,
             "n_steps": model_result["n_steps"],
             "mean_error_replay": eef_err_replay if args.save_video else 0,
             "mean_error_model": eef_err_model,
+        progress_path = Path(args.out_dir) / "episode_results.json"
+        progress_temporary = progress_path.with_suffix(".json.tmp")
+        progress_temporary.write_text(json.dumps({"episodes": mujoco_results,
+                                                "requested_episodes": len(episodes)}, indent=2))
+        progress_temporary.replace(progress_path)
             "success": model_result["success"],
         })
 
@@ -1548,6 +1565,7 @@ def main():
             },
         }
         summary_path = Path(args.checkpoint).with_suffix(f".mujoco_eval_{args.switch_at}.json")
+        (Path(args.out_dir) / "result.json").write_text(json.dumps(summary, indent=2))
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(f"\n  Summary written to: {summary_path}")

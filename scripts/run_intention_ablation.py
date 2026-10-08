@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Train four cached-feature intention/memory ablations sequentially on CUDA.
+
+Uses the production model, sequential trainer, and validation functions.
+Unlike the standard trainer, splits whole episodes and fixes validation crops.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+import gc
+import json
+import os
+from pathlib import Path
+import random
+import subprocess
+import sys
+import time
+from types import SimpleNamespace
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from data.align_dataset import ALIGNDataset
+from models.align_intention import ALIGNIntentionModel
+from training.train_intention import train_v4_epoch, validate
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def episode_split(dataset, seed, fraction):
+    tasks = defaultdict(list)
+    for ep, key in enumerate(dataset._episode_keys):
+        text = dataset._h5[f"{key}/texts"][()]
+        if isinstance(text, bytes):
+            text = text.decode()
+        tasks[str(text)].append(ep)
+    train, val = [], []
+    rng = np.random.default_rng(seed)
+    for task in sorted(tasks):
+        eps = rng.permutation(tasks[task]).tolist()
+        if len(eps) < 2:
+            raise ValueError(f"Task has fewer than two episodes: {task}")
+        count = min(len(eps) - 1, max(1, round(len(eps) * fraction)))
+        val.extend(eps[:count])
+        train.extend(eps[count:])
+    assert not set(train) & set(val)
+    return sorted(train), sorted(val)
+
+
+class CachedEpisodes(Dataset):
+    def __init__(self, dataset, episodes, length, seed, training):
+        self.dataset, self.episodes = dataset, episodes
+        self.length, self.seed, self.training = length, seed, training
+        self.epoch = 0
+
+    def __len__(self):
+        return len(self.episodes)
+
+    def __getitem__(self, index):
+        ep = self.episodes[index]
+        n = self.dataset._get_episode_length(ep)
+        length = min(n, self.length)
+        rng = np.random.default_rng(np.random.SeedSequence(
+            [self.seed, ep, self.epoch if self.training else 0]))
+        start = int(rng.integers(0, n - length + 1))
+        frames = self.dataset._read_frames_dinov2(ep, start, length)
+        poses = self.dataset._read_poses(ep, start, length)
+        gripper = self.dataset._read_poses_gripper(ep, start, length)
+        states = np.concatenate([poses[:, :6], gripper[:, None]], axis=1)
+        actions = self.dataset._read_actions(ep, start, length)
+        return dict(frames_segment=frames, states_segment=states.astype(np.float32),
+                    actions_segment=actions.astype(np.float32), segment_len=length)
+
+
+def collate_segments(items):
+    length = max(item["segment_len"] for item in items)
+    result = {"segment_len": np.array([x["segment_len"] for x in items])}
+    for key in ("frames_segment", "states_segment", "actions_segment"):
+        rows = []
+        for item in items:
+            arr = item[key]
+            pad = [(0, length - len(arr))] + [(0, 0)] * (arr.ndim - 1)
+            rows.append(np.pad(arr, pad))
+        result[key] = torch.from_numpy(np.stack(rows))
+    return result
+
+
+def atomic_json(path, value):
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    temporary.replace(path)
+
+
+def summarize(out, records, manifest):
+    atomic_json(out / "summary.json", records)
+    rows = ["# Intention/memory ablation", "",
+            f"Dataset: `{manifest['data']}`. Held-out prediction metrics, not simulator success rates.", "",
+            f"Epoch budget: {manifest['epochs']}; optimizer steps/epoch: {manifest['max_steps'] or 'full loader'}.",
+            "Best checkpoints are selected by fixed-seed validation loss.", "",
+            "| Variant | Epoch | Val loss | Position MSE | Rotation MSE | Gripper MSE | Gripper accuracy |",
+            "|---|---:|---:|---:|---:|---:|---:|"]
+    for name, record in records.items():
+        r = record["best"]
+        rows.append(f"| {name} | {r['epoch']} | {r['val/loss']:.6f} | {r['pos_mse']:.6f} | {r['rot_mse']:.6f} | {r['grip_mse']:.6f} | {r['grip_acc']:.3f} |")
+    rows += ["", "All variants use the same episode split, crop schedule, observation history,",
+             "batch order, optimizer budget, and validation RNG seeds. Intent-disabled variants",
+             "omit the intention encoder; memory-only retrieves perceptual and state streams.",
+             "The cached per-camera features bypass raw-image/cross-camera vision computation.",
+             "Results use one training seed; model dimensions and optimizer budget are recorded in manifest.json.",
+             "Fixed validation seeds make comparisons repeatable but do not remove seed uncertainty.",
+             "Comparative policy-quality conclusions require multiple seeds and simulator rollouts."]
+    (out / "comparison.md").write_text("\n".join(rows) + "\n")
+
+
+def evaluate_existing(out):
+    """Reevaluate best checkpoints using their saved shared configuration."""
+    manifest = json.loads((out / "manifest.json").read_text())
+    records = json.loads((out / "summary.json").read_text())
+    cameras = manifest.get("cameras", ["image", "wrist_image"])
+    threshold = manifest.get("gripper_threshold", 0.5)
+    dataset = ALIGNDataset(manifest["data"], mode="head", cameras=cameras,
+        traj_window=manifest["segment_length"], dinov2_path=manifest["cache"])
+    val_eps = [dataset._episode_keys.index(key) for key in manifest["val_episodes"]]
+    data = CachedEpisodes(dataset, val_eps, manifest["segment_length"], manifest["seed"] + 1000, False)
+    loader = DataLoader(data, batch_size=manifest["batch_size"], shuffle=False,
+        num_workers=0, pin_memory=True, collate_fn=collate_segments)
+    args = SimpleNamespace(history_size=manifest["history_size"], chunk_size=manifest["chunk_size"],
+        action_dim=7, head_type=manifest["head_type"], skip_nan=False, gripper_threshold=threshold,
+        gripper_loss_weight=manifest.get("gripper_loss_weight", 0.01))
+    device = torch.device("cuda")
+    torch.set_num_threads(manifest.get("cpu_threads", 2))
+    torch.cuda.set_per_process_memory_fraction(manifest.get("gpu_memory_fraction", 0.40))
+    for name, record in records.items():
+        with torch.serialization.safe_globals([type(torch.__version__)]):
+            checkpoint = torch.load(out / name / "intention_best.pt", map_location="cpu", weights_only=True)
+        config = checkpoint["config"]
+        model = ALIGNIntentionModel(state_dim=config["state_dim"], mamba_output_dim=config["mamba_output_dim"],
+            action_dim=7, chunk_size=config["chunk_size"], history_size=config["history_size"],
+            num_cameras=len(cameras), compressed_dim=config["compressed_dim"], head_type=config["head_type"],
+            head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
+            num_intent_tokens=config.get("num_intent_tokens", 1), intent_dim=config["intent_dim"],
+            mamba_d_state=config.get("mamba_d_state", 16), mamba_d_conv=config.get("mamba_d_conv", 4),
+            mamba_expand=config.get("mamba_expand", 2),
+            use_memory_bank=config["use_memory_bank"], memory_bank_len=config["memory_bank_len"])
+        model._build_head_and_bank(config.get("pool_out_dim", 256 * len(cameras) * config["compressed_dim"]))
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        vision = model.vision_encoder
+        model.vision_encoder = torch.nn.Identity()
+        model.to(device)
+        model.vision_encoder = vision
+        seed_everything(manifest["seed"] + 10000)
+        val_loss, _, metrics = validate(model, loader, device, args)
+        record["best"].update(metrics)
+        record["best"]["val/loss"] = val_loss
+        record["gripper_threshold"] = threshold
+        atomic_json(out / name / "best_evaluation.json", dict(val_loss=val_loss, **metrics,
+            gripper_threshold=threshold, checkpoint_epoch=checkpoint["epoch"]))
+        print(f"REEVALUATED {name}: val={val_loss:.6f} grip_acc={metrics['grip_acc']:.3f} threshold={threshold:g}", flush=True)
+        del model, checkpoint, vision
+        gc.collect()
+        torch.cuda.empty_cache()
+    summarize(out, records, manifest)
+    with (out / "comparison.md").open("a") as f:
+        f.write(f"\nBest checkpoints reevaluated with gripper prediction threshold {threshold:g}.\n")
+        baseline_path = out / "trivial_baseline.json"
+        if baseline_path.exists():
+            baseline = json.loads(baseline_path.read_text())
+            f.write(f"\nReference: zero motion plus last observed gripper — position MSE "
+                    f"{baseline['pos_mse']:.6f}, rotation MSE {baseline['rot_mse']:.6f}, "
+                    f"gripper MSE {baseline['grip_mse']:.6f}, accuracy {baseline['grip_acc']:.3f}.\n")
+        f.write("\nAction errors are in dataset action units, not Cartesian meters/degrees. "
+                "GPU elapsed times include contention with another training job.\n")
+    dataset.close()
+    (out / "EVALUATION_COMPLETE").write_text(f"All best checkpoints reevaluated with threshold {threshold:g}.\n")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", default=str(ROOT / "data/libero_goal.h5"))
+    parser.add_argument("--cache", default=str(ROOT / "data/libero_goal.dinov2"))
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--evaluate-existing", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue from epoch checkpoints; preserve/restart attempts without optimizer state.")
+    parser.add_argument("--epochs", type=int, default=80)
+    parser.add_argument("--max-steps", type=int, default=0,
+                        help="Optimizer steps per epoch; 0 uses the full training loader.")
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cameras", nargs="+", default=["image", "wrist_image"])
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--head-type", choices=["diffusion", "flow_matching"], default="diffusion")
+    parser.add_argument("--state-dim", type=int, default=64)
+    parser.add_argument("--compressed-dim", type=int, default=4)
+    parser.add_argument("--head-d-model", type=int, default=64)
+    parser.add_argument("--mamba-output-dim", type=int, default=128)
+    parser.add_argument("--mamba-d-state", type=int, default=16)
+    parser.add_argument("--mamba-d-conv", type=int, default=4)
+    parser.add_argument("--mamba-expand", type=int, default=2)
+    parser.add_argument("--num-intent-tokens", type=int, default=1)
+    parser.add_argument("--intent-dim", type=int, default=128)
+    parser.add_argument("--memory-bank-len", type=int, default=8)
+    parser.add_argument("--gripper-loss-weight", type=float, default=0.01)
+    parser.add_argument("--gripper-threshold", type=float, default=0.5)
+    parser.add_argument("--cpu-threads", type=int, default=2)
+    parser.add_argument("--history-size", type=int, default=1)
+    parser.add_argument("--chunk-size", type=int, default=8)
+    parser.add_argument("--segment-length", type=int, default=20)
+    parser.add_argument("--variants", nargs="+", default=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"])
+    parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"],
+                        help="Train only this variant, retaining the ordered common initialization.")
+    parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
+    args = parser.parse_args(argv)
+    for name in ("epochs", "batch_size", "history_size", "chunk_size", "segment_length",
+                 "state_dim", "compressed_dim", "head_d_model", "mamba_output_dim",
+                 "mamba_d_state", "mamba_d_conv", "mamba_expand", "num_intent_tokens",
+                 "intent_dim", "memory_bank_len", "cpu_threads"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.segment_length < args.history_size + args.chunk_size:
+        parser.error("Segment must contain both history and action chunk")
+    if args.chunk_size < 4:
+        parser.error("--chunk-size must be at least 4 for the generative U-Net")
+    if args.head_d_model % 8:
+        parser.error("--head-d-model must be divisible by 8 for GroupNorm")
+    if args.compressed_dim % 4 or args.state_dim % 4 or (args.intent_dim * args.num_intent_tokens) % 4:
+        parser.error("Compressed/state/total intent dimensions must be divisible by 4 for attention")
+    if len(set(args.cameras)) != len(args.cameras):
+        parser.error("Camera names must be unique")
+    if not 0 < args.validation_fraction < 1 or not 0 < args.gpu_memory_fraction <= 1:
+        parser.error("Validation fraction must be in (0, 1); GPU memory fraction in (0, 1]")
+    if args.lr <= 0 or min(args.weight_decay, args.grad_clip, args.gripper_loss_weight, args.max_steps) < 0:
+        parser.error("Learning rate must be positive; decay, clipping, loss weight and max steps must be nonnegative")
+    if len(set(args.variants)) != len(args.variants):
+        parser.error("Each variant may appear only once")
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if not torch.cuda.is_available():
+        raise RuntimeError("These ablations require a CUDA GPU")
+    if args.evaluate_existing:
+        evaluate_existing(Path(args.output).resolve())
+        return
+    if args.segment_length < args.history_size + args.chunk_size:
+        raise ValueError("Segment must contain both history and action chunk")
+    out = Path(args.output).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    if (out / "manifest.json").exists() and not args.resume:
+        raise FileExistsError("Use a new output directory; existing runs are preserved")
+    os.environ["WANDB_MODE"] = "disabled"
+    torch.set_num_threads(args.cpu_threads)
+    device = torch.device("cuda")
+    # Bound this process's allocator while another training job shares the GPU.
+    if not 0 < args.gpu_memory_fraction <= 1:
+        raise ValueError("GPU memory fraction must be in (0, 1]")
+    if args.worker_variant and args.worker_variant not in args.variants:
+        raise ValueError("Worker variant must be in the requested variants")
+    torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
+    dataset = ALIGNDataset(args.data, mode="head", cameras=args.cameras,
+                           traj_window=args.segment_length, dinov2_path=args.cache)
+    sample = dataset._read_frames_dinov2(0, 0, 1)
+    # The production cached trainer expects 256 patches + CLS per camera.
+    if sample.shape[-2:] != (257 * len(args.cameras), 768):
+        raise ValueError("Expected 257 DINOv2 tokens of width 768 per selected camera")
+    pool_out_dim = (sample.shape[-2] - len(args.cameras)) * args.compressed_dim
+    train_eps, val_eps = episode_split(dataset, args.seed, args.validation_fraction)
+    if len(train_eps) < args.batch_size:
+        raise ValueError("Batch size exceeds the training episode count")
+    if any(dataset._get_episode_length(ep) < args.history_size + args.chunk_size for ep in train_eps + val_eps):
+        raise ValueError("An episode is too short for this history/chunk configuration")
+    manifest = dict(vars(args), commit=subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        torch=str(torch.__version__), cuda=torch.version.cuda,
+        gpu=torch.cuda.get_device_name(), split="task-stratified whole episodes",
+        train_episodes=[dataset._episode_keys[ep] for ep in train_eps],
+        val_episodes=[dataset._episode_keys[ep] for ep in val_eps],
+        num_cameras=len(args.cameras), pool_out_dim=pool_out_dim, frozen_cached_vision=True,
+        intention_recurrence="causal observation state across each segment")
+    if args.resume and (out / "manifest.json").exists():
+        previous = json.loads((out / "manifest.json").read_text())
+        legacy_defaults = dict(cameras=["image", "wrist_image"], validation_fraction=0.1,
+                               weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
+                               mamba_d_state=16, mamba_d_conv=4, mamba_expand=2)
+        for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
+                    "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
+                    "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
+                    "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
+                    "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold"):
+            if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
+                raise ValueError(f"Resume configuration mismatch: {key}")
+        manifest = dict(manifest, **previous)
+    else:
+        atomic_json(out / "manifest.json", manifest)
+    print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
+    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True)
+    val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False)
+    records = (json.loads((out / "summary.json").read_text())
+               if args.resume and (out / "summary.json").exists() else {})
+    report_out = out
+    if args.worker_variant:
+        report_out = out / args.worker_variant
+        if (report_out / "summary.json").exists():
+            records = json.loads((report_out / "summary.json").read_text())
+        records = {name: record for name, record in records.items() if name == args.worker_variant}
+    shared_initialization = {}
+    for name in args.variants:
+        if name not in {"no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"}:
+            raise ValueError(name)
+        intent = name.startswith("intent_")
+        memory = name.endswith("_memory") and not name.endswith("no_memory")
+        seed_everything(args.seed)
+        model = ALIGNIntentionModel(state_dim=args.state_dim, mamba_output_dim=args.mamba_output_dim,
+            action_dim=7, chunk_size=args.chunk_size, history_size=args.history_size,
+            num_cameras=len(args.cameras), compressed_dim=args.compressed_dim,
+            head_type=args.head_type, head_d_model=args.head_d_model,
+            mamba_d_state=args.mamba_d_state, mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
+            use_intent_tokens=intent, num_intent_tokens=args.num_intent_tokens, intent_dim=args.intent_dim,
+            use_memory_bank=memory, memory_bank_len=args.memory_bank_len)
+        # Cached training never uses the raw-image modules. Keep them off GPU.
+        model.vision_encoder.requires_grad_(False)
+        vision = model.vision_encoder
+        model.vision_encoder = torch.nn.Identity()
+        model.to(device)
+        model.vision_encoder = vision
+        seed_everything(args.seed + 1)
+        model._build_head_and_bank(pool_out_dim)
+        model.intention_head.to(device)
+        if model.memory_module is not None:
+            model.memory_module.to(device)
+        with torch.no_grad():
+            for key, value in model.state_dict().items():
+                if key.startswith("vision_encoder."):
+                    continue
+                if key in shared_initialization and shared_initialization[key].shape == value.shape:
+                    value.copy_(shared_initialization[key].to(value.device))
+                else:
+                    shared_initialization.setdefault(key, value.detach().cpu().clone())
+        # The encoder's legacy patch encoder and hidden projection have no consumers.
+        if model.intention_encoder is not None:
+            model.intention_encoder.vision_patch_encoder.requires_grad_(False)
+            model.intention_encoder.mamba_to_hidden.requires_grad_(False)
+        if args.worker_variant and name != args.worker_variant:
+            del model, vision
+            torch.cuda.empty_cache()
+            continue
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, fused=True)
+        loop_args = SimpleNamespace(history_size=args.history_size, chunk_size=args.chunk_size,
+            action_dim=7, head_type=args.head_type, skip_nan=False, grad_clip=args.grad_clip,
+            no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,
+            gripper_loss_weight=args.gripper_loss_weight)
+        val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, pin_memory=True, collate_fn=collate_segments)
+        run = out / name
+        start_epoch = 1
+        best = float("inf")
+        if args.resume and run.exists():
+            if records.get(name, {}).get("completed_epochs", 0) >= args.epochs:
+                print(f"SKIP completed {name}", flush=True)
+                del model, optimizer, params, vision, val_loader
+                torch.cuda.empty_cache()
+                continue
+            last_checkpoint = run / "training_last.pt"
+            if last_checkpoint.exists():
+                saved = torch.load(last_checkpoint, map_location=device, weights_only=True)
+                model.load_state_dict(saved["model_state_dict"], strict=False)
+                optimizer.load_state_dict(saved["optimizer_state_dict"])
+                start_epoch = saved["epoch"] + 1
+                best = saved["best_loss"]
+                records[name] = saved["record"]
+                # A metric written before an interrupted checkpoint save is replayed.
+                metric_file = run / "metrics.jsonl"
+                if metric_file.exists():
+                    completed = [line for line in metric_file.read_text().splitlines()
+                                 if json.loads(line)["epoch"] < start_epoch]
+                    metric_file.write_text("\n".join(completed) + ("\n" if completed else ""))
+                del saved
+                print(f"RESUME {name} epoch={start_epoch}", flush=True)
+            else:
+                archive = out / f"{name}_interrupted_{int(time.time())}"
+                run.rename(archive)
+                records.pop(name, None)
+                print(f"RESTART {name}: no optimizer checkpoint; preserved {archive.name}", flush=True)
+        run.mkdir(exist_ok=True)
+        config = dict(manifest, use_intent_tokens=intent, use_memory_bank=memory,
+                      use_history=True, mamba_output_dim=args.mamba_output_dim, action_dim=7,
+                      num_cameras=len(args.cameras), model_class="ALIGNIntentionModel",
+                      trainable_parameters=sum(p.numel() for p in params))
+        atomic_json(run / "config.json", config)
+        torch.cuda.reset_peak_memory_stats()
+        print(f"START {name}: {config['trainable_parameters']:,} trainable parameters", flush=True)
+        with (run / "metrics.jsonl").open("a" if start_epoch > 1 else "w", buffering=1) as log:
+            for epoch in range(start_epoch, args.epochs + 1):
+                train_data.epoch = epoch
+                generator = torch.Generator().manual_seed(args.seed + epoch)
+                train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
+                    generator=generator, num_workers=0, pin_memory=True,
+                    collate_fn=collate_segments, drop_last=True)
+                seed_everything(args.seed + epoch)
+                start = time.monotonic()
+                train_loss, _ = train_v4_epoch(model, train_loader, optimizer, device,
+                    loop_args, max_steps=args.max_steps)
+                seed_everything(args.seed + 10000)
+                val_loss, _, metrics = validate(model, val_loader, device, loop_args)
+                row = dict(epoch=epoch, **{"train/loss": train_loss, "val/loss": val_loss},
+                    **metrics, elapsed_s=time.monotonic() - start,
+                    peak_gpu_gib=torch.cuda.max_memory_allocated() / 1024 ** 3)
+                if not np.isfinite(train_loss) or not np.isfinite(val_loss):
+                    raise FloatingPointError(f"Nonfinite loss in {name}: {row}")
+                log.write(json.dumps(row, allow_nan=False) + "\n")
+                if val_loss < best:
+                    best = val_loss
+                    records[name] = dict(best=row, completed_epochs=epoch)
+                    torch.save(dict(model_state_dict=model.state_dict(), config=config,
+                        epoch=epoch, val_loss=val_loss), run / "intention_best.pt")
+                records[name]["completed_epochs"] = epoch
+                # Frozen raw vision is reconstructible and excluded to keep
+                # epoch recovery saves small. Seed/crop/order reset every epoch.
+                latest = dict(model_state_dict={key: value for key, value in model.state_dict().items()
+                                                if not key.startswith("vision_encoder.")},
+                              optimizer_state_dict=optimizer.state_dict(), epoch=epoch,
+                              best_loss=best, record=records[name])
+                temporary = run / "training_last.pt.tmp"
+                torch.save(latest, temporary)
+                temporary.replace(run / "training_last.pt")
+                del latest
+                summarize(report_out, records, manifest)
+                print(f"RESULT {name} epoch={epoch} train={train_loss:.6f} val={val_loss:.6f} "
+                      f"pos={metrics['pos_mse']:.6f} rot={metrics['rot_mse']:.6f} "
+                      f"grip_acc={metrics['grip_acc']:.3f} seconds={row['elapsed_s']:.1f}", flush=True)
+        del model, optimizer, params, vision, val_loader
+        torch.cuda.empty_cache()
+    dataset.close()
+    summarize(report_out, records, manifest)
+    (report_out / "COMPLETE").write_text("Requested worker variants completed.\n")
+    print(f"COMPLETE: {report_out / 'comparison.md'}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

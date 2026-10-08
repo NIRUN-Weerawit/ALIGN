@@ -2,6 +2,7 @@
 align_data/
 h5_data/
 data/*.h5
+data/*.dinov2
 
 # Training artifacts
 checkpoints/

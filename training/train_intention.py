@@ -380,7 +380,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # Per-dimension loss weights: down-weight gripper (dim 6) so it doesn't dominate
         dim_weights = torch.ones(args.action_dim, device=device)
         if args.action_dim >= 7:
-            dim_weights[6] = 0.01
+            dim_weights[6] = getattr(args, "gripper_loss_weight", 0.01)
 
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
@@ -585,7 +585,7 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
         # Per-dimension loss weights: down-weight gripper (dim 6) so it doesn't dominate
         dim_weights = torch.ones(args.action_dim, device=device)
         if args.action_dim >= 7:
-            dim_weights[6] = 0.01
+            dim_weights[6] = getattr(args, "gripper_loss_weight", 0.01)
 
         # Forward (BF16 always on for speed; disabled automatically on CPU)
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
@@ -766,7 +766,7 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                         actions_pred = None
                     dim_weights = torch.ones(args.action_dim, device=device)
                     if args.action_dim >= 7:
-                        dim_weights[6] = 0.01
+                        dim_weights[6] = getattr(args, "gripper_loss_weight", 0.01)
                     loss = model.intention_head.loss(
                         target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
                     )
@@ -846,7 +846,7 @@ def validate(model, loader, device, args):
         # Per-dimension loss weights: down-weight gripper (dim 6) so it doesn't dominate
         dim_weights = torch.ones(args.action_dim, device=device)
         if args.action_dim >= 7:
-            dim_weights[6] = 0.01
+            dim_weights[6] = getattr(args, "gripper_loss_weight", 0.01)
 
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
@@ -1003,7 +1003,7 @@ def validate(model, loader, device, args):
                     genuine_gripper_batches += 1
                     grip_pred = actions_pred[..., 6]  # model's gripper prediction
                     grip_target = target[..., 6]
-                    grip_pred_binary = (grip_pred > 0).float()
+                    grip_pred_binary = (grip_pred > getattr(args, "gripper_threshold", 0.0)).float()
                     grip_target_binary = (grip_target > 0).float()
                     grip_correct = (grip_pred_binary == grip_target_binary).float().sum().item()
                     grip_total = B_win * T
@@ -1123,6 +1123,11 @@ def parse_args():
                         help="Mamba block expansion factor (default 2).")
     parser.add_argument("--action-dim", type=int, default=7,
                         help="Action output dim (default 7).")
+
+    parser.add_argument("--gripper-loss-weight", type=float, default=0.01,
+                        help="Gripper loss weight relative to each motion dimension")
+    parser.add_argument("--gripper-threshold", type=float, default=0.0,
+                        help="Validation cutoff for predicted gripper: 0 for signed commands, 0.5 for binary 0/1 targets.")
 
     # Patch tokens
     parser.add_argument("--no-patch-tokens", dest="use_patch_tokens",
