@@ -520,7 +520,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                             actions_pred = None
                         else:
                             actions_pred = model.sample_actions(
-                                z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
+                                z_v_win_for_head, z_s_win_for_head, h_for_head
                             )
                             if getattr(args, "debug", False):
                                 print(f"[DEBUG] actions_pred: {actions_pred.shape}, "
@@ -606,7 +606,6 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 )
                 actions_pred = model.sample_actions(
                     out["z_v_pooled_seq"], out["z_s_seq"], head_intent,
-                    num_steps=target.shape[1],
                 )
                 loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
             else:
@@ -760,7 +759,7 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                     cond = model.intention_head(z_v_win, z_s_win, intent_emb)
                     if not getattr(args, "no_sample_during_train", False):
                         actions_pred = model.sample_actions(
-                            z_v_win, z_s_win, intent_emb, num_steps=chunk_size,
+                            z_v_win, z_s_win, intent_emb,
                         )
                     else:
                         actions_pred = None
@@ -957,7 +956,7 @@ def validate(model, loader, device, args):
                             z_v_win_for_head, z_s_win_for_head, h_for_head,
                         )
                         actions_pred = model.sample_actions(
-                            z_v_win_for_head, z_s_win_for_head, h_for_head, num_steps=chunk_size
+                            z_v_win_for_head, z_s_win_for_head, h_for_head
                         )
                         loss = model.intention_head.loss(
                             target, cond, dim_weights=dim_weights, sample_mask=valid_mask,

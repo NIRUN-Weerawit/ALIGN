@@ -195,7 +195,10 @@ def test_real_trainer_and_validation_ignore_padded_targets(monkeypatch, use_memo
         valid_cond = cond[sample_mask]
         return target[sample_mask].square().mean() + valid_cond.square().mean() * .001
     model.intention_head.loss = loss
-    model.intention_head.sample = lambda cond, num_steps=None: cond.new_zeros(cond.shape[0], 2, 7)
+    def sample(cond, num_steps=None):
+        assert num_steps is None  # Action chunk length must not set denoising steps.
+        return cond.new_zeros(cond.shape[0], 2, 7)
+    model.intention_head.sample = sample
     actions = np.ones((2, 5, 7), np.float32)
     actions[1, 3:] = 1000.0  # Replicated padding must not enter loss or metrics.
     batch = {"frames_segment": np.zeros((2, 5, 1, 4, 4, 3), np.uint8),

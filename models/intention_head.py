@@ -468,6 +468,9 @@ class DiffusionPolicyHead(nn.Module):
         theta = torch.tensor(math.pi / 2, dtype=torch.float64) * (
             t_vals / T_steps + s) / (1 + s)
         alpha_bar = torch.cos(theta).pow(2)
+        # Index 0 is clean. Keep the terminal signal positive so epsilon-to-x0
+        # inversion remains finite; an exactly zero cosine endpoint is singular.
+        alpha_bar = (alpha_bar / alpha_bar[0]).clamp(min=1e-4, max=1.0)
         sigma = torch.sqrt(1 - alpha_bar)
         self.register_buffer("alpha_bar", alpha_bar.float())
         self.register_buffer("sigma", sigma.float())
@@ -544,14 +547,16 @@ class DiffusionPolicyHead(nn.Module):
             actions_target: (B, K, action_dim)
             cond: (B, K, cond_dim)
             dim_weights: (action_dim,) optional per-dimension loss weights.
-                         Use to down-weight gripper (e.g. [1,1,1,1,1,1,0.01]).
+                         Defaults to equal weights, including gripper.
         """
         actions_target, cond = _valid_loss_samples(actions_target, cond, sample_mask)
         B, K = actions_target.shape[:2]
         device = actions_target.device
 
-        t_indices = torch.randint(0, self.num_inference_steps + 1,
-                                  (B,), device=device).long()
+        # Train only noisy timesteps. Legacy checkpoints have a zero-signal
+        # terminal buffer: exclude that singular endpoint when resuming them.
+        last = int(torch.where(self.alpha_bar > 1e-8)[0][-1])
+        t_indices = torch.randint(1, last + 1, (B,), device=device)
         alpha_bar_t = self.alpha_bar[t_indices][:, None, None]
         sigma_t = self.sigma[t_indices][:, None, None]
 
@@ -564,28 +569,38 @@ class DiffusionPolicyHead(nn.Module):
             err = err * dim_weights.unsqueeze(0).unsqueeze(0)  # broadcast
         return err.mean()
 
+    def sampling_timesteps(self, num_steps=None):
+        """Cover the full usable noise schedule, regardless of action horizon.
+
+        Old checkpoints retain their original buffers. Their zero-signal cosine
+        endpoint cannot be inverted: use the largest finite timestep and retain
+        their slightly noisy index 0 as the last denoising timestep.
+        """
+        last = int(torch.where(self.alpha_bar > 1e-8)[0][-1])
+        first = 1 if float(self.alpha_bar[0]) == 1.0 else 0
+        available = last - first + 1
+        steps = self.num_inference_steps if num_steps is None else num_steps
+        if not isinstance(steps, int) or not 1 <= steps <= available:
+            raise ValueError(f"num_steps must be an integer in [1, {available}]")
+        return torch.linspace(last, first, steps, device=self.alpha_bar.device).round().long()
+
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, num_steps: int = None) -> torch.Tensor:
-        """DDIM deterministic sampling (eta=0) from noise to actions."""
-        if num_steps is None:
-            num_steps = self.num_inference_steps
+        """DDIM (eta=0); fewer steps subsample the full training noise grid."""
+        timesteps = self.sampling_timesteps(num_steps)
         B, K, D = cond.shape[0], self.chunk_size, self.action_dim
-        device = cond.device
-
-        x = torch.randn(B, K, D, device=device)
-
-        for i in range(num_steps - 1, -1, -1):
-            t = torch.full((B,), i, device=device, dtype=torch.long)
-            eps = self.predict_noise(x, t, cond)
-
-            a_bar_t = self.alpha_bar[i]
-            a_bar_prev = (self.alpha_bar[max(i - 1, 0)]
-                          if i > 0
-                          else torch.tensor(1.0, dtype=torch.float32, device=device))
-            sigma_t = self.sigma[i]
-
-            x_0_pred = (x - sigma_t * eps) / a_bar_t.sqrt()
-            x = a_bar_prev.sqrt() * x_0_pred + (1.0 - a_bar_prev).sqrt() * eps
+        x = torch.randn(B, K, D, device=cond.device, dtype=torch.float32)
+        for j, index in enumerate(timesteps):
+            t = index.expand(B)
+            # Epsilon errors are amplified by 1/sqrt(alpha). Keep the
+            # denoiser in FP32 even when conditioning was encoded under AMP.
+            with torch.autocast(device_type=cond.device.type, enabled=False):
+                eps = self.predict_noise(x, t, cond.float()).float()
+            alpha = self.alpha_bar[index].float()
+            previous = (self.alpha_bar[timesteps[j + 1]].float()
+                        if j + 1 < len(timesteps) else alpha.new_tensor(1.0))
+            x0 = (x - self.sigma[index].float() * eps) / alpha.sqrt()
+            x = previous.sqrt() * x0 + (1.0 - previous).sqrt() * eps
         return x
 
 
