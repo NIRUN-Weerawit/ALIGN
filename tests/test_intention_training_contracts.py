@@ -274,3 +274,53 @@ def test_cli_defaults_to_supported_diffusion_head(monkeypatch):
     assert args.head_type == "diffusion"
     assert args.gripper_loss_weight == 1.0
     assert args.gripper_threshold == 0.5
+
+
+def test_training_packet_outage_hides_current_features_and_does_not_store_them(monkeypatch):
+    from types import SimpleNamespace
+    import models.align_intention as module
+    from training.train_intention import train_v4_epoch
+    monkeypatch.setattr(module,'VisionEncoder',FakeVision)
+    model=ALIGNIntentionModel(state_dim=4,compressed_dim=4,num_cameras=2,
+        use_intent_tokens=False,use_memory_bank=True,head_type='flow_matching',head_d_model=8,history_size=1,action_dim=7,chunk_size=4)
+    model._build_head_and_bank(2048)
+    batch=dict(frames_segment=torch.randn(1,8,514,768),states_segment=torch.randn(1,8,7),
+               actions_segment=torch.randn(1,8,7),segment_len=np.array([8]),
+               loss_anchor_mask=torch.ones(1,8,dtype=torch.bool),observation_timesteps=torch.arange(8)[None],
+               observation_camera_mask=torch.ones(1,8,2,dtype=torch.bool),observation_state_mask=torch.ones(1,8,dtype=torch.bool))
+    batch['observation_camera_mask'][:,2]=False;batch['observation_state_mask'][:,2]=False
+    calls=[]
+    def capture(module,inputs,kwargs):calls.append((inputs[0].detach().clone(),inputs[1].detach().clone(),kwargs['observed_mask'].clone()))
+    hook=model.memory_module.register_forward_pre_hook(capture,with_kwargs=True)
+    args=SimpleNamespace(history_size=1,chunk_size=4,action_dim=7,head_type='flow_matching',skip_nan=True,grad_clip=1.,gripper_loss_weight=1.)
+    optimizer=torch.optim.AdamW(model.parameters(),lr=.0001)
+    loss,_=train_v4_epoch(model,[batch],optimizer,torch.device('cpu'),args,max_steps=1)
+    hook.remove()
+    assert np.isfinite(loss)
+    assert not calls[2][0].any() and not calls[2][1].any() and not calls[2][2].any()
+    assert model.memory_module._count.tolist()==[4]
+    assert model.memory_module.timestamps[0,:4].tolist()==[0,1,3,4]
+
+
+def test_streaming_visibility_masks_match_training_and_remove_hidden_input_leakage(monkeypatch):
+    import models.align_intention as module
+    from models.intention_stream import IntentionStream
+    monkeypatch.setattr(module,'VisionEncoder',FakeVision)
+    model=ALIGNIntentionModel(state_dim=4,compressed_dim=4,num_cameras=2,use_intent_tokens=False,
+        use_memory_bank=True,memory_patch_retrieval=True,head_type='flow_matching',head_d_model=8,history_size=1)
+    frames=torch.ones(1,2,4,4,3);states=torch.randn(1,7)
+    camera_mask=torch.tensor([[True,False]]);state_mask=torch.tensor([False])
+    first=model.encode_step(frames,states,camera_mask=camera_mask,state_mask=state_mask)
+    frames[:,1]=100;states*=100
+    second=model.encode_step(frames,states,camera_mask=camera_mask,state_mask=state_mask)
+    torch.testing.assert_close(first[0],second[0]);assert not first[1].any()
+    assert not second[0][:,8:].any() # two patches * four channels in hidden camera
+    model.memory_module.reset(1,torch.device('cpu'))
+    stream=IntentionStream(model,1)
+    stream.observe(frames,states,store_memory=True)
+    missing=stream.observe(frames,states,store_memory=True,camera_mask=torch.zeros(1,2,dtype=torch.bool),state_mask=state_mask)
+    assert not missing['z_v_pooled_seq'].any() and not missing['z_s_seq'].any()
+    assert not missing['observed_mask'].any() and missing['timestamp'].item()==1
+    stream.observe(frames,states,store_memory=True)
+    assert model.memory_module._count.item()==2
+    assert model.memory_module.timestamps[0,:2].tolist()==[0,2]

@@ -57,12 +57,13 @@ def episode_split(dataset, seed, fraction):
 
 
 class CachedEpisodes(Dataset):
-    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0.):
+    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False):
         self.dataset, self.episodes = dataset, episodes
         self.length, self.seed, self.training = length, seed, training
         self.epoch = 0
         self.temporal_sampling, self.supervision_points, self.chunk_size = temporal_sampling, supervision_points, chunk_size
         self.observation_dropout_prob = observation_dropout_prob
+        self.drop_state_with_all_views = drop_state_with_all_views
 
     def __len__(self):
         return len(self.episodes)
@@ -99,6 +100,7 @@ class CachedEpisodes(Dataset):
                 if rng.random() < .5:visible[t] = False
                 else:visible[t,int(rng.integers(cameras))] = False
             result['observation_camera_mask'] = visible
+            if self.drop_state_with_all_views:result['observation_state_mask'] = visible.any(1)
         return result
 
 
@@ -112,7 +114,7 @@ def collate_segments(items):
             pad = [(0, length - len(arr))] + [(0, 0)] * (arr.ndim - 1)
             rows.append(np.pad(arr, pad))
         result[key] = torch.from_numpy(np.stack(rows))
-    for key in ("loss_anchor_mask","observation_timesteps","observation_camera_mask"):
+    for key in ("loss_anchor_mask","observation_timesteps","observation_camera_mask","observation_state_mask"):
         if key in items[0]:
             result[key] = torch.from_numpy(np.stack([np.pad(x[key],[(0,length-len(x[key]))]+[(0,0)]*(x[key].ndim-1)) for x in items]))
     return result
@@ -222,6 +224,7 @@ def parse_args(argv=None):
     parser.add_argument("--temporal-sampling",choices=["crop","episode"],default="episode")
     parser.add_argument("--supervision-points",type=int,default=16)
     parser.add_argument("--observation-dropout-prob",type=float,default=0.,help="Training-only camera/all-view feature loss at supervised anchors; same masks across ablations")
+    parser.add_argument("--drop-state-with-all-views",action=argparse.BooleanOptionalAction,default=False,help="Complete observation-packet outages when all cameras are dropped")
     parser.add_argument("--memory-mode",choices=["legacy","episodic"],default="episodic")
     parser.add_argument("--memory-detach-writes",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--memory-write-fused",action=argparse.BooleanOptionalAction,default=False)
@@ -348,21 +351,21 @@ def main(argv=None):
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
                                memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
-                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.)
+                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False)
         for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
-                    "memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob"):
+                    "memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         manifest = dict(manifest, **previous)
     else:
         atomic_json(out / "manifest.json", manifest)
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
-    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob)
+    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob,args.drop_state_with_all_views)
     val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size)
     records = (json.loads((out / "summary.json").read_text())
                if args.resume and (out / "summary.json").exists() else {})

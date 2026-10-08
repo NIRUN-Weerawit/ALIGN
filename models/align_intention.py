@@ -388,7 +388,7 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     def encode_step(self, frames: torch.Tensor, robot_state: torch.Tensor,
                     h_states: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-                    produce_intent: bool = False
+                    produce_intent: bool = False, camera_mask=None, state_mask=None
                     ):
         """One step of encoding (inference).
 
@@ -400,6 +400,8 @@ class ALIGNIntentionModel(nn.Module):
             robot_state: (B, 7)
             h_states: (conv_state, ssm_state) from previous step, or None
             produce_intent: if True, read tokens on a fork after the observation
+            camera_mask: optional (B,V) availability; masked cameras contribute no CLS/patch features
+            state_mask: optional (B,) availability; masked state contributes no encoded features
 
         Returns:
             (z_v_pooled, z_s, h_new, h_states_new) or
@@ -413,7 +415,12 @@ class ALIGNIntentionModel(nn.Module):
             z_v_all = z_v_all.reshape(batch, cameras * z_v_all.shape[1], -1)
         else:
             z_v_all = self._vision_forward(frames)
+        state_visible = None
+        if state_mask is not None:
+            state_visible = torch.as_tensor(state_mask,device=robot_state.device,dtype=torch.bool).reshape(-1,1)
+            robot_state = torch.where(state_visible,robot_state,torch.zeros_like(robot_state))
         z_s = self.state_encoder(robot_state)
+        if state_visible is not None:z_s = z_s*state_visible
         V = self.num_cameras
         # Per-camera training/cache layout: [cam0_patches..., cam0_CLS,
         # cam1_patches..., cam1_CLS, ...].
@@ -423,11 +430,17 @@ class ALIGNIntentionModel(nn.Module):
         P = P_plus_1 - 1
         # Reshape to (B, V, P+1, 768) so we can split into patches and CLS per camera
         z_v_all_reshaped = z_v_all.reshape(z_v_all.shape[0], V, P_plus_1, 768)
+        camera_visible = None
+        if camera_mask is not None:
+            camera_visible = torch.as_tensor(camera_mask,device=z_v_all.device,dtype=torch.bool).reshape(z_v_all.shape[0],V)
+            z_v_all_reshaped = torch.where(camera_visible[:,:,None,None],z_v_all_reshaped,torch.zeros_like(z_v_all_reshaped))
         # CLS is the last position per camera: (B, V, 768)
         z_v_cls = z_v_all_reshaped[:, :, -1, :]  # (B, V, 768)
         # Patches are all positions except the last per camera: (B, V, P, 768)
         z_v_patches = z_v_all_reshaped[:, :, :-1, :].reshape(z_v_all.shape[0], V * P, 768)
         z_v_mod = self.vision_patch_encoder(z_v_patches, z_s)
+        if camera_visible is not None:
+            z_v_mod = (z_v_mod.reshape(z_v_mod.shape[0],V,P,-1)*camera_visible[:,:,None,None]).reshape(z_v_mod.shape)
         z_v_pooled = z_v_mod.flatten(1)
 
         # Build head on first call

@@ -111,16 +111,17 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     conds['memory_shuffle'] = model.intention_head(*model.condition_actions(p,s,i))
                     restore(model.memory_module,after)
                 if visual_occlusion:
-                    for case in ['last_camera','all_visual']:
+                    for case in ['last_camera','all_visual','all_observation']:
                         missing = p.clone()
                         start = (p.shape[-1]//model.num_cameras)*(model.num_cameras-1) if case=='last_camera' else 0
                         missing[:,:,start:] = 0
+                        missing_state = torch.zeros_like(s) if case=='all_observation' else s
                         if before is not None:restore(model.memory_module,before)
-                        conds[case+'_correct'] = model.intention_head(*model.condition_actions(missing,s,i))
-                        conds[case+'_bypass'] = model.intention_head(missing,s,i)
+                        conds[case+'_correct'] = model.intention_head(*model.condition_actions(missing,missing_state,i))
+                        conds[case+'_bypass'] = model.intention_head(missing,missing_state,i)
                         if before is not None:
                             restore(model.memory_module,before,permutation)
-                            conds[case+'_shuffle'] = model.intention_head(*model.condition_actions(missing,s,i))
+                            conds[case+'_shuffle'] = model.intention_head(*model.condition_actions(missing,missing_state,i))
                             restore(model.memory_module,after)
                 conds['visual_zero_control'] = model.intention_head(torch.zeros_like(fused[0]),fused[1],fused[2])
                 conds['state_zero_control'] = model.intention_head(fused[0],torch.zeros_like(fused[1]),fused[2])

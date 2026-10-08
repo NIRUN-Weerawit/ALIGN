@@ -200,3 +200,14 @@ def test_missing_view_training_is_deterministic_causal_and_validation_is_complet
     assert 'observation_camera_mask' not in validation
     batch=collate_segments([sample,sample])
     assert batch['observation_camera_mask'].shape==(2,120,2)
+
+
+def test_complete_observation_outages_hide_only_inputs_not_targets():
+    class Episode(FakeEpisode):cameras=['image','wrist_image']
+    data=CachedEpisodes(Episode(),[0],20,42,True,'episode',16,8,1.,True)
+    sample=data[0]
+    np.testing.assert_array_equal(sample['observation_state_mask'],sample['observation_camera_mask'].any(1))
+    assert not sample['observation_state_mask'].all()
+    np.testing.assert_array_equal(sample['actions_segment'][:,0],np.arange(120))
+    assert sample['observation_state_mask'][0]
+    assert collate_segments([sample,sample])['observation_state_mask'].shape==(2,120)

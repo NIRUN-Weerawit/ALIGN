@@ -283,6 +283,8 @@ class InferenceWorker(threading.Thread):
 
                         z_v_for_head, z_s_for_head, h_for_head = self.model.condition_actions(
                             out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
+                            **({"observed_mask":out.get("observed_mask"),"timestamp":out.get("timestamp")}
+                               if getattr(self.model,"use_memory_bank",False) else {}),
                         )
                         if self.model.head_type in ("diffusion", "flow_matching"):
                             a_model_full = self.model.sample_actions(

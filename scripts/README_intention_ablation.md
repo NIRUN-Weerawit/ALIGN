@@ -150,3 +150,9 @@ observed. Hidden cameras contribute neither current CLS tokens nor encoded
 patches. Use `--visual-occlusion` in the condition probe for paired current-view
 latent dropout with correct, shuffled and bypassed history. Report these
 partial-observation diagnostics separately from unmodified simulator success.
+
+`--drop-state-with-all-views` extends that experiment to complete observation
+packet loss. Current state features are then unavailable along with the cameras;
+completely missing packets are excluded from bank writes. Streaming
+`encode_step`/`IntentionStream.observe` accept the corresponding camera/state
+availability masks and preserve physical observation indices across outages.

@@ -435,10 +435,15 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # Extract patches (all positions except the last per camera)
         z_v_all = z_v_all[:, :, :-1, :].reshape(B, S , V * P, 768)   # (B, S, V*P, raw_dim=768)
 
+        state_visibility = None
+        if "observation_state_mask" in batch:
+            state_visibility = torch.as_tensor(batch["observation_state_mask"],device=device,dtype=torch.bool)
+            states_seg = torch.where(state_visibility[:,:,None],states_seg,torch.zeros_like(states_seg))
         _, _, state_dim = states_seg.shape
         z_s_all = model.state_encoder(
             states_seg.reshape(B * S, state_dim)
         ).reshape(B, S, -1)
+        if state_visibility is not None:z_s_all = z_s_all*state_visibility[:,:,None]
 
         # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
         # z_s_all = torch.stack(z_s_all, dim=1)
@@ -528,7 +533,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     B_seg, H_actual, VP, comp_dim = z_v_win.shape
                     z_v_win_for_head, z_s_win_for_head, h_for_head = model.condition_actions(
                         z_v_win.reshape(B_seg, H_actual, VP * comp_dim),
-                        z_s_win, intent_emb, observed_mask=current_t < seg_lens,
+                        z_s_win, intent_emb, observed_mask=((current_t < seg_lens) &
+                            (state_visibility[:,current_t] | visibility.reshape(B,S,V)[:,current_t].any(1))
+                            if state_visibility is not None and visibility is not None else (current_t < seg_lens)),
                         **({"timestamp":batch["observation_timesteps"][:,current_t].to(device)} if "observation_timesteps" in batch else {}),
                     )
 
@@ -915,10 +922,15 @@ def validate(model, loader, device, args):
         # Extract patches (all positions except the last per camera)
         z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B, S , V * P, 768)   # (B, S, V*P, raw_dim=768)
 
+        state_visibility = None
+        if "observation_state_mask" in batch:
+            state_visibility = torch.as_tensor(batch["observation_state_mask"],device=device,dtype=torch.bool)
+            states_seg = torch.where(state_visibility[:,:,None],states_seg,torch.zeros_like(states_seg))
         _, _, state_dim = states_seg.shape
         z_s_all = model.state_encoder(
             states_seg.reshape(B * S, state_dim)
         ).reshape(B, S, -1)
+        if state_visibility is not None:z_s_all = z_s_all*state_visibility[:,:,None]
 
         z_v_mod_all = getattr(model,"encode_patch_sequence",model.vision_patch_encoder)(
             z_v_all.reshape(B * S, V * P, 768),
@@ -996,7 +1008,9 @@ def validate(model, loader, device, args):
                     B_seg, H_actual, VP, comp_dim = z_v_win.shape
                     z_v_win_for_head, z_s_win_for_head, h_for_head = model.condition_actions(
                         z_v_win.reshape(B_seg, H_actual, VP * comp_dim),
-                        z_s_win, intent_emb, observed_mask=current_t < seg_lens,
+                        z_s_win, intent_emb, observed_mask=((current_t < seg_lens) &
+                            (state_visibility[:,current_t] | visibility.reshape(B,S,V)[:,current_t].any(1))
+                            if state_visibility is not None and visibility is not None else (current_t < seg_lens)),
                         **({"timestamp":batch["observation_timesteps"][:,current_t].to(device)} if "observation_timesteps" in batch else {}),
                     )
 

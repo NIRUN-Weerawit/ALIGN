@@ -63,7 +63,9 @@ def main():
     eligible=[(key,v['normal']) for key,v in result.items() if 'normal' in v]
     if eligible:
         key,winner=max(eligible,key=lambda x:x[1]['success_rate'])
-        atomic_json(a.output/'selected_policy.json',dict(candidate=key,checkpoint=winner['checkpoint'],success_rate=winner['success_rate'],protocol=protocol))
+        atomic_json(a.output/'selected_policy.json',dict(candidate=key,checkpoint=winner['checkpoint'],success_rate=winner['success_rate'],
+            selection_status='no_candidate_succeeded' if winner['success_rate']==0 else 'provisional_validation_selection',
+            tied_candidates=[k for k,v in eligible if v['success_rate']==winner['success_rate']],protocol=protocol))
     (a.output/'COMPLETE').write_text('Closed-loop candidate comparison complete.\n')
 
 if __name__=='__main__':main()

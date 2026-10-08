@@ -788,6 +788,8 @@ def run_model_in_sim(
                         # intent_emb = torch.zeros_like(intent_emb)
                         z_v_for_head, z_s_for_head, h_for_head = model.condition_actions(
                             out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
+                            **({"observed_mask":out.get("observed_mask"),"timestamp":out.get("timestamp")}
+                               if getattr(model,"use_memory_bank",False) else {}),
                         )
                         a_model_full = _predict_action_chunk(
                             model, z_v_for_head, z_s_for_head, h_for_head,
