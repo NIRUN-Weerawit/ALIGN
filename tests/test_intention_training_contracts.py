@@ -110,6 +110,23 @@ class FakeVision(nn.Module):
         return tokens[:, None, None].expand(-1, 3, 768)
 
 
+def test_streaming_camera_features_match_batched_training(monkeypatch):
+    import models.align_intention as module
+    monkeypatch.setattr(module, "VisionEncoder", FakeVision)
+    model = ALIGNIntentionModel(state_dim=4, compressed_dim=4, num_cameras=2,
+                                use_intent_tokens=False, head_type="flow_matching",
+                                head_d_model=8).eval()
+    frames = torch.randint(0, 256, (2, 3, 2, 4, 4, 3), dtype=torch.uint8)
+    states = torch.randn(2, 3, 7)
+    with torch.no_grad():
+        batched = model(frames, states)
+        for t in range(3):
+            visual, state, _, _ = model.encode_step(frames[:, t], states[:, t])
+            assert visual.shape == (2, 16)  # 2 cameras * 2 patches * 4 compressed dims
+            torch.testing.assert_close(visual, batched["z_v_pooled_seq"][:, t])
+            torch.testing.assert_close(state, batched["z_s_seq"][:, t])
+
+
 def test_disabled_intent_ablation_omits_encoder_and_retrieves_memory(monkeypatch):
     import models.align_intention as module
     monkeypatch.setattr(module, "VisionEncoder", FakeVision)

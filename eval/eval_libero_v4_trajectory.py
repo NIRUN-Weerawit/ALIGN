@@ -648,6 +648,11 @@ def run_model_in_sim(
     if getattr(model, 'use_memory_bank', False) and model.memory_module is not None:
         model.memory_module.reset(batch_size=1, device=device)
 
+    from models.intention_stream import IntentionStream
+    observation_history = getattr(model, "history_size", chunk_size)
+    intention_stream = (IntentionStream(model, getattr(model, "history_size", chunk_size))
+                        if getattr(model, "intention_encoder", None) is not None else None)
+
     # State buffer (K-window) — each entry is a (7,) state vector
     pose_buffer = []
     # Frame buffer (K-window) — each entry is (V, H, W, 3) uint8, V = num cameras
@@ -679,7 +684,7 @@ def run_model_in_sim(
     init_frame_stack = _render_all_cameras()  # (V, H, W, 3)
 
     # Pad initial buffers with K copies of the initial state/frame
-    for k in range(chunk_size):
+    for k in range(observation_history):
         pose_buffer.append(init_state.copy())
         frame_buffer.append(init_frame_stack.copy())
 
@@ -744,10 +749,14 @@ def run_model_in_sim(
         frame_buffer.pop(0)
 
         # 3. Build K-window tensors
-        win_states = np.stack(pose_buffer, axis=0).astype(np.float32)  # (K, 7)
-        win_frames = np.stack(frame_buffer, axis=0)  # (K, V, H, W, 3) uint8
-        f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)  # (1, K, V, H, W, 3)
-        s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
+        if intention_stream is not None:
+            f_t = torch.from_numpy(current_frame_stack).unsqueeze(0).to(device)
+            s_t = torch.from_numpy(sim_state).float().unsqueeze(0).to(device)
+        else:
+            win_states = np.stack(pose_buffer, axis=0).astype(np.float32)
+            win_frames = np.stack(frame_buffer, axis=0)
+            f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)
+            s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
 
         # 4. Run V4 model every `action_horizon` steps, OR when the buffer is
         # empty (whichever comes first). With ensemble="none", the buffer
@@ -759,12 +768,20 @@ def run_model_in_sim(
             step % action_horizon == 0  # every action_horizon steps
             or not pending_actions      # buffer drained (only happens in "none")
         )
+        stream_out = None
+        if intention_stream is not None:
+            with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                                     enabled=device.type == "cuda"):
+                with sdpa_kernel(backends=[SDPBackend.MATH]):
+                    stream_out = intention_stream.observe(
+                        f_t, s_t, produce_intent=should_infer,
+                    )
         if should_infer:
             with torch.no_grad():
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                          enabled=device.type == "cuda"):
                     with sdpa_kernel(backends=[SDPBackend.MATH]):
-                        out = model(f_t, s_t)
+                        out = stream_out if stream_out is not None else model(f_t, s_t)
                         h_current = out["h_seq"][:, -1]
                         intent_emb = out.get("intent_emb", None)
                         # intent_emb = torch.zeros_like(intent_emb)

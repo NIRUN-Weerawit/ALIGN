@@ -53,7 +53,7 @@ class ALIGNIntentionModel(nn.Module):
         mamba_output_dim: int = 512,
         action_dim: int = 6,
         chunk_size: int = 10,
-        history_size: int = 20,
+        history_size: int = 1,
         num_cameras: int = 1,
         use_patch_tokens: bool = True,
         mamba_d_state: int = 16,
@@ -374,16 +374,24 @@ class ALIGNIntentionModel(nn.Module):
             frames: (B, H, W, 3) or (B, V, H, W, 3)
             robot_state: (B, 7)
             h_states: (conv_state, ssm_state) from previous step, or None
-            produce_intent: if True, run intent tokens after history step
+            produce_intent: if True, read tokens on a fork after the observation
 
         Returns:
             (z_v_pooled, z_s, h_new, h_states_new) or
             (z_v_pooled, z_s, h_new, h_states_new, intent_emb)
         """
-        z_v_all = self._vision_forward(frames)  # (B, V*(P+1), 768) — patches + 1 CLS per camera
+        # Match batched training: encode raw cameras individually, then restore
+        # camera-major patches/CLS. Cached features already have that layout.
+        if frames.ndim == 5:
+            batch, cameras = frames.shape[:2]
+            z_v_all = self._vision_forward(frames.flatten(0, 1))
+            z_v_all = z_v_all.reshape(batch, cameras * z_v_all.shape[1], -1)
+        else:
+            z_v_all = self._vision_forward(frames)
         z_s = self.state_encoder(robot_state)
         V = self.num_cameras
-        # VisionEncoder output layout: [cam0_patches..., cam1_patches..., cam0_CLS, cam1_CLS, ...]
+        # Per-camera training/cache layout: [cam0_patches..., cam0_CLS,
+        # cam1_patches..., cam1_CLS, ...].
         # Total tokens = V * (P + 1) where each camera has P patches + 1 CLS at the end.
         total_tokens = z_v_all.shape[1]
         P_plus_1 = total_tokens // V  # P + 1 per camera
@@ -394,12 +402,12 @@ class ALIGNIntentionModel(nn.Module):
         z_v_cls = z_v_all_reshaped[:, :, -1, :]  # (B, V, 768)
         # Patches are all positions except the last per camera: (B, V, P, 768)
         z_v_patches = z_v_all_reshaped[:, :, :-1, :].reshape(z_v_all.shape[0], V * P, 768)
-        z_v_pooled = z_v_patches
+        z_v_mod = self.vision_patch_encoder(z_v_patches, z_s)
+        z_v_pooled = z_v_mod.flatten(1)
 
         # Build head on first call
         if not self._built:
-            B, N_tok, comp_dim = z_v_pooled.shape
-            self._build_head_and_bank(N_tok * comp_dim)
+            self._build_head_and_bank(z_v_pooled.shape[-1])
 
         if self.intention_encoder is not None:
             result = self.intention_encoder.forward_step(

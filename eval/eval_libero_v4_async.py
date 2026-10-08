@@ -219,13 +219,12 @@ def _try_load_libero_task_list(suite_name: str) -> List[str]:
 class InferenceWorker(threading.Thread):
     """Background thread that runs model inference asynchronously.
 
-    Reads the latest sim state from `state_queue` (a single-slot queue,
-    always keeping only the newest), runs the model, and puts action
-    chunks into `action_queue`. The sim thread consumes actions from
-    `action_queue` at its own pace.
+    Intent-enabled models consume every queued observation in order, then plan
+    from the latest encoded state. Other models use a single-slot latest-window
+    queue. The sim thread consumes action chunks at its own pace.
 
     Thread safety:
-    - state_queue: maxsize=1, only newest state kept (sim overwrites)
+    - state_queue: FIFO CPU observations for intent; latest window otherwise
     - action_queue: maxsize=1, only newest action chunk kept (inference overwrites)
     """
 
@@ -241,6 +240,9 @@ class InferenceWorker(threading.Thread):
         self.stop_event = stop_event
         self.n_calls = 0
         self.total_inference_ms = 0.0
+        from models.intention_stream import IntentionStream
+        self.intention_stream = (IntentionStream(model, getattr(model, "history_size", chunk_size))
+                                 if getattr(model, "intention_encoder", None) is not None else None)
 
     def run(self):
         while not self.stop_event.is_set():
@@ -250,14 +252,30 @@ class InferenceWorker(threading.Thread):
             except queue.Empty:
                 continue
 
-            f_t, s_t = state_data  # (1, K, V, H, W, 3) and (1, K, 7)
+            observations = [state_data]
+            if self.intention_stream is not None:
+                # Preserve every observation for recurrence; coalesce only action
+                # planning. The producer queues CPU single frames, not windows.
+                while True:
+                    try:
+                        observations.append(self.state_queue.get_nowait())
+                    except queue.Empty:
+                        break
+            f_t, s_t = state_data
 
             t0 = time.perf_counter()
             with torch.no_grad():
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                          enabled=self.device.type == "cuda"):
                     with sdpa_kernel(backends=[SDPBackend.MATH]):
-                        out = self.model(f_t, s_t)
+                        if self.intention_stream is not None:
+                            for i, (frame, state) in enumerate(observations):
+                                out = self.intention_stream.observe(
+                                    frame.to(self.device), state.to(self.device),
+                                    produce_intent=i == len(observations) - 1,
+                                )
+                        else:
+                            out = self.model(f_t, s_t)
                         h_current = out["h_seq"][:, -1]
                         intent_emb = out.get("intent_emb", None)
 
@@ -398,7 +416,10 @@ def run_async_episode(
     switch_step = int(ep_len * switch_at)
 
     # Async inference setup
-    state_queue: queue.Queue = queue.Queue(maxsize=1)
+    recurrent = getattr(model, "intention_encoder", None) is not None
+    # Intent recurrence needs every observation. CPU backlog is bounded by the
+    # rollout length; inference drains it in chronological order before planning.
+    state_queue: queue.Queue = queue.Queue(maxsize=0 if recurrent else 1)
     action_queue: queue.Queue = queue.Queue(maxsize=1)
     stop_event = threading.Event()
     worker = InferenceWorker(
@@ -475,16 +496,21 @@ def run_async_episode(
 
         # 4. Push state to inference thread (always — so inference always
         #    has the freshest sim state to work with)
-        win_states = np.stack(pose_buffer, axis=0).astype(np.float32)  # (K, 7)
-        win_frames = np.stack(frame_buffer, axis=0)  # (K, V, H, W, 3)
-        f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)
-        s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
+        if recurrent:
+            f_t = torch.from_numpy(current_frame_stack.copy()).unsqueeze(0)
+            s_t = torch.from_numpy(sim_state.copy()).float().unsqueeze(0)
+        else:
+            win_states = np.stack(pose_buffer, axis=0).astype(np.float32)
+            win_frames = np.stack(frame_buffer, axis=0)
+            f_t = torch.from_numpy(win_frames).unsqueeze(0).to(device)
+            s_t = torch.from_numpy(win_states).float().unsqueeze(0).to(device)
 
         # Overwrite stale state in queue (keep only newest)
-        try:
-            state_queue.get_nowait()
-        except queue.Empty:
-            pass
+        if not recurrent:
+            try:
+                state_queue.get_nowait()
+            except queue.Empty:
+                pass
         state_queue.put((f_t, s_t))
 
         # 5. Check for new action from inference thread

@@ -1141,7 +1141,7 @@ def head_collate(batch: list, chunk_size: int = 5,
 # V4 Segment Collate — Variable-length segments with persistent bank
 # ================================================================
 
-def v4_segment_collate(batch: list, history_size: int = 20,
+def v4_segment_collate(batch: list, history_size: int = 1,
                        chunk_size: int = 10,
                        segment_min_mult: int = 2,
                        segment_max_mult: int = 5) -> dict:
