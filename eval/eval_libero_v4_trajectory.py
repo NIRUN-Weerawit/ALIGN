@@ -651,7 +651,8 @@ def run_model_in_sim(
     from models.intention_stream import IntentionStream
     observation_history = getattr(model, "history_size", chunk_size)
     intention_stream = (IntentionStream(model, getattr(model, "history_size", chunk_size))
-                        if getattr(model, "intention_encoder", None) is not None else None)
+                        if getattr(model, "intention_encoder", None) is not None or
+                           (getattr(model,"use_memory_bank",False) and getattr(model,"memory_mode","legacy")=="episodic") else None)
 
     # State buffer (K-window) — each entry is a (7,) state vector
     pose_buffer = []
@@ -774,7 +775,7 @@ def run_model_in_sim(
                                                      enabled=device.type == "cuda"):
                 with sdpa_kernel(backends=[SDPBackend.MATH]):
                     stream_out = intention_stream.observe(
-                        f_t, s_t, produce_intent=should_infer,
+                        f_t, s_t, produce_intent=should_infer, store_memory=not should_infer,
                     )
         if should_infer:
             with torch.no_grad():
@@ -1132,6 +1133,7 @@ def main():
                         help="Camera names (default: wrist_image). "
                              "MUST match the cameras used during training "
                              "(e.g. 'image wrist_image' for 2-cam checkpoints).")
+    parser.add_argument("--memory-intervention",choices=["normal","bypass","empty"],default="normal")
     parser.add_argument("--n-episodes", type=int, default=1,
                         help="Number of episodes to evaluate.")
     parser.add_argument("--seed", type=int, default=42,
@@ -1310,6 +1312,15 @@ def main():
     # Compute flip flags (same convention as old eval_libero_trajectory.py)
     flip_vertical = not args.no_flip_vertical
     flip_horizontal = not args.no_flip_horizontal
+    if args.memory_intervention != "normal" and model.use_memory_bank:
+        original_condition = model.condition_actions
+        def condition_with_intervention(p,s,intent=None,**kwargs):
+            if args.memory_intervention == "bypass":
+                return p,s,intent
+            model.memory_module.reset(p.shape[0],p.device)
+            return original_condition(p,s,intent,**kwargs)
+        model.condition_actions = condition_with_intervention
+
     print(f"  Flip vertical:   {flip_vertical}  (--no-flip-vertical to disable)")
     print(f"  Flip horizontal: {flip_horizontal}  (--no-flip-horizontal to enable)")
 
@@ -1508,6 +1519,7 @@ def main():
             "episode": ep_key,
             "task_name": task_name,
             "n_steps": model_result["n_steps"],
+            "memory_intervention":args.memory_intervention,
             "reference_steps": min(reference_steps, model_result["n_steps"]),
             "mean_error_replay": eef_err_replay if args.save_video else 0,
             "mean_error_model": eef_err_model,

@@ -72,6 +72,7 @@ BEST CHECKPOINT:
 ────────────────────────────────────────────────────────────────────────
 """
 
+from contextlib import nullcontext
 import argparse
 import json
 import math
@@ -344,6 +345,10 @@ def build_model(args, num_cameras, device):
         intent_dim=args.intent_dim,
         use_memory_bank=args.use_memory_bank,
         memory_bank_len=args.memory_bank_len,
+        memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
+        memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
+        diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
+        visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample,
     )
     model = model.to(device)
     return model
@@ -433,7 +438,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
         # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
         # z_s_all = torch.stack(z_s_all, dim=1)
-        z_v_mod_all = model.vision_patch_encoder(
+        z_v_mod_all = getattr(model,"encode_patch_sequence",model.vision_patch_encoder)(
             z_v_all.reshape(B * S, V * P, 768),
             z_s_all.reshape(B * S, -1),
         ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
@@ -482,6 +487,21 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     history_start = n
                     history_end = n + 1
                 valid_mask = seg_lens >= (current_t + chunk_size)
+                if "loss_anchor_mask" in batch:
+                    selected = torch.as_tensor(batch["loss_anchor_mask"][:,current_t],device=device)
+                    valid_mask = valid_mask & selected
+                    if not valid_mask.any():
+                        if model.use_memory_bank:
+                            p_context = z_v_mod_all[:,current_t].flatten(1)
+                            c_context = intent_sequence[:,current_t] if intent_sequence is not None else None
+                            observed = current_t < seg_lens
+                            timestamp = batch["observation_timesteps"][:,current_t].to(device)
+                            with (torch.no_grad() if getattr(model.memory_module,"detach_writes",False) else nullcontext()):
+                                if hasattr(model.memory_module,"observe_only"):
+                                    model.memory_module.observe_only(p_context,z_s_all[:,current_t],c_context,observed,timestamp)
+                                else:
+                                    model.condition_actions(p_context[:,None],z_s_all[:,current_t:current_t+1],c_context,observed)
+                        continue
                 if not valid_mask.any():
                     # No valid samples in this window, skip
                     continue
@@ -501,6 +521,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     z_v_win_for_head, z_s_win_for_head, h_for_head = model.condition_actions(
                         z_v_win.reshape(B_seg, H_actual, VP * comp_dim),
                         z_s_win, intent_emb, observed_mask=current_t < seg_lens,
+                        **({"timestamp":batch["observation_timesteps"][:,current_t].to(device)} if "observation_timesteps" in batch else {}),
                     )
 
                     # Loss
@@ -887,7 +908,7 @@ def validate(model, loader, device, args):
             states_seg.reshape(B * S, state_dim)
         ).reshape(B, S, -1)
 
-        z_v_mod_all = model.vision_patch_encoder(
+        z_v_mod_all = getattr(model,"encode_patch_sequence",model.vision_patch_encoder)(
             z_v_all.reshape(B * S, V * P, 768),
             z_s_all.reshape(B * S, -1),
         ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
@@ -930,6 +951,21 @@ def validate(model, loader, device, args):
                     history_start = n
                     history_end = n + 1
                 valid_mask = seg_lens >= (current_t + chunk_size)
+                if "loss_anchor_mask" in batch:
+                    selected = torch.as_tensor(batch["loss_anchor_mask"][:,current_t],device=device)
+                    valid_mask = valid_mask & selected
+                    if not valid_mask.any():
+                        if model.use_memory_bank:
+                            p_context = z_v_mod_all[:,current_t].flatten(1)
+                            c_context = intent_sequence[:,current_t] if intent_sequence is not None else None
+                            observed = current_t < seg_lens
+                            timestamp = batch["observation_timesteps"][:,current_t].to(device)
+                            with (torch.no_grad() if getattr(model.memory_module,"detach_writes",False) else nullcontext()):
+                                if hasattr(model.memory_module,"observe_only"):
+                                    model.memory_module.observe_only(p_context,z_s_all[:,current_t],c_context,observed,timestamp)
+                                else:
+                                    model.condition_actions(p_context[:,None],z_s_all[:,current_t:current_t+1],c_context,observed)
+                        continue
                 if not valid_mask.any():
                     continue
 
@@ -945,6 +981,7 @@ def validate(model, loader, device, args):
                     z_v_win_for_head, z_s_win_for_head, h_for_head = model.condition_actions(
                         z_v_win.reshape(B_seg, H_actual, VP * comp_dim),
                         z_s_win, intent_emb, observed_mask=current_t < seg_lens,
+                        **({"timestamp":batch["observation_timesteps"][:,current_t].to(device)} if "observation_timesteps" in batch else {}),
                     )
 
                     # Target: chunk_size future actions from current time
@@ -1146,6 +1183,14 @@ def parse_args():
                         help="Intent token output dim (default 512).")
 
     # V4: Memory bank
+    parser.add_argument("--memory-mode",choices=["legacy","episodic"],default="episodic")
+    parser.add_argument("--memory-detach-writes",action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument("--memory-write-fused",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--visual-token-attention",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--diffusion-clip-sample",action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument("--diffusion-train-steps",type=int,default=100)
+    parser.add_argument("--diffusion-loss-repeats",type=int,default=4)
     parser.add_argument("--use-memory-bank", action="store_true", default=False,
                         help="Enable Perceptual-Cognitive Memory Bank (V4).")
     parser.add_argument("--memory-bank-len", type=int, default=16,

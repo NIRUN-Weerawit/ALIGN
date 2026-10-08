@@ -146,6 +146,13 @@ def load_intention_model(
         intent_dim=cfg.get("intent_dim", 512),
         use_memory_bank=cfg.get("use_memory_bank", False),
         memory_bank_len=cfg.get("memory_bank_len", 16),
+        memory_mode=cfg.get("memory_mode","legacy"),
+        memory_detach_writes=cfg.get("memory_detach_writes",False),
+        memory_write_fused=cfg.get("memory_write_fused",True),
+        memory_patch_retrieval=cfg.get("memory_patch_retrieval",False),
+        diffusion_train_steps=cfg.get("diffusion_train_steps",10),
+        diffusion_loss_repeats=cfg.get("diffusion_loss_repeats",1),
+        visual_token_attention=cfg.get("visual_token_attention",False),diffusion_clip_sample=cfg.get("diffusion_clip_sample",False),
     ).to(device)
 
     # Build head and bank by probing vision output shape
@@ -168,6 +175,13 @@ def load_intention_model(
     # (e.g. checkpoint was trained with slightly different head config)
     # we fall back to a non-strict load and report mismatches.
     sd = ckpt.get("model_state_dict", ckpt)
+    if cfg.get("frozen_vision_omitted",False):
+        incompatible = model.load_state_dict(sd,strict=False)
+        if incompatible.unexpected_keys or any(not key.startswith("vision_encoder.") for key in incompatible.missing_keys):
+            raise ValueError("Checkpoint is missing trained parameters; evaluation aborted")
+        print(f"  Loaded trained parameters; reconstructed frozen vision ({len(sd)} tensors)")
+        model.eval()
+        return model,cfg
     try:
         model.load_state_dict(sd, strict=True)
         print(f"  Loaded state_dict strictly ({len(sd)} tensors)")

@@ -24,7 +24,7 @@ GROUPS = {'position': slice(0,3), 'rotation': slice(3,6), 'gripper': slice(6,7)}
 
 
 def snapshot(bank):
-    return {key: getattr(bank, key).clone() for key in BANK_FIELDS}
+    return {key: getattr(bank, key).clone() for key in BANK_FIELDS+('timestamps','_next_timestep') if getattr(bank,key,None) is not None}
 
 
 def restore(bank, saved, permutation=None):
@@ -41,9 +41,15 @@ def load_model(path, cameras):
         'intent_dim','use_memory_bank','memory_bank_len')}
     for key, default in [('num_intent_tokens',1),('mamba_d_state',16),('mamba_d_conv',4),('mamba_expand',2)]:
         kwargs[key] = c.get(key, default)
+    for key,default in [('memory_mode','legacy'),('memory_detach_writes',False),('memory_write_fused',True),
+                        ('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
+        kwargs[key] = c.get(key,default)
     model = ALIGNIntentionModel(action_dim=7, num_cameras=len(cameras), **kwargs)
     model._build_head_and_bank(c.get('pool_out_dim',256*len(cameras)*c['compressed_dim']))
-    model.load_state_dict(ckpt['model_state_dict'], strict=True)
+    incompatible=model.load_state_dict(ckpt['model_state_dict'],strict=not c.get('frozen_vision_omitted',False))
+    if c.get('frozen_vision_omitted',False):
+        if incompatible.unexpected_keys or any(not k.startswith('vision_encoder.') for k in incompatible.missing_keys):
+            raise ValueError('Recovery checkpoint is missing trained parameters')
     vision = model.vision_encoder
     model.vision_encoder = torch.nn.Identity()
     model.cuda().eval()
@@ -61,7 +67,7 @@ def encode(model, batch):
     cls = camera[:,:,-1].reshape(B,S,V,D)
     patches = camera[:,:,:-1].reshape(B*S,V*256,D)
     state = model.state_encoder(states.reshape(B*S,7)).reshape(B,S,-1)
-    visual = model.vision_patch_encoder(patches, state.reshape(B*S,-1)).reshape(B,S,-1)
+    visual = model.encode_patch_sequence(patches, state.reshape(B*S,-1)).reshape(B,S,-1)
     n = S-model.chunk_size+1
     intent = (model.intention_encoder.forward_sequence(cls[:,:n], state[:,:n],
                readout_start=model.history_size-1)
@@ -70,7 +76,7 @@ def encode(model, batch):
 
 
 @torch.no_grad()
-def evaluate_variant(model, loader, anchors, seed):
+def evaluate_variant(model, loader, anchors, seed, episode_anchors=False):
     totals = defaultdict(lambda: defaultdict(float))
     rows = []
     for batch_index, batch in enumerate(loader):
@@ -82,14 +88,16 @@ def evaluate_variant(model, loader, anchors, seed):
             permutation = torch.arange(B,device='cuda').roll(1)
             if model.use_memory_bank:
                 model.memory_module.reset(B, torch.device('cuda'))
-            for t in range(S-model.chunk_size+1):
+            limit = int(min(batch['segment_len']))-model.chunk_size+1
+            selected_anchors = {0,limit//2,limit-1} if episode_anchors else anchors
+            for t in range(limit):
                 if t < model.history_size-1:
                     continue
                 p,s = visual[:,t-model.history_size+1:t+1],state[:,t-model.history_size+1:t+1]
                 i = None if intents is None else intents[:,t]
-                before = snapshot(model.memory_module) if model.use_memory_bank and t in anchors else None
+                before = snapshot(model.memory_module) if model.use_memory_bank and t in selected_anchors else None
                 fused = model.condition_actions(p,s,i)
-                if t not in anchors:
+                if t not in selected_anchors:
                     continue
                 after = snapshot(model.memory_module) if before is not None else None
                 conds = {'baseline': model.intention_head(*fused)}
@@ -108,7 +116,8 @@ def evaluate_variant(model, loader, anchors, seed):
                 draw_seed = seed + batch_index*100 + t
                 seed_everything(draw_seed)
                 noise = torch.randn_like(target)
-                probe_indices = [1,5,9]
+                T=model.intention_head.num_train_timesteps
+                probe_indices = [1,max(1,T//2),max(1,round(.9*T))]
                 inputs = [(model.intention_head.alpha_bar[k].sqrt()*target +
                           model.intention_head.sigma[k]*noise) for k in probe_indices]
                 outputs = {}
@@ -165,6 +174,7 @@ def main():
     parser.add_argument('--run',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--batch-size',type=int,default=4)
+    parser.add_argument("--episode-anchors",action="store_true",help="Probe beginning, middle, and last valid common prefix timestep")
     parser.add_argument('--anchors',type=int,nargs='+',default=[0,6,12])
     args = parser.parse_args()
     manifest = json.loads((args.run/'manifest.json').read_text())
@@ -191,23 +201,23 @@ def main():
                        for e in episodes[start:start+args.batch_size]]
         if any(task==batch_tasks[(k-1)%len(batch_tasks)] for k,task in enumerate(batch_tasks)):
             raise ValueError('Batch shuffling would pair identical tasks; choose a different batch size')
-    cached = CachedEpisodes(dataset,episodes,manifest['segment_length'],manifest['seed']+1000,False)
+    cached = CachedEpisodes(dataset,episodes,manifest['segment_length'],manifest['seed']+1000,False,manifest.get("temporal_sampling","crop"),manifest.get("supervision_points",16),manifest["chunk_size"])
     loader = DataLoader(cached,batch_size=args.batch_size,shuffle=False,num_workers=0,
                         pin_memory=True,collate_fn=collate_segments)
     torch.set_num_threads(2)
     torch.cuda.set_per_process_memory_fraction(.3)
     report = dict(protocol=dict(run=str(args.run.resolve()),held_out_episodes=len(episodes),
         episode_keys=[dataset._episode_keys[ep] for ep in episodes],batch_size=args.batch_size,anchors=args.anchors,
-        crops='original fixed validation crops',seed=manifest['seed']+20000,
+        crops=manifest.get('temporal_sampling','crop'),episode_anchors=args.episode_anchors,seed=manifest['seed']+20000,
         intent_intervention='final head intent; perceptual/state conditioning held fixed; shuffle across distinct tasks',
         memory_shuffle='all bank streams swapped between distinct tasks/episodes, queries held fixed; baseline history restored',
-        precision='BF16 conditioning/epsilon probes; FP32 DDIM denoiser and state',noise_probe_timesteps=[1,5,9],
-        caveat='Dependence and held-out action errors do not establish closed-loop benefit. Old endpoint buffers retained.'),variants={})
+        precision='BF16 conditioning/epsilon probes; FP32 DDIM denoiser and state',
+        caveat='Dependence and held-out action errors do not establish closed-loop benefit. Each checkpoint retains its configured diffusion schedule.'),variants={})
     for name in manifest['variants']:
         model,epoch = load_model(args.run/name/'intention_best.pt',cameras)
         print(f'{name} best epoch {epoch}',flush=True)
-        results,rows = evaluate_variant(model,loader,set(args.anchors),manifest['seed']+20000)
-        report['variants'][name] = dict(epoch=epoch,sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
+        results,rows = evaluate_variant(model,loader,set(args.anchors),manifest['seed']+20000,args.episode_anchors)
+        report['variants'][name] = dict(epoch=epoch,noise_probe_timesteps=[1,max(1,model.intention_head.num_train_timesteps//2),max(1,round(.9*model.intention_head.num_train_timesteps))],sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
         atomic_json(args.output/(name+'.json'),dict(results=results,rows=rows))
         atomic_json(args.output/'summary.json',report)
         del model

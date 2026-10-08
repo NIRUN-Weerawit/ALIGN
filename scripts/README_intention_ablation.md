@@ -10,7 +10,7 @@ all epochs of each before starting the next:
 
 All models receive the same CLI arguments. Only the intention/memory flags
 change. Shared parameters start from identical initial weights; the episode
-split, training crop schedule, batch order and validation RNG seeds also match.
+split, training supervision schedule, batch order and validation RNG seeds also match.
 Disabled-intention models omit the Mamba encoder entirely. Memory-only models
 still retrieve perceptual/state information.
 
@@ -57,7 +57,7 @@ Run `python scripts/run_intention_ablation.py --help` for every argument.
 | Mamba state / convolution / expansion | `--mamba-d-state`, `--mamba-d-conv`, `--mamba-expand` | 16 / 4 / 2 |
 | Tokens in intention-enabled variants | `--num-intent-tokens` | 1 |
 | Intent embedding width | `--intent-dim` | 128 |
-| Memory capacity | `--memory-bank-len` | 8 |
+| Memory capacity | `--memory-bank-len` | 16 |
 | Gripper loss weight | `--gripper-loss-weight` | 1.0 |
 | Predicted gripper accuracy cutoff | `--gripper-threshold` | 0.5 for binary 0/1 |
 | Validation fraction per task | `--validation-fraction` | 0.1 |
@@ -66,10 +66,13 @@ Run `python scripts/run_intention_ablation.py --help` for every argument.
 | CPU threads | `--cpu-threads` | 2 |
 
 History size 1 gives the action head the current observation. Mamba retains
-causal context across the training segment, resetting between random segments.
-Each training epoch samples one reproducible crop from every training episode;
-the default runs all batches. Validation uses fixed held-out whole episodes and
-fixed crops. Select `flow_matching` to run the same four comparisons with that
+causal context across every observation in the episode. The default
+`--temporal-sampling episode` resets memory and Mamba between episodes, retains
+all intervening observations, and samples `--supervision-points 16` deterministic
+action-loss anchors per episode. Targets are contiguous future action chunks.
+`--temporal-sampling crop` restores the bounded segment protocol;
+`--segment-length` controls that mode. Validation uses the same sampling mode
+with fixed anchors. The default runs all batches. Select `flow_matching` to run the same four comparisons with that
 head. Training and validation both apply the configured gripper loss weight.
 
 Each variant gets its own configuration, epoch metrics, best checkpoint and
@@ -89,7 +92,10 @@ parallel-worker workflows.
 Action chunk length is independent of denoising steps. Diffusion and flow
 validation use the head's default 10 solver steps, matching deployment. Fresh
 diffusion heads use a normalized cosine schedule with a positive terminal
-signal and train on noisy indices 1..10. The denoiser and DDIM inversion use FP32 even under outer BF16 autocast.
+signal and train on noisy indices 1..100 by default (`--diffusion-train-steps 100`).
+`--diffusion-loss-repeats 4` draws independent noise/timestep samples per
+condition. `--diffusion-clip-sample` clips predicted clean actions to normalized
+motion bounds and the binary gripper range. The denoiser and DDIM inversion use FP32 even under outer BF16 autocast.
 Legacy checkpoints keep their original
 buffers; sampling skips their singular zero-signal endpoint.
 
@@ -113,3 +119,26 @@ and cross-task shuffles. It compares final-head intention zeroing/shuffling,
 whole-memory bypass, and bank-content shuffling, restoring each episode's real
 memory after interventions. Zeroed visual/state controls and an identical-input
 control help interpret the result. Dependence does not establish policy benefit.
+
+### Episodic memory and policy selection
+
+New runs use `--memory-mode episodic`, detached raw writes, and timestamp age
+encoding on retrieval keys. `--memory-write-fused` and
+`--no-memory-detach-writes` expose controlled write-policy comparisons.
+`--memory-patch-retrieval` preserves spatial tokens;
+`--visual-token-attention` adds a residual visual cross-attention path in the
+diffusion/flow U-Net. These architecture options default off and require
+matched ablations. Legacy checkpoints load with their original contracts.
+
+Use `--warm-start EXISTING_RUN` for exploratory adaptation; matching weights
+are copied but the diffusion schedule is fresh. Different variant warm starts
+do not give a controlled cross-model comparison. Within-model memory
+interventions remain paired. Add `--episode-anchors` to the condition probe
+for beginning/middle/end diagnostics on full-episode runs.
+
+Training checkpoint selection by position error is provisional. Add
+`--keep-epoch-checkpoints`, then use `scripts/select_policy_checkpoint.py`
+with immutable `--candidates`, a shared `--episodes` file, and
+`--interventions normal bypass empty`. It selects by simulator success. Use
+independent episodes/seeds for final reporting, and keep task and action
+protocols identical between candidates.

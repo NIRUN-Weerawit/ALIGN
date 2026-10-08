@@ -242,7 +242,8 @@ class InferenceWorker(threading.Thread):
         self.total_inference_ms = 0.0
         from models.intention_stream import IntentionStream
         self.intention_stream = (IntentionStream(model, getattr(model, "history_size", chunk_size))
-                                 if getattr(model, "intention_encoder", None) is not None else None)
+                                 if getattr(model, "intention_encoder", None) is not None or
+                                    (getattr(model,"use_memory_bank",False) and getattr(model,"memory_mode","legacy")=="episodic") else None)
 
     def run(self):
         while not self.stop_event.is_set():
@@ -273,6 +274,7 @@ class InferenceWorker(threading.Thread):
                                 out = self.intention_stream.observe(
                                     frame.to(self.device), state.to(self.device),
                                     produce_intent=i == len(observations) - 1,
+                                    store_memory=i != len(observations) - 1,
                                 )
                         else:
                             out = self.model(f_t, s_t)
@@ -416,7 +418,8 @@ def run_async_episode(
     switch_step = int(ep_len * switch_at)
 
     # Async inference setup
-    recurrent = getattr(model, "intention_encoder", None) is not None
+    recurrent = (getattr(model, "intention_encoder", None) is not None or
+                 (getattr(model,"use_memory_bank",False) and getattr(model,"memory_mode","legacy")=="episodic"))
     # Intent recurrence needs every observation. CPU backlog is bounded by the
     # rollout length; inference drains it in chronological order before planning.
     state_queue: queue.Queue = queue.Queue(maxsize=0 if recurrent else 1)

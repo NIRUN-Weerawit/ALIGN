@@ -57,10 +57,11 @@ def episode_split(dataset, seed, fraction):
 
 
 class CachedEpisodes(Dataset):
-    def __init__(self, dataset, episodes, length, seed, training):
+    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8):
         self.dataset, self.episodes = dataset, episodes
         self.length, self.seed, self.training = length, seed, training
         self.epoch = 0
+        self.temporal_sampling, self.supervision_points, self.chunk_size = temporal_sampling, supervision_points, chunk_size
 
     def __len__(self):
         return len(self.episodes)
@@ -72,13 +73,23 @@ class CachedEpisodes(Dataset):
         rng = np.random.default_rng(np.random.SeedSequence(
             [self.seed, ep, self.epoch if self.training else 0]))
         start = int(rng.integers(0, n - length + 1))
+        anchors = None
+        if self.temporal_sampling == "episode":
+            start,length = 0,n
+            available = n-self.chunk_size+1
+            if available<1:raise ValueError('Episode shorter than action horizon')
+            anchors = np.zeros(n,dtype=bool)
+            anchors[rng.choice(available,min(available,self.supervision_points),replace=False)] = True
         frames = self.dataset._read_frames_dinov2(ep, start, length)
         poses = self.dataset._read_poses(ep, start, length)
         gripper = self.dataset._read_poses_gripper(ep, start, length)
         states = np.concatenate([poses[:, :6], gripper[:, None]], axis=1)
         actions = self.dataset._read_actions(ep, start, length)
-        return dict(frames_segment=frames, states_segment=states.astype(np.float32),
+        result = dict(frames_segment=frames, states_segment=states.astype(np.float32),
                     actions_segment=actions.astype(np.float32), segment_len=length)
+        if anchors is not None:
+            result.update(loss_anchor_mask=anchors,observation_timesteps=np.arange(n,dtype=np.float32))
+        return result
 
 
 def collate_segments(items):
@@ -91,6 +102,9 @@ def collate_segments(items):
             pad = [(0, length - len(arr))] + [(0, 0)] * (arr.ndim - 1)
             rows.append(np.pad(arr, pad))
         result[key] = torch.from_numpy(np.stack(rows))
+    for key in ("loss_anchor_mask","observation_timesteps"):
+        if key in items[0]:
+            result[key] = torch.from_numpy(np.stack([np.pad(x[key],(0,length-len(x[key]))) for x in items]))
     return result
 
 
@@ -105,7 +119,7 @@ def summarize(out, records, manifest):
     rows = ["# Intention/memory ablation", "",
             f"Dataset: `{manifest['data']}`. Held-out prediction metrics, not simulator success rates.", "",
             f"Epoch budget: {manifest['epochs']}; optimizer steps/epoch: {manifest['max_steps'] or 'full loader'}.",
-            "Best checkpoints are selected by fixed-seed validation loss.", "",
+            f"Provisional checkpoint selection: {manifest.get('selection_metric','val/loss')}; closed-loop selection is reported separately.", "",
             "| Variant | Epoch | Val loss | Position MSE | Rotation MSE | Gripper MSE | Gripper accuracy |",
             "|---|---:|---:|---:|---:|---:|---:|"]
     for name, record in records.items():
@@ -130,7 +144,7 @@ def evaluate_existing(out):
     dataset = ALIGNDataset(manifest["data"], mode="head", cameras=cameras,
         traj_window=manifest["segment_length"], dinov2_path=manifest["cache"])
     val_eps = [dataset._episode_keys.index(key) for key in manifest["val_episodes"]]
-    data = CachedEpisodes(dataset, val_eps, manifest["segment_length"], manifest["seed"] + 1000, False)
+    data = CachedEpisodes(dataset, val_eps, manifest["segment_length"], manifest["seed"] + 1000, False, manifest.get("temporal_sampling","crop"),manifest.get("supervision_points",16),manifest["chunk_size"])
     loader = DataLoader(data, batch_size=manifest["batch_size"], shuffle=False,
         num_workers=0, pin_memory=True, collate_fn=collate_segments)
     args = SimpleNamespace(history_size=manifest["history_size"], chunk_size=manifest["chunk_size"],
@@ -150,7 +164,11 @@ def evaluate_existing(out):
             num_intent_tokens=config.get("num_intent_tokens", 1), intent_dim=config["intent_dim"],
             mamba_d_state=config.get("mamba_d_state", 16), mamba_d_conv=config.get("mamba_d_conv", 4),
             mamba_expand=config.get("mamba_expand", 2),
-            use_memory_bank=config["use_memory_bank"], memory_bank_len=config["memory_bank_len"])
+            use_memory_bank=config["use_memory_bank"], memory_bank_len=config["memory_bank_len"],
+            memory_mode=config.get("memory_mode","legacy"),memory_detach_writes=config.get("memory_detach_writes",False),
+            memory_write_fused=config.get("memory_write_fused",True),memory_patch_retrieval=config.get("memory_patch_retrieval",False),
+            diffusion_train_steps=config.get("diffusion_train_steps",10),diffusion_loss_repeats=config.get("diffusion_loss_repeats",1),
+            visual_token_attention=config.get("visual_token_attention",False),diffusion_clip_sample=config.get("diffusion_clip_sample",False))
         model._build_head_and_bank(config.get("pool_out_dim", 256 * len(cameras) * config["compressed_dim"]))
         model.load_state_dict(checkpoint["model_state_dict"], strict=True)
         vision = model.vision_encoder
@@ -191,6 +209,20 @@ def parse_args(argv=None):
     parser.add_argument("--evaluate-existing", action="store_true")
     parser.add_argument("--resume", action="store_true",
                         help="Continue from epoch checkpoints; preserve/restart attempts without optimizer state.")
+    parser.add_argument("--temporal-sampling",choices=["crop","episode"],default="episode")
+    parser.add_argument("--supervision-points",type=int,default=16)
+    parser.add_argument("--memory-mode",choices=["legacy","episodic"],default="episodic")
+    parser.add_argument("--memory-detach-writes",action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument("--memory-write-fused",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--visual-token-attention",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--diffusion-clip-sample",action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument("--diffusion-train-steps",type=int,default=100)
+    parser.add_argument("--diffusion-loss-repeats",type=int,default=4)
+    parser.add_argument("--warm-start",type=Path,help="Existing four-variant run; copy matching parameters, retain fresh diffusion schedule")
+    parser.add_argument("--keep-epoch-checkpoints",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--selection-metric",choices=["val/loss","pos_mse"],default="pos_mse",
+                        help="Prediction-based provisional selection; closed-loop selection is separate")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Optimizer steps per epoch; 0 uses the full training loader.")
@@ -211,7 +243,7 @@ def parse_args(argv=None):
     parser.add_argument("--mamba-expand", type=int, default=2)
     parser.add_argument("--num-intent-tokens", type=int, default=1)
     parser.add_argument("--intent-dim", type=int, default=128)
-    parser.add_argument("--memory-bank-len", type=int, default=8)
+    parser.add_argument("--memory-bank-len", type=int, default=16)
     parser.add_argument("--gripper-loss-weight", type=float, default=1.0)
     parser.add_argument("--gripper-threshold", type=float, default=0.5)
     parser.add_argument("--cpu-threads", type=int, default=2)
@@ -243,6 +275,12 @@ def parse_args(argv=None):
         parser.error("Validation fraction must be in (0, 1); GPU memory fraction in (0, 1]")
     if args.lr <= 0 or min(args.weight_decay, args.grad_clip, args.gripper_loss_weight, args.max_steps) < 0:
         parser.error("Learning rate must be positive; decay, clipping, loss weight and max steps must be nonnegative")
+    if min(args.supervision_points,args.diffusion_train_steps,args.diffusion_loss_repeats)<1 or args.diffusion_train_steps<10:
+        parser.error('Supervision points/repeats must be positive; diffusion schedule needs at least 10 steps')
+    if args.temporal_sampling=="episode" and args.history_size!=1:
+        parser.error('Episode supervision currently requires history size 1')
+    if args.memory_patch_retrieval and (args.compressed_dim%2 or args.memory_mode!="episodic"):
+        parser.error('Patch retrieval needs even compressed width and episodic memory')
     if len(set(args.variants)) != len(args.variants):
         parser.error("Each variant may appear only once")
     return args
@@ -257,6 +295,7 @@ def main(argv=None):
         return
     if args.segment_length < args.history_size + args.chunk_size:
         raise ValueError("Segment must contain both history and action chunk")
+    args.warm_start = str(args.warm_start.resolve()) if args.warm_start else None
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     if (out / "manifest.json").exists() and not args.resume:
@@ -294,20 +333,24 @@ def main(argv=None):
         previous = json.loads((out / "manifest.json").read_text())
         legacy_defaults = dict(cameras=["image", "wrist_image"], validation_fraction=0.1,
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
-                               mamba_d_state=16, mamba_d_conv=4, mamba_expand=2)
+                               mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
+                               memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
+                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False)
         for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
-                    "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold"):
+                    "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
+                    "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
+                    "memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         manifest = dict(manifest, **previous)
     else:
         atomic_json(out / "manifest.json", manifest)
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
-    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True)
-    val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False)
+    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size)
+    val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size)
     records = (json.loads((out / "summary.json").read_text())
                if args.resume and (out / "summary.json").exists() else {})
     report_out = out
@@ -329,7 +372,11 @@ def main(argv=None):
             head_type=args.head_type, head_d_model=args.head_d_model,
             mamba_d_state=args.mamba_d_state, mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
             use_intent_tokens=intent, num_intent_tokens=args.num_intent_tokens, intent_dim=args.intent_dim,
-            use_memory_bank=memory, memory_bank_len=args.memory_bank_len)
+            use_memory_bank=memory, memory_bank_len=args.memory_bank_len,
+            memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
+            memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
+            diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
+            visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample)
         # Cached training never uses the raw-image modules. Keep them off GPU.
         model.vision_encoder.requires_grad_(False)
         vision = model.vision_encoder
@@ -357,6 +404,16 @@ def main(argv=None):
             del model, vision
             torch.cuda.empty_cache()
             continue
+        if args.warm_start:
+            with torch.serialization.safe_globals([type(torch.__version__)]):
+                saved = torch.load(Path(args.warm_start)/name/"intention_best.pt",map_location="cpu",weights_only=True)
+            source = saved["model_state_dict"]
+            own = model.state_dict()
+            matched = {k:v for k,v in source.items() if k in own and own[k].shape==v.shape
+                       and not k.startswith("vision_encoder.") and not k.endswith(("alpha_bar","sigma"))}
+            model.load_state_dict(matched,strict=False)
+            print(f"WARM START {name}: {len(matched)} parameters/buffers, fresh noise schedule",flush=True)
+            del saved,source,own,matched
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, fused=True)
         loop_args = SimpleNamespace(history_size=args.history_size, chunk_size=args.chunk_size,
@@ -422,11 +479,15 @@ def main(argv=None):
                 if not np.isfinite(train_loss) or not np.isfinite(val_loss):
                     raise FloatingPointError(f"Nonfinite loss in {name}: {row}")
                 log.write(json.dumps(row, allow_nan=False) + "\n")
-                if val_loss < best:
-                    best = val_loss
+                selection_score = row[args.selection_metric]
+                if selection_score < best:
+                    best = selection_score
                     records[name] = dict(best=row, completed_epochs=epoch)
                     torch.save(dict(model_state_dict=model.state_dict(), config=config,
                         epoch=epoch, val_loss=val_loss), run / "intention_best.pt")
+                if args.keep_epoch_checkpoints:
+                    torch.save(dict(model_state_dict={k:v for k,v in model.state_dict().items() if not k.startswith("vision_encoder.")},
+                                    config=dict(config,frozen_vision_omitted=True),epoch=epoch,val_loss=val_loss),run/f"epoch_{epoch:03d}.pt")
                 records[name]["completed_epochs"] = epoch
                 # Frozen raw vision is reconstructible and excluded to keep
                 # epoch recovery saves small. Seed/crop/order reset every epoch.
