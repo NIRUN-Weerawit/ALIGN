@@ -99,3 +99,17 @@ rather than 0.01. To resume the old 80-epoch experiment, explicitly use
 For binary LIBERO actions, both validation and simulator execution use cutoff
 0.5. Simulator feedback carries the last **executed binary command** in dataset
 units, while pose action scaling applies to the first six dimensions.
+
+Measure dependence of existing diffusion checkpoints without changing weights:
+
+```bash
+python scripts/probe_condition_dependence.py \
+  --run checkpoints/ablation_libero_goal_h1_e80_20261008 \
+  --output checkpoints/condition_dependence
+```
+
+This uses all held-out episodes, fixed validation crops, matched noise draws,
+and cross-task shuffles. It compares final-head intention zeroing/shuffling,
+whole-memory bypass, and bank-content shuffling, restoring each episode's real
+memory after interventions. Zeroed visual/state controls and an identical-input
+control help interpret the result. Dependence does not establish policy benefit.
