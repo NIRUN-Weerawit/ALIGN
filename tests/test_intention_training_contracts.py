@@ -224,7 +224,7 @@ def test_real_trainer_and_validation_ignore_padded_targets(monkeypatch, use_memo
 @pytest.mark.parametrize("action_scale", [1.0, 10.0])
 def test_rollout_carries_executed_gripper_without_rewriting_history(monkeypatch, commands, action_scale):
     import eval.eval_libero_v4_trajectory as evaluator
-    monkeypatch.setattr(evaluator, "get_sim_eef_pose", lambda obs: np.zeros(6, np.float32))
+    monkeypatch.setattr(evaluator, "get_sim_eef_pose", lambda obs, rotation_convention="libero": np.zeros(6, np.float32))
     monkeypatch.setattr(evaluator, "get_sim_frame", lambda *args, **kwargs: np.zeros((4, 4, 3), np.uint8))
     class Env:
         def reset(self):
