@@ -73,3 +73,13 @@ def test_async_recurrence_consumes_every_observation_before_planning():
     assert model.observations == [(0, None, False), (1, 1, False), (2, 2, False), (3, 3, True)]
     assert model.sample_calls == 1
     assert actions.get_nowait()[0].shape == (2, 7)
+
+
+def test_episode_seed_is_independent_of_episode_order_and_changes_with_trial_seed():
+    from eval.eval_libero_v4_trajectory import episode_random_seed
+    keys=['ep_000010','ep_000033','ep_000063']
+    forward={k:episode_random_seed(42,k) for k in keys}
+    backward={k:episode_random_seed(42,k) for k in reversed(keys)}
+    assert forward==backward and len(set(forward.values()))==len(keys)
+    assert all(episode_random_seed(43,k)!=forward[k] for k in keys)
+    assert all(0<=v<2**31 for v in forward.values())

@@ -39,6 +39,8 @@ Outputs:
 """
 
 import argparse
+import hashlib
+import random
 import json
 import os
 import sys
@@ -324,6 +326,17 @@ def plot_trajectory(episode_key: str, expert: np.ndarray,
 # ================================================================
 # MuJoCo helpers
 # ================================================================
+
+def episode_random_seed(base_seed,episode_key):
+    """Keep each episode's sampler/scene RNG independent of list order."""
+    offset=int.from_bytes(hashlib.sha256(str(episode_key).encode()).digest()[:4],'little')
+    return (int(base_seed)+offset) % (2**31)
+
+
+def seed_episode(seed):
+    random.seed(seed);np.random.seed(seed);torch.manual_seed(seed)
+    if torch.cuda.is_available():torch.cuda.manual_seed_all(seed)
+
 
 def quat_to_axisangle(quat: np.ndarray) -> np.ndarray:
     """Convert quaternion (x,y,z,w) to axis-angle (rx,ry,rz)."""
@@ -1356,6 +1369,8 @@ def main():
         print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key} → task='{task_name}'")
         print(f"    BDDL: {bddl_path}")
 
+        episode_seed = episode_random_seed(args.seed,ep_key)
+        seed_episode(episode_seed)
         try:
             if OffScreenRenderEnv is None:
                 raise ImportError("OffScreenRenderEnv not available")
@@ -1389,6 +1404,10 @@ def main():
             )
             t_replay = time.time() - t0
 
+        # Reseed after optional replay so video and task order cannot change
+        # model initial conditions or the paired action-sampling noise stream.
+        seed_episode(episode_seed)
+        if hasattr(env,"seed"):env.seed(episode_seed)
         # ── Run 2: Model rollout in sim ──
         t0 = time.time()
         ep_timing_log = [] if args.save_timing else None
@@ -1522,6 +1541,7 @@ def main():
             "task_name": task_name,
             "n_steps": model_result["n_steps"],
             "memory_intervention":args.memory_intervention,
+            "episode_seed":episode_seed,
             "reference_steps": min(reference_steps, model_result["n_steps"]),
             "mean_error_replay": eef_err_replay if args.save_video else 0,
             "mean_error_model": eef_err_model,

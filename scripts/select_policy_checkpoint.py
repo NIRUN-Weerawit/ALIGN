@@ -32,14 +32,15 @@ def main():
             for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
         return h.hexdigest()
     protocol=dict(checkpoint_sha256={str(x.resolve()):digest(x) for x in a.candidates},candidates=[str(x.resolve()) for x in a.candidates],data=str(a.data.resolve()),episodes=a.episodes.read_text().splitlines(),
-                  seeds=a.seeds,max_steps=a.max_steps,switch_at=a.switch_at,interventions=a.interventions,
+                  seed_protocol='base seed plus SHA256 episode key; scene/sampler reseeded before each model rollout; PYTHONHASHSEED=0',
+                  sampling='clipped DDIM reconstructs epsilon consistently',seeds=a.seeds,max_steps=a.max_steps,switch_at=a.switch_at,interventions=a.interventions,
                   selection='normal-memory success rate; deterministic candidate order breaks ties; interventions do not select',
                   caveat='One trial/task/seed is provisional. Selected-on validation episodes cannot serve as an independent final test.')
     if (a.output/'protocol.json').exists() and json.loads((a.output/'protocol.json').read_text())!=protocol:
         raise ValueError('Existing evaluation protocol differs; use a new output directory')
     atomic_json(a.output/'protocol.json',protocol)
     result={}
-    env=dict(os.environ,MUJOCO_GL='egl',LIBERO_CONFIG_PATH='/home/whinnoy/.local/share/align/libero-config')
+    env=dict(os.environ,PYTHONHASHSEED='0',MUJOCO_GL='egl',LIBERO_CONFIG_PATH='/home/whinnoy/.local/share/align/libero-config')
     env['PYTHONPATH']='/home/whinnoy/.local/share/align/LIBERO'+(':'+env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
     for index,checkpoint in enumerate(a.candidates):
         key=f'{index:02d}_{checkpoint.parent.name}_{checkpoint.stem}'

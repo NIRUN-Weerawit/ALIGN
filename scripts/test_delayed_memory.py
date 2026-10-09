@@ -28,6 +28,7 @@ def main():
     ap.add_argument('--steps',type=int,default=400)
     ap.add_argument('--device',default='cpu')
     ap.add_argument('--patch',action='store_true')
+    ap.add_argument('--checkpoint',type=Path,help='Evaluate saved benchmark weights without further training')
     ap.add_argument('--head',choices=['linear','diffusion','flow_matching'],default='linear')
     args=ap.parse_args()
     if args.steps < 1:ap.error('--steps must be positive')
@@ -43,6 +44,9 @@ def main():
     else:
         head=FlowMatchingPolicyHead(cond_dim=12,hidden_dim=16,time_dim=16,chunk_size=4)
     head=head.to(args.device)
+    if args.checkpoint:
+        saved=torch.load(args.checkpoint,map_location=args.device,weights_only=True)
+        memory.load_state_dict(saved['memory']);head.load_state_dict(saved['head'])
     def condition(p,s):return torch.cat([p,s],dim=-1).unsqueeze(1)
     def prediction(p,s,seed):
         if args.head=='linear':return head(p).squeeze(-1)>0,None
@@ -52,7 +56,7 @@ def main():
     opt=torch.optim.AdamW(list(memory.parameters())+list(head.parameters()),lr=.003)
     start=time.monotonic()
     with (args.output/'training.jsonl').open('w',buffering=1) as log:
-        for step in range(args.steps):
+        for step in range(0 if args.checkpoint else args.steps):
             labels=torch.randint(0,2,(16,),device=args.device).float()
             history=[4,8,16,32][step%4]
             current,state=prepare(memory,labels,history)
@@ -91,7 +95,8 @@ def main():
             results[str(history)]={k:v/total for k,v in counts.items()}
             if args.head!='linear':results[str(history)]['gripper_accuracy']={k:v/total for k,v in grip_counts.items()}
     report=dict(protocol='Same current observation/state for both labels; target is cue shown only at first observation. Wrong-bank donors have opposite cue.',
-                training_steps=args.steps,patch=args.patch,head=args.head,results=results,seconds=time.monotonic()-start,
+                training_steps=0 if args.checkpoint else args.steps,evaluated_checkpoint=str(args.checkpoint) if args.checkpoint else None,
+                sampling="DDIM noise consistent with clipped clean estimate" if args.head=="diffusion" else args.head,patch=args.patch,head=args.head,results=results,seconds=time.monotonic()-start,
                 caveat='Controlled mechanism capacity, not evidence of LIBERO policy benefit.')
     (args.output/'results.json').write_text(json.dumps(report,indent=2)+'\n')
     torch.save(dict(memory=memory.state_dict(),head=head.state_dict()),args.output/'model.pt')

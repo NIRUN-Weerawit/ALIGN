@@ -636,6 +636,9 @@ class DiffusionPolicyHead(nn.Module):
                 x0 = x0.clamp(-1.,1.)
                 if self.action_dim>=7:
                     x0[...,6] = x0[...,6].clamp(0.,1.)
+                # Clipping changes the clean estimate. Reconstruct its matching
+                # noise so x_t = sqrt(alpha_t)*x0 + sigma_t*eps still holds.
+                eps = (x-alpha.sqrt()*x0)/self.sigma[index].float().clamp_min(1e-12)
             x = previous.sqrt() * x0 + (1.0 - previous).sqrt() * eps
         return x
 

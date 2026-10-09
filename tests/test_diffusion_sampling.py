@@ -59,3 +59,22 @@ def test_sampling_disables_autocast_for_epsilon_inversion():
     with torch.autocast('cpu',dtype=torch.bfloat16):
         output = head.sample(torch.zeros(1,1,4,dtype=torch.bfloat16))
     assert len(called)==10 and torch.isfinite(output).all()
+
+
+def test_clipped_ddim_update_uses_noise_consistent_with_clipped_clean_actions():
+    head=DiffusionPolicyHead(cond_dim=4,hidden_dim=8,chunk_size=4,num_train_timesteps=100,clip_denoised=True)
+    calls=[]
+    def zero_noise(x,t,cond):
+        calls.append(x.clone())
+        return torch.zeros_like(x)
+    head.predict_noise=zero_noise
+    torch.manual_seed(17)
+    head.sample(torch.zeros(2,1,4))
+    steps=head.sampling_timesteps()
+    alpha=head.alpha_bar[steps[0]];sigma=head.sigma[steps[0]]
+    clean=(calls[0]/alpha.sqrt()).clamp(-1,1)
+    clean[:,:,6]=clean[:,:,6].clamp(0,1)
+    consistent_noise=(calls[0]-alpha.sqrt()*clean)/sigma
+    previous=head.alpha_bar[steps[1]]
+    expected=previous.sqrt()*clean+(1-previous).sqrt()*consistent_noise
+    torch.testing.assert_close(calls[1],expected,rtol=0,atol=1e-7)
