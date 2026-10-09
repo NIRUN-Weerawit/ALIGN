@@ -98,3 +98,15 @@ def test_binary_gripper_validation_uses_explicit_cutoff(monkeypatch):
     args.gripper_threshold = 0.0
     _, _, legacy_metrics = validate(model, [batch], torch.device("cpu"), args)
     assert legacy_metrics["grip_acc"] == 1.0
+
+
+def test_probe_report_describes_actual_checkpoint_and_anchors():
+    from scripts.probe_condition_dependence import render_comparison
+    report={'protocol':{'held_out_episodes':44,'episode_anchors':True,
+                       'checkpoint_selection':'final epoch 4, equal budgets'},
+            'variants':{'memory':{'epoch':4,'results':{}}}}
+    text=render_comparison(report)
+    assert 'final epoch 4, equal budgets' in text
+    assert 'beginning/middle/last valid common prefix' in text
+    assert 'memory=4' in text
+    assert 'predate' not in text and 't=6' not in text

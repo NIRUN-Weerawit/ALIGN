@@ -42,7 +42,7 @@ def load_model(path, cameras):
     for key, default in [('num_intent_tokens',1),('mamba_d_state',16),('mamba_d_conv',4),('mamba_expand',2)]:
         kwargs[key] = c.get(key, default)
     for key,default in [('memory_mode','legacy'),('memory_detach_writes',False),('memory_write_fused',True),
-                        ('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
+                        ('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
         kwargs[key] = c.get(key,default)
     model = ALIGNIntentionModel(action_dim=7, num_cameras=len(cameras), **kwargs)
     model._build_head_and_bank(c.get('pool_out_dim',256*len(cameras)*c['compressed_dim']))
@@ -222,14 +222,16 @@ def main():
     torch.cuda.set_per_process_memory_fraction(.3)
     report = dict(protocol=dict(run=str(args.run.resolve()),held_out_episodes=len(episodes),
         episode_keys=[dataset._episode_keys[ep] for ep in episodes],batch_size=args.batch_size,anchors=args.anchors,
+        checkpoint_selection=manifest.get('probe_checkpoint_selection','configured intention_best.pt for each variant'),
         crops=manifest.get('temporal_sampling','crop'),episode_anchors=args.episode_anchors,visual_occlusion=args.visual_occlusion,seed=manifest['seed']+20000,
         intent_intervention='final head intent; perceptual/state conditioning held fixed; shuffle across distinct tasks',
         memory_shuffle='all bank streams swapped between distinct tasks/episodes, queries held fixed; baseline history restored',
         precision='BF16 conditioning/epsilon probes; FP32 DDIM denoiser and state',
+        clipped_ddim='epsilon reconstructed from clipped clean estimate',
         caveat='Dependence and held-out action errors do not establish closed-loop benefit. Each checkpoint retains its configured diffusion schedule.'),variants={})
     for name in manifest['variants']:
         model,epoch = load_model(args.run/name/'intention_best.pt',cameras)
-        print(f'{name} best epoch {epoch}',flush=True)
+        print(f'{name} checkpoint epoch {epoch}',flush=True)
         results,rows = evaluate_variant(model,loader,set(args.anchors),manifest['seed']+20000,args.episode_anchors,args.visual_occlusion)
         report['variants'][name] = dict(epoch=epoch,noise_probe_timesteps=[1,max(1,model.intention_head.num_train_timesteps//2),max(1,round(.9*model.intention_head.num_train_timesteps))],sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
         atomic_json(args.output/(name+'.json'),dict(results=results,rows=rows))
@@ -237,8 +239,15 @@ def main():
         del model
         gc.collect()
         torch.cuda.empty_cache()
+    (args.output/'comparison.md').write_text(render_comparison(report))
+    print(f"Saved {args.output/'comparison.md'}",flush=True)
+
+
+def render_comparison(report):
     lines = ['# Trained head condition dependence','',
-        f"{len(episodes)} held-out episodes; {len(args.anchors)} matched-noise anchors per episode; original best checkpoints.",
+        f"{report['protocol']['held_out_episodes']} held-out episodes; matched-noise anchors: " + ("beginning/middle/last valid common prefix" if report['protocol']['episode_anchors'] else str(report['protocol']['anchors'])) + ".",
+        "Checkpoints: " + report['protocol'].get('checkpoint_selection','configured checkpoints') + ".",
+        "Epochs: " + ", ".join(f"{name}={v['epoch']}" for name,v in report['variants'].items()) + ".",
         'Shuffles exchange distinct tasks. Values are dataset action units. Intent interventions change final head tokens; memory interventions change retrieval.',
         '', '| Model | Intervention | Position delta RMS | Rotation delta RMS | Gripper delta RMS | Gripper flips | Position MSE | Gripper accuracy |',
         '|---|---|---:|---:|---:|---:|---:|---:|']
@@ -247,10 +256,9 @@ def main():
             lines.append(f"| {name} | {intervention} | {r['position_action_delta_rms']:.6f} | {r['rotation_action_delta_rms']:.6f} | {r['gripper_action_delta_rms']:.6f} | {r['gripper_flip_fraction']:.1%} | {r['position_action_mse']:.6f} | {r['gripper_accuracy']:.1%} |")
     lines += ['', 'Repeated-condition controls must have exactly zero action/noise changes.',
         'Zeroing is out of distribution. Shuffling tests information sensitivity but does not prove semantic understanding.',
-        'Memory is empty at t=0, partially populated at t=6, and at capacity before t=12; histories remain independent.',
-        'These weights predate the schedule and gripper-loss fixes. New training is required to measure those improvements.']
-    (args.output/'comparison.md').write_text('\n'.join(lines)+'\n')
-    print(f"Saved {args.output/'comparison.md'}",flush=True)
+        'Bank counts at every anchor are recorded in the per-variant JSON rows. Histories remain episode-local.',
+        'Each checkpoint uses its saved schedule and loss configuration; intervention errors do not establish closed-loop success.']
+    return '\n'.join(lines)+'\n'
 
 if __name__=='__main__':
     main()
