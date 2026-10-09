@@ -94,16 +94,16 @@ class SEVisualCompressor(nn.Module):
 
 # ================================================================
 # State-Conditional Cross-Attn Modulator -- z_s modulates patches per position
-# NOT pooling. Each patch token gets its own modulation from state context.
+# Preserve patch residuals; add a shared state-query visual context.
 # ================================================================
 
 class StateConditionalCrossAttn(nn.Module):
     """Per-patch cross-attention where VP token positions each get a query
     derived from z_s robot state, attending to the actual patch KV features.
 
-    Unlike pooling (which collapses P->1 by averaging), this modulates each
-    position independently through unique per-position queries while all
-    derive from the same underlying z_s embedding via learned projections.
+    The projected state query is shared across positions, so its attended
+    visual context is also shared. Each output retains its own patch through
+    the residual connection; there are no distinct per-position queries.
 
     Args:
         compressed_dim:  per-token dim after SE compression (default 16)
@@ -120,14 +120,13 @@ class StateConditionalCrossAttn(nn.Module):
 
     def __init__(self, compressed_dim: int = 16, state_dim: int = 256, num_heads: int = 4):
         super().__init__()
-        # Per-position query from z_s. Different random weights per position -> queries
-        # diverge during training and attend to distinct spatial regions.
+        # One state query, expanded across patch positions.
         self.q_proj = nn.Linear(state_dim, compressed_dim)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=compressed_dim, num_heads=num_heads, batch_first=True,
         )
         self.norm = nn.LayerNorm(compressed_dim)
-        # Start at identity so modulator learns adaptively from gradient signals
+        # Unit attention scale; the residual plus normalization is not identity.
         self.attn_scale = nn.Parameter(torch.tensor(1.0))
 
     def forward(self, z_v_comp: torch.Tensor, z_s: torch.Tensor,
