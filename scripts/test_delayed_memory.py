@@ -103,14 +103,21 @@ def main():
                 total+=len(labels)
             results[str(history)]={k:v/total for k,v in counts.items()}
             if args.head!='linear':results[str(history)]['gripper_accuracy']={k:v/total for k,v in grip_counts.items()}
+    motion_passed=all(r['correct']>=.95 and r['correct']-r['shuffled']>=.2 for r in results.values())
+    gripper_passed=(all(r['gripper_accuracy']['correct']>=.95 and
+                        r['gripper_accuracy']['correct']-r['gripper_accuracy']['shuffled']>=.2
+                        for r in results.values()) if args.head!='linear' else None)
+    acceptance=dict(motion_passed=motion_passed,gripper_passed=gripper_passed,
+                    passed=motion_passed and gripper_passed is not False,
+                    criterion='At every horizon: correct >=95%, correct-minus-wrong >=20 percentage points, for motion and gripper')
     report=dict(protocol='Same current observation/state for both labels; target is cue shown only at first observation. Wrong-bank donors have opposite cue.',
                 training_steps=0 if args.checkpoint else args.steps,evaluated_checkpoint=str(args.checkpoint) if args.checkpoint else None,
-                sampling="DDIM noise consistent with clipped clean estimate" if args.head=="diffusion" else args.head,patch=args.patch,value_preserving=args.value_preserving,patch_temporal=args.patch_temporal,context_only=args.context_only,head=args.head,results=results,seconds=time.monotonic()-start,
+                sampling="DDIM noise consistent with clipped clean estimate" if args.head=="diffusion" else args.head,patch=args.patch,value_preserving=args.value_preserving,patch_temporal=args.patch_temporal,context_only=args.context_only,head=args.head,acceptance=acceptance,results=results,seconds=time.monotonic()-start,
                 caveat='Controlled mechanism capacity, not evidence of LIBERO policy benefit.')
     (args.output/'results.json').write_text(json.dumps(report,indent=2)+'\n')
     torch.save(dict(memory=memory.state_dict(),head=head.state_dict(),value_preserving=args.value_preserving,patch_temporal=args.patch_temporal,context_only=args.context_only),args.output/'model.pt')
     print(json.dumps(report,indent=2),flush=True)
-    if any(r['correct']<.95 or r['correct']-r['shuffled']<.2 for r in results.values()):
+    if not acceptance['passed']:
         raise RuntimeError('Memory did not pass the delayed-cue acceptance test')
 
 if __name__=='__main__':main()
