@@ -126,3 +126,9 @@ Implementation and controlled mechanism tests pass. Real-data pilots still fail 
 - Raw-value flow head at 2,000 updates passed: motion correct **99.4–99.8%**, gripper **98.2–99.4%**; opposite history motion **0–0.4%**, gripper **1.0–1.6%**, bypass ~50%. These are controlled capacity results only.
 - Raw-value LIBERO pilot launched sequentially after temporal diagnostics: same 4×64 update budget, shared warm start/split/seed/visibility loss, with final paired probe and cluster summary queued. No raw-value LIBERO or policy benefit claimed before those results.
 - Benchmark acceptance now explicitly records and enforces the 95% correct / 20-point correct-minus-wrong thresholds for both motion and gripper, rather than checking only motion after printing gripper results.
+
+## Gripper semantic descriptions and per-class evaluation
+
+- Verified simulator polarity directly in installed Robosuite `PandaGripper.format_action` (-1=open,+1=closed) and official MemoryVLA `evaluation/libero/robot_utils.py` (RLDS 0=closed,1=open; normalized command is inverted). The LeRobot source decoder copies the binary action values; held-out data starts with 1 in the initial open phase. The existing conversion `1 - 2*command` is correct. Fixed misleading comments and earlier audit text that described opposite labels/polarity; no action mapping or saved weights changed.
+- All held-out Goal episode action labels have approximately **62.0% label 1**. Overall accuracy alone is insufficient: the final raw-value probe now records TP/TN/FP/FN, numerical-class recall and balanced accuracy, with the verified LIBERO open/closed convention recorded in its protocol. Both recalls are unavailable when that target class is absent rather than inventing a score.
+- Class-metric test verifies a 90%-majority-only predictor has 50% balanced accuracy and zero minority-class recall. Gripper/ablation subset **29 passed**; total distinct targeted tests now **98**.
