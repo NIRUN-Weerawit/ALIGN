@@ -346,7 +346,7 @@ def build_model(args, num_cameras, device):
         use_memory_bank=args.use_memory_bank,
         memory_bank_len=args.memory_bank_len,
         memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
-        memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
+        memory_context_only=getattr(args,"memory_context_only",False),memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
         diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
         visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample,
     )
@@ -1216,6 +1216,7 @@ def parse_args():
     parser.add_argument("--memory-mode",choices=["legacy","episodic"],default="episodic")
     parser.add_argument("--memory-detach-writes",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--memory-write-fused",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--memory-context-only",action=argparse.BooleanOptionalAction,default=False,help="Experimental historical-context branch without direct current-query residual")
     parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument("--visual-token-attention",action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument("--diffusion-clip-sample",action=argparse.BooleanOptionalAction,default=True)

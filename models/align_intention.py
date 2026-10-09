@@ -108,6 +108,8 @@ class ALIGNIntentionModel(nn.Module):
         self.memory_detach_writes = memory_detach_writes
         self.memory_write_fused = memory_write_fused
         self.memory_patch_retrieval = memory_patch_retrieval
+        if memory_context_only and memory_mode != "episodic":
+            raise ValueError("Context-only retrieval requires episodic memory")
         self.memory_context_only = memory_context_only
         self.diffusion_train_steps = diffusion_train_steps
         self.diffusion_loss_repeats = diffusion_loss_repeats
