@@ -19,12 +19,13 @@ def main():
     p.add_argument('--output',type=Path,required=True)
     p.add_argument('--seeds',type=int,nargs='+',default=[42])
     p.add_argument('--max-steps',type=int,default=300)
+    p.add_argument('--action-horizon',type=int,default=1,help='Actions executed per predicted chunk before replanning')
     p.add_argument('--switch-at',type=float,default=0.,help='0 means model controls from reset')
     p.add_argument('--interventions',nargs='+',choices=['normal','bypass','empty'],default=['normal'])
     p.add_argument('--resume',action='store_true')
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=True)
     n=len([x for x in a.episodes.read_text().splitlines() if x.strip()])
-    if n < 1 or a.max_steps < 1 or not a.seeds:
+    if n < 1 or a.max_steps < 1 or a.action_horizon < 1 or not a.seeds:
         p.error('At least one episode, seed and simulator step are required')
     def digest(path):
         h=hashlib.sha256()
@@ -33,11 +34,15 @@ def main():
         return h.hexdigest()
     protocol=dict(checkpoint_sha256={str(x.resolve()):digest(x) for x in a.candidates},candidates=[str(x.resolve()) for x in a.candidates],data=str(a.data.resolve()),episodes=a.episodes.read_text().splitlines(),
                   seed_protocol='base seed plus SHA256 episode key; scene/sampler reseeded before each model rollout; PYTHONHASHSEED=0',
-                  sampling='clipped DDIM reconstructs epsilon consistently',seeds=a.seeds,max_steps=a.max_steps,switch_at=a.switch_at,interventions=a.interventions,
+                  sampling='clipped DDIM reconstructs epsilon consistently',seeds=a.seeds,max_steps=a.max_steps,action_horizon=a.action_horizon,switch_at=a.switch_at,interventions=a.interventions,
                   selection='normal-memory success rate; deterministic candidate order breaks ties; interventions do not select',
                   caveat='One trial/task/seed is provisional. Selected-on validation episodes cannot serve as an independent final test.')
-    if (a.output/'protocol.json').exists() and json.loads((a.output/'protocol.json').read_text())!=protocol:
-        raise ValueError('Existing evaluation protocol differs; use a new output directory')
+    if (a.output/'protocol.json').exists():
+        previous=json.loads((a.output/'protocol.json').read_text())
+        # Earlier selector versions always used the evaluator's horizon of one.
+        previous.setdefault('action_horizon',1)
+        if previous!=protocol:
+            raise ValueError('Existing evaluation protocol differs; use a new output directory')
     atomic_json(a.output/'protocol.json',protocol)
     result={}
     env=dict(os.environ,PYTHONHASHSEED='0',MUJOCO_GL='egl',LIBERO_CONFIG_PATH='/home/whinnoy/.local/share/align/libero-config')
@@ -53,7 +58,7 @@ def main():
                     cmd=[sys.executable,str(ROOT/'eval/eval_libero_v4_trajectory.py'),'--checkpoint',str(checkpoint.resolve()),
                          '--data',str(a.data.resolve()),'--val-episodes',str(a.episodes.resolve()),'--n-episodes',str(n),
                          '--out-dir',str(out.resolve()),'--seed',str(seed),'--max-steps',str(a.max_steps),
-                         '--switch-at',str(a.switch_at),'--memory-intervention',intervention,'--noise-std','0','--no-video','--no-plot']
+                         '--switch-at',str(a.switch_at),'--action-horizon',str(a.action_horizon),'--memory-intervention',intervention,'--noise-std','0','--no-video','--no-plot']
                     with (out/'eval.log').open('w') as log:subprocess.run(cmd,env=env,stdout=log,stderr=subprocess.STDOUT,check=True,cwd=ROOT)
                 records=json.loads((out/'result.json').read_text())['episodes']
                 episodes.extend(dict(record,seed=seed) for record in records)
