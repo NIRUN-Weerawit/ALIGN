@@ -123,6 +123,13 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                             restore(model.memory_module,before,permutation)
                             conds[case+'_shuffle'] = model.intention_head(*model.condition_actions(missing,missing_state,i))
                             restore(model.memory_module,after)
+                if visual_occlusion and t > 0 and model.history_size == 1 and i is None:
+                    # Reference: carry the latest real observation directly into
+                    # the head. This diagnoses information lost by learned
+                    # retrieval; it does not change the saved model architecture.
+                    previous_p,previous_s=visual[:,t-1:t],state[:,t-1:t]
+                    conds['previous_observation_correct']=model.intention_head(previous_p,previous_s,None)
+                    conds['previous_observation_shuffle']=model.intention_head(previous_p[permutation],previous_s[permutation],None)
                 conds['visual_zero_control'] = model.intention_head(torch.zeros_like(fused[0]),fused[1],fused[2])
                 conds['state_zero_control'] = model.intention_head(fused[0],torch.zeros_like(fused[1]),fused[2])
                 target = batch['actions_segment'][:,t:t+model.chunk_size].cuda().float()
@@ -150,7 +157,7 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     acc['max_action_delta'] = max(acc['max_action_delta'],(action-baseline).abs().max().item())
                     acc['max_noise_delta'] = max(acc['max_noise_delta'],(eps-baseline_eps).abs().max().item())
                     row = dict(batch=batch_index,t=t,intervention=name,
-                               bank_count=0 if before is None else before['_count'].tolist())
+                               history_available=t>0,bank_count=0 if before is None else before['_count'].tolist())
                     for group,sl in GROUPS.items():
                         delta = (action[:,:,sl]-baseline[:,:,sl]).square().mean().item()
                         mse = (action[:,:,sl]-target[:,:,sl]).square().mean().item()
@@ -225,6 +232,7 @@ def main():
         checkpoint_selection=manifest.get('probe_checkpoint_selection','configured intention_best.pt for each variant'),
         crops=manifest.get('temporal_sampling','crop'),episode_anchors=args.episode_anchors,visual_occlusion=args.visual_occlusion,seed=manifest['seed']+20000,
         intent_intervention='final head intent; perceptual/state conditioning held fixed; shuffle across distinct tasks',
+        previous_observation_control='No-intent/history-1 reference only: raw prior-frame visual/state embeddings go directly to the head; correct vs cross-task shuffled past; no t=0 rows',
         memory_shuffle='all bank streams swapped between distinct tasks/episodes, queries held fixed; baseline history restored',
         precision='BF16 conditioning/epsilon probes; FP32 DDIM denoiser and state',
         clipped_ddim='epsilon reconstructed from clipped clean estimate',

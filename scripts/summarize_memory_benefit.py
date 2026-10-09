@@ -13,18 +13,22 @@ import numpy as np
 def summarize(rows,draws=20000,seed=42):
     indexed={}
     for row in rows:
-        counts=row.get('bank_count',0)
-        if not isinstance(counts,list) or not counts or min(counts)<=0:continue
         key=(row['batch'],row['t'],row['intervention'])
         if key in indexed:raise ValueError('Duplicate probe row')
         indexed[key]=row
-    pairs=[('full_observation','baseline','memory_shuffle'),
+    pairs=[('previous_observation_control','previous_observation_correct','previous_observation_shuffle'),
+           ('full_observation','baseline','memory_shuffle'),
            ('last_camera','last_camera_correct','last_camera_shuffle'),
            ('all_visual','all_visual_correct','all_visual_shuffle'),
            ('all_observation','all_observation_correct','all_observation_shuffle')]
     result={}
     for case,correct,wrong in pairs:
-        anchors=sorted({(b,t) for b,t,arm in indexed if arm in [correct,wrong]})
+        def available(row):
+            if case=='previous_observation_control':return row.get('history_available',row['t']>0)
+            counts=row.get('bank_count',0)
+            return isinstance(counts,list) and bool(counts) and min(counts)>0
+        anchors=sorted({(b,t) for (b,t,arm),row in indexed.items()
+                        if arm in [correct,wrong] and available(row)})
         if not anchors:continue
         clusters={}
         for b,t in anchors:
@@ -52,7 +56,7 @@ def main():
     p.add_argument('--output',type=Path,required=True)
     args=p.parse_args()
     report=dict(source=str(args.probe.resolve()),
-                protocol='Correct vs cross-task shuffled histories, matched noise; empty-bank anchors excluded; 20,000 paired batch-cluster bootstrap draws, seed 42.',
+                protocol='Correct vs cross-task shuffled histories, matched noise; empty-bank anchors excluded (direct prior-frame controls require an actual past frame); 20,000 paired batch-cluster bootstrap draws, seed 42.',
                 caveat='Rows aggregate episodes within batches. Intervals describe prediction errors, not simulator success. Statistical detectability alone does not establish practical benefit.',
                 cases=summarize(json.loads(args.probe.read_text())['rows']))
     args.output.write_text(json.dumps(report,indent=2)+'\n')

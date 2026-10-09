@@ -22,3 +22,13 @@ def test_paired_clusters_exclude_empty_banks_and_preserve_error_sign():
 def test_incomplete_intervention_pairs_are_rejected():
     with pytest.raises(ValueError,match='Unpaired'):
         summarize([row(0,30,'baseline',1)])
+
+
+def test_prior_frame_control_does_not_require_a_learned_bank():
+    rows=[row(0,0,'previous_observation_correct',100,0),
+          row(0,0,'previous_observation_shuffle',0,0),
+          row(0,30,'previous_observation_correct',1,0),
+          row(0,30,'previous_observation_shuffle',3,0)]
+    result=summarize(rows,draws=100)['previous_observation_control']
+    assert result['nonempty_anchors']==1
+    assert result['metrics']['position_mse']['benefit']==2
