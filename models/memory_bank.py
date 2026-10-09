@@ -47,6 +47,7 @@ class MemoryRetrieval(nn.Module):
             nn.Linear(dim, dim),
         )
         self.out_norm = nn.LayerNorm(dim)
+        self.context_only = False
 
     def forward(self, query: torch.Tensor, bank_kv: torch.Tensor,
                 bank_mask: Optional[torch.Tensor] = None,
@@ -108,9 +109,12 @@ class MemoryRetrieval(nn.Module):
             )
 
         # FFN with residual
-        ffn_in = torch.cat([q, attn_out], dim=-1)  # (B, 1, 2*dim)
+        # Optional context branch keeps the current query only in attention
+        # selection. Current features are already preserved by the fusion gate.
+        residual = attn_out if self.context_only else q
+        ffn_in = torch.cat([residual, attn_out], dim=-1)  # (B, 1, 2*dim)
         ffn_out = self.ffn(ffn_in)  # (B, 1, dim)
-        out = self.out_norm(ffn_out + q)
+        out = self.out_norm(ffn_out + residual)
         return out.squeeze(1) if query.ndim == 2 else out
 
 
@@ -480,7 +484,7 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
     Bank buffers are episode-local state, never checkpoint parameters.
     """
     def __init__(self, perceptual_dim, cognitive_dim, state_dim, bank_len=16,
-                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None):
+                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False):
         if bank_len < 2:
             raise ValueError('Episodic memory capacity must be at least two for consolidation')
         super().__init__(perceptual_dim,cognitive_dim,state_dim,bank_len,num_heads)
@@ -491,6 +495,9 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
                 raise ValueError('Patch width must divide perceptual width and attention heads')
             self.perceptual_retrieval = MemoryRetrieval(patch_dim,num_heads)
             self.perceptual_gate = MemoryGateFusion(patch_dim)
+        for retrieval in [self.perceptual_retrieval,self.state_retrieval,self.cognitive_retrieval]:
+            if retrieval is not None:
+                retrieval.context_only = context_only
         # Begin with balanced current/history fusion, rather than suppressing memory.
         for gate in [self.perceptual_gate,self.state_gate,self.cognitive_gate]:
             if gate is not None:

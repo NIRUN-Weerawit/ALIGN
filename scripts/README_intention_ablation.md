@@ -156,3 +156,5 @@ packet loss. Current state features are then unavailable along with the cameras;
 completely missing packets are excluded from bank writes. Streaming
 `encode_step`/`IntentionStream.observe` accept the corresponding camera/state
 availability masks and preserve physical observation indices across outages.
+
+`--memory-context-only` is an opt-in experiment: the retrieved branch uses historical attention output in its FFN and residual, with current features preserved separately by the fusion gate. Existing checkpoints default to the original query-residual branch. Its LIBERO policy benefit is not established; compare correct and cross-task shuffled histories before adopting it.

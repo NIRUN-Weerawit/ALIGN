@@ -149,6 +149,7 @@ def load_intention_model(
         memory_mode=cfg.get("memory_mode","legacy"),
         memory_detach_writes=cfg.get("memory_detach_writes",False),
         memory_write_fused=cfg.get("memory_write_fused",True),
+        memory_context_only=cfg.get("memory_context_only",False),
         memory_patch_retrieval=cfg.get("memory_patch_retrieval",False),
         diffusion_train_steps=cfg.get("diffusion_train_steps",10),
         diffusion_loss_repeats=cfg.get("diffusion_loss_repeats",1),

@@ -211,3 +211,34 @@ def test_complete_observation_outages_hide_only_inputs_not_targets():
     np.testing.assert_array_equal(sample['actions_segment'][:,0],np.arange(120))
     assert sample['observation_state_mask'][0]
     assert collate_segments([sample,sample])['observation_state_mask'].shape==(2,120)
+
+
+def test_context_only_retrieval_has_no_direct_query_shortcut():
+    # With exactly one historical token, attention selection is fixed. Changing
+    # the current query must not change the retrieved context branch.
+    from models.memory_bank import MemoryRetrieval
+    torch.manual_seed(11)
+    retrieval=MemoryRetrieval(4,2).eval()
+    retrieval.context_only=True
+    values=torch.randn(2,1,4)
+    query=torch.randn(2,4)
+    first=retrieval(query,values)
+    second=retrieval(query+torch.randn_like(query)*5,values)
+    torch.testing.assert_close(first,second)
+    changed=retrieval(query,values+torch.randn_like(values))
+    assert not torch.allclose(first,changed)
+    changed.square().sum().backward()
+    assert retrieval.retrieval_attn.in_proj_weight.grad.abs().sum()>0
+
+
+def test_context_only_is_optional_and_empty_bank_is_identity():
+    old=EpisodicMemoryModule(8,0,4,bank_len=3)
+    new=EpisodicMemoryModule(8,0,4,bank_len=3,context_only=True)
+    new.load_state_dict(old.state_dict(),strict=True)
+    assert not old.perceptual_retrieval.context_only
+    assert new.perceptual_retrieval.context_only and new.state_retrieval.context_only
+    new.reset(2,torch.device('cpu'))
+    p,s=torch.randn(2,8),torch.randn(2,4)
+    out=new(p,s)
+    torch.testing.assert_close(out[0],p,rtol=0,atol=0)
+    torch.testing.assert_close(out[1],s,rtol=0,atol=0)
