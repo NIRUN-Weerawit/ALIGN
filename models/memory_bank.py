@@ -484,12 +484,15 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
     Bank buffers are episode-local state, never checkpoint parameters.
     """
     def __init__(self, perceptual_dim, cognitive_dim, state_dim, bank_len=16,
-                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False):
+                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False):
         if bank_len < 2:
             raise ValueError('Episodic memory capacity must be at least two for consolidation')
         super().__init__(perceptual_dim,cognitive_dim,state_dim,bank_len,num_heads)
         self.detach_writes, self.write_fused = detach_writes,write_fused
+        if patch_temporal and patch_dim is None:
+            raise ValueError("Temporal patch retrieval requires patch-preserving memory")
         self.patch_dim = patch_dim
+        self.patch_temporal = patch_temporal
         if patch_dim is not None:
             if perceptual_dim % patch_dim or patch_dim % num_heads:
                 raise ValueError('Patch width must divide perceptual width and attention heads')
@@ -524,6 +527,15 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
         values = bank.clone()
         if bank.ndim==4:
             B,L,N,D = bank.shape
+            if self.patch_temporal:
+                # Each fixed camera/grid slot searches its own temporal history.
+                # This preserves spatial identity without mixing L*N tokens in
+                # a very narrow attention space; work scales as N*L, not N*N*L.
+                temporal_values = values.permute(0,2,1,3).reshape(B*N,L,D)
+                temporal_keys = (values + self.age_encoding(age,D).unsqueeze(2).to(values.dtype)).permute(0,2,1,3).reshape(B*N,L,D)
+                temporal_mask = mask[:,None].expand(B,N,L).reshape(B*N,L)
+                result = module(query.reshape(B*N,D),temporal_keys,temporal_mask,temporal_values).reshape(B,N,D)
+                return torch.where(mask.any(1)[:,None,None],result,query)
             keys = values + self.age_encoding(age,D).unsqueeze(2).to(values.dtype)
             # Spatial position remains separate from the recorded observation age.
             spatial = self.age_encoding(torch.arange(N,device=bank.device),D).to(values.dtype)

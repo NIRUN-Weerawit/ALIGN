@@ -178,7 +178,7 @@ def evaluate_existing(out):
             mamba_expand=config.get("mamba_expand", 2),
             use_memory_bank=config["use_memory_bank"], memory_bank_len=config["memory_bank_len"],
             memory_mode=config.get("memory_mode","legacy"),memory_detach_writes=config.get("memory_detach_writes",False),
-            memory_context_only=config.get("memory_context_only",False),memory_write_fused=config.get("memory_write_fused",True),memory_patch_retrieval=config.get("memory_patch_retrieval",False),
+            memory_patch_temporal=config.get("memory_patch_temporal",False),memory_context_only=config.get("memory_context_only",False),memory_write_fused=config.get("memory_write_fused",True),memory_patch_retrieval=config.get("memory_patch_retrieval",False),
             diffusion_train_steps=config.get("diffusion_train_steps",10),diffusion_loss_repeats=config.get("diffusion_loss_repeats",1),
             visual_token_attention=config.get("visual_token_attention",False),diffusion_clip_sample=config.get("diffusion_clip_sample",False))
         model._build_head_and_bank(config.get("pool_out_dim", 256 * len(cameras) * config["compressed_dim"]))
@@ -228,6 +228,7 @@ def parse_args(argv=None):
     parser.add_argument("--memory-mode",choices=["legacy","episodic"],default="episodic")
     parser.add_argument("--memory-detach-writes",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--memory-write-fused",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--memory-patch-temporal",action=argparse.BooleanOptionalAction,default=False,help="Experimental per-camera/grid-slot temporal retrieval instead of global historical patch attention")
     parser.add_argument("--memory-context-only",action=argparse.BooleanOptionalAction,default=False,help="Experimental retrieved branch without a direct current-query residual; current features remain in the fusion gate")
     parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument("--visual-token-attention",action=argparse.BooleanOptionalAction,default=False)
@@ -296,6 +297,8 @@ def parse_args(argv=None):
         parser.error("Observation dropout probability must be in [0,1]")
     if args.temporal_sampling=="episode" and args.history_size!=1:
         parser.error('Episode supervision currently requires history size 1')
+    if args.memory_patch_temporal and (not args.memory_patch_retrieval or args.memory_mode != "episodic"):
+        parser.error("Temporal patch retrieval requires episodic patch memory")
     if args.memory_context_only and args.memory_mode != "episodic":
         parser.error("Context-only retrieval requires episodic memory")
     if args.memory_patch_retrieval and (args.compressed_dim%2 or args.memory_mode!="episodic"):
@@ -353,7 +356,7 @@ def main(argv=None):
         legacy_defaults = dict(cameras=["image", "wrist_image"], validation_fraction=0.1,
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
-                               memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
+                               memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False)
         for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
@@ -361,7 +364,7 @@ def main(argv=None):
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
-                    "memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views"):
+                    "memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         manifest = dict(manifest, **previous)
@@ -393,7 +396,7 @@ def main(argv=None):
             use_intent_tokens=intent, num_intent_tokens=args.num_intent_tokens, intent_dim=args.intent_dim,
             use_memory_bank=memory, memory_bank_len=args.memory_bank_len,
             memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
-            memory_context_only=args.memory_context_only,memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
+            memory_patch_temporal=args.memory_patch_temporal,memory_context_only=args.memory_context_only,memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
             diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
             visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample)
         # Cached training never uses the raw-image modules. Keep them off GPU.

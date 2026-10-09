@@ -28,6 +28,7 @@ def main():
     ap.add_argument('--steps',type=int,default=400)
     ap.add_argument('--device',default='cpu')
     ap.add_argument('--patch',action='store_true')
+    ap.add_argument('--patch-temporal',action='store_true')
     ap.add_argument('--context-only',action='store_true')
     ap.add_argument('--checkpoint',type=Path,help='Evaluate saved benchmark weights without further training')
     ap.add_argument('--head',choices=['linear','diffusion','flow_matching'],default='linear')
@@ -36,7 +37,7 @@ def main():
     if (args.output/'results.json').exists():raise ValueError('Completed experiment exists; use a new output directory')
     args.output.mkdir(parents=True,exist_ok=True)
     torch.set_num_threads(2);torch.manual_seed(81)
-    memory=EpisodicMemoryModule(8,0,4,bank_len=16,context_only=args.context_only,patch_dim=4 if args.patch else None).to(args.device)
+    memory=EpisodicMemoryModule(8,0,4,bank_len=16,patch_temporal=args.patch_temporal,context_only=args.context_only,patch_dim=4 if args.patch else None).to(args.device)
     if args.head=='linear':
         head=nn.Linear(8,1)
     elif args.head=='diffusion':
@@ -47,6 +48,8 @@ def main():
     head=head.to(args.device)
     if args.checkpoint:
         saved=torch.load(args.checkpoint,map_location=args.device,weights_only=True)
+        if saved.get('patch_temporal',False) != args.patch_temporal:
+            raise ValueError('Saved benchmark patch layout differs')
         if saved.get('context_only',False) != args.context_only:
             raise ValueError('Saved benchmark retrieval mode differs; specify its original --context-only setting')
         memory.load_state_dict(saved['memory']);head.load_state_dict(saved['head'])
@@ -99,10 +102,10 @@ def main():
             if args.head!='linear':results[str(history)]['gripper_accuracy']={k:v/total for k,v in grip_counts.items()}
     report=dict(protocol='Same current observation/state for both labels; target is cue shown only at first observation. Wrong-bank donors have opposite cue.',
                 training_steps=0 if args.checkpoint else args.steps,evaluated_checkpoint=str(args.checkpoint) if args.checkpoint else None,
-                sampling="DDIM noise consistent with clipped clean estimate" if args.head=="diffusion" else args.head,patch=args.patch,context_only=args.context_only,head=args.head,results=results,seconds=time.monotonic()-start,
+                sampling="DDIM noise consistent with clipped clean estimate" if args.head=="diffusion" else args.head,patch=args.patch,patch_temporal=args.patch_temporal,context_only=args.context_only,head=args.head,results=results,seconds=time.monotonic()-start,
                 caveat='Controlled mechanism capacity, not evidence of LIBERO policy benefit.')
     (args.output/'results.json').write_text(json.dumps(report,indent=2)+'\n')
-    torch.save(dict(memory=memory.state_dict(),head=head.state_dict(),context_only=args.context_only),args.output/'model.pt')
+    torch.save(dict(memory=memory.state_dict(),head=head.state_dict(),patch_temporal=args.patch_temporal,context_only=args.context_only),args.output/'model.pt')
     print(json.dumps(report,indent=2),flush=True)
     if any(r['correct']<.95 or r['correct']-r['shuffled']<.2 for r in results.values()):
         raise RuntimeError('Memory did not pass the delayed-cue acceptance test')

@@ -242,3 +242,29 @@ def test_context_only_is_optional_and_empty_bank_is_identity():
     out=new(p,s)
     torch.testing.assert_close(out[0],p,rtol=0,atol=0)
     torch.testing.assert_close(out[1],s,rtol=0,atol=0)
+
+
+def test_temporal_patch_lookup_preserves_camera_grid_slots():
+    torch.manual_seed(17)
+    memory=EpisodicMemoryModule(8,0,4,bank_len=3,patch_dim=4,
+                               context_only=True,patch_temporal=True).eval()
+    memory.reset(2,torch.device('cpu'))
+    values=torch.randn(2,8)
+    memory.observe_only(values,torch.randn(2,4),observed_mask=torch.tensor([True,False]))
+    query=torch.randn(2,2,4)
+    mask=torch.arange(3)[None]<memory._count[:,None]
+    age=torch.ones(2,3)
+    original=memory._retrieve(memory.perceptual_retrieval,query,memory.perceptual_bank,mask,age)
+    changed_bank=memory.perceptual_bank.clone()
+    changed_bank[0,0,0]+=torch.tensor([2.,-1.,3.,-4.])
+    changed=memory._retrieve(memory.perceptual_retrieval,query,changed_bank,mask,age)
+    assert not torch.allclose(original[0,0],changed[0,0])
+    torch.testing.assert_close(original[0,1],changed[0,1],rtol=0,atol=0)
+    torch.testing.assert_close(original[1],query[1],rtol=0,atol=0)
+    changed[0].square().sum().backward()
+    assert memory.perceptual_retrieval.retrieval_attn.in_proj_weight.grad.abs().sum()>0
+
+
+def test_temporal_patch_mode_requires_patch_layout():
+    with pytest.raises(ValueError,match='patch-preserving'):
+        EpisodicMemoryModule(8,0,4,patch_temporal=True)

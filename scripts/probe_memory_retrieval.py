@@ -20,6 +20,7 @@ def main():
     parser.add_argument('--run',type=Path,required=True)
     parser.add_argument('--checkpoint',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
+    parser.add_argument('--patch-temporal-override',action=argparse.BooleanOptionalAction,default=None,help='Diagnostic-only architecture intervention; weights stay fixed, not a policy-quality comparison')
     parser.add_argument('--frames',type=int,default=40)
     parser.add_argument('--batch-size',type=int,default=4)
     args=parser.parse_args()
@@ -41,9 +42,13 @@ def main():
     if not model.use_memory_bank or model.memory_mode!='episodic':
         parser.error('Requires an episodic-memory checkpoint')
     bank=model.memory_module
+    if args.patch_temporal_override is not None:
+        if bank.patch_dim is None:parser.error("Temporal layout intervention requires a patch bank")
+        bank.patch_temporal=args.patch_temporal_override
     report=dict(checkpoint=str(args.checkpoint.resolve()),epoch=epoch,
                 frames=args.frames,episode_keys=[dataset._episode_keys[k] for k in indices],
-                context_only=model.memory_context_only,
+                context_only=model.memory_context_only,patch_temporal=bank.patch_temporal,saved_patch_temporal=model.memory_patch_temporal,
+                architecture_override=args.patch_temporal_override,
                 protocol='Zero current queries; cross-task values swapped; key ages held fixed; BF16 conditioning',
                 caveat='Feature sensitivity diagnostic, not action accuracy or policy success.',streams={})
     with torch.no_grad(),torch.autocast('cuda',dtype=torch.bfloat16):

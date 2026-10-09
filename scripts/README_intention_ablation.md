@@ -158,3 +158,5 @@ completely missing packets are excluded from bank writes. Streaming
 availability masks and preserve physical observation indices across outages.
 
 `--memory-context-only` is an opt-in experiment: the retrieved branch uses historical attention output in its FFN and residual, with current features preserved separately by the fusion gate. Existing checkpoints default to the original query-residual branch. Its LIBERO policy benefit is not established; compare correct and cross-task shuffled histories before adopting it.
+
+`--memory-patch-temporal` is a second opt-in experiment requiring `--memory-patch-retrieval`: each fixed camera/grid slot retrieves across its own past frames. This avoids global averaging over all historical patches in the four-channel pilot representation and reduces attention score size from N²L to NL. It restricts spatial search; deployment benefit must be measured rather than assumed. `probe_memory_retrieval.py` measures stored, attention, retrieved, and gated history differences before the head.
