@@ -272,7 +272,7 @@ def main():
             model.memory_module.perceptual_recency_scale=scale
         print(f'{name} checkpoint epoch {epoch}',flush=True)
         results,rows = evaluate_variant(model,loader,set(args.anchors),manifest['seed']+20000,args.episode_anchors,args.visual_occlusion)
-        report['variants'][name] = dict(epoch=epoch,saved_perceptual_recency=saved_recency,effective_perceptual_recency=0. if not model.use_memory_bank else model.memory_module.perceptual_recency_scale,noise_probe_timesteps=[1,max(1,model.intention_head.num_train_timesteps//2),max(1,round(.9*model.intention_head.num_train_timesteps))],sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
+        report['variants'][name] = dict(epoch=epoch,saved_perceptual_recency=saved_recency,effective_perceptual_recency=0. if not model.use_memory_bank else getattr(model.memory_module,"perceptual_recency_scale",0.),noise_probe_timesteps=[1,max(1,model.intention_head.num_train_timesteps//2),max(1,round(.9*model.intention_head.num_train_timesteps))],sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
         atomic_json(args.output/(name+'.json'),dict(results=results,rows=rows))
         atomic_json(args.output/'summary.json',report)
         del model
