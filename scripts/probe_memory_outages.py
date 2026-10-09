@@ -17,6 +17,21 @@ from scripts.probe_condition_dependence import encode, load_model, gripper_class
 from scripts.summarize_memory_benefit import summarize, summarize_gripper_controls
 
 
+def field_mask_effects(cases,durations):
+    effects={}
+    for duration in durations:
+        paired=[]
+        for masked,arm in [(True,'baseline'),(False,'memory_bypass')]:
+            paired.extend(dict(row,intervention=arm) for row in cases[f'field_masks_{masked}_outage_{duration}']['rows']
+                          if row['intervention']=='baseline')
+        error_rows=[dict(row,intervention='memory_shuffle' if row['intervention']=='memory_bypass' else row['intervention']) for row in paired]
+        error=summarize(error_rows)['full_observation']['metrics']['position_mse']
+        effects[duration]=dict(masked_position_mse=error['correct'],unmasked_position_mse=error['shuffled'],
+            relative_error_reduction=error['relative_benefit'],absolute_error_reduction_interval=error['bootstrap_95_percent_interval'],
+            gripper_recall=summarize_gripper_controls(paired)['normal_vs_bypass']['metrics'])
+    return effects
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run',type=Path,required=True)
@@ -89,6 +104,8 @@ def main():
     report=dict(checkpoint=str(args.checkpoint.resolve()),checkpoint_sha256=hashlib.sha256(args.checkpoint.read_bytes()).hexdigest(),epoch=epoch,
         protocol='Fixed trained weights, field-mask override off/on; middle-of-episode camera outages, current expert state available; distinct-task donor histories; matched sampling noise; batch-cluster intervals.',
         held_out_episodes=len(episodes),saved_field_masks=model.memory_field_masks,
+        field_mask_effects=field_mask_effects(cases,args.outage_frames),
+        field_mask_effect_protocol='Same correct histories; masks ON minus OFF; gripper normal means masked and comparison means unmasked.',
         caveat='Offline architecture intervention, not training or simulator success. Class 0 is closed and class 1 open for LIBERO.',cases=cases)
     args.output.parent.mkdir(parents=True,exist_ok=True);atomic_json(args.output,report)
     print(f'Saved {args.output}',flush=True)
