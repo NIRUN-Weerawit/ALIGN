@@ -57,6 +57,16 @@ def load_model(path, cameras):
     return model, ckpt['epoch']
 
 
+def gripper_class_metrics(counts):
+    tp,tn,fp,fn=(counts[k] for k in ('tp','tn','fp','fn'))
+    one_recall=tp/(tp+fn) if tp+fn else None
+    zero_recall=tn/(tn+fp) if tn+fp else None
+    return dict(confusion=dict(tp=tp,tn=tn,fp=fp,fn=fn),
+                label_1_recall=one_recall,label_0_recall=zero_recall,
+                balanced_accuracy=(one_recall+zero_recall)/2 if one_recall is not None and zero_recall is not None else None,
+                target_label_1_fraction=(tp+fn)/(tp+tn+fp+fn))
+
+
 @torch.no_grad()
 def encode(model, batch):
     frames = batch['frames_segment'].cuda(non_blocking=True)
@@ -153,6 +163,10 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     acc = totals[name]
                     acc['count'] += B*model.chunk_size
                     acc['gripper_flips'] += ((action[:,:,6]>.5)!=(baseline[:,:,6]>.5)).sum().item()
+                    pred_grip=action[:,:,6]>.5
+                    true_grip=target[:,:,6]>.5
+                    for key,bits in [('tp',pred_grip & true_grip),('tn',~pred_grip & ~true_grip),('fp',pred_grip & ~true_grip),('fn',~pred_grip & true_grip)]:
+                        acc['gripper_'+key] += int(bits.sum())
                     acc['gripper_correct'] += ((action[:,:,6]>.5)==(target[:,:,6]>.5)).sum().item()
                     acc['max_action_delta'] = max(acc['max_action_delta'],(action-baseline).abs().max().item())
                     acc['max_noise_delta'] = max(acc['max_noise_delta'],(eps-baseline_eps).abs().max().item())
@@ -179,6 +193,7 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
         r = dict(action_predictions=int(n),gripper_flip_fraction=acc['gripper_flips']/n,
                  gripper_accuracy=acc['gripper_correct']/n,max_action_delta=acc['max_action_delta'],
                  max_noise_delta=acc['max_noise_delta'])
+        r['gripper_classes']=gripper_class_metrics({key:int(acc['gripper_'+key]) for key in ['tp','tn','fp','fn']})
         for group in GROUPS:
             r[group+'_action_delta_rms'] = (acc[group+'_delta_sq']/n)**.5
             r[group+'_action_mse'] = acc[group+'_mse']/n
@@ -232,6 +247,7 @@ def main():
         checkpoint_selection=manifest.get('probe_checkpoint_selection','configured intention_best.pt for each variant'),
         crops=manifest.get('temporal_sampling','crop'),episode_anchors=args.episode_anchors,visual_occlusion=args.visual_occlusion,seed=manifest['seed']+20000,
         intent_intervention='final head intent; perceptual/state conditioning held fixed; shuffle across distinct tasks',
+        gripper_label_semantics='LIBERO/LeRobot 1=open, 0=closed; simulator -1=open,+1=closed; class rates are labeled numerically for other datasets',
         previous_observation_control='No-intent/history-1 reference only: raw prior-frame visual/state embeddings go directly to the head; correct vs cross-task shuffled past; no t=0 rows',
         memory_shuffle='all bank streams swapped between distinct tasks/episodes, queries held fixed; baseline history restored',
         precision='BF16 conditioning/epsilon probes; FP32 DDIM denoiser and state',
@@ -262,6 +278,16 @@ def render_comparison(report):
     for name,v in report['variants'].items():
         for intervention,r in v['results'].items():
             lines.append(f"| {name} | {intervention} | {r['position_action_delta_rms']:.6f} | {r['rotation_action_delta_rms']:.6f} | {r['gripper_action_delta_rms']:.6f} | {r['gripper_flip_fraction']:.1%} | {r['position_action_mse']:.6f} | {r['gripper_accuracy']:.1%} |")
+    if any('gripper_classes' in r for v in report['variants'].values() for r in v['results'].values()):
+        lines += ['', report['protocol'].get('gripper_label_semantics','Gripper class labels use the saved dataset encoding.'),
+                  '', '| Model | Intervention | Target label 1 | Label 1 recall | Label 0 recall | Balanced accuracy |',
+                  '|---|---|---:|---:|---:|---:|']
+        def rate(value):return 'unavailable' if value is None else f'{value:.1%}'
+        for name,v in report['variants'].items():
+            for intervention,r in v['results'].items():
+                if 'gripper_classes' not in r:continue
+                g=r['gripper_classes']
+                lines.append(f"| {name} | {intervention} | {rate(g['target_label_1_fraction'])} | {rate(g['label_1_recall'])} | {rate(g['label_0_recall'])} | {rate(g['balanced_accuracy'])} |")
     lines += ['', 'Repeated-condition controls must have exactly zero action/noise changes.',
         'Zeroing is out of distribution. Shuffling tests information sensitivity but does not prove semantic understanding.',
         'Bank counts at every anchor are recorded in the per-variant JSON rows. Histories remain episode-local.',

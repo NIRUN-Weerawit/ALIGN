@@ -110,3 +110,13 @@ def test_probe_report_describes_actual_checkpoint_and_anchors():
     assert 'beginning/middle/last valid common prefix' in text
     assert 'memory=4' in text
     assert 'predate' not in text and 't=6' not in text
+
+
+def test_gripper_balanced_accuracy_exposes_majority_only_predictions():
+    from scripts.probe_condition_dependence import gripper_class_metrics
+    rates=gripper_class_metrics(dict(tp=90,tn=0,fp=10,fn=0))
+    assert rates['target_label_1_fraction']==.9
+    assert rates['label_1_recall']==1 and rates['label_0_recall']==0
+    assert rates['balanced_accuracy']==.5
+    single_class=gripper_class_metrics(dict(tp=10,tn=0,fp=0,fn=0))
+    assert single_class['label_0_recall'] is None and single_class['balanced_accuracy'] is None

@@ -37,10 +37,11 @@ def carry_gripper_state(last_state, current_pose):
 
 
 def executed_binary_gripper(prediction, threshold=0.5):
-    """Dataset command (0=open, 1=close) and matching simulator polarity.
+    """LIBERO/LeRobot command (0=closed, 1=open) and simulator polarity.
 
     Feed the binary command actually executed back into the next observation,
     rather than the continuous head score or the simulator's +/-1 polarity.
+    Panda receives -1 for open and +1 for closed: simulator = 1 - 2*command.
     """
     command = float(prediction > threshold)
     return command, 1.0 - 2.0 * command

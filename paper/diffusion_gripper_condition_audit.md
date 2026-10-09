@@ -12,7 +12,7 @@ Legacy checkpoint buffers retain their exact saved values and load strictly. The
 
 ## Gripper correction
 
-LIBERO predictions are dataset commands: 0=open and 1=close. A continuous score is thresholded at 0.5; the next observation carries this executed binary command, and the simulator receives the matching +1=open/-1=close polarity. Both synchronous and asynchronous V4 evaluators share this conversion. Pose scaling affects only the first six action dimensions. Causal dataset fallback remains the previous executed command, never the current target.
+LIBERO/LeRobot predictions are dataset commands: 0=closed and 1=open. A continuous score is thresholded at 0.5; the next observation carries this executed binary command, and the simulator receives the matching -1=open/+1=closed polarity. Both synchronous and asynchronous V4 evaluators share this conversion. Pose scaling affects only the first six action dimensions. Causal dataset fallback remains the previous executed command, never the current target.
 
 All supported training paths and validation use configurable gripper dimension weights, with default 1.0 instead of 0.01. Equal weight matters for diffusion because the target noise has the same variance in every dimension; the old setting suppressed gripper gradients by 100x. The standard trainer now defaults to validation threshold 0.5 like LIBERO deployment; signed-command datasets can explicitly request threshold 0.0. Existing ablation manifests retain their original weight; resuming requires matching it explicitly.
 

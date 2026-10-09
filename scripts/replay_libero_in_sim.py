@@ -498,8 +498,8 @@ def replay_episode(
             # Pad to 7D if dataset only stored 6D
             action = np.concatenate([action, np.array([0.0])])
 
-        # Remap gripper: dataset stores 0=open / 1=close, but LIBERO env
-        # expects -1=open / 1=close (0=stay). Map 0→-1, 1→1.
+        # Remap gripper: LIBERO/LeRobot dataset stores 0=closed / 1=open, but LIBERO env
+        # expects -1=open / +1=closed (0=stay). Map 0→+1, 1→-1.
         if len(action) >= 7:
             if action[6] <= 0.5:
                 action[6] = 1.0  # close
