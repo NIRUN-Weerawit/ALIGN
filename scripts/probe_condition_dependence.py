@@ -173,7 +173,10 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     acc['max_action_delta'] = max(acc['max_action_delta'],(action-baseline).abs().max().item())
                     acc['max_noise_delta'] = max(acc['max_noise_delta'],(eps-baseline_eps).abs().max().item())
                     row = dict(batch=batch_index,t=t,intervention=name,
-                               history_available=t>0,bank_count=0 if before is None else before['_count'].tolist())
+                               history_available=t>0,bank_count=0 if before is None else before['_count'].tolist(),
+                               gripper_counts={key:int(bits.sum()) for key,bits in
+                                   [('tp',pred_grip & true_grip),('tn',~pred_grip & ~true_grip),
+                                    ('fp',pred_grip & ~true_grip),('fn',~pred_grip & true_grip)]})
                     for group,sl in GROUPS.items():
                         delta = (action[:,:,sl]-baseline[:,:,sl]).square().mean().item()
                         mse = (action[:,:,sl]-target[:,:,sl]).square().mean().item()

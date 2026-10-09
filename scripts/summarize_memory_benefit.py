@@ -50,15 +50,52 @@ def summarize(rows,draws=20000,seed=42):
     return result
 
 
+def summarize_gripper_controls(rows,draws=20000,seed=42):
+    """Resample paired batches, recomputing class recall from summed counts."""
+    indexed={(r['batch'],r['t'],r['intervention']):r for r in rows}
+    if len(indexed)!=len(rows):raise ValueError('Duplicate probe row')
+    result={}
+    for case,left,right in [('normal_vs_bypass','baseline','memory_bypass'),
+                            ('normal_vs_wrong_history','baseline','memory_shuffle')]:
+        clusters={}
+        for (b,t,arm),row in indexed.items():
+            if arm!=left or 'gripper_counts' not in row:continue
+            other=indexed.get((b,t,right))
+            if other is None or 'gripper_counts' not in other:continue
+            clusters.setdefault(b,[]).append((row,other))
+        if not clusters:continue
+        counts=np.array([[[sum(a['gripper_counts'][k] for a,z in pairs) for k in ['tp','tn','fp','fn']],
+                          [sum(z['gripper_counts'][k] for a,z in pairs) for k in ['tp','tn','fp','fn']]]
+                         for pairs in clusters.values()],dtype=float)
+        samples=np.random.default_rng(seed).integers(0,len(clusters),size=(draws,len(clusters)))
+        total=counts.sum(0)
+        sampled=counts[samples].sum(1)
+        metrics={}
+        for label,num,den in [('label_1_recall',0,[0,3]),('label_0_recall',1,[1,2])]:
+            totals=total[:,den].sum(-1)
+            if np.any(totals==0):continue
+            point=total[:,num]/totals
+            denominators=sampled[:,:,den].sum(-1)
+            valid=(denominators>0).all(1)
+            rates=sampled[valid,:,num]/denominators[valid]
+            metrics[label]=dict(normal=float(point[0]),comparison=float(point[1]),
+                recall_difference=float(point[0]-point[1]),
+                bootstrap_95_percent_interval=np.quantile(rates[:,0]-rates[:,1],[.025,.975]).tolist(),
+                valid_bootstrap_draws=int(valid.sum()))
+        result[case]=dict(batch_clusters=len(clusters),anchors=sum(map(len,clusters.values())),metrics=metrics)
+    return result
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--probe',type=Path,required=True,help='Per-memory-variant JSON with results and rows')
     p.add_argument('--output',type=Path,required=True)
     args=p.parse_args()
+    rows=json.loads(args.probe.read_text())['rows']
     report=dict(source=str(args.probe.resolve()),
                 protocol='Correct vs cross-task shuffled histories, matched noise; empty-bank anchors excluded (direct prior-frame controls require an actual past frame); 20,000 paired batch-cluster bootstrap draws, seed 42.',
                 caveat='Rows aggregate episodes within batches. Intervals describe prediction errors, not simulator success. Statistical detectability alone does not establish practical benefit.',
-                cases=summarize(json.loads(args.probe.read_text())['rows']))
+                cases=summarize(rows),gripper_controls=summarize_gripper_controls(rows))
     args.output.write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
 
