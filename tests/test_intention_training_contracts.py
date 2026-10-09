@@ -110,6 +110,26 @@ class FakeVision(nn.Module):
         return tokens[:, None, None].expand(-1, 3, 768)
 
 
+def test_task_text_changes_diffusion_condition_after_training(monkeypatch):
+    import models.align_intention as module
+    monkeypatch.setattr(module, "VisionEncoder", FakeVision)
+    model = ALIGNIntentionModel(state_dim=8, mamba_output_dim=0, action_dim=7,
+        chunk_size=4, num_cameras=1, compressed_dim=4, head_type="diffusion",
+        head_d_model=32, use_text=True, text_dim=8, text_encoder_type="bag",
+        text_vocab=["put", "bowl", "stove", "cabinet"])
+    model._build_head_and_bank(8)
+    visual, state = torch.randn(2, 1, 8), torch.randn(2, 1, 8)
+    task = model.encode_task_text(["put bowl stove", "put bowl cabinet"])
+    base = model.intention_head(visual, state)
+    torch.testing.assert_close(model.action_condition(visual, state, text_emb=task), base)
+    model.action_condition(visual, state, text_emb=task).sum().backward()
+    assert model.text_condition.weight.grad.abs().sum() > 0
+    with torch.no_grad():
+        model.text_condition.weight.add_(model.text_condition.weight.grad * 0.01)
+    changed = model.action_condition(visual, state, text_emb=task)
+    assert not torch.allclose((changed - base)[0], (changed - base)[1])
+
+
 def test_streaming_camera_features_match_batched_training(monkeypatch):
     import models.align_intention as module
     monkeypatch.setattr(module, "VisionEncoder", FakeVision)

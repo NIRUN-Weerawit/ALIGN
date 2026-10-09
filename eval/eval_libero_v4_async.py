@@ -227,7 +227,7 @@ class InferenceWorker(threading.Thread):
 
     def __init__(self, model, device, chunk_size: int,
                  state_queue: queue.Queue, action_queue: queue.Queue,
-                 stop_event: threading.Event):
+                 stop_event: threading.Event, task_text: Optional[str] = None):
         super().__init__(daemon=True)
         self.model = model
         self.device = device
@@ -237,6 +237,12 @@ class InferenceWorker(threading.Thread):
         self.stop_event = stop_event
         self.n_calls = 0
         self.total_inference_ms = 0.0
+        self.text_emb = None
+        if getattr(model, "text_condition", None) is not None:
+            if not task_text:
+                raise ValueError("Text-conditioned checkpoint requires a task instruction")
+            with torch.no_grad():
+                self.text_emb = model.encode_task_text([task_text])
         from models.intention_stream import IntentionStream
         self.intention_stream = (IntentionStream(model, getattr(model, "history_size", chunk_size))
                                  if getattr(model, "intention_encoder", None) is not None or
@@ -284,9 +290,9 @@ class InferenceWorker(threading.Thread):
                                if getattr(self.model,"use_memory_bank",False) else {}),
                         )
                         if self.model.head_type in ("diffusion", "flow_matching"):
-                            a_model_full = self.model.sample_actions(
-                                z_v_for_head, z_s_for_head, h_for_head,
-                            )
+                            a_model_full = (self.model.sample_actions(z_v_for_head, z_s_for_head, h_for_head,
+                                text_emb=self.text_emb) if self.text_emb is not None else
+                                self.model.sample_actions(z_v_for_head, z_s_for_head, h_for_head))
                         else:
                             a_model_full = self.model.predict_actions(
                                 z_v_for_head, z_s_for_head, h_for_head,
@@ -335,6 +341,7 @@ def run_async_episode(
     ensemble_decay: float = 0.9,
     initial_gripper: float = 0.0,
     rotation_convention: str = "libero",
+    task_text: Optional[str] = None,
 ) -> Dict:
     """Run one episode with async inference and constant-FPS rendering.
 
@@ -428,7 +435,7 @@ def run_async_episode(
     worker = InferenceWorker(
         model=model, device=device, chunk_size=chunk_size,
         state_queue=state_queue, action_queue=action_queue,
-        stop_event=stop_event,
+        stop_event=stop_event, task_text=task_text,
     )
     worker.start()
 
@@ -747,6 +754,8 @@ def main():
                         help="Gaussian noise std for noised actions.")
     parser.add_argument("--max-steps", type=int, default=300,
                         help="Max steps per episode.")
+    parser.add_argument("--task-text", type=str, default=None,
+                        help="Task instruction override (default: HDF5 episode text).")
     parser.add_argument("--out-dir", default=None,
                         help="Output dir for results (default: alongside checkpoint).")
     parser.add_argument("--device", default=None)
@@ -944,6 +953,7 @@ def main():
             sim_fps=args.sim_fps,
             live_view=args.live_view,
             rotation_convention=args.rotation_convention,
+            task_text=args.task_text if args.task_text is not None else traj["text"],
             debug=args.debug,
             action_horizon=args.action_horizon,
             ensemble=args.ensemble,

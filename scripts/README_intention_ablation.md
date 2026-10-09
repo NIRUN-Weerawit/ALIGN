@@ -162,3 +162,14 @@ availability masks and preserve physical observation indices across outages.
 `--memory-patch-temporal` is a second opt-in experiment requiring `--memory-patch-retrieval`: each fixed camera/grid slot retrieves across its own past frames. This avoids global averaging over all historical patches in the four-channel pilot representation and reduces attention score size from N²L to NL. It restricts spatial search; deployment benefit must be measured rather than assumed. `probe_memory_retrieval.py` measures stored, attention, retrieved, and gated history differences before the head.
 
 `--memory-value-preserving` is an opt-in warm-start compatibility experiment: learn historical attention selection using Q/K projections, but return a weighted combination of raw encoded bank values. The historical value projection, output projection, FFN, and output normalization are bypassed; unused downstream layers are frozen. It replaces `--memory-context-only` and requires `--memory-patch-temporal` when patch retrieval is enabled. Existing checkpoint defaults remain unchanged. Controlled diffusion recall required 4,000 updates to pass the 95% threshold; real-data usefulness is tested separately.
+
+`--use-task-text --text-dim 128` is an explicit-goal ablation for the cached
+diffusion/flow trainer. It uses the first recorded instruction in each episode's
+`texts` field, a trainable word-average encoder with vocabulary built only from
+training episodes, and a zero-initialized projection added to the generative
+head's condition. The same instruction is supplied once per simulator episode
+by the synchronous and async V4 evaluators; `--task-text` overrides it for a
+controlled rollout. This encoder is task-specific and is **not** pretrained
+CLIP or an unseen-language generalization test. The run does not mask text;
+compare it with the original no-text checkpoint and test wrong-task text to
+establish that the head actually uses the instruction.

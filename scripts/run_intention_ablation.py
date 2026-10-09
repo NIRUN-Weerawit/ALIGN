@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 import time
@@ -89,6 +90,7 @@ class CachedEpisodes(Dataset):
         actions = self.dataset._read_actions(ep, start, length)
         result = dict(frames_segment=frames, states_segment=states.astype(np.float32),
                     actions_segment=actions.astype(np.float32), segment_len=length)
+        result['text'] = self.dataset._read_text(ep) if hasattr(self.dataset, '_read_text') else ''
         if anchors is not None:
             result.update(loss_anchor_mask=anchors,observation_timesteps=np.arange(n,dtype=np.float32))
         if self.training and self.observation_dropout_prob > 0:
@@ -107,6 +109,7 @@ class CachedEpisodes(Dataset):
 def collate_segments(items):
     length = max(item["segment_len"] for item in items)
     result = {"segment_len": np.array([x["segment_len"] for x in items])}
+    result["texts"] = [x.get("text", "") for x in items]
     for key in ("frames_segment", "states_segment", "actions_segment"):
         rows = []
         for item in items:
@@ -173,6 +176,8 @@ def evaluate_existing(out):
             action_dim=7, chunk_size=config["chunk_size"], history_size=config["history_size"],
             num_cameras=len(cameras), compressed_dim=config["compressed_dim"], head_type=config["head_type"],
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
+            use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
+            text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
             num_intent_tokens=config.get("num_intent_tokens", 1), intent_dim=config["intent_dim"],
             mamba_d_state=config.get("mamba_d_state", 16), mamba_d_conv=config.get("mamba_d_conv", 4),
             mamba_expand=config.get("mamba_expand", 2),
@@ -254,6 +259,8 @@ def parse_args(argv=None):
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--head-type", choices=["diffusion", "flow_matching"], default="diffusion")
+    parser.add_argument("--use-task-text", action="store_true", help="Condition the generative head on the recorded task instruction")
+    parser.add_argument("--text-dim", type=int, default=128)
     parser.add_argument("--state-dim", type=int, default=64)
     parser.add_argument("--compressed-dim", type=int, default=4)
     parser.add_argument("--head-d-model", type=int, default=64)
@@ -315,6 +322,8 @@ def parse_args(argv=None):
         parser.error("Context-only retrieval requires episodic memory")
     if args.memory_patch_retrieval and (args.compressed_dim%2 or args.memory_mode!="episodic"):
         parser.error('Patch retrieval needs even compressed width and episodic memory')
+    if args.use_task_text and args.text_dim < 1:
+        parser.error('--text-dim must be positive')
     if len(set(args.variants)) != len(args.variants):
         parser.error("Each variant may appear only once")
     return args
@@ -351,6 +360,9 @@ def main(argv=None):
         raise ValueError("Expected 257 DINOv2 tokens of width 768 per selected camera")
     pool_out_dim = (sample.shape[-2] - len(args.cameras)) * args.compressed_dim
     train_eps, val_eps = episode_split(dataset, args.seed, args.validation_fraction)
+    text_vocab = (sorted({word for ep in train_eps for word in
+                          re.findall(r"[a-z0-9]+", dataset._read_text(ep).lower())})
+                  if args.use_task_text else [])
     if len(train_eps) < args.batch_size:
         raise ValueError("Batch size exceeds the training episode count")
     if any(dataset._get_episode_length(ep) < args.history_size + args.chunk_size for ep in train_eps + val_eps):
@@ -362,6 +374,8 @@ def main(argv=None):
         train_episodes=[dataset._episode_keys[ep] for ep in train_eps],
         val_episodes=[dataset._episode_keys[ep] for ep in val_eps],
         num_cameras=len(args.cameras), pool_out_dim=pool_out_dim, frozen_cached_vision=True,
+        use_text=args.use_task_text, text_encoder_type="bag" if args.use_task_text else "clip",
+        text_vocab=text_vocab,
         intention_recurrence="causal observation state across each segment")
     if args.resume and (out / "manifest.json").exists():
         previous = json.loads((out / "manifest.json").read_text())
@@ -369,11 +383,13 @@ def main(argv=None):
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
                                memory_perceptual_recency=0.,memory_field_masks=False,memory_pre_state_visual=False,memory_value_preserving=False,memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
-                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False)
+                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
+                               use_task_text=False,text_dim=128,text_vocab=[])
         for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
+                    "use_task_text", "text_dim", "text_vocab",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
                     "memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views"):
@@ -410,7 +426,9 @@ def main(argv=None):
             memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
             memory_perceptual_recency=args.memory_perceptual_recency,memory_field_masks=args.memory_field_masks,memory_pre_state_visual=args.memory_pre_state_visual,memory_value_preserving=args.memory_value_preserving,memory_patch_temporal=args.memory_patch_temporal,memory_context_only=args.memory_context_only,memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
             diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
-            visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample)
+            visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample,
+            use_text=args.use_task_text,text_dim=args.text_dim,
+            text_encoder_type="bag" if args.use_task_text else "clip",text_vocab=text_vocab)
         # Cached training never uses the raw-image modules. Keep them off GPU.
         model.vision_encoder.requires_grad_(False)
         vision = model.vision_encoder
@@ -420,6 +438,8 @@ def main(argv=None):
         seed_everything(args.seed + 1)
         model._build_head_and_bank(pool_out_dim)
         model.intention_head.to(device)
+        if model.text_condition is not None:
+            model.text_condition.to(device)
         if model.memory_module is not None:
             model.memory_module.to(device)
         with torch.no_grad():

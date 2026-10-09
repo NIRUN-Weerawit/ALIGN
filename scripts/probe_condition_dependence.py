@@ -42,7 +42,7 @@ def load_model(path, cameras):
     for key, default in [('num_intent_tokens',1),('mamba_d_state',16),('mamba_d_conv',4),('mamba_expand',2)]:
         kwargs[key] = c.get(key, default)
     for key,default in [('memory_mode','legacy'),('memory_detach_writes',False),('memory_write_fused',True),
-                        ('memory_perceptual_recency',0.),('memory_field_masks',False),('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
+                        ('memory_perceptual_recency',0.),('memory_field_masks',False),('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False),('use_text',False),('text_dim',128),('text_encoder_type','clip'),('text_vocab',None)]:
         kwargs[key] = c.get(key,default)
     model = ALIGNIntentionModel(action_dim=7, num_cameras=len(cameras), **kwargs)
     model._build_head_and_bank(c.get('pool_out_dim',256*len(cameras)*c['compressed_dim']))
@@ -92,6 +92,7 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
     for batch_index, batch in enumerate(loader):
         with torch.amp.autocast('cuda',dtype=torch.bfloat16):
             visual, state, intents = encode(model,batch)
+            text_emb = model.encode_task_text(batch['texts']) if getattr(model,'text_condition',None) is not None else None
             B,S,_ = visual.shape
             if B < 2:
                 raise ValueError('Shuffling requires at least two distinct episodes per batch')
@@ -110,17 +111,21 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                 if t not in selected_anchors:
                     continue
                 after = snapshot(model.memory_module) if before is not None else None
-                conds = {'baseline': model.intention_head(*fused)}
+                def head(v,s,i,task=text_emb):
+                    return model.action_condition(v,s,i,task)
+                conds = {'baseline': head(*fused)}
                 conds['repeat_control'] = conds['baseline'].clone()
+                if text_emb is not None:
+                    conds['text_shuffle'] = head(*fused,task=text_emb[permutation])
                 if i is not None:
-                    conds['intent_zero'] = model.intention_head(fused[0],fused[1],torch.zeros_like(fused[2]))
-                    conds['intent_shuffle'] = model.intention_head(fused[0],fused[1],fused[2][permutation])
+                    conds['intent_zero'] = head(fused[0],fused[1],torch.zeros_like(fused[2]))
+                    conds['intent_shuffle'] = head(fused[0],fused[1],fused[2][permutation])
                 if before is not None:
-                    conds['memory_bypass'] = model.intention_head(*model.prepare_head_inputs(p,s,i))
-                    conds['state_memory_bypass'] = model.intention_head(fused[0],s,fused[2])
-                    conds['perceptual_memory_bypass'] = model.intention_head(*model.prepare_head_inputs(p,fused[1],fused[2],modulation_state=s))
+                    conds['memory_bypass'] = head(*model.prepare_head_inputs(p,s,i))
+                    conds['state_memory_bypass'] = head(fused[0],s,fused[2])
+                    conds['perceptual_memory_bypass'] = head(*model.prepare_head_inputs(p,fused[1],fused[2],modulation_state=s))
                     restore(model.memory_module,before,permutation)
-                    conds['memory_shuffle'] = model.intention_head(*model.condition_actions(p,s,i))
+                    conds['memory_shuffle'] = head(*model.condition_actions(p,s,i))
                     restore(model.memory_module,after)
                 if visual_occlusion:
                     for case in ['last_camera','all_visual','all_observation']:
@@ -129,21 +134,21 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                         missing[:,:,start:] = 0
                         missing_state = torch.zeros_like(s) if case=='all_observation' else s
                         if before is not None:restore(model.memory_module,before)
-                        conds[case+'_correct'] = model.intention_head(*model.condition_actions(missing,missing_state,i))
-                        conds[case+'_bypass'] = model.intention_head(*model.prepare_head_inputs(missing,missing_state,i))
+                        conds[case+'_correct'] = head(*model.condition_actions(missing,missing_state,i))
+                        conds[case+'_bypass'] = head(*model.prepare_head_inputs(missing,missing_state,i))
                         if before is not None:
                             restore(model.memory_module,before,permutation)
-                            conds[case+'_shuffle'] = model.intention_head(*model.condition_actions(missing,missing_state,i))
+                            conds[case+'_shuffle'] = head(*model.condition_actions(missing,missing_state,i))
                             restore(model.memory_module,after)
                 if visual_occlusion and t > 0 and model.history_size == 1 and i is None:
                     # Reference: carry the latest real observation directly into
                     # the head. This diagnoses information lost by learned
                     # retrieval; it does not change the saved model architecture.
                     previous_p,previous_s=visual[:,t-1:t],state[:,t-1:t]
-                    conds['previous_observation_correct']=model.intention_head(*model.prepare_head_inputs(previous_p,previous_s,None))
-                    conds['previous_observation_shuffle']=model.intention_head(*model.prepare_head_inputs(previous_p[permutation],previous_s[permutation],None))
-                conds['visual_zero_control'] = model.intention_head(torch.zeros_like(fused[0]),fused[1],fused[2])
-                conds['state_zero_control'] = model.intention_head(fused[0],torch.zeros_like(fused[1]),fused[2])
+                    conds['previous_observation_correct']=head(*model.prepare_head_inputs(previous_p,previous_s,None))
+                    conds['previous_observation_shuffle']=head(*model.prepare_head_inputs(previous_p[permutation],previous_s[permutation],None))
+                conds['visual_zero_control'] = head(torch.zeros_like(fused[0]),fused[1],fused[2])
+                conds['state_zero_control'] = head(fused[0],torch.zeros_like(fused[1]),fused[2])
                 target = batch['actions_segment'][:,t:t+model.chunk_size].cuda().float()
                 draw_seed = seed + batch_index*100 + t
                 seed_everything(draw_seed)

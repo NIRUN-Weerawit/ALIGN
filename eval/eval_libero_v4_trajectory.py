@@ -551,7 +551,7 @@ def run_replay_in_sim(
     }
 
 
-def _predict_action_chunk(model, z_v_pooled_seq, z_s_seq, h_for_head):
+def _predict_action_chunk(model, z_v_pooled_seq, z_s_seq, h_for_head, text_emb=None):
     """Produce an action chunk using the API required by the configured head.
 
     Diffusion and flow-matching heads are generative: their forward method only
@@ -559,6 +559,8 @@ def _predict_action_chunk(model, z_v_pooled_seq, z_s_seq, h_for_head):
     Deterministic heads directly return actions through ``predict_actions``.
     """
     if model.head_type in ("diffusion", "flow_matching"):
+        if text_emb is not None:
+            return model.sample_actions(z_v_pooled_seq, z_s_seq, h_for_head, text_emb=text_emb)
         return model.sample_actions(z_v_pooled_seq, z_s_seq, h_for_head)
     return model.predict_actions(z_v_pooled_seq, z_s_seq, h_for_head)
 
@@ -587,6 +589,7 @@ def run_model_in_sim(
     live_view: bool = False,
     initial_gripper: float = 0.0,
     rotation_convention: str = "libero",
+    task_text: Optional[str] = None,
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
 
@@ -654,6 +657,12 @@ def run_model_in_sim(
     errors = []
     stored_actions = []
     success = 0
+    text_emb = None
+    if getattr(model, "text_condition", None) is not None:
+        if not task_text:
+            raise ValueError("Text-conditioned checkpoint requires a task instruction")
+        with torch.no_grad():
+            text_emb = model.encode_task_text([task_text])
 
     # Reset memory bank at start of episode
     if getattr(model, 'use_memory_bank', False) and model.memory_module is not None:
@@ -803,7 +812,7 @@ def run_model_in_sim(
                                if getattr(model,"use_memory_bank",False) else {}),
                         )
                         a_model_full = _predict_action_chunk(
-                            model, z_v_for_head, z_s_for_head, h_for_head,
+                            model, z_v_for_head, z_s_for_head, h_for_head, text_emb,
                         )
             inference_t1 = time.perf_counter()
 
@@ -1435,6 +1444,7 @@ def main():
             debug=args.debug,
             live_view=args.live_view,
             rotation_convention=args.rotation_convention,
+            task_text=args.task_text if args.task_text is not None else traj["text"],
         )
         if ep_timing_log is not None:
             all_timing_logs.append({"episode": ep_key, "timing": ep_timing_log})

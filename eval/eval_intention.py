@@ -139,6 +139,8 @@ def load_intention_model(
         head_type=cfg.get("head_type", "mamba"),
         use_text=cfg.get("use_text", False),
         text_dim=cfg.get("text_dim", 256),
+        text_encoder_type=cfg.get("text_encoder_type", "clip"),
+        text_vocab=cfg.get("text_vocab"),
         compressed_dim=cfg.get("compressed_dim", 16),
         # V4 args (default to False/0 for backward compat with V3 checkpoints)
         use_intent_tokens=cfg.get("use_intent_tokens", False),
@@ -215,13 +217,15 @@ def load_intention_model(
     return model, cfg
 
 
-def _predict_action_chunk(model: ALIGNIntentionModel, out: dict) -> torch.Tensor:
+def _predict_action_chunk(model: ALIGNIntentionModel, out: dict, text_emb=None) -> torch.Tensor:
     """Use the checkpoint's head type and the model's current call signature."""
     intent_emb = out.get("intent_emb")
     if intent_emb is not None and intent_emb.ndim != 3:
         intent_emb = None
     args = (out["z_v_pooled_seq"], out["z_s_seq"], intent_emb)
     if model.head_type in ("flow_matching", "diffusion"):
+        if text_emb is not None:
+            return model.sample_actions(*args, text_emb=text_emb)
         return model.sample_actions(*args)
     return model.predict_actions(*args)
 
@@ -315,7 +319,9 @@ def evaluate(
             with torch.amp.autocast("cuda", dtype=torch.bfloat16,
                                     enabled=device.type == "cuda"):
                 out = model(frames, state)
-                actions_pred = _predict_action_chunk(model, out)
+                text_emb = (model.encode_task_text(batch["texts"])
+                            if getattr(model, "text_condition", None) is not None else None)
+                actions_pred = _predict_action_chunk(model, out, text_emb)
                 # (B, K, action_dim)
 
             actions_pred_f = actions_pred.float()

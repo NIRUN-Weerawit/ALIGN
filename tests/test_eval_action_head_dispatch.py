@@ -31,6 +31,18 @@ def test_flow_matching_uses_sampling_path():
     assert model.predict_calls == 0
 
 
+def test_text_condition_reaches_generative_sampler():
+    class TextModel(DummyModel):
+        def sample_actions(self, z_v, z_s, intent, *, text_emb=None):
+            assert text_emb is marker
+            return super().sample_actions(z_v, z_s, intent)
+
+    marker = torch.ones(1, 8)
+    model = TextModel("diffusion")
+    assert _predict_action_chunk(model, None, None, None, marker).shape == (1, 10, 7)
+    assert model.sample_calls == 1
+
+
 def test_direct_head_uses_prediction_path():
     model = DummyModel("transformer")
     output = _predict_action_chunk(model, None, None, None)

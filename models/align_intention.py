@@ -26,6 +26,7 @@ V4: [z0..zT, INTENT_1..INTENT_N] → Mamba → intent_emb (B, N, intent_dim)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import re
 from typing import Optional, Tuple, List
 
 from models.align_model import VisionEncoder, RobotStateEncoder
@@ -35,6 +36,22 @@ from models.intention_head import (
     FlowMatchingPolicyHead,
 )
 from models.memory_bank import PerceptualCognitiveMemoryModule, EpisodicMemoryModule
+
+
+class TaskWordEncoder(nn.Module):
+    """Small trainable instruction encoder for the explicit-goal ablation."""
+
+    def __init__(self, vocabulary: List[str], dim: int):
+        super().__init__()
+        self.word_to_id = {word: index + 2 for index, word in enumerate(vocabulary)}
+        self.embedding = nn.Embedding(len(vocabulary) + 2, dim, padding_idx=0)
+
+    def forward(self, texts: List[str]) -> torch.Tensor:
+        rows = [torch.tensor([self.word_to_id.get(word, 1) for word in re.findall(r"[a-z0-9]+", text.lower())] or [1],
+                             device=self.embedding.weight.device) for text in texts]
+        padded = nn.utils.rnn.pad_sequence(rows, batch_first=True)
+        valid = padded.ne(0)
+        return (self.embedding(padded) * valid.unsqueeze(-1)).sum(1) / valid.sum(1, keepdim=True)
 
 
 class ALIGNIntentionModel(nn.Module):
@@ -66,6 +83,8 @@ class ALIGNIntentionModel(nn.Module):
         head_dim_ff: int = 1024,
         use_text: bool = False,
         text_dim: int = 256,
+        text_encoder_type: str = "clip",
+        text_vocab: Optional[List[str]] = None,
         compressed_dim: int = 16,
         raw_dim: int = 768,
         # V4 args
@@ -99,6 +118,7 @@ class ALIGNIntentionModel(nn.Module):
         self.use_patch_tokens = use_patch_tokens
         self.use_text = use_text
         self.text_dim = text_dim
+        self.text_encoder_type = text_encoder_type
         self.compressed_dim = compressed_dim
         self.raw_dim = raw_dim
         # V4 flags
@@ -190,11 +210,20 @@ class ALIGNIntentionModel(nn.Module):
         self.memory_module: Optional[nn.Module] = None
 
         # Text encoder (optional)
-        if use_text:
+        if use_text and text_encoder_type == "bag":
+            if not text_vocab:
+                raise ValueError("Bag task text requires a saved training vocabulary")
+            if head_type not in ("diffusion", "flow_matching"):
+                raise ValueError("Bag task text currently supports generative action heads")
+            self.text_encoder = TaskWordEncoder(text_vocab, text_dim)
+        elif use_text and text_encoder_type == "clip":
             from models.align_model import TextEncoder
             self.text_encoder = TextEncoder(embed_dim=text_dim)
+        elif use_text:
+            raise ValueError(f"Unknown text encoder type: {text_encoder_type}")
         else:
             self.text_encoder = None
+        self.text_condition = None
 
         # Trainable prefixes
         self._trainable_prefixes = {
@@ -266,6 +295,10 @@ class ALIGNIntentionModel(nn.Module):
             )
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
+
+        if self.use_text and self.text_encoder_type == "bag":
+            self.text_condition = nn.Linear(self.text_dim, cond_dim, bias=False).to(device)
+            nn.init.zeros_(self.text_condition.weight)
 
         if self.visual_token_attention and hasattr(self.intention_head,"unet"):
             self.intention_head.unet.configure_visual_attention(pool_out_dim,self.compressed_dim)
@@ -559,6 +592,19 @@ class ALIGNIntentionModel(nn.Module):
             z_v_pooled_window, z_s_window, intent_emb=intent_emb,
         )
 
+    def encode_task_text(self, texts: List[str]) -> torch.Tensor:
+        if not self.use_text or self.text_encoder is None:
+            raise ValueError("Task text is disabled for this model")
+        return self.text_encoder(texts)
+
+    def action_condition(self, visual, states, intent=None, text_emb=None):
+        cond = self.intention_head(visual, states, intent)
+        if self.text_condition is not None:
+            if text_emb is None:
+                raise ValueError("Task text is required by this checkpoint")
+            cond = cond + self.text_condition(text_emb).unsqueeze(1)
+        return cond
+
     # ----------------------------------------------------------------
     # Probe / interpretability forward
     # ----------------------------------------------------------------
@@ -650,11 +696,10 @@ class ALIGNIntentionModel(nn.Module):
     def sample_actions(self, z_v_pooled_window: torch.Tensor,
                        z_s_window: torch.Tensor,
                        intent_emb: torch.Tensor = None,
-                       num_steps: int = None) -> torch.Tensor:
+                       num_steps: int = None,
+                       text_emb: torch.Tensor = None) -> torch.Tensor:
         if isinstance(self.intention_head, (DiffusionPolicyHead, FlowMatchingPolicyHead)):
-            cond = self.intention_head(
-                z_v_pooled_window, z_s_window, intent_emb=intent_emb,
-            )
+            cond = self.action_condition(z_v_pooled_window, z_s_window, intent_emb, text_emb)
             return self.intention_head.sample(cond, num_steps=num_steps)
         else:
             return self.intention_head(

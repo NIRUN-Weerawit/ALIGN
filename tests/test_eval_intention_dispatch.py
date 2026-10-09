@@ -34,3 +34,16 @@ def test_transformer_predicts_without_intent_tokens():
 
     assert _predict_action_chunk(model, out).shape == (1, 10, 7)
     assert model.calls == [("predict", None)]
+
+
+def test_diffusion_samples_with_task_text():
+    class TextModel(DummyModel):
+        def sample_actions(self, z_v, z_s, intent, *, text_emb=None):
+            self.calls.append(("text", text_emb))
+            return torch.zeros(1, 10, 7)
+
+    model = TextModel("diffusion")
+    task = torch.ones(1, 128)
+    out = {"z_v_pooled_seq": None, "z_s_seq": None, "intent_emb": None}
+    assert _predict_action_chunk(model, out, task).shape == (1, 10, 7)
+    assert model.calls == [("text", task)]

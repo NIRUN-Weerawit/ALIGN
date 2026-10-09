@@ -390,6 +390,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
+        text_emb = model.encode_task_text(batch["texts"]) if getattr(model, "text_condition", None) is not None else None
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
         # print(f"seg_lens: {seg_lens}")
@@ -545,9 +546,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                             print(f"[DEBUG] z_v_win_for_head: {z_v_win_for_head.shape}, "
                                   f"z_s_win_for_head: {z_s_win_for_head.shape}, "
                                   f"h_for_head: {h_for_head.shape if h_for_head is not None else None}")
-                        cond = model.intention_head(
-                            z_v_win_for_head, z_s_win_for_head, h_for_head,
-                        )
+                        cond = (model.action_condition(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb)
+                                if text_emb is not None else model.intention_head(z_v_win_for_head, z_s_win_for_head, h_for_head))
                         if getattr(args, "debug", False):
                             print(f"[DEBUG] cond: {cond.shape}, finite: {torch.isfinite(cond).all().item()}")
                         # Sample actions for the action mean (5-10x slower than loss compute).
@@ -555,9 +555,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         if getattr(args, "no_sample_during_train", False):
                             actions_pred = None
                         else:
-                            actions_pred = model.sample_actions(
-                                z_v_win_for_head, z_s_win_for_head, h_for_head
-                            )
+                            actions_pred = (model.sample_actions(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb=text_emb)
+                                            if text_emb is not None else model.sample_actions(z_v_win_for_head, z_s_win_for_head, h_for_head))
                             if getattr(args, "debug", False):
                                 print(f"[DEBUG] actions_pred: {actions_pred.shape}, "
                                       f"finite: {torch.isfinite(actions_pred).all().item()}, "
@@ -873,6 +872,7 @@ def validate(model, loader, device, args):
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False,
                 disable=not is_primary())
     for batch in pbar:
+        text_emb = model.encode_task_text(batch["texts"]) if getattr(model, "text_condition", None) is not None else None
 
         Hs = args.history_size
         chunk_size = args.chunk_size
@@ -1019,12 +1019,10 @@ def validate(model, loader, device, args):
 
                     # Loss
                     if args.head_type in ("diffusion", "flow_matching"):
-                        cond = model.intention_head(
-                            z_v_win_for_head, z_s_win_for_head, h_for_head,
-                        )
-                        actions_pred = model.sample_actions(
-                            z_v_win_for_head, z_s_win_for_head, h_for_head
-                        )
+                        cond = (model.action_condition(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb)
+                                if text_emb is not None else model.intention_head(z_v_win_for_head, z_s_win_for_head, h_for_head))
+                        actions_pred = (model.sample_actions(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb=text_emb)
+                                        if text_emb is not None else model.sample_actions(z_v_win_for_head, z_s_win_for_head, h_for_head))
                         loss = model.intention_head.loss(
                             target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
                         )
