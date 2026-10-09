@@ -1,0 +1,97 @@
+# Memory adjustment work log — 2026-10-09
+
+Baseline: main c65427e. Reference: official MemoryVLA openvla-codebase d732ea9072bc063399ccc817aed74ab172eb50be.
+
+## Objective and acceptance checks
+
+Make historical information improve action decisions. Module sensitivity alone is insufficient. Require independent memory-contract tests, a held-out delayed-cue experiment where the current observation cannot identify the action, paired true/bypassed/shuffled-memory prediction diagnostics on LIBERO, and paired closed-loop evaluation. Report prediction benefit and simulator benefit separately; do not declare policy improvement from loss or synthetic success alone.
+
+## Priority 1: temporal contracts (implemented, verification in progress)
+
+- New episodic memory stores actual timestamps, merges timestamps with consolidated entries, and encodes elapsed observation age on keys only. Raw values preserve historical content.
+- Default writes are raw and detached. Retrieval/gates remain trained by current action losses. Differentiable/fused writes and explicit legacy memory remain configurable for controlled comparisons.
+- Full-episode cached training retains every real observation for causal Mamba and memory; 16 deterministic sampled supervision anchors span each episode. Labels remain contiguous future action chunks; no sparse-frame/future-label misalignment.
+- Memory capacity default for experiments is 16. Non-supervised context updates raw memory without evaluating unnecessary action heads.
+- Diffusion uses 100 training timesteps, 10 inference steps, and four independent noise draws per condition. Old checkpoints restore their original schedule/time normalization.
+
+## Priority 2: representation and action conditioning
+
+- Optional patch-preserving perceptual retrieval is implemented. Its lower-dimensional per-patch attention shares historical token content without flattening each frame into one attention token.
+- Explicit visual-token action-head attention and closed-loop checkpoint selection are implemented. Architecture changes will be evaluated separately from memory write/sampling changes.
+
+## Experiments
+
+Artifacts go under `checkpoints/memory_adjustment_20261009`. Initial tests retain older supported APIs and strict legacy loading. Real-data pilots will use a fresh 100-step schedule, preserved original episode split, and explicitly recorded warm-start provenance. No previous checkpoint or result will be overwritten.
+
+## Status
+
+Implementation and controlled mechanism tests pass. Real-data pilots still fail the correct-history acceptance criterion. Policy benefit is not established; experimental retrieval and outage-training flags remain opt-in.
+
+## Iteration 1 results
+
+- 63 targeted tests passed, including distributed synchronization and legacy loaders.
+- First full-episode validation exceeded the 35% allocator limit in patch attention. Corrected by chunked/checkpointed BF16 feature encoding and omitting unused attention weights. Production smoke rerun completed with one optimizer step and all 44 validation episodes.
+- Controlled delayed-cue experiment: both flat and patch layouts reached 100% accuracy with correct history, 0% with opposite-cue donor history, and 50% when bypassed; tested horizons 8/32/48 with capacity 16. These synthetic results establish capacity, not LIBERO policy improvement. Logs and weights are under `delayed_cue_{flat,patch}`.
+- Implemented optional residual visual-token attention in diffusion/flow U-Nets. Residual projection starts at zero to preserve the initial pretrained head function.
+- Implemented `select_policy_checkpoint.py`: shared tasks/seeds, normal/bypass/empty interventions, model control from reset by default, persistent results, and selection by normal-memory success. Independent episodes/seeds remain necessary for final reporting.
+- Added optional normalized-action denoised clipping (motion [-1,1], binary gripper [0,1]) to stabilize epsilon inversion at low signal. It is explicitly saved in new configs; legacy loaders preserve old behavior.
+- Full-episode paired baseline/memory pilot: 4 epochs x 32 updates per variant, original 384/44 split, seed 42, warm start from corresponding 80-epoch weights, learning rate 2e-5. Cross-model comparisons are exploratory because the starting checkpoints differ; within-model interventions are the causal information-use check.
+
+## Live pilot update
+
+- 70 regression tests passed across memory, training, distributed synchronization, ablation setup, diffusion, Mamba, and evaluator dispatch. Subsequent review fixed context-write gradient suppression for the optional differentiable-write setting and made omitted-frozen-vision snapshots reject missing trained parameters during evaluation.
+- Baseline first-selected checkpoint: **1/10 simulator successes** under model control from reset, 300 steps/task, seed 42. This differs from the older expert-prefix protocol and is not a direct comparison. Results: `baseline_closed_loop/summary.json`.
+- Baseline 4-epoch pilot complete; provisional minimum position MSE 0.077878 at epoch 1. Memory pilot first epoch position MSE 0.081517; training remains underway. Lower noise loss alone does not establish improvement.
+
+- Production patch + visual-attention + Mamba smoke passed with one optimizer update and all 44 validation episodes (`patch_attention_smoke`). This verifies integration, not performance.
+- Fixed deployment observation retention for episodic memory when planning is less frequent than observations, including FIFO async memory-only mode. Intermediate observations are stored once; cognitive readouts are produced for their raw writes. Added regression test; 23 focused tests passed.
+- Next controlled patch pilot gives BOTH no-intention variants the exact same no-memory 80-epoch warm start, including their shared head/encoder weights. Patch memory parameters start fresh; visual residual attention is enabled in both. This removes the differing warm-start confound in the flat pilot.
+
+## Flat pilot diagnosis
+
+- Four epochs completed for both variants (128 updates each). Best position-error checkpoint remains epoch 1 for both.
+- Whole-episode paired probe: 44 held-out episodes, beginning/middle/last-common-valid anchors, matched noise. Memory model position MSE: correct bank **0.078084**, bypass **0.086177**, cross-task shuffled bank **0.077873**. Gripper accuracy: 74.4%, 77.5%, 74.1%, respectively. Thus bank presence helps position relative to bypass, but correct historical content has no measurable advantage over incorrect history. **This pilot does not pass the real-data information-use criterion.**
+- Flat simulator launch initially failed during checkpoint GPU loading because it overlapped the GPU probe and training. Retried after the probe completed, preserving the evaluation protocol. No other user's GPU process was modified. Limit overlapping GPU work before repeating deployment experiments.
+- Implementation milestones committed separately: `0b93522` (memory/model contracts), `02baa53` (episode training/deployment and paired diagnostics). Latest regression suite: **73 passed**.
+
+## Actual action-head capacity and write efficiency
+
+- Extended delayed-cue benchmark to the production diffusion/flow action heads with matched sampling noise and separate gripper accuracy. Motion target sign and binary gripper depend solely on the first historical cue; current perception/state are identical across labels.
+- Diffusion (2,000 updates, patch bank): correct history motion/gripper **100%** at horizons 8/32/48; wrong history **0%**; bypass approximately **47–51%**.
+- Flow matching (1,500 updates, patch bank): correct motion **99.8–100%**, gripper **99.4–99.8%**; wrong motion **0–0.2%**, gripper **0.4–1.4%**; bypass approximately **49–51%**. This shows real action-head information use under controlled partial observation; it does not establish LIBERO benefit.
+- Vectorized per-episode adjacent consolidation and masked writes, avoiding per-row GPU count/argmax transfers. Mixed-row consolidation, padding, raw/detached writes, and differentiable merged gradients are verified. Full targeted regression suite **75 passed**.
+- Repeated production diffusion delayed-cue training with vectorized writes: identical 100/0/chance results at all horizons (`vectorized_delayed_cue_diffusion`), wall time 26.9 s versus 44.9 s in the earlier run. These timings include shared-host effects and are not a whole-policy speed claim.
+
+## Patch pilot diagnosis and next training signal
+
+- Controlled shared-warm-start patch pilot completed: 128 updates/variant, original train/validation split, visual attention in both models. No-memory provisional best epoch 1 position MSE 0.082193; memory best epoch 2 MSE 0.086327.
+- Paired whole-episode probes remain history-insensitive. Memory normal/shuffled position MSE **0.098190/0.098180**; bypass **0.122005**. With one camera's current latent features removed, correct/shuffled **0.221816/0.221808**; bypass **0.259356**. All current visual features removed: correct/shuffled **0.481300/0.481307**; bypass **0.673938**. The improvement over bypass is not evidence of correct-history use.
+- Flat closed-loop evaluation completed: normal/bypass/empty banks each **0/10 successes**, seed 42, control from reset. Baseline separately **1/10**. No policy improvement claimed.
+- New optional training-only `--observation-dropout-prob`: deterministic camera/all-view visibility loss at supervision anchors, shared across variants. First observation and intervening unsupervised observations stay visible; no action/state labels are modified. Invisible cameras are masked before CLS/patch encoding and their encoded patches are suppressed, preventing hidden-current-camera leakage through Mamba or camera aggregation. Validation remains fully observed. This provides a partial-observation training signal where correct stored history can matter. Default stays zero until validated.
+- BF16 checks caught a scatter input/bank dtype mismatch in vectorized writes; fixed with explicit bank-dtype conversion. Empty banks now preserve inputs bitwise. Latest CPU/CUDA regression suite **79 passed**, plus augmentation checks pending.
+
+## Complete observation outages and deployment parity
+
+- Camera-only partial-observation run was superseded after preserving its saved baseline epochs/recovery state. Its state input can still identify actions, so a stronger optional `--drop-state-with-all-views` experiment hides current state whenever all camera features are unavailable. No targets are altered. Completely unavailable packets are queried but never stored as actual observations.
+- `packet_outage_pilot`: same original shared 80-epoch baseline weights for both variants; patch memory + visual head attention; 4 epochs × 64 updates/variant; visibility dropout probability 0.5, half of outages affecting all views/state; original split, seed 42, lr 1e-4, GPU allocator cap 35%. Normal full-observation validation remains separate from outage diagnostics.
+- Training integration test verifies exactly zero hidden visual/state conditioning and excludes lost packets from bank counts/timestamps.
+- Streaming encoder now accepts optional camera/state availability masks with identical feature suppression; stream supplies real observation indices and observed masks to bank consumers. Full packet outages advance physical time while retaining the preceding bank. Existing three-argument heads without memory retain their call signatures. Added streaming leakage/time-gap tests.
+- Patch closed-loop selected candidate (all four candidates tied at 0/3 screening): **1/10 normal memory versus 0/10 bypass**, seed 42, control from reset. This one-success difference is preliminary and does not demonstrate historical content use; shuffled-bank diagnostics remained insensitive. No policy-quality acceptance claimed.
+
+## Sampling and evaluation corrections discovered during iteration
+
+- Newly introduced denoised-action clipping originally retained epsilon from the *unclipped* clean estimate. Corrected DDIM to recompute epsilon from the bounded clean estimate, preserving `x_t = sqrt(alpha_t) * x0 + sigma_t * epsilon`. Analytic next-step test passes. Clipping-disabled legacy sampling is unchanged. Old reports are preserved; corrected sampling gets new artifact directories. Training losses/weights are unaffected; provisional validation metrics from running jobs used the earlier sampler and require reevaluation.
+- Re-evaluated saved production diffusion delayed-cue weights with consistent DDIM without retraining (`consistent_ddim_delayed_cue`): mechanism acceptance still passes.
+- Simulator screening versus full-list runs revealed task-order dependence in the RNG stream (the stove task was 0/1 first in screening but 1/1 second in a full list). This is not evidence of checkpoint improvement. Fixed per-episode seed derivation from base seed + SHA256 episode key, reseeding scene/sampler immediately before the model rollout so optional replay/video cannot alter model initial conditions. Selector subprocesses set PYTHONHASHSEED=0. Protocol versions are explicit; older results will not be silently reused.
+- Packet + Mamba GPU smoke completed with one optimizer update and all 44 validation episodes.
+- Commit `ea47633` preserves observation-visibility/time contracts across training and streaming.
+
+## Continuation: completed packet-loss probe and retrieval shortcut experiment
+
+- Completed matched final-epoch probe on all 44 held-out episodes with consistent clipped DDIM: both models use epoch 4 (256 updates), not independently selected early epochs. Current full-observation position MSE: baseline **0.120154**, memory **0.133837**. Within memory: bypass **0.216561**, shuffled bank **0.133856**. With current perception/state absent: correct **0.613250**, shuffled **0.614892**, bypass **1.065331**. Gripper accuracy correct/shuffled/bypass: **42.7/42.3/45.9%**. This fails the useful-history criterion: correct history has negligible benefit and the memory model is worse than the baseline. Do not interpret bypass degradation as useful recall.
+- A direct four-task diagnostic (`retrieval_content_diagnostic.json`) finds stored perceptual donor differences RMS **0.419351**, reduced to **0.003981** in retrieval output. Historical state retrieval remains responsive (stored delta 0.195748; retrieved delta 0.232016). The current-query FFN/residual shortcut is a plausible contributor to visual history suppression, not a proven sole cause.
+- Added opt-in `--memory-context-only`: query selects historical attention, but the retrieved branch FFN/residual receives attention output rather than directly receiving the query. Current features remain in the separate gate. Legacy and existing checkpoint behavior defaults unchanged; saved configs, strict loading, resume contracts, and synthetic benchmark mode are explicit. Commit **4c6d916**.
+- New production diffusion delayed-cue run: 2,000 updates; motion correct **99.8–100%**, wrong **0–0.4%**, bypass **50%**; gripper correct **99.8–100%**, wrong **0–0.2%**, bypass **50%**, horizons 8/32/48. Capacity confirmed, not LIBERO benefit.
+- Context-only packet-loss pilot launched: same original shared baseline initialization, split, seed, masks, architecture, 4 × 64 updates, lr 1e-4. Only the memory retrieval branch changes. Reuse the saved no-memory epoch-4 control because the new flag has no effect when memory is disabled; no extra baseline training is needed. Paired final-epoch probe pending.
+- Corrected simulator evaluation launched for the prior packet-loss epoch-4 memory policy: all ten Goal tasks, normal/bypass, from reset, 300 steps, keyed episode seeds, consistent DDIM. This uses a new directory; older sampler/RNG results remain archived.
+- Sampling/seed fixes committed separately as **e44a90c**. Full targeted suite **87 passed**, then **13 ablation/report tests passed** after adding one report test (88 distinct targeted tests total). Probe reports now state actual epochs/selection and anchor strategy, replacing stale claims that every checkpoint predates fixes or that episode-middle anchors are always t=6. Original numerical artifacts are retained; corrected metadata reports are separate.
