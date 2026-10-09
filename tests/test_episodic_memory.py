@@ -312,7 +312,8 @@ def test_value_preserving_mode_rejects_conflicting_context_or_spatial_layout():
         EpisodicMemoryModule(8,0,4,patch_dim=4,value_preserving=True)
 
 
-def test_pre_state_visual_memory_stores_state_free_features_and_uses_live_state(monkeypatch):
+@pytest.mark.parametrize('field_masks',[False,True])
+def test_pre_state_visual_memory_stores_state_free_features_and_uses_live_state(monkeypatch,field_masks):
     import models.align_intention as module
     from models.align_intention import ALIGNIntentionModel
     from tests.test_intention_training_contracts import FakeVision
@@ -321,7 +322,7 @@ def test_pre_state_visual_memory_stores_state_free_features_and_uses_live_state(
     model=ALIGNIntentionModel(state_dim=4,mamba_output_dim=0,compressed_dim=4,
         num_cameras=1,use_memory_bank=True,memory_bank_len=3,
         memory_patch_retrieval=True,memory_patch_temporal=True,
-        memory_value_preserving=True,memory_pre_state_visual=True,
+        memory_value_preserving=True,memory_pre_state_visual=True,memory_field_masks=field_masks,
         head_d_model=8,chunk_size=8,history_size=1).eval()
     model._build_head_and_bank(16);model.memory_module.reset(2,torch.device('cpu'))
     patches=torch.randn(2,4,768)
