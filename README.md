@@ -230,6 +230,8 @@ python eval/eval_libero_v4_trajectory.py \
     --switch-at 0.5
 ```
 
+Both V4 rollouts use the LIBERO positive-X axis-angle convention, including angles above π. The former shortest-rotation-vector conversion flipped the state input near π; `--rotation-convention shortest` reproduces those older inputs. New selector protocols record the convention.
+
 The `--switch-at` flag controls when the model takes over:
 - `0.0` = model from the start (fully autonomous)
 - `0.5` = expert controls first half, model second half (intent observation)

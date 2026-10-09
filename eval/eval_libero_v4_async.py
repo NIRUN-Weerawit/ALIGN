@@ -77,10 +77,7 @@ except ImportError:
 # standalone operation — no import dependency on that script)
 # ================================================================
 
-def quat_to_axisangle(quat: np.ndarray) -> np.ndarray:
-    if _Rotation is not None:
-        return _Rotation.from_quat(quat).as_rotvec().astype(np.float32)
-    return np.zeros(3, dtype=np.float32)
+from eval.libero_state import quat_to_axisangle
 
 
 def get_sim_frame(env, key: str = "agentview_image",
@@ -119,14 +116,14 @@ def get_sim_frame(env, key: str = "agentview_image",
     return img
 
 
-def get_sim_eef_pose(obs: dict) -> np.ndarray:
+def get_sim_eef_pose(obs: dict, rotation_convention: str = "libero") -> np.ndarray:
     pos = obs.get("robot0_eef_pos", np.zeros(3))
     quat = obs.get("robot0_eef_quat", np.zeros(4))
     if isinstance(pos, torch.Tensor):
         pos = pos.cpu().numpy()
     if isinstance(quat, torch.Tensor):
         quat = quat.cpu().numpy()
-    aa = quat_to_axisangle(quat)
+    aa = quat_to_axisangle(quat,rotation_convention)
     return np.concatenate([pos, aa]).astype(np.float32)
 
 
@@ -337,6 +334,7 @@ def run_async_episode(
     ensemble: str = "none",
     ensemble_decay: float = 0.9,
     initial_gripper: float = 0.0,
+    rotation_convention: str = "libero",
 ) -> Dict:
     """Run one episode with async inference and constant-FPS rendering.
 
@@ -407,7 +405,7 @@ def run_async_episode(
         return np.stack(per_cam, axis=0)  # (V, H, W, 3)
 
     # Initial state
-    init_eef = get_sim_eef_pose(obs)
+    init_eef = get_sim_eef_pose(obs,rotation_convention)
     init_state = np.concatenate([init_eef, [initial_gripper]]).astype(np.float32)
     last_state = init_state.copy()
     init_frame_stack = _render_all_cameras()
@@ -489,7 +487,7 @@ def run_async_episode(
                 live_view = False
 
         # 2. Get sim state
-        sim_eef = get_sim_eef_pose(obs)
+        sim_eef = get_sim_eef_pose(obs,rotation_convention)
         sim_positions.append(sim_eef)
 
         # 3. Update sliding windows
@@ -654,7 +652,7 @@ def run_async_episode(
 
         # 7. Step sim
         obs, reward, done, info = env.step(final_action)
-        sim_eef_after = get_sim_eef_pose(obs)
+        sim_eef_after = get_sim_eef_pose(obs,rotation_convention)
         sim_positions[-1] = sim_eef_after
 
         # 8. EEF error
@@ -800,6 +798,7 @@ def main():
                         help="Skip vertical flip on sim frames.")
     parser.add_argument("--no-flip-horizontal", action="store_true",
                         help="Skip horizontal flip on sim frames.")
+    parser.add_argument("--rotation-convention",choices=["libero","shortest"],default="libero")
     args = parser.parse_args()
 
     if args.live_view and not CV2_AVAILABLE:
@@ -944,6 +943,7 @@ def main():
             noise_std=args.noise_std,
             sim_fps=args.sim_fps,
             live_view=args.live_view,
+            rotation_convention=args.rotation_convention,
             debug=args.debug,
             action_horizon=args.action_horizon,
             ensemble=args.ensemble,
@@ -1008,6 +1008,7 @@ def main():
                     "switch_at": args.switch_at,
                     "action_scale": args.action_scale,
                     "action_horizon": args.action_horizon,
+                    "rotation_convention": args.rotation_convention,
                     "ensemble": args.ensemble,
                     "ensemble_decay": args.ensemble_decay,
                     "max_steps": args.max_steps,

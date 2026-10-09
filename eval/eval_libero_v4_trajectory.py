@@ -126,7 +126,7 @@ def load_trajectory(h5_path: str, episode_key: str,
     Returns:
         dict with keys: frames, states, actions, poses, text, cam_name
         - frames: (N, V, H, W, 3) uint8 — multi-cam
-        - states: (N, 7) float32 — robot states [pos(3), euler(3), gripper(1)]
+        - states: (N, 7) float32 — robot states [pos(3), axis_angle(3), gripper(1)]
         - actions: (N, 7) float32 — expert actions (pose deltas + gripper)
         - poses: (N, 6+) float32 — expert EEF poses
         - text: str — task description
@@ -159,7 +159,7 @@ def load_trajectory(h5_path: str, episode_key: str,
         actions = group["actions"][:]  # (N, 7)
         # Build states: concat[poses, gripper] = (N, 7)
         # matches the v4 model's expected state format:
-        # [pos_x, pos_y, pos_z, roll, pitch, yaw, gripper]
+        # [pos_x, pos_y, pos_z, axis_angle_x, axis_angle_y, axis_angle_z, gripper]
         if poses is not None:
             gripper = (group["gripper"][:] if "gripper" in group else
                        previous_gripper_commands(actions, initial_gripper=float(group.attrs.get("initial_gripper", 0.0))))
@@ -338,11 +338,7 @@ def seed_episode(seed):
     if torch.cuda.is_available():torch.cuda.manual_seed_all(seed)
 
 
-def quat_to_axisangle(quat: np.ndarray) -> np.ndarray:
-    """Convert quaternion (x,y,z,w) to axis-angle (rx,ry,rz)."""
-    if _Rotation is not None:
-        return _Rotation.from_quat(quat).as_rotvec().astype(np.float32)
-    return np.zeros(3, dtype=np.float32)
+from eval.libero_state import quat_to_axisangle
 
 
 def get_sim_frame(env, key: str = "agentview_image",
@@ -400,7 +396,7 @@ def get_sim_frame(env, key: str = "agentview_image",
     return img
 
 
-def get_sim_eef_pose(obs: dict) -> np.ndarray:
+def get_sim_eef_pose(obs: dict, rotation_convention: str = "libero") -> np.ndarray:
     """Get current EEF pose from sim observation.
 
     Returns (6,) array: [x, y, z, rx, ry, rz] in world frame.
@@ -411,7 +407,7 @@ def get_sim_eef_pose(obs: dict) -> np.ndarray:
         pos = pos.cpu().numpy()
     if isinstance(quat, torch.Tensor):
         quat = quat.cpu().numpy()
-    aa = quat_to_axisangle(quat)
+    aa = quat_to_axisangle(quat,rotation_convention)
     return np.concatenate([pos, aa]).astype(np.float32)
 
 
@@ -485,6 +481,7 @@ def run_replay_in_sim(
     flip_vertical: bool = True,
     flip_horizontal: bool = False,
     live_view: bool = False,
+    rotation_convention: str = "libero",
 ) -> Dict:
     """Replay dataset's expert actions in MuJoCo sim. Record frames.
 
@@ -525,7 +522,7 @@ def run_replay_in_sim(
         if frame is not None and frame.size > 0:
             frames.append(frame.copy())
         _live_view_show(frame, step, title="ALIGN Replay (expert)", live_view=live_view)
-        sim_eef = get_sim_eef_pose(obs)
+        sim_eef = get_sim_eef_pose(obs,rotation_convention)
         sim_positions.append(sim_eef)
         # Step sim with expert action
         action = actions[step].copy()
@@ -534,7 +531,7 @@ def run_replay_in_sim(
             action[6] = 1.0 if action[6] <= 0.1 else -1.0
         obs, reward, done, info = env.step(action)
         # Get sim_eef AFTER step
-        sim_eef_after = get_sim_eef_pose(obs)
+        sim_eef_after = get_sim_eef_pose(obs,rotation_convention)
         sim_positions[-1] = sim_eef_after
         # Compute EEF error vs expert (if poses available)
         if expert_poses is not None and step < len(expert_poses):
@@ -589,6 +586,7 @@ def run_model_in_sim(
     timing_log: Optional[List[Dict]] = None,
     live_view: bool = False,
     initial_gripper: float = 0.0,
+    rotation_convention: str = "libero",
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
 
@@ -692,7 +690,7 @@ def run_model_in_sim(
         return np.stack(per_cam, axis=0)  # (V, H, W, 3)
 
     # Get initial sim state to populate buffer
-    init_eef = get_sim_eef_pose(obs)
+    init_eef = get_sim_eef_pose(obs,rotation_convention)
     init_state = np.concatenate([init_eef, [initial_gripper]]).astype(np.float32)  # (7,)
     last_state = init_state.copy()
     init_frame_stack = _render_all_cameras()  # (V, H, W, 3)
@@ -752,7 +750,7 @@ def run_model_in_sim(
         frames.append(current_frame_stack[0].copy())
         _live_view_show(current_frame_stack[0], step, title="ALIGN Model Rollout", live_view=live_view)
 
-        sim_eef = get_sim_eef_pose(obs)
+        sim_eef = get_sim_eef_pose(obs,rotation_convention)
         sim_positions.append(sim_eef)
 
         # 2. Update sliding windows: pop oldest, push newest
@@ -941,7 +939,7 @@ def run_model_in_sim(
 
         # 6. Step sim
         obs, reward, done, info = env.step(final_action)
-        sim_eef_after = get_sim_eef_pose(obs)
+        sim_eef_after = get_sim_eef_pose(obs,rotation_convention)
         sim_positions[-1] = sim_eef_after
         # 7. Compute EEF error vs dataset expert (only while expert data exists)
         if expert_poses is not None and step < len(expert_poses):
@@ -1231,6 +1229,7 @@ def main():
                              "real-time during eval. Requires opencv-python and "
                              "a display (X-forwarding or local monitor). Press "
                              "'q' or ESC to close the window.")
+    parser.add_argument("--rotation-convention",choices=["libero","shortest"],default="libero",help="LIBERO positive-X axis-angle branch; shortest reproduces the old incompatible input representation")
     args = parser.parse_args()
 
     if args.live_view and not CV2_AVAILABLE:
@@ -1401,6 +1400,7 @@ def main():
                 flip_vertical=flip_vertical,
                 flip_horizontal=flip_horizontal,
                 live_view=args.live_view,
+                rotation_convention=args.rotation_convention,
             )
             t_replay = time.time() - t0
 
@@ -1434,6 +1434,7 @@ def main():
             timing_log=ep_timing_log,
             debug=args.debug,
             live_view=args.live_view,
+            rotation_convention=args.rotation_convention,
         )
         if ep_timing_log is not None:
             all_timing_logs.append({"episode": ep_key, "timing": ep_timing_log})
@@ -1588,6 +1589,7 @@ def main():
             "checkpoint": args.checkpoint,
             "data": args.data,
             "alpha": args.alpha,
+            "rotation_convention": args.rotation_convention,
             "n_episodes": len(mujoco_results),
             "success_rate": f"{success_count}/{ len(mujoco_results)}",
             "episodes": mujoco_results,
