@@ -310,3 +310,46 @@ def test_value_preserving_mode_rejects_conflicting_context_or_spatial_layout():
         EpisodicMemoryModule(8,0,4,context_only=True,value_preserving=True)
     with pytest.raises(ValueError,match='alignment'):
         EpisodicMemoryModule(8,0,4,patch_dim=4,value_preserving=True)
+
+
+def test_pre_state_visual_memory_stores_state_free_features_and_uses_live_state(monkeypatch):
+    import models.align_intention as module
+    from models.align_intention import ALIGNIntentionModel
+    from tests.test_intention_training_contracts import FakeVision
+    monkeypatch.setattr(module,'VisionEncoder',FakeVision)
+    torch.manual_seed(31)
+    model=ALIGNIntentionModel(state_dim=4,mamba_output_dim=0,compressed_dim=4,
+        num_cameras=1,use_memory_bank=True,memory_bank_len=3,
+        memory_patch_retrieval=True,memory_patch_temporal=True,
+        memory_value_preserving=True,memory_pre_state_visual=True,
+        head_d_model=8,chunk_size=8,history_size=1).eval()
+    model._build_head_and_bank(16);model.memory_module.reset(2,torch.device('cpu'))
+    patches=torch.randn(2,4,768)
+    old_state,new_state=torch.randn(2,4),torch.randn(2,4)
+    visual=model.encode_visual_features(patches,old_state)
+    torch.testing.assert_close(visual,model.encode_visual_features(patches,new_state))
+    model.condition_actions(visual.flatten(1)[:,None],old_state[:,None])
+    torch.testing.assert_close(model.memory_module.perceptual_bank[:,0],visual)
+    recalled=model.condition_actions(visual.flatten(1)[:,None],new_state[:,None])
+    # Same image, changed gripper/pose: visual modulation must use the live
+    # state, not the old state fused into the state-memory conditioning slot.
+    expected=model.vision_patch_encoder(patches,new_state).flatten(1)[:,None]
+    torch.testing.assert_close(recalled[0],expected)
+    bypass=model.prepare_head_inputs(visual.flatten(1)[:,None],new_state[:,None])
+    torch.testing.assert_close(bypass[0],expected)
+    model.use_memory_bank=False
+    torch.testing.assert_close(model.encode_visual_features(patches,new_state),expected[:,0].reshape(2,4,4))
+
+
+def test_state_modulation_masks_missing_tokens_without_phantom_bias_features():
+    from models.intention_encoder import StateConditionalCrossAttn
+    torch.manual_seed(37)
+    mod=StateConditionalCrossAttn(4,4,2).eval()
+    mod.norm.bias.data.fill_(.8)
+    visual=torch.randn(2,4,4);state=torch.randn(2,4)
+    mask=torch.tensor([[True,True,False,False],[False,False,False,False]])
+    first=mod(visual,state,token_mask=mask)
+    changed=visual.clone();changed[~mask]=1000
+    second=mod(changed,state,token_mask=mask)
+    torch.testing.assert_close(first[mask],second[mask])
+    assert torch.count_nonzero(first[~mask])==0 and torch.isfinite(first).all()

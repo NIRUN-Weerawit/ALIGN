@@ -1331,7 +1331,7 @@ def main():
         original_condition = model.condition_actions
         def condition_with_intervention(p,s,intent=None,**kwargs):
             if args.memory_intervention == "bypass":
-                return p,s,intent
+                return model.prepare_head_inputs(p,s,intent)
             model.memory_module.reset(p.shape[0],p.device)
             return original_condition(p,s,intent,**kwargs)
         model.condition_actions = condition_with_intervention

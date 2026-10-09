@@ -130,17 +130,27 @@ class StateConditionalCrossAttn(nn.Module):
         # Start at identity so modulator learns adaptively from gradient signals
         self.attn_scale = nn.Parameter(torch.tensor(1.0))
 
-    def forward(self, z_v_comp: torch.Tensor, z_s: torch.Tensor) -> torch.Tensor:
+    def forward(self, z_v_comp: torch.Tensor, z_s: torch.Tensor,
+                token_mask: torch.Tensor = None) -> torch.Tensor:
         B, N_pos, D = z_v_comp.shape
+        if token_mask is not None:
+            nonempty=token_mask.any(-1)
+            if not bool(nonempty.all()):
+                out=torch.zeros_like(z_v_comp)
+                if bool(nonempty.any()):
+                    out[nonempty]=self.forward(z_v_comp[nonempty],z_s[nonempty],token_mask[nonempty])
+                return out
 
         # One query per position, all derived from same z_s via projection weights
         q = self.q_proj(z_s).unsqueeze(1).expand(-1, N_pos, -1)  # (B, N_pos, D)
         k = v = z_v_comp                                         # patches as KV
 
-        attn_out, _ = self.cross_attn(q, k, v, need_weights=False)                   # (B, N_pos, D)
+        attn_out, _ = self.cross_attn(q, k, v, need_weights=False,
+                                      key_padding_mask=None if token_mask is None else ~token_mask)                   # (B, N_pos, D)
 
         out = z_v_comp + self.attn_scale * attn_out              # residual modulation
-        return self.norm(out)
+        out=self.norm(out)
+        return out if token_mask is None else torch.where(token_mask[:,:,None],out,torch.zeros_like(out))
 
 
 # ================================================================

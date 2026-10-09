@@ -47,7 +47,7 @@ def main():
         bank.patch_temporal=args.patch_temporal_override
     report=dict(checkpoint=str(args.checkpoint.resolve()),epoch=epoch,
                 frames=args.frames,episode_keys=[dataset._episode_keys[k] for k in indices],
-                context_only=model.memory_context_only,value_preserving=model.memory_value_preserving,patch_temporal=bank.patch_temporal,saved_patch_temporal=model.memory_patch_temporal,
+                pre_state_visual=model.memory_pre_state_visual,context_only=model.memory_context_only,value_preserving=model.memory_value_preserving,patch_temporal=bank.patch_temporal,saved_patch_temporal=model.memory_patch_temporal,
                 architecture_override=args.patch_temporal_override,
                 protocol='Zero current queries; cross-task values swapped; key ages held fixed; BF16 conditioning',
                 caveat='Feature sensitivity diagnostic, not action accuracy or policy success.',streams={})

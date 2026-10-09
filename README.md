@@ -76,6 +76,8 @@ A fixed-size episodic memory that stores past (visual, state, intent) triplets. 
 
 The bank uses a circular buffer with token-merge consolidation when full.
 
+Experimental episodic modes are opt-in: `--memory-patch-temporal` retrieves each camera/grid slot across time; `--memory-value-preserving` returns weighted raw historical values. `--memory-pre-state-visual` stores compressed vision before robot-state modulation and applies current state after retrieval, avoiding replay of old state-conditioned visual context. It requires episodic raw writes. Existing checkpoint behavior stays unchanged. See [the experiment ledger](paper/memory_adjustment_work_log.md) for measured benefits and remaining failures.
+
 ### Diffusion Policy Head
 
 A 1D U-Net that denoises random noise into a chunk of K future actions via DDPM/DDIM. Conditioning is global (mean-pooled over the window) rather than per-step, using FiLM modulation:

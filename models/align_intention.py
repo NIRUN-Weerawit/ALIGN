@@ -81,6 +81,7 @@ class ALIGNIntentionModel(nn.Module):
         memory_context_only: bool = False,
         memory_patch_temporal: bool = False,
         memory_value_preserving: bool = False,
+        memory_pre_state_visual: bool = False,
         diffusion_train_steps: int = 100,
         diffusion_loss_repeats: int = 4,
         visual_token_attention: bool = False,
@@ -118,7 +119,10 @@ class ALIGNIntentionModel(nn.Module):
         if memory_value_preserving and (memory_context_only or memory_mode != "episodic" or (memory_patch_retrieval and not memory_patch_temporal)):
             raise ValueError("Value-preserving retrieval requires episodic mode, no context FFN, and temporal alignment for patch banks")
         self.memory_patch_temporal = memory_patch_temporal
+        if memory_pre_state_visual and (memory_mode != "episodic" or memory_write_fused):
+            raise ValueError("Pre-state visual memory requires episodic raw writes")
         self.memory_value_preserving = memory_value_preserving
+        self.memory_pre_state_visual = memory_pre_state_visual
         self.diffusion_train_steps = diffusion_train_steps
         self.diffusion_loss_repeats = diffusion_loss_repeats
         self.visual_token_attention = visual_token_attention
@@ -367,7 +371,7 @@ class ALIGNIntentionModel(nn.Module):
         # vision_patch_encoder expects (B, VP, raw_dim) and (B, state_dim) per timestep
         # So we flatten B*T together, process, then reshape back
         B, T, N_tok, raw_dim = z_v_all.shape
-        z_v_mod_seq = self.vision_patch_encoder(
+        z_v_mod_seq = self.encode_visual_features(
             z_v_all.reshape(B * T, N_tok, raw_dim),
             z_s_seq.reshape(B * T, -1),
         )  # (B*T, VP, comp_dim)
@@ -450,7 +454,7 @@ class ALIGNIntentionModel(nn.Module):
         z_v_cls = z_v_all_reshaped[:, :, -1, :]  # (B, V, 768)
         # Patches are all positions except the last per camera: (B, V, P, 768)
         z_v_patches = z_v_all_reshaped[:, :, :-1, :].reshape(z_v_all.shape[0], V * P, 768)
-        z_v_mod = self.vision_patch_encoder(z_v_patches, z_s)
+        z_v_mod = self.encode_visual_features(z_v_patches, z_s)
         if camera_visible is not None:
             z_v_mod = (z_v_mod.reshape(z_v_mod.shape[0],V,P,-1)*camera_visible[:,:,None,None]).reshape(z_v_mod.shape)
         z_v_pooled = z_v_mod.flatten(1)
@@ -477,6 +481,23 @@ class ALIGNIntentionModel(nn.Module):
     # ----------------------------------------------------------------
     # Predict actions from window
     # ----------------------------------------------------------------
+    def encode_visual_features(self,patches,states):
+        if self.use_memory_bank and self.memory_pre_state_visual:
+            return self.vision_patch_encoder.se_compressor(patches)
+        return self.vision_patch_encoder(patches,states)
+
+    def prepare_head_inputs(self,visual,states,intent=None,modulation_state=None):
+        """Finish visual state conditioning after a read, or on a bank bypass."""
+        if not (self.use_memory_bank and self.memory_pre_state_visual):
+            return visual,states,intent
+        B,H,_=visual.shape
+        tokens=visual.reshape(B*H,-1,self.compressed_dim)
+        state_for_visual=states if modulation_state is None else modulation_state
+        state_for_visual=state_for_visual.reshape(B*H,-1)
+        available=tokens.ne(0).any(-1)
+        modulated=self.vision_patch_encoder.state_modulator(tokens,state_for_visual,token_mask=available)
+        return modulated.reshape(B,H,-1),states,intent
+
     def encode_patch_sequence(self,patches,states,chunk_size=16):
         """Bound long-episode feature activations; preserve gradients to encoders."""
         from torch.utils.checkpoint import checkpoint
@@ -486,9 +507,9 @@ class ALIGNIntentionModel(nn.Module):
             for start in range(0,len(patches),chunk_size):
                 p,s = patches[start:start+chunk_size],states[start:start+chunk_size]
                 if self.training and torch.is_grad_enabled():
-                    outputs.append(checkpoint(self.vision_patch_encoder,p,s,use_reentrant=False))
+                    outputs.append(checkpoint(self.encode_visual_features,p,s,use_reentrant=False))
                 else:
-                    outputs.append(self.vision_patch_encoder(p,s))
+                    outputs.append(self.encode_visual_features(p,s))
         return torch.cat(outputs)
 
     def condition_actions(self, z_v_window: torch.Tensor,
@@ -508,6 +529,10 @@ class ALIGNIntentionModel(nn.Module):
             observed_mask=observed_mask,
             **({"timestamp":timestamp} if self.memory_mode == "episodic" else {}),
         )
+        if self.memory_pre_state_visual:
+            current_state=z_s_window[:,-1]
+            live_state=torch.where(current_state.ne(0).any(-1,keepdim=True),current_state,z_s)
+            return self.prepare_head_inputs(z_v.unsqueeze(1),z_s.unsqueeze(1),intent,live_state.unsqueeze(1))
         return z_v.unsqueeze(1), z_s.unsqueeze(1), intent
 
     def predict_actions(self, z_v_pooled_window: torch.Tensor,
@@ -584,7 +609,7 @@ class ALIGNIntentionModel(nn.Module):
         z_s_seq = self.state_encoder(state_seq)  # (B, T, state_dim)
 
         # ---- Patch encoding for head consumption ----
-        z_v_mod_seq = self.vision_patch_encoder(
+        z_v_mod_seq = self.encode_visual_features(
             z_v_patches.reshape(B * T, -1, raw_dim),
             z_s_seq.reshape(B * T, -1),
         )  # (B*T, V*P, comp_dim)

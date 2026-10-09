@@ -42,7 +42,7 @@ def load_model(path, cameras):
     for key, default in [('num_intent_tokens',1),('mamba_d_state',16),('mamba_d_conv',4),('mamba_expand',2)]:
         kwargs[key] = c.get(key, default)
     for key,default in [('memory_mode','legacy'),('memory_detach_writes',False),('memory_write_fused',True),
-                        ('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
+                        ('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
         kwargs[key] = c.get(key,default)
     model = ALIGNIntentionModel(action_dim=7, num_cameras=len(cameras), **kwargs)
     model._build_head_and_bank(c.get('pool_out_dim',256*len(cameras)*c['compressed_dim']))
@@ -116,7 +116,9 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     conds['intent_zero'] = model.intention_head(fused[0],fused[1],torch.zeros_like(fused[2]))
                     conds['intent_shuffle'] = model.intention_head(fused[0],fused[1],fused[2][permutation])
                 if before is not None:
-                    conds['memory_bypass'] = model.intention_head(p,s,i)
+                    conds['memory_bypass'] = model.intention_head(*model.prepare_head_inputs(p,s,i))
+                    conds['state_memory_bypass'] = model.intention_head(fused[0],s,fused[2])
+                    conds['perceptual_memory_bypass'] = model.intention_head(*model.prepare_head_inputs(p,fused[1],fused[2],modulation_state=s))
                     restore(model.memory_module,before,permutation)
                     conds['memory_shuffle'] = model.intention_head(*model.condition_actions(p,s,i))
                     restore(model.memory_module,after)
@@ -128,7 +130,7 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                         missing_state = torch.zeros_like(s) if case=='all_observation' else s
                         if before is not None:restore(model.memory_module,before)
                         conds[case+'_correct'] = model.intention_head(*model.condition_actions(missing,missing_state,i))
-                        conds[case+'_bypass'] = model.intention_head(missing,missing_state,i)
+                        conds[case+'_bypass'] = model.intention_head(*model.prepare_head_inputs(missing,missing_state,i))
                         if before is not None:
                             restore(model.memory_module,before,permutation)
                             conds[case+'_shuffle'] = model.intention_head(*model.condition_actions(missing,missing_state,i))
@@ -138,8 +140,8 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     # the head. This diagnoses information lost by learned
                     # retrieval; it does not change the saved model architecture.
                     previous_p,previous_s=visual[:,t-1:t],state[:,t-1:t]
-                    conds['previous_observation_correct']=model.intention_head(previous_p,previous_s,None)
-                    conds['previous_observation_shuffle']=model.intention_head(previous_p[permutation],previous_s[permutation],None)
+                    conds['previous_observation_correct']=model.intention_head(*model.prepare_head_inputs(previous_p,previous_s,None))
+                    conds['previous_observation_shuffle']=model.intention_head(*model.prepare_head_inputs(previous_p[permutation],previous_s[permutation],None))
                 conds['visual_zero_control'] = model.intention_head(torch.zeros_like(fused[0]),fused[1],fused[2])
                 conds['state_zero_control'] = model.intention_head(fused[0],torch.zeros_like(fused[1]),fused[2])
                 target = batch['actions_segment'][:,t:t+model.chunk_size].cuda().float()
