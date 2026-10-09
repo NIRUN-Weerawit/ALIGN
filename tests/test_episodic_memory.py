@@ -353,3 +353,84 @@ def test_state_modulation_masks_missing_tokens_without_phantom_bias_features():
     second=mod(changed,state,token_mask=mask)
     torch.testing.assert_close(first[mask],second[mask])
     assert torch.count_nonzero(first[~mask])==0 and torch.isfinite(first).all()
+
+
+def test_field_masks_preserve_vision_during_long_state_only_observation_runs():
+    bank=EpisodicMemoryModule(8,0,4,bank_len=16,patch_dim=4,
+        patch_temporal=True,value_preserving=True,mask_missing_fields=True)
+    bank.reset(1,torch.device('cpu'))
+    p=torch.arange(1,9,dtype=torch.float32)[None];s=torch.ones(1,4)
+    for t in range(16):bank.observe_only(p,s,timestamp=torch.tensor([float(t)]))
+    for t in range(16,80):bank.observe_only(torch.zeros_like(p),s,timestamp=torch.tensor([float(t)]))
+    valid=bank.perceptual_times>=0
+    assert valid.any() and bank.perceptual_times.max()<16
+    torch.testing.assert_close(bank.perceptual_bank[valid],p.reshape(2,4))
+    query=torch.zeros(1,2,4)
+    recalled=bank._retrieve(bank.perceptual_retrieval,query,bank.perceptual_bank,
+        valid,80-bank.perceptual_times)
+    torch.testing.assert_close(recalled,p.reshape(1,2,4))
+    assert bank._next_timestep.item()==80
+
+
+def test_field_merge_copies_single_valid_values_and_preserves_their_time():
+    bank=EpisodicMemoryModule(4,0,4,bank_len=2,mask_missing_fields=True)
+    bank.reset(1,torch.device('cpu'));p=torch.ones(1,4);s=2*p
+    bank.observe_only(p,s,timestamp=torch.tensor([0.]))
+    bank.observe_only(0*p,s,timestamp=torch.tensor([1.]))
+    bank.observe_only(0*p,s,timestamp=torch.tensor([2.]))
+    torch.testing.assert_close(bank.perceptual_bank[:,0],p)
+    assert bank.perceptual_times.tolist()==[[0.,-1.]]
+    assert bank.state_times.tolist()==[[.5,2.]]
+    torch.testing.assert_close(bank.state_bank[:,0],s)
+
+
+def test_field_masks_empty_stream_is_identity_even_with_other_stream_present():
+    bank=EpisodicMemoryModule(8,4,4,bank_len=2,patch_dim=4,
+        patch_temporal=True,value_preserving=True,mask_missing_fields=True)
+    bank.reset(1,torch.device('cpu'))
+    bank.observe_only(torch.zeros(1,8),torch.ones(1,4),torch.zeros(1,4))
+    p=torch.randn(1,8);s=torch.randn(1,4);c=torch.randn(1,4)
+    actual=bank(p,s,c)
+    assert torch.equal(actual[0],p) and torch.equal(actual[2],c)
+
+
+def test_field_masks_average_two_valid_observations_and_reset_masks():
+    bank=EpisodicMemoryModule(4,0,4,bank_len=2,mask_missing_fields=True)
+    bank.reset(1,torch.device('cpu'));p=torch.ones(1,4)
+    for t,k in enumerate([1,3,5]):bank.observe_only(k*p,p,timestamp=torch.tensor([float(t)]))
+    torch.testing.assert_close(bank.perceptual_bank[:,0],2*p)
+    assert bank.perceptual_times.tolist()==[[.5,2.]]
+    bank.reset(2,torch.device('cpu'))
+    assert bank.perceptual_times.shape==(2,2) and (bank.perceptual_times==-1).all()
+
+
+def test_missing_patch_slots_are_excluded_and_empty_slots_keep_their_query():
+    bank=EpisodicMemoryModule(8,0,4,bank_len=2,patch_dim=4,
+        patch_temporal=True,value_preserving=True,mask_missing_fields=True)
+    bank.reset(1,torch.device('cpu'))
+    bank.observe_only(torch.tensor([[1.,2.,3.,4.,0.,0.,0.,0.]]),torch.ones(1,4))
+    query=torch.randn(1,8)
+    out=bank(query,torch.ones(1,4))[0].reshape(1,2,4)
+    assert torch.equal(out[:,1],query.reshape(1,2,4)[:,1])
+    assert bank.perceptual_times[:,0].tolist()==[[0.,-1.]]
+
+
+@pytest.mark.parametrize('device',['cpu','cuda'])
+def test_field_masks_full_observation_parity_and_bfloat16_writes(device):
+    if device=='cuda' and not torch.cuda.is_available():pytest.skip('CUDA unavailable')
+    torch.manual_seed(42)
+    kwargs=dict(perceptual_dim=8,cognitive_dim=4,state_dim=4,bank_len=4,
+        patch_dim=4,patch_temporal=True,value_preserving=True)
+    old=EpisodicMemoryModule(**kwargs).to(device).eval()
+    new=EpisodicMemoryModule(**kwargs,mask_missing_fields=True).to(device).eval()
+    new.load_state_dict(old.state_dict())
+    for bank in [old,new]:bank.reset(2,torch.device(device))
+    with torch.autocast(device_type=device,dtype=torch.bfloat16),torch.no_grad():
+        for t in range(12):
+            p=torch.randn(2,8,device=device).bfloat16()
+            s=torch.randn(2,4,device=device).bfloat16();c=torch.randn_like(s)
+            a,z=old(p,s,c),new(p,s,c)
+            for first,second in zip(a,z):torch.testing.assert_close(first,second)
+    torch.testing.assert_close(new.perceptual_times,old.timestamps[:,:,None].expand(2,4,2))
+    new.observe_only(torch.zeros_like(p),s,c)
+    assert torch.isfinite(new.perceptual_bank).all()

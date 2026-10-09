@@ -82,6 +82,7 @@ class ALIGNIntentionModel(nn.Module):
         memory_patch_temporal: bool = False,
         memory_value_preserving: bool = False,
         memory_pre_state_visual: bool = False,
+        memory_field_masks: bool = False,
         diffusion_train_steps: int = 100,
         diffusion_loss_repeats: int = 4,
         visual_token_attention: bool = False,
@@ -122,6 +123,9 @@ class ALIGNIntentionModel(nn.Module):
         if memory_pre_state_visual and (memory_mode != "episodic" or memory_write_fused):
             raise ValueError("Pre-state visual memory requires episodic raw writes")
         self.memory_value_preserving = memory_value_preserving
+        if memory_field_masks and (memory_mode != "episodic" or memory_write_fused):
+            raise ValueError("Field validity requires episodic raw writes")
+        self.memory_field_masks = memory_field_masks
         self.memory_pre_state_visual = memory_pre_state_visual
         self.diffusion_train_steps = diffusion_train_steps
         self.diffusion_loss_repeats = diffusion_loss_repeats
@@ -269,7 +273,7 @@ class ALIGNIntentionModel(nn.Module):
         if self.use_memory_bank:
             cognitive_dim = self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0
             memory_class = EpisodicMemoryModule if self.memory_mode == "episodic" else PerceptualCognitiveMemoryModule
-            memory_kwargs = dict(value_preserving=self.memory_value_preserving,patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
+            memory_kwargs = dict(mask_missing_fields=self.memory_field_masks,value_preserving=self.memory_value_preserving,patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
                                  patch_dim=self.compressed_dim if self.memory_patch_retrieval else None) if self.memory_mode == "episodic" else {}
             self.memory_module = memory_class(
                 perceptual_dim=pool_out_dim,

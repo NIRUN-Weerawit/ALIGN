@@ -149,6 +149,7 @@ def load_intention_model(
         memory_mode=cfg.get("memory_mode","legacy"),
         memory_detach_writes=cfg.get("memory_detach_writes",False),
         memory_write_fused=cfg.get("memory_write_fused",True),
+        memory_field_masks=cfg.get("memory_field_masks",False),
         memory_pre_state_visual=cfg.get("memory_pre_state_visual",False),
         memory_value_preserving=cfg.get("memory_value_preserving",False),
         memory_patch_temporal=cfg.get("memory_patch_temporal",False),

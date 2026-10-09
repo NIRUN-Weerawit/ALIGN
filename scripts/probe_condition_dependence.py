@@ -24,7 +24,7 @@ GROUPS = {'position': slice(0,3), 'rotation': slice(3,6), 'gripper': slice(6,7)}
 
 
 def snapshot(bank):
-    return {key: getattr(bank, key).clone() for key in BANK_FIELDS+('timestamps','_next_timestep') if getattr(bank,key,None) is not None}
+    return {key: getattr(bank, key).clone() for key in BANK_FIELDS+('timestamps','_next_timestep','perceptual_times','state_times','cognitive_times') if getattr(bank,key,None) is not None}
 
 
 def restore(bank, saved, permutation=None):
@@ -42,7 +42,7 @@ def load_model(path, cameras):
     for key, default in [('num_intent_tokens',1),('mamba_d_state',16),('mamba_d_conv',4),('mamba_expand',2)]:
         kwargs[key] = c.get(key, default)
     for key,default in [('memory_mode','legacy'),('memory_detach_writes',False),('memory_write_fused',True),
-                        ('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
+                        ('memory_field_masks',False),('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
         kwargs[key] = c.get(key,default)
     model = ALIGNIntentionModel(action_dim=7, num_cameras=len(cameras), **kwargs)
     model._build_head_and_bank(c.get('pool_out_dim',256*len(cameras)*c['compressed_dim']))

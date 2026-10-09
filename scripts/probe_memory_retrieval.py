@@ -47,7 +47,7 @@ def main():
         bank.patch_temporal=args.patch_temporal_override
     report=dict(checkpoint=str(args.checkpoint.resolve()),epoch=epoch,
                 frames=args.frames,episode_keys=[dataset._episode_keys[k] for k in indices],
-                pre_state_visual=model.memory_pre_state_visual,context_only=model.memory_context_only,value_preserving=model.memory_value_preserving,patch_temporal=bank.patch_temporal,saved_patch_temporal=model.memory_patch_temporal,
+                field_masks=model.memory_field_masks,pre_state_visual=model.memory_pre_state_visual,context_only=model.memory_context_only,value_preserving=model.memory_value_preserving,patch_temporal=bank.patch_temporal,saved_patch_temporal=model.memory_patch_temporal,
                 architecture_override=args.patch_temporal_override,
                 protocol='Zero current queries; cross-task values swapped; key ages held fixed; BF16 conditioning',
                 caveat='Feature sensitivity diagnostic, not action accuracy or policy success.',streams={})
@@ -63,12 +63,17 @@ def main():
                  ('state',torch.zeros_like(s[:,args.frames]),bank.state_bank,
                   bank.state_retrieval,bank.state_gate)]
         for name,query,values,retrieval,gate in streams:
+            field_mask,field_age=mask,age
+            if bank.mask_missing_fields:
+                times=getattr(bank,name+'_times')
+                field_mask=(mask if times.ndim==2 else mask[:,:,None]) & (times>=0)
+                field_age=(args.frames-times).clamp_min(0)
             if name=='perceptual' and bank.patch_dim is not None:
                 query=query.reshape(len(indices),-1,bank.patch_dim)
             outputs=[]
             hook=retrieval.retrieval_attn.register_forward_hook(lambda m,a,out:outputs.append(out[0].detach()))
-            correct=bank._retrieve(retrieval,query,values,mask,age)
-            wrong=bank._retrieve(retrieval,query,values.roll(1,0),mask,age)
+            correct=bank._retrieve(retrieval,query,values,field_mask,field_age)
+            wrong=bank._retrieve(retrieval,query,values.roll(1,0),field_mask,field_age)
             hook.remove()
             def rms(x):return x.float().square().mean().sqrt().item()
             report['streams'][name]=dict(bank_rms=rms(values),bank_donor_delta_rms=rms(values-values.roll(1,0)),
