@@ -268,3 +268,45 @@ def test_temporal_patch_lookup_preserves_camera_grid_slots():
 def test_temporal_patch_mode_requires_patch_layout():
     with pytest.raises(ValueError,match='patch-preserving'):
         EpisodicMemoryModule(8,0,4,patch_temporal=True)
+
+
+def test_value_preserving_retrieval_returns_raw_values_and_trains_selection():
+    from models.memory_bank import MemoryRetrieval
+    torch.manual_seed(23)
+    module=MemoryRetrieval(4,2).eval();module.value_preserving=True
+    query=torch.randn(2,4,requires_grad=True)
+    keys=torch.randn(2,3,4)
+    values=torch.randn(2,3,4)*3+7
+    single_mask=torch.tensor([[True,False,False],[False,True,False]])
+    out=module(query,keys,single_mask,values)
+    torch.testing.assert_close(out,torch.stack([values[0,0],values[1,1]]),rtol=0,atol=0)
+    selected=module(query,keys,torch.ones(2,3,dtype=torch.bool),values)
+    selected.square().sum().backward()
+    grad=module.retrieval_attn.in_proj_weight.grad
+    assert grad[:8].abs().sum()>0 and grad[8:].abs().sum()==0
+    assert module.ffn[-1].weight.grad is None and module.out_norm.weight.grad is None
+    assert module.retrieval_attn.out_proj.weight.grad is None
+
+
+@pytest.mark.parametrize('dtype',[torch.float32,torch.bfloat16])
+def test_raw_value_temporal_lookup_mixed_empty_rows_and_dtype(dtype):
+    memory=EpisodicMemoryModule(8,0,4,bank_len=3,patch_dim=4,
+                               patch_temporal=True,value_preserving=True).eval()
+    memory.reset(2,torch.device('cpu'))
+    p,s=torch.randn(2,8).to(dtype),torch.randn(2,4).to(dtype)
+    memory.observe_only(p,s,observed_mask=torch.tensor([True,False]))
+    query=torch.randn(2,2,4).to(dtype)
+    mask=torch.arange(3)[None]<memory._count[:,None]
+    with torch.autocast('cpu',dtype=dtype,enabled=dtype==torch.bfloat16):
+        out=memory._retrieve(memory.perceptual_retrieval,query,memory.perceptual_bank,mask,torch.ones(2,3))
+    assert out.dtype==dtype
+    torch.testing.assert_close(out[0],p[0].reshape(2,4),rtol=0,atol=0)
+    torch.testing.assert_close(out[1],query[1],rtol=0,atol=0)
+    assert not any(x.requires_grad for x in memory.perceptual_retrieval.ffn.parameters())
+
+
+def test_value_preserving_mode_rejects_conflicting_context_or_spatial_layout():
+    with pytest.raises(ValueError,match='combine'):
+        EpisodicMemoryModule(8,0,4,context_only=True,value_preserving=True)
+    with pytest.raises(ValueError,match='alignment'):
+        EpisodicMemoryModule(8,0,4,patch_dim=4,value_preserving=True)

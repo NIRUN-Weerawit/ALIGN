@@ -48,6 +48,7 @@ class MemoryRetrieval(nn.Module):
         )
         self.out_norm = nn.LayerNorm(dim)
         self.context_only = False
+        self.value_preserving = False
 
     def forward(self, query: torch.Tensor, bank_kv: torch.Tensor,
                 bank_mask: Optional[torch.Tensor] = None,
@@ -93,6 +94,26 @@ class MemoryRetrieval(nn.Module):
             attn_mask = ~bank_mask  # (B, L), True = padding (masked out)
         else:
             attn_mask = None
+
+        if self.value_preserving:
+            # Learn selection in Q/K space, but return raw encoded values in the
+            # representation already understood by a warm-started action head.
+            dim=self.retrieval_attn.embed_dim
+            heads=self.retrieval_attn.num_heads
+            weight,bias=self.retrieval_attn.in_proj_weight,self.retrieval_attn.in_proj_bias
+            q_proj=F.linear(q,weight[:dim],None if bias is None else bias[:dim])
+            k_proj=F.linear(bank_kv,weight[dim:2*dim],None if bias is None else bias[dim:2*dim])
+            q_proj=q_proj.reshape(B,q.shape[1],heads,dim//heads).transpose(1,2)
+            k_proj=k_proj.reshape(B,bank_kv.shape[1],heads,dim//heads).transpose(1,2)
+            with torch.autocast(device_type=query.device.type,enabled=False):
+                scores=q_proj.float()@k_proj.float().transpose(-1,-2)/(dim//heads)**.5
+                if attn_mask is not None:scores=scores.masked_fill(attn_mask[:,None,None],float('-inf'))
+                weights=scores.softmax(-1)
+                weights=F.dropout(weights,p=self.retrieval_attn.dropout,training=self.training)
+                values=bank_kv if bank_values is None else bank_values
+                out=weights.mean(1)@values.float()
+            out=out.to(query.dtype)
+            return out.squeeze(1) if query.ndim==2 else out
 
         # Use math SDPA backend for stability (same fix as align_model.py)
         try:
@@ -484,7 +505,11 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
     Bank buffers are episode-local state, never checkpoint parameters.
     """
     def __init__(self, perceptual_dim, cognitive_dim, state_dim, bank_len=16,
-                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False):
+                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False, value_preserving=False):
+        if value_preserving and context_only:
+            raise ValueError("Value-preserving retrieval replaces the FFN context branch; do not combine modes")
+        if value_preserving and patch_dim is not None and not patch_temporal:
+            raise ValueError("Value-preserving patch retrieval requires temporal spatial alignment")
         if bank_len < 2:
             raise ValueError('Episodic memory capacity must be at least two for consolidation')
         super().__init__(perceptual_dim,cognitive_dim,state_dim,bank_len,num_heads)
@@ -501,6 +526,11 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
         for retrieval in [self.perceptual_retrieval,self.state_retrieval,self.cognitive_retrieval]:
             if retrieval is not None:
                 retrieval.context_only = context_only
+                retrieval.value_preserving = value_preserving
+                if value_preserving:
+                    retrieval.ffn.requires_grad_(False)
+                    retrieval.out_norm.requires_grad_(False)
+                    retrieval.retrieval_attn.out_proj.requires_grad_(False)
         # Begin with balanced current/history fusion, rather than suppressing memory.
         for gate in [self.perceptual_gate,self.state_gate,self.cognitive_gate]:
             if gate is not None:

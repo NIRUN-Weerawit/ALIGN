@@ -47,7 +47,7 @@ def main():
         bank.patch_temporal=args.patch_temporal_override
     report=dict(checkpoint=str(args.checkpoint.resolve()),epoch=epoch,
                 frames=args.frames,episode_keys=[dataset._episode_keys[k] for k in indices],
-                context_only=model.memory_context_only,patch_temporal=bank.patch_temporal,saved_patch_temporal=model.memory_patch_temporal,
+                context_only=model.memory_context_only,value_preserving=model.memory_value_preserving,patch_temporal=bank.patch_temporal,saved_patch_temporal=model.memory_patch_temporal,
                 architecture_override=args.patch_temporal_override,
                 protocol='Zero current queries; cross-task values swapped; key ages held fixed; BF16 conditioning',
                 caveat='Feature sensitivity diagnostic, not action accuracy or policy success.',streams={})
@@ -72,7 +72,7 @@ def main():
             hook.remove()
             def rms(x):return x.float().square().mean().sqrt().item()
             report['streams'][name]=dict(bank_rms=rms(values),bank_donor_delta_rms=rms(values-values.roll(1,0)),
-                attention_donor_delta_rms=rms(outputs[0]-outputs[1]),retrieved_rms=rms(correct),
+                attention_donor_delta_rms=None if not outputs else rms(outputs[0]-outputs[1]),retrieved_rms=rms(correct),
                 retrieved_donor_delta_rms=rms(correct-wrong),
                 gated_donor_delta_rms=rms(gate(query,correct)-gate(query,wrong)))
     atomic_json(args.output,report)

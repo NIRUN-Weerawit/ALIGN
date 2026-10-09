@@ -80,6 +80,7 @@ class ALIGNIntentionModel(nn.Module):
         memory_patch_retrieval: bool = False,
         memory_context_only: bool = False,
         memory_patch_temporal: bool = False,
+        memory_value_preserving: bool = False,
         diffusion_train_steps: int = 100,
         diffusion_loss_repeats: int = 4,
         visual_token_attention: bool = False,
@@ -114,7 +115,10 @@ class ALIGNIntentionModel(nn.Module):
         if memory_patch_temporal and (not memory_patch_retrieval or memory_mode != "episodic"):
             raise ValueError("Temporal patch retrieval requires episodic patch memory")
         self.memory_context_only = memory_context_only
+        if memory_value_preserving and (memory_context_only or memory_mode != "episodic" or (memory_patch_retrieval and not memory_patch_temporal)):
+            raise ValueError("Value-preserving retrieval requires episodic mode, no context FFN, and temporal alignment for patch banks")
         self.memory_patch_temporal = memory_patch_temporal
+        self.memory_value_preserving = memory_value_preserving
         self.diffusion_train_steps = diffusion_train_steps
         self.diffusion_loss_repeats = diffusion_loss_repeats
         self.visual_token_attention = visual_token_attention
@@ -261,7 +265,7 @@ class ALIGNIntentionModel(nn.Module):
         if self.use_memory_bank:
             cognitive_dim = self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0
             memory_class = EpisodicMemoryModule if self.memory_mode == "episodic" else PerceptualCognitiveMemoryModule
-            memory_kwargs = dict(patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
+            memory_kwargs = dict(value_preserving=self.memory_value_preserving,patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
                                  patch_dim=self.compressed_dim if self.memory_patch_retrieval else None) if self.memory_mode == "episodic" else {}
             self.memory_module = memory_class(
                 perceptual_dim=pool_out_dim,
