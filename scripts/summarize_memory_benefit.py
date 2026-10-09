@@ -86,16 +86,53 @@ def summarize_gripper_controls(rows,draws=20000,seed=42):
     return result
 
 
+def compare_policies(primary_rows,comparison_rows,draws=20000,seed=42):
+    """Compare baseline predictions of two policies at all matched anchors."""
+    def index(rows):
+        selected=[r for r in rows if r['intervention']=='baseline']
+        out={(r['batch'],r['t']):r for r in selected}
+        if len(out)!=len(selected) or not out:raise ValueError('Invalid baseline anchors')
+        return out
+    a,z=index(primary_rows),index(comparison_rows)
+    if a.keys()!=z.keys():raise ValueError('Policy anchor sets differ')
+    clusters=sorted({b for b,t in a})
+    samples=np.random.default_rng(seed).integers(0,len(clusters),size=(draws,len(clusters)))
+    metrics={}
+    for metric in ['position_mse','rotation_mse','gripper_mse']:
+        left=np.array([np.mean([a[b,t][metric] for batch,t in a if batch==b]) for b in clusters])
+        right=np.array([np.mean([z[b,t][metric] for batch,t in z if batch==b]) for b in clusters])
+        delta=right-left
+        metrics[metric]=dict(primary=float(left.mean()),comparison=float(right.mean()),
+            error_reduction=float(delta.mean()),relative_error_reduction=float(delta.mean()/right.mean()) if right.mean()!=0 else None,
+            bootstrap_95_percent_interval=np.quantile(delta[samples].mean(1),[.025,.975]).tolist())
+    rows=[dict(r,intervention=arm) for indexed,arm in [(a,'baseline'),(z,'memory_bypass')] for r in indexed.values()]
+    gripper=summarize_gripper_controls(rows,draws,seed).get('normal_vs_bypass',{}).get('metrics',{})
+    return dict(batch_clusters=len(clusters),anchors=len(a),metrics=metrics,
+                gripper_recall={key:dict(primary=r['normal'],comparison=r['comparison'],
+                    recall_difference=r['recall_difference'],bootstrap_95_percent_interval=r['bootstrap_95_percent_interval'])
+                    for key,r in gripper.items()})
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--probe',type=Path,required=True,help='Per-memory-variant JSON with results and rows')
     p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--comparison-probe',type=Path,help='Optional other policy at identical episode/anchor/noise protocol')
     args=p.parse_args()
     rows=json.loads(args.probe.read_text())['rows']
     report=dict(source=str(args.probe.resolve()),
                 protocol='Correct vs cross-task shuffled histories, matched noise; empty-bank anchors excluded (direct prior-frame controls require an actual past frame); 20,000 paired batch-cluster bootstrap draws, seed 42.',
                 caveat='Rows aggregate episodes within batches. Intervals describe prediction errors, not simulator success. Statistical detectability alone does not establish practical benefit.',
                 cases=summarize(rows),gripper_controls=summarize_gripper_controls(rows))
+    if args.comparison_probe is not None:
+        primary=json.loads((args.probe.parent/'summary.json').read_text())['protocol']
+        comparison=json.loads((args.comparison_probe.parent/'summary.json').read_text())['protocol']
+        for key in ['episode_keys','batch_size','anchors','crops','episode_anchors','seed','precision','clipped_ddim']:
+            if key not in primary or key not in comparison or primary[key]!=comparison[key]:
+                raise ValueError(f'Policy comparison protocol mismatch: {key}')
+        report['comparison_source']=str(args.comparison_probe.resolve())
+        report['policy_comparison_protocol']='All matched baseline anchors, including empty-bank initial observations; equal batch-weight error means; primary-minus-comparison class recall; paired batch-cluster resampling.'
+        report['policy_comparison']=compare_policies(rows,json.loads(args.comparison_probe.read_text())['rows'])
     args.output.write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
 

@@ -1,5 +1,5 @@
 import pytest
-from scripts.summarize_memory_benefit import summarize, summarize_gripper_controls
+from scripts.summarize_memory_benefit import summarize, summarize_gripper_controls, compare_policies
 
 
 def row(batch,t,arm,error,count=16):
@@ -56,3 +56,17 @@ def test_gripper_old_reports_and_absent_classes_are_supported():
     result=summarize_gripper_controls(rows,draws=100)['normal_vs_bypass']['metrics']
     assert 'label_0_recall' not in result
     assert result['label_1_recall']['recall_difference']==0
+
+
+def test_policy_comparison_includes_initial_anchors_and_preserves_error_sign():
+    a=[row(b,t,'baseline',1,0) for b in range(3) for t in [0,20]]
+    z=[row(b,t,'baseline',2,0) for b in range(3) for t in [0,20]]
+    result=compare_policies(a,z,draws=100)
+    assert result['anchors']==6
+    assert result['metrics']['position_mse']['relative_error_reduction']==.5
+    assert result['metrics']['position_mse']['bootstrap_95_percent_interval']==[1,1]
+
+
+def test_policy_comparison_rejects_unmatched_or_duplicate_anchors():
+    with pytest.raises(ValueError,match='differ'):compare_policies([row(0,0,'baseline',1)],[row(0,1,'baseline',1)])
+    with pytest.raises(ValueError,match='Invalid'):compare_policies([row(0,0,'baseline',1)]*2,[row(0,0,'baseline',1)])
