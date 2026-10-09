@@ -42,7 +42,7 @@ def load_model(path, cameras):
     for key, default in [('num_intent_tokens',1),('mamba_d_state',16),('mamba_d_conv',4),('mamba_expand',2)]:
         kwargs[key] = c.get(key, default)
     for key,default in [('memory_mode','legacy'),('memory_detach_writes',False),('memory_write_fused',True),
-                        ('memory_field_masks',False),('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
+                        ('memory_perceptual_recency',0.),('memory_field_masks',False),('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False)]:
         kwargs[key] = c.get(key,default)
     model = ALIGNIntentionModel(action_dim=7, num_cameras=len(cameras), **kwargs)
     model._build_head_and_bank(c.get('pool_out_dim',256*len(cameras)*c['compressed_dim']))
@@ -214,6 +214,8 @@ def main():
     parser.add_argument('--run',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--batch-size',type=int,default=4)
+    parser.add_argument('--memory-perceptual-recency-override',type=float,default=None,
+                        help='Fixed-weight architecture intervention; checkpoint configuration stays unchanged')
     parser.add_argument("--visual-occlusion",action="store_true",help="Paired pre-retrieval latent camera/all-visual dropout, with correct/bypassed/shuffled history")
     parser.add_argument("--episode-anchors",action="store_true",help="Probe beginning, middle, and last valid common prefix timestep")
     parser.add_argument('--anchors',type=int,nargs='+',default=[0,6,12])
@@ -256,13 +258,21 @@ def main():
         previous_observation_control='No-intent/history-1 reference only: raw prior-frame visual/state embeddings go directly to the head; correct vs cross-task shuffled past; no t=0 rows',
         memory_shuffle='all bank streams swapped between distinct tasks/episodes, queries held fixed; baseline history restored',
         precision='BF16 conditioning/epsilon probes; FP32 DDIM denoiser and state',
+        perceptual_recency_override=args.memory_perceptual_recency_override,
         clipped_ddim='epsilon reconstructed from clipped clean estimate',
         caveat='Dependence and held-out action errors do not establish closed-loop benefit. Each checkpoint retains its configured diffusion schedule.'),variants={})
     for name in manifest['variants']:
         model,epoch = load_model(args.run/name/'intention_best.pt',cameras)
+        saved_recency=model.memory_perceptual_recency
+        if args.memory_perceptual_recency_override is not None and model.use_memory_bank:
+            import math
+            scale=args.memory_perceptual_recency_override
+            if not math.isfinite(scale) or scale<0 or model.memory_mode!='episodic' or not model.memory_value_preserving:
+                parser.error('Recency intervention requires a finite nonnegative scale and episodic raw-value memory')
+            model.memory_module.perceptual_recency_scale=scale
         print(f'{name} checkpoint epoch {epoch}',flush=True)
         results,rows = evaluate_variant(model,loader,set(args.anchors),manifest['seed']+20000,args.episode_anchors,args.visual_occlusion)
-        report['variants'][name] = dict(epoch=epoch,noise_probe_timesteps=[1,max(1,model.intention_head.num_train_timesteps//2),max(1,round(.9*model.intention_head.num_train_timesteps))],sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
+        report['variants'][name] = dict(epoch=epoch,saved_perceptual_recency=saved_recency,effective_perceptual_recency=0. if not model.use_memory_bank else model.memory_module.perceptual_recency_scale,noise_probe_timesteps=[1,max(1,model.intention_head.num_train_timesteps//2),max(1,round(.9*model.intention_head.num_train_timesteps))],sampling_timesteps=model.intention_head.sampling_timesteps().tolist(),results=results)
         atomic_json(args.output/(name+'.json'),dict(results=results,rows=rows))
         atomic_json(args.output/'summary.json',report)
         del model
@@ -280,6 +290,8 @@ def render_comparison(report):
         'Shuffles exchange distinct tasks. Values are dataset action units. Intent interventions change final head tokens; memory interventions change retrieval.',
         '', '| Model | Intervention | Position delta RMS | Rotation delta RMS | Gripper delta RMS | Gripper flips | Position MSE | Gripper accuracy |',
         '|---|---|---:|---:|---:|---:|---:|---:|']
+    if report['protocol'].get('perceptual_recency_override') is not None:
+        lines.insert(2,f"Fixed-weight architecture intervention: perceptual recency scale {report['protocol']['perceptual_recency_override']}; no retraining or deployed-policy acceptance.")
     for name,v in report['variants'].items():
         for intervention,r in v['results'].items():
             lines.append(f"| {name} | {intervention} | {r['position_action_delta_rms']:.6f} | {r['rotation_action_delta_rms']:.6f} | {r['gripper_action_delta_rms']:.6f} | {r['gripper_flip_fraction']:.1%} | {r['position_action_mse']:.6f} | {r['gripper_accuracy']:.1%} |")

@@ -346,7 +346,7 @@ def build_model(args, num_cameras, device):
         use_memory_bank=args.use_memory_bank,
         memory_bank_len=args.memory_bank_len,
         memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
-        memory_field_masks=getattr(args,"memory_field_masks",False),memory_pre_state_visual=getattr(args,"memory_pre_state_visual",False),memory_value_preserving=getattr(args,"memory_value_preserving",False),memory_patch_temporal=getattr(args,"memory_patch_temporal",False),memory_context_only=getattr(args,"memory_context_only",False),memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
+        memory_perceptual_recency=getattr(args,"memory_perceptual_recency",0.),memory_field_masks=getattr(args,"memory_field_masks",False),memory_pre_state_visual=getattr(args,"memory_pre_state_visual",False),memory_value_preserving=getattr(args,"memory_value_preserving",False),memory_patch_temporal=getattr(args,"memory_patch_temporal",False),memory_context_only=getattr(args,"memory_context_only",False),memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
         diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
         visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample,
     )
@@ -1216,6 +1216,7 @@ def parse_args():
     parser.add_argument("--memory-mode",choices=["legacy","episodic"],default="episodic")
     parser.add_argument("--memory-detach-writes",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--memory-write-fused",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--memory-perceptual-recency",type=float,default=0.,help="Experimental visual attention logit penalty per frame of age; zero preserves checkpoint behavior")
     parser.add_argument("--memory-field-masks",action=argparse.BooleanOptionalAction,default=False,help="Exclude zero-marked missing fields from retrieval and preserve valid fields during consolidation")
     parser.add_argument("--memory-pre-state-visual",action=argparse.BooleanOptionalAction,default=False,help="Store state-independent compressed visual features, then apply current state after retrieval")
     parser.add_argument("--memory-value-preserving",action=argparse.BooleanOptionalAction,default=False,help="Experimental learned Q/K selection with raw historical feature values, bypassing value projections and FFN")

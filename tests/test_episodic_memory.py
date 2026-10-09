@@ -435,3 +435,32 @@ def test_field_masks_full_observation_parity_and_bfloat16_writes(device):
     torch.testing.assert_close(new.perceptual_times,old.timestamps[:,:,None].expand(2,4,2))
     new.observe_only(torch.zeros_like(p),s,c)
     assert torch.isfinite(new.perceptual_bank).all()
+
+
+def test_perceptual_recency_prior_prefers_recent_values_without_changing_state_read():
+    bank=EpisodicMemoryModule(4,0,4,bank_len=2,value_preserving=True,
+        perceptual_recency_scale=1/16)
+    for retrieval in [bank.perceptual_retrieval,bank.state_retrieval]:
+        retrieval.retrieval_attn.in_proj_weight.data.zero_()
+        retrieval.retrieval_attn.in_proj_bias.data.zero_()
+    bank.reset(1,torch.device('cpu'));p=torch.ones(1,4)
+    bank.observe_only(p,p,timestamp=torch.tensor([0.]))
+    bank.observe_only(3*p,3*p,timestamp=torch.tensor([31.]))
+    ages=torch.tensor([[32.,1.]]);mask=torch.ones(1,2,dtype=torch.bool)
+    old_weight=torch.sigmoid(torch.tensor(-31/16))
+    visual=bank._retrieve(bank.perceptual_retrieval,0*p,bank.perceptual_bank,mask,ages)
+    state=bank._retrieve(bank.state_retrieval,0*p,bank.state_bank,mask,ages)
+    torch.testing.assert_close(visual,(3-2*old_weight)*p)
+    torch.testing.assert_close(state,2*p)
+
+
+def test_raw_attention_bias_preserves_mixed_empty_identity_and_rejects_legacy_mode():
+    from models.memory_bank import MemoryRetrieval
+    retrieval=MemoryRetrieval(4,2).eval();retrieval.value_preserving=True
+    query=torch.randn(2,4);values=torch.randn(2,2,4)
+    mask=torch.tensor([[True,False],[False,False]])
+    output=retrieval(query,values,mask,values,torch.tensor([[-10.,0.],[-10.,0.]]))
+    torch.testing.assert_close(output[0],values[0,0])
+    assert torch.equal(output[1],query[1])
+    retrieval.value_preserving=False
+    with pytest.raises(ValueError,match='raw-value'):retrieval(query,values,mask,attention_bias=torch.zeros(2,2))

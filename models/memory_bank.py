@@ -52,7 +52,8 @@ class MemoryRetrieval(nn.Module):
 
     def forward(self, query: torch.Tensor, bank_kv: torch.Tensor,
                 bank_mask: Optional[torch.Tensor] = None,
-                bank_values: Optional[torch.Tensor] = None) -> torch.Tensor:
+                bank_values: Optional[torch.Tensor] = None,
+                attention_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Retrieve from memory bank.
 
         Args:
@@ -63,6 +64,8 @@ class MemoryRetrieval(nn.Module):
             (B, dim) — retrieved context with residual
         """
         B = query.shape[0]
+        if attention_bias is not None and not self.value_preserving:
+            raise ValueError('Attention bias requires raw-value retrieval')
         q = query.unsqueeze(1) if query.ndim == 2 else query
 
         # Handle empty bank: return query directly
@@ -84,6 +87,7 @@ class MemoryRetrieval(nn.Module):
                 out[nonempty] = self.forward(
                     query[nonempty], bank_kv[nonempty], bank_mask[nonempty],
                     None if bank_values is None else bank_values[nonempty],
+                    None if attention_bias is None else attention_bias[nonempty],
                 )
                 return out
 
@@ -107,6 +111,7 @@ class MemoryRetrieval(nn.Module):
             k_proj=k_proj.reshape(B,bank_kv.shape[1],heads,dim//heads).transpose(1,2)
             with torch.autocast(device_type=query.device.type,enabled=False):
                 scores=q_proj.float()@k_proj.float().transpose(-1,-2)/(dim//heads)**.5
+                if attention_bias is not None:scores=scores+attention_bias.float()[:,None,None,:]
                 if attn_mask is not None:scores=scores.masked_fill(attn_mask[:,None,None],float('-inf'))
                 weights=scores.softmax(-1)
                 weights=F.dropout(weights,p=self.retrieval_attn.dropout,training=self.training)
@@ -505,7 +510,9 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
     Bank buffers are episode-local state, never checkpoint parameters.
     """
     def __init__(self, perceptual_dim, cognitive_dim, state_dim, bank_len=16,
-                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False, value_preserving=False, mask_missing_fields=False):
+                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False, value_preserving=False, mask_missing_fields=False, perceptual_recency_scale=0.):
+        if not __import__('math').isfinite(perceptual_recency_scale) or perceptual_recency_scale<0 or (perceptual_recency_scale>0 and not value_preserving):
+            raise ValueError('Perceptual recency scale must be finite, nonnegative, and requires raw-value retrieval')
         if mask_missing_fields and write_fused:
             raise ValueError('Missing-field masks require raw observation writes')
         if value_preserving and context_only:
@@ -517,6 +524,7 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
         super().__init__(perceptual_dim,cognitive_dim,state_dim,bank_len,num_heads)
         self.detach_writes, self.write_fused = detach_writes,write_fused
         self.mask_missing_fields = mask_missing_fields
+        self.perceptual_recency_scale = perceptual_recency_scale
         if patch_temporal and patch_dim is None:
             raise ValueError("Temporal patch retrieval requires patch-preserving memory")
         self.patch_dim = patch_dim
@@ -562,6 +570,8 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
 
     def _retrieve(self,module,query,bank,mask,age):
         values = bank.clone()
+        def recency_bias(ages):
+            return {'attention_bias':-self.perceptual_recency_scale*ages} if self.perceptual_recency_scale>0 and module is self.perceptual_retrieval else {}
         if bank.ndim==4:
             B,L,N,D = bank.shape
             age_features = self.age_encoding(age,D).to(values.dtype)
@@ -574,7 +584,8 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
                 temporal_values = values.permute(0,2,1,3).reshape(B*N,L,D)
                 temporal_keys = (values + age_features).permute(0,2,1,3).reshape(B*N,L,D)
                 temporal_mask = patch_mask.permute(0,2,1).reshape(B*N,L)
-                result = module(query.reshape(B*N,D),temporal_keys,temporal_mask,temporal_values).reshape(B,N,D)
+                temporal_age=(age if age.ndim==3 else age[:,:,None].expand(B,L,N)).permute(0,2,1).reshape(B*N,L)
+                result = module(query.reshape(B*N,D),temporal_keys,temporal_mask,temporal_values,**recency_bias(temporal_age)).reshape(B,N,D)
                 return torch.where(patch_mask.any(1)[:,:,None],result,query)
             keys = values + age_features
             # Spatial position remains separate from the recorded observation age.
@@ -584,7 +595,7 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
             result = module(q,keys.reshape(B,L*N,D),patch_mask.reshape(B,L*N),values.reshape(B,L*N,D))
             return torch.where(patch_mask.flatten(1).any(1)[:,None,None],result,query)
         keys = values + self.age_encoding(age,bank.shape[-1]).to(values.dtype)
-        return module(query,keys,mask,values)
+        return module(query,keys,mask,values,**recency_bias(age))
 
     def _write(self,p,s,c,timestamp,observed_mask):
         B = p.shape[0]
