@@ -252,6 +252,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Optimizer steps per epoch; 0 uses the full training loader.")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--head-window-batch-size", type=int, default=2,
+                        help="Group this many supervised anchors per diffusion/flow loss call after ordered memory retrieval; 1 restores one loss call per anchor.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cameras", nargs="+", default=["image", "wrist_image"])
     parser.add_argument("--validation-fraction", type=float, default=0.1)
@@ -285,7 +287,7 @@ def parse_args(argv=None):
     for name in ("epochs", "batch_size", "history_size", "chunk_size", "segment_length",
                  "state_dim", "compressed_dim", "head_d_model", "mamba_output_dim",
                  "mamba_d_state", "mamba_d_conv", "mamba_expand", "num_intent_tokens",
-                 "intent_dim", "memory_bank_len", "cpu_threads"):
+                 "intent_dim", "memory_bank_len", "cpu_threads", "head_window_batch_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.segment_length < args.history_size + args.chunk_size:
@@ -384,7 +386,7 @@ def main(argv=None):
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
                                memory_perceptual_recency=0.,memory_field_masks=False,memory_pre_state_visual=False,memory_value_preserving=False,memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
-                               use_task_text=False,text_dim=128,text_vocab=[])
+                               use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=1)
         for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
@@ -392,7 +394,7 @@ def main(argv=None):
                     "use_task_text", "text_dim", "text_vocab",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
-                    "memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views"):
+                    "memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         manifest = dict(manifest, **previous)
@@ -473,7 +475,8 @@ def main(argv=None):
         loop_args = SimpleNamespace(history_size=args.history_size, chunk_size=args.chunk_size,
             action_dim=7, head_type=args.head_type, skip_nan=False, grad_clip=args.grad_clip,
             no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,
-            gripper_loss_weight=args.gripper_loss_weight)
+            gripper_loss_weight=args.gripper_loss_weight,
+            head_window_batch_size=args.head_window_batch_size)
         val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
             num_workers=0, pin_memory=True, collate_fn=collate_segments)
         run = out / name

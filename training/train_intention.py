@@ -392,7 +392,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         text_emb = model.encode_task_text(batch["texts"]) if getattr(model, "text_condition", None) is not None else None
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
-        seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
+        # Keep length/anchor bookkeeping on CPU. Moving a tiny mask to CUDA is
+        # cheap; calling .any()/.sum().item() on a CUDA mask at every anchor
+        # would serialize the GPU with the host once or twice per window.
+        seg_lens_cpu = torch.as_tensor(batch["segment_len"])  # (B,)
+        seg_lens = seg_lens_cpu.to(device, non_blocking=True)
         # print(f"seg_lens: {seg_lens}")
         # Reset memory bank at start of segment
         if model.use_memory_bank:
@@ -470,6 +474,21 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_pred = None
         loss_accum = []
         valid_counts = []
+        # The memory bank (when enabled) must still be read and written in
+        # observation order. Once each anchor's condition has been produced,
+        # however, the per-example diffusion/flow objective is independent and
+        # can be evaluated in small groups. This avoids one U-Net launch per
+        # supervised anchor without changing the sample-weighted objective.
+        head_window_batch_size = max(1, int(getattr(args, "head_window_batch_size", 1)))
+        batch_head_losses = (
+            head_window_batch_size > 1
+            and args.head_type in ("diffusion", "flow_matching")
+            and getattr(args, "no_sample_during_train", False)
+            and not getattr(args, "skip_nan", False)
+        )
+        pending_head_conds = []
+        pending_head_targets = []
+        pending_head_count = 0
         max_seg_len = S
         if model.use_history:
             num_windows = max_seg_len - Hs - chunk_size + 2
@@ -500,11 +519,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     current_t = n
                     history_start = n
                     history_end = n + 1
-                valid_mask = seg_lens >= (current_t + chunk_size)
+                valid_mask_cpu = seg_lens_cpu >= (current_t + chunk_size)
                 if "loss_anchor_mask" in batch:
-                    selected = torch.as_tensor(batch["loss_anchor_mask"][:,current_t],device=device)
-                    valid_mask = valid_mask & selected
-                    if not valid_mask.any():
+                    selected = torch.as_tensor(batch["loss_anchor_mask"][:,current_t], dtype=torch.bool)
+                    valid_mask_cpu = valid_mask_cpu & selected
+                    if not bool(valid_mask_cpu.any()):
                         if model.use_memory_bank:
                             p_context = z_v_mod_all[:,current_t].flatten(1)
                             c_context = intent_sequence[:,current_t] if intent_sequence is not None else None
@@ -516,9 +535,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                                 else:
                                     model.condition_actions(p_context[:,None],z_s_all[:,current_t:current_t+1],c_context,observed)
                         continue
-                if not valid_mask.any():
+                if not bool(valid_mask_cpu.any()):
                     # No valid samples in this window, skip
                     continue
+                valid_count = int(valid_mask_cpu.sum())
+                valid_mask = valid_mask_cpu.to(device, non_blocking=True)
 
                 z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
                 z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
@@ -562,24 +583,51 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                                       f"finite: {torch.isfinite(actions_pred).all().item()}, "
                                       f"abs.mean: {actions_pred.detach().abs().mean().item()}")
                             assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
-                        loss = model.intention_head.loss(
-                            target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
-                        )
+                        if batch_head_losses:
+                            pending_head_conds.append(cond[valid_mask])
+                            pending_head_targets.append(target[valid_mask])
+                            pending_head_count += valid_count
+                            loss = None
+                            if len(pending_head_conds) >= head_window_batch_size:
+                                group_cond = torch.cat(pending_head_conds, dim=0)
+                                group_target = torch.cat(pending_head_targets, dim=0)
+                                group_loss = model.intention_head.loss(
+                                    group_target, group_cond, dim_weights=dim_weights,
+                                )
+                                loss_accum.append(group_loss)
+                                valid_counts.append(pending_head_count)
+                                pending_head_conds.clear()
+                                pending_head_targets.clear()
+                                pending_head_count = 0
+                        else:
+                            loss = model.intention_head.loss(
+                                target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
+                            )
                         if getattr(args, "debug", False):
-                            print(f"[DEBUG] loss: {loss.item()}")
+                            print(f"[DEBUG] loss: {loss.item() if loss is not None else 'batched'}")
                     else:
                         actions_pred = model.predict_actions(
                             z_v_win_for_head, z_s_win_for_head, h_for_head,
                         )
                         loss = F.mse_loss(actions_pred, target, reduction='none')
-                        loss = loss[valid_mask].mean() if valid_mask.any() else loss.mean()
+                        loss = loss[valid_mask].mean()
 
-                if args.skip_nan and not torch.isfinite(loss):
+                if loss is not None and args.skip_nan and not torch.isfinite(loss):
                     continue
 
-                loss_accum.append(loss)
-                valid_counts.append(int(valid_mask.sum().item()))
+                if loss is not None:
+                    loss_accum.append(loss)
+                    valid_counts.append(valid_count)
                 last_actions_pred = actions_pred
+
+            if pending_head_conds:
+                group_cond = torch.cat(pending_head_conds, dim=0)
+                group_target = torch.cat(pending_head_targets, dim=0)
+                group_loss = model.intention_head.loss(
+                    group_target, group_cond, dim_weights=dim_weights,
+                )
+                loss_accum.append(group_loss)
+                valid_counts.append(pending_head_count)
 
         # One optimizer step per segment, averaged over valid sample/windows.
         if loss_accum:
