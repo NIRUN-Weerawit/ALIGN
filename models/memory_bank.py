@@ -72,30 +72,14 @@ class MemoryRetrieval(nn.Module):
         if bank_kv.shape[1] == 0:
             return query
 
-        # Handle bank with all masked entries (no valid entries to attend to).
-        # This happens when the bank is empty (no entries stored yet) and we still
-        # want to query it. Without this check, the attention softmax would be
-        # all-masked → NaN, which propagates through the FFN.
-        if bank_mask is not None and not bank_mask.any():
-            return query
-
+        nonempty = None
         if bank_mask is not None:
             nonempty = bank_mask.any(dim=1)
-            if not nonempty.all():
-                # An empty sample must not enter an all-masked softmax.
-                out = query.clone()
-                out[nonempty] = self.forward(
-                    query[nonempty], bank_kv[nonempty], bank_mask[nonempty],
-                    None if bank_values is None else bank_values[nonempty],
-                    None if attention_bias is None else attention_bias[nonempty],
-                )
-                return out
-
-        # Attention mask: True = attend, False = don't attend
-        # nn.MultiheadAttention expects key_padding_mask where True = masked
-        if bank_mask is not None:
-            # bank_mask: True = valid → invert for key_padding_mask
-            attn_mask = ~bank_mask  # (B, L), True = padding (masked out)
+            # Avoid all-masked softmax rows without branching on CUDA values.
+            # Empty rows temporarily attend to slot zero, then return query.
+            safe_bank_mask = bank_mask.clone()
+            safe_bank_mask[:, 0] |= ~nonempty
+            attn_mask = ~safe_bank_mask
         else:
             attn_mask = None
 
@@ -118,6 +102,9 @@ class MemoryRetrieval(nn.Module):
                 values=bank_kv if bank_values is None else bank_values
                 out=weights.mean(1)@values.float()
             out=out.to(query.dtype)
+            if nonempty is not None:
+                keep = nonempty.view(B, *([1] * (out.ndim - 1)))
+                out = torch.where(keep, out, q)
             return out.squeeze(1) if query.ndim==2 else out
 
         # Use math SDPA backend for stability (same fix as align_model.py)
@@ -141,6 +128,9 @@ class MemoryRetrieval(nn.Module):
         ffn_in = torch.cat([residual, attn_out], dim=-1)  # (B, 1, 2*dim)
         ffn_out = self.ffn(ffn_in)  # (B, 1, dim)
         out = self.out_norm(ffn_out + residual)
+        if nonempty is not None:
+            keep = nonempty.view(B, *([1] * (out.ndim - 1)))
+            out = torch.where(keep, out, q)
         return out.squeeze(1) if query.ndim == 2 else out
 
 
@@ -665,7 +655,10 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
             raise ValueError('Memory timestamps must have one value per episode row')
         observed = torch.ones_like(timestamp,dtype=torch.bool) if observed_mask is None else observed_mask.bool()
         invalid = ~torch.isfinite(timestamp) | (timestamp < self._next_timestep)
-        if bool((observed & invalid).any()):
+        valid = ~(observed & invalid).any()
+        if timestamp.device.type == 'cuda' and hasattr(torch, '_assert_async'):
+            torch._assert_async(valid, 'Memory observations must have finite, strictly increasing timestamps; reset at episode boundaries')
+        elif not bool(valid):
             raise ValueError('Memory observations must have finite, strictly increasing timestamps; reset at episode boundaries')
         return timestamp
 

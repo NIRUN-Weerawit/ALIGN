@@ -998,7 +998,10 @@ def validate(model, loader, device, args):
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         target_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
 
-        seg_lens = torch.as_tensor(batch["segment_len"], device=device)# (B,)
+        # Keep length/anchor filtering on CPU. Copying a tiny validity mask from
+        # CUDA to ask whether it is empty would synchronize every T-loop step.
+        seg_lens_cpu = torch.as_tensor(batch["segment_len"], dtype=torch.long)
+        seg_lens = seg_lens_cpu.to(device, non_blocking=True)
 
         # Reset memory bank at start of segment
         if model.use_memory_bank:
@@ -1063,6 +1066,14 @@ def validate(model, loader, device, args):
         actions_pred = None
         loss_accum = []
         valid_counts = []
+        sample_conditions = []
+        sample_targets = []
+        metric_predictions = []
+        metric_targets = []
+        grip_correct_segment = torch.zeros((), device=device, dtype=torch.float64)
+        grip_total_segment = 0
+        padded_segment = 0
+        genuine_segment = 0
         max_seg_len = S
         if model.use_history:
             num_windows = max_seg_len - Hs - chunk_size + 2
@@ -1089,11 +1100,11 @@ def validate(model, loader, device, args):
                     current_t = n
                     history_start = n
                     history_end = n + 1
-                valid_mask = seg_lens >= (current_t + chunk_size)
+                valid_mask_cpu = seg_lens_cpu >= (current_t + chunk_size)
                 if "loss_anchor_mask" in batch:
-                    selected = torch.as_tensor(batch["loss_anchor_mask"][:,current_t],device=device)
-                    valid_mask = valid_mask & selected
-                    if not valid_mask.any():
+                    selected_cpu = torch.as_tensor(batch["loss_anchor_mask"][:,current_t], dtype=torch.bool)
+                    valid_mask_cpu = valid_mask_cpu & selected_cpu
+                    if not bool(valid_mask_cpu.any()):
                         if model.use_memory_bank:
                             p_context = z_v_mod_all[:,current_t].flatten(1)
                             c_context = intent_sequence[:,current_t] if intent_sequence is not None else None
@@ -1105,8 +1116,9 @@ def validate(model, loader, device, args):
                                 else:
                                     model.condition_actions(p_context[:,None],z_s_all[:,current_t:current_t+1],c_context,observed)
                         continue
-                if not valid_mask.any():
+                elif not bool(valid_mask_cpu.any()):
                     continue
+                valid_mask = valid_mask_cpu.to(device, non_blocking=True)
 
                 z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
                 z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
@@ -1132,8 +1144,6 @@ def validate(model, loader, device, args):
                     if args.head_type in ("diffusion", "flow_matching"):
                         cond = (model.action_condition(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb)
                                 if text_emb is not None else model.intention_head(z_v_win_for_head, z_s_win_for_head, h_for_head))
-                        actions_pred = (model.sample_actions(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb=text_emb)
-                                        if text_emb is not None else model.sample_actions(z_v_win_for_head, z_s_win_for_head, h_for_head))
                         loss = model.intention_head.loss(
                             target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
                         )
@@ -1142,51 +1152,68 @@ def validate(model, loader, device, args):
                             z_v_win_for_head, z_s_win_for_head, h_for_head,
                         )
                         loss = F.mse_loss(actions_pred, target, reduction='none')
-                        loss = loss[valid_mask].mean() if valid_mask.any() else loss.mean()
+                        loss = loss[valid_mask].mean()
 
                 if args.skip_nan and not torch.isfinite(loss):
                     continue
 
                 loss_accum.append(loss)
-                valid_counts.append(int(valid_mask.sum().item()))
+                valid_count = int(valid_mask_cpu.sum())
+                valid_counts.append(valid_count)
                 last_actions_pred = actions_pred
 
-                # Accumulate every valid prediction window, excluding padded samples.
-                actions_pred = actions_pred[valid_mask]
-                target = target[valid_mask]
-                if actions_pred.shape[-1] < target.shape[-1]:
-                    pad = target[..., actions_pred.shape[-1]:].detach().float().cpu().numpy()
-                    actions_pred_for_metric = np.concatenate(
-                        [actions_pred.detach().float().cpu().numpy(), pad], axis=-1,
-                    )
-                    padded_gripper_batches += 1
+                # Generative sampling uses a fixed number of denoising steps;
+                # sampling all valid anchors together improves GPU utilization.
+                if args.head_type in ("diffusion", "flow_matching"):
+                    sample_conditions.append(cond[valid_mask])
+                    sample_targets.append(target[valid_mask])
                 else:
-                    actions_pred_for_metric = actions_pred.detach().float().cpu().numpy()
-                target_np = target.detach().float().cpu().numpy()
-                diff = actions_pred_for_metric - target_np  # (B, T, D)
-                B_win, T, D = diff.shape
-                if per_dim_squared is None:
-                    per_dim_squared = np.zeros(D, dtype=np.float64)
-                    per_dim_abs = np.zeros(D, dtype=np.float64)
-                per_dim_squared += (diff ** 2).sum(axis=(0, 1))  # (D,)
-                per_dim_abs += np.abs(diff).sum(axis=(0, 1))      # (D,)
-                n_samples += B_win * T
-
-                # Gripper accuracy (only meaningful if model output has >=7 dims
-                # AND the model is actually predicting gripper, not just padded).
-                if actions_pred.shape[-1] >= 7 and target.shape[-1] >= 7:
-                    genuine_gripper_batches += 1
-                    grip_pred = actions_pred[..., 6]  # model's gripper prediction
-                    grip_target = target[..., 6]
-                    grip_pred_binary = (grip_pred > getattr(args, "gripper_threshold", 0.5)).float()
-                    grip_target_binary = (grip_target > 0).float()
-                    grip_correct = (grip_pred_binary == grip_target_binary).float().sum().item()
-                    grip_total = B_win * T
-                    grip_correct_total += grip_correct
-                    grip_total_total += grip_total
+                    pred_valid = actions_pred[valid_mask]
+                    target_valid = target[valid_mask]
+                    metric_predictions.append(pred_valid)
+                    metric_targets.append(target_valid)
+                    if pred_valid.shape[-1] < target_valid.shape[-1]:
+                        padded_segment += 1
+                    if pred_valid.shape[-1] >= 7 and target_valid.shape[-1] >= 7:
+                        genuine_segment += 1
+                        grip_pred_binary = (pred_valid[..., 6] > getattr(args, "gripper_threshold", 0.5))
+                        grip_target_binary = target_valid[..., 6] > 0
+                        grip_correct_segment += (grip_pred_binary == grip_target_binary).sum()
+                        grip_total_segment += valid_count * target_valid.shape[1]
 
         # Accumulate metrics across all windows in this segment
         if loss_accum:
+            if args.head_type in ("diffusion", "flow_matching") and sample_conditions:
+                sampled = model.intention_head.sample(torch.cat(sample_conditions, dim=0))
+                metric_predictions = [sampled]
+                metric_targets = [torch.cat(sample_targets, dim=0)]
+                # Keep the existing avg-action diagnostic's last-window meaning.
+                actions_pred = sampled[-sample_conditions[-1].shape[0]:]
+                if sampled.shape[-1] < metric_targets[0].shape[-1]:
+                    padded_segment = len(sample_conditions)
+                if sampled.shape[-1] >= 7 and metric_targets[0].shape[-1] >= 7:
+                    genuine_segment = len(sample_conditions)
+                    grip_pred_binary = sampled[..., 6] > getattr(args, "gripper_threshold", 0.5)
+                    grip_target_binary = metric_targets[0][..., 6] > 0
+                    grip_correct_segment = (grip_pred_binary == grip_target_binary).sum()
+                    grip_total_segment = sampled.shape[0] * sampled.shape[1]
+
+            pred_all = torch.cat(metric_predictions, dim=0).float()
+            target_all = torch.cat(metric_targets, dim=0).float()
+            if pred_all.shape[-1] < target_all.shape[-1]:
+                pred_all = torch.cat([pred_all, target_all[..., pred_all.shape[-1]:]], dim=-1)
+            diff = (pred_all - target_all).detach().cpu().numpy()
+            B_win, T, D = diff.shape
+            if per_dim_squared is None:
+                per_dim_squared = np.zeros(D, dtype=np.float64)
+                per_dim_abs = np.zeros(D, dtype=np.float64)
+            per_dim_squared += (diff ** 2).sum(axis=(0, 1))
+            per_dim_abs += np.abs(diff).sum(axis=(0, 1))
+            n_samples += B_win * T
+            padded_gripper_batches += padded_segment
+            genuine_gripper_batches += genuine_segment
+            grip_correct_total += float(grip_correct_segment.item())
+            grip_total_total += grip_total_segment
             avg_window_loss = (sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / sum(valid_counts)).item()
             losses.append(avg_window_loss)
             actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
