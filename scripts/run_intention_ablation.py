@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -61,10 +61,18 @@ class CachedEpisodes(Dataset):
     def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False):
         self.dataset, self.episodes = dataset, episodes
         self.length, self.seed, self.training = length, seed, training
-        self.epoch = 0
+        self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
         self.temporal_sampling, self.supervision_points, self.chunk_size = temporal_sampling, supervision_points, chunk_size
         self.observation_dropout_prob = observation_dropout_prob
         self.drop_state_with_all_views = drop_state_with_all_views
+
+    @property
+    def epoch(self):
+        return int(self._epoch.item())
+
+    @epoch.setter
+    def epoch(self, value):
+        self._epoch.fill_(int(value))
 
     def __len__(self):
         return len(self.episodes)
@@ -83,7 +91,9 @@ class CachedEpisodes(Dataset):
             if available<1:raise ValueError('Episode shorter than action horizon')
             anchors = np.zeros(n,dtype=bool)
             anchors[rng.choice(available,min(available,self.supervision_points),replace=False)] = True
-        frames = self.dataset._read_frames_dinov2(ep, start, length)
+        read_features = getattr(self.dataset, "_read_frames_dinov2_view",
+                                self.dataset._read_frames_dinov2)
+        frames = read_features(ep, start, length)
         poses = self.dataset._read_poses(ep, start, length)
         gripper = self.dataset._read_poses_gripper(ep, start, length)
         states = np.concatenate([poses[:, :6], gripper[:, None]], axis=1)
@@ -111,16 +121,61 @@ def collate_segments(items):
     result = {"segment_len": np.array([x["segment_len"] for x in items])}
     result["texts"] = [x.get("text", "") for x in items]
     for key in ("frames_segment", "states_segment", "actions_segment"):
-        rows = []
-        for item in items:
+        first = items[0][key]
+        batch = np.zeros((len(items), length, *first.shape[1:]), dtype=first.dtype)
+        for index, item in enumerate(items):
             arr = item[key]
-            pad = [(0, length - len(arr))] + [(0, 0)] * (arr.ndim - 1)
-            rows.append(np.pad(arr, pad))
-        result[key] = torch.from_numpy(np.stack(rows))
+            batch[index, :len(arr)] = arr
+        result[key] = torch.from_numpy(batch)
     for key in ("loss_anchor_mask","observation_timesteps","observation_camera_mask","observation_state_mask"):
         if key in items[0]:
-            result[key] = torch.from_numpy(np.stack([np.pad(x[key],[(0,length-len(x[key]))]+[(0,0)]*(x[key].ndim-1)) for x in items]))
+            first = items[0][key]
+            batch = np.zeros((len(items), length, *first.shape[1:]), dtype=first.dtype)
+            for index, item in enumerate(items):
+                arr = item[key]
+                batch[index, :len(arr)] = arr
+            result[key] = torch.from_numpy(batch)
     return result
+
+
+class LengthBucketBatchSampler(Sampler):
+    """Randomize inside length-sorted pools to limit padding between batches."""
+    def __init__(self, lengths, batch_size, seed, bucket_multiplier=20, drop_last=True):
+        self.lengths = list(map(int, lengths))
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.bucket_size = max(self.batch_size, self.batch_size * int(bucket_multiplier))
+        self.drop_last = bool(drop_last)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        randomized = torch.randperm(len(self.lengths), generator=generator).tolist()
+        random_rank = {index: rank for rank, index in enumerate(randomized)}
+        if self.drop_last:
+            keep = len(randomized) - len(randomized) % self.batch_size
+            randomized = randomized[:keep]
+        order = sorted(randomized, key=lambda index: (self.lengths[index], random_rank[index]))
+        batches = []
+        for start in range(0, len(order), self.bucket_size):
+            pool = order[start:start + self.bucket_size]
+            pool_order = torch.randperm(len(pool), generator=generator).tolist()
+            shuffled_pool = [pool[index] for index in pool_order]
+            batches.extend(shuffled_pool[i:i + self.batch_size]
+                           for i in range(0, len(shuffled_pool), self.batch_size)
+                           if not self.drop_last or len(pool[i:i + self.batch_size]) == self.batch_size)
+        if batches:
+            permutation = torch.randperm(len(batches), generator=generator).tolist()
+            for index in permutation:
+                yield batches[index]
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
 
 
 def atomic_json(path, value):
@@ -252,6 +307,12 @@ def parse_args(argv=None):
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Optimizer steps per epoch; 0 uses the full training loader.")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="DataLoader processes; HDF5 handles are reopened per worker.")
+    parser.add_argument("--prefetch-factor", type=int, default=1,
+                        help="Batches prefetched per worker when --num-workers is positive.")
+    parser.add_argument("--length-bucket-multiplier", type=int, default=20,
+                        help="Randomize and batch inside length-sorted pools of this many batches.")
     parser.add_argument("--head-window-batch-size", type=int, default=2,
                         help="Group this many supervised anchors per diffusion/flow loss call after ordered memory retrieval; 1 restores one loss call per anchor.")
     parser.add_argument("--seed", type=int, default=42)
@@ -290,6 +351,8 @@ def parse_args(argv=None):
                  "intent_dim", "memory_bank_len", "cpu_threads", "head_window_batch_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.num_workers < 0 or args.prefetch_factor < 1 or args.length_bucket_multiplier < 1:
+        parser.error("--num-workers must be nonnegative; prefetch and bucket multipliers must be positive")
     if args.segment_length < args.history_size + args.chunk_size:
         parser.error("Segment must contain both history and action chunk")
     if args.chunk_size < 4:
@@ -386,7 +449,8 @@ def main(argv=None):
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
                                memory_perceptual_recency=0.,memory_field_masks=False,memory_pre_state_visual=False,memory_value_preserving=False,memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
-                               use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2)
+                               use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
+                               length_bucket_multiplier=20)
         for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
@@ -394,7 +458,7 @@ def main(argv=None):
                     "use_task_text", "text_dim", "text_vocab",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
-                    "memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size"):
+                    "memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         manifest = dict(manifest, **previous)
@@ -403,6 +467,23 @@ def main(argv=None):
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
     train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob,args.drop_state_with_all_views)
     val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size)
+    train_lengths = [dataset._get_episode_length(ep) if args.temporal_sampling == "episode"
+                     else min(dataset._get_episode_length(ep), args.segment_length)
+                     for ep in train_eps]
+    train_sampler = LengthBucketBatchSampler(
+        train_lengths, args.batch_size, args.seed, args.length_bucket_multiplier, drop_last=True)
+    loader_options = dict(
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    if args.num_workers > 0:
+        loader_options.update(prefetch_factor=args.prefetch_factor, multiprocessing_context="spawn")
+    train_loader = DataLoader(
+        train_data, batch_sampler=train_sampler, collate_fn=collate_segments, **loader_options)
+    val_loader = DataLoader(
+        val_data, batch_size=args.batch_size, shuffle=False, collate_fn=collate_segments,
+        **loader_options)
     records = (json.loads((out / "summary.json").read_text())
                if args.resume and (out / "summary.json").exists() else {})
     report_out = out
@@ -477,15 +558,13 @@ def main(argv=None):
             no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,
             gripper_loss_weight=args.gripper_loss_weight,
             head_window_batch_size=args.head_window_batch_size)
-        val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False,
-            num_workers=0, pin_memory=True, collate_fn=collate_segments)
         run = out / name
         start_epoch = 1
         best = float("inf")
         if args.resume and run.exists():
             if records.get(name, {}).get("completed_epochs", 0) >= args.epochs:
                 print(f"SKIP completed {name}", flush=True)
-                del model, optimizer, params, vision, val_loader
+                del model, optimizer, params, vision
                 torch.cuda.empty_cache()
                 continue
             last_checkpoint = run / "training_last.pt"
@@ -520,10 +599,7 @@ def main(argv=None):
         with (run / "metrics.jsonl").open("a" if start_epoch > 1 else "w", buffering=1) as log:
             for epoch in range(start_epoch, args.epochs + 1):
                 train_data.epoch = epoch
-                generator = torch.Generator().manual_seed(args.seed + epoch)
-                train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True,
-                    generator=generator, num_workers=0, pin_memory=True,
-                    collate_fn=collate_segments, drop_last=True)
+                train_sampler.set_epoch(epoch)
                 seed_everything(args.seed + epoch)
                 start = time.monotonic()
                 train_start = time.perf_counter()
@@ -570,8 +646,10 @@ def main(argv=None):
                 print(f"RESULT {name} epoch={epoch} train={train_loss:.6f} val={val_loss:.6f} "
                       f"pos={metrics['pos_mse']:.6f} rot={metrics['rot_mse']:.6f} "
                       f"grip_acc={metrics['grip_acc']:.3f} seconds={row['elapsed_s']:.1f}", flush=True)
-        del model, optimizer, params, vision, val_loader
+        del model, optimizer, params, vision
         torch.cuda.empty_cache()
+    del train_loader, val_loader
+    gc.collect()
     dataset.close()
     summarize(report_out, records, manifest)
     (report_out / "COMPLETE").write_text("Requested worker variants completed.\n")

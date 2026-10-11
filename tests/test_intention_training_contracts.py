@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 from torch import nn
+from torch.utils.data import DataLoader
 
 from data.align_dataset import ALIGNDataset, v4_segment_collate
 from data.gripper_state import previous_gripper_commands, carry_gripper_state
@@ -49,6 +50,19 @@ def test_measured_gripper_takes_precedence_and_padding_carries_state(tmp_path):
     with ALIGNDataset(str(path), cameras=["wrist_image"], frames_per_ep=2, traj_window=2) as ds:
         np.testing.assert_allclose(ds[0]["grippers"], 0.3)
         np.testing.assert_allclose(ds._read_poses_gripper(0, 10, 4), 0.3)
+
+
+def test_align_dataset_reopens_hdf5_in_spawned_loader_workers(tmp_path):
+    path = tmp_path / "spawn-safe.h5"
+    write_dataset(path)
+    ds = ALIGNDataset(str(path), cameras=["wrist_image"], frames_per_ep=2, traj_window=2)
+    loader = DataLoader(ds, batch_size=2, num_workers=2, persistent_workers=True,
+                        multiprocessing_context="spawn")
+    batch = next(iter(loader))
+    assert batch["actions"].shape[0] == 2
+    assert torch.isfinite(batch["actions"]).all()
+    loader._iterator._shutdown_workers()
+    ds.close()
 
 
 def test_causal_gripper_never_reads_previous_episode_or_mutates_last_state():

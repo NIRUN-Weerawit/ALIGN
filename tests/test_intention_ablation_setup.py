@@ -2,8 +2,10 @@
 import numpy as np
 import torch
 import pytest
+from torch.utils.data import DataLoader
 
-from scripts.run_intention_ablation import CachedEpisodes, collate_segments, episode_split
+from scripts.run_intention_ablation import (CachedEpisodes, LengthBucketBatchSampler,
+    collate_segments, episode_split)
 from scripts.run_intention_ablation import parse_args
 
 
@@ -12,6 +14,7 @@ def test_sequential_cli_defaults_and_shared_overrides():
     assert defaults.variants == ["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"]
     assert defaults.worker_variant is None
     assert defaults.history_size == 1 and defaults.epochs == 80 and defaults.max_steps == 0
+    assert defaults.num_workers == 4 and defaults.prefetch_factor == 1
     args = parse_args(["--output", "example", "--head-type", "flow_matching", "--lr", "0.0003",
                        "--state-dim", "32", "--compressed-dim", "8", "--intent-dim", "64",
                        "--num-intent-tokens", "2", "--memory-bank-len", "16", "--chunk-size", "10",
@@ -73,6 +76,54 @@ def test_validation_crops_ignore_epoch_and_training_crops_are_reproducible():
     batch = collate_segments([first, first])
     assert batch["frames_segment"].shape == (2, 20, 1, 1)
     assert torch.isfinite(batch["states_segment"]).all()
+
+
+def test_collator_pads_once_and_preserves_variable_length_values():
+    first = dict(segment_len=3, text="a",
+        frames_segment=np.arange(18, dtype=np.float32).reshape(3, 2, 3),
+        states_segment=np.ones((3, 7), np.float32), actions_segment=np.full((3, 7), 2, np.float32),
+        loss_anchor_mask=np.array([True, False, True]), observation_timesteps=np.arange(3, dtype=np.float32))
+    second = dict(segment_len=2, text="b",
+        frames_segment=np.full((2, 2, 3), 9, np.float32),
+        states_segment=np.full((2, 7), 3, np.float32), actions_segment=np.full((2, 7), 4, np.float32),
+        loss_anchor_mask=np.array([False, True]), observation_timesteps=np.arange(2, dtype=np.float32))
+    batch = collate_segments([first, second])
+    np.testing.assert_array_equal(batch["frames_segment"][0, :3], first["frames_segment"])
+    np.testing.assert_array_equal(batch["frames_segment"][1, :2], second["frames_segment"])
+    assert torch.count_nonzero(batch["frames_segment"][1, 2]) == 0
+    np.testing.assert_array_equal(batch["loss_anchor_mask"], [[True, False, True], [False, True, False]])
+    assert batch["texts"] == ["a", "b"]
+
+
+def test_length_bucket_sampler_is_reproducible_and_groups_lengths():
+    lengths = [1, 2, 1, 2, 100, 101, 102, 103, 104]
+    sampler = LengthBucketBatchSampler(lengths, batch_size=2, seed=13,
+                                      bucket_multiplier=2, drop_last=True)
+    sampler.set_epoch(4)
+    batches = list(sampler)
+    assert batches == list(sampler)
+    assert len(batches) == 4
+    selected = sorted(index for batch in batches for index in batch)
+    assert len(selected) == 8 and len(set(selected)) == 8
+    assert 8 in selected  # The longest episode is not systematically dropped.
+    even_sampler = LengthBucketBatchSampler(lengths[:8], batch_size=2, seed=13,
+                                            bucket_multiplier=2, drop_last=True)
+    even_batches = list(even_sampler)
+    assert all(max(lengths[i] for i in batch) - min(lengths[i] for i in batch) <= 3
+               for batch in even_batches)
+
+
+def test_persistent_workers_observe_training_epoch_updates():
+    train = CachedEpisodes(FakeDataset(), [0], 20, 42, True)
+    loader = DataLoader(train, batch_size=1, shuffle=False, num_workers=1,
+                        persistent_workers=True, multiprocessing_context="spawn",
+                        collate_fn=collate_segments)
+    train.epoch = 1
+    first = next(iter(loader))["frames_segment"].clone()
+    train.epoch = 2
+    second = next(iter(loader))["frames_segment"].clone()
+    assert not torch.equal(first, second)
+    loader._iterator._shutdown_workers()
 
 
 def test_binary_gripper_validation_uses_explicit_cutoff(monkeypatch):
