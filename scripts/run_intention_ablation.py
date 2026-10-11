@@ -526,16 +526,23 @@ def main(argv=None):
                     collate_fn=collate_segments, drop_last=True)
                 seed_everything(args.seed + epoch)
                 start = time.monotonic()
+                train_start = time.perf_counter()
                 train_loss, _ = train_v4_epoch(model, train_loader, optimizer, device,
                     loop_args, max_steps=args.max_steps)
+                train_wall_s = time.perf_counter() - train_start
                 seed_everything(args.seed + 10000)
+                val_start = time.perf_counter()
                 val_loss, _, metrics = validate(model, val_loader, device, loop_args)
+                val_wall_s = time.perf_counter() - val_start
                 row = dict(epoch=epoch, **{"train/loss": train_loss, "val/loss": val_loss},
                     **metrics, elapsed_s=time.monotonic() - start,
-                    peak_gpu_gib=torch.cuda.max_memory_allocated() / 1024 ** 3)
+                    peak_gpu_gib=torch.cuda.max_memory_allocated() / 1024 ** 3,
+                    timing={**getattr(loop_args, "_last_stage_times", {}),
+                            "train_wall_s": train_wall_s,
+                            "val_wall_s": val_wall_s})
                 if not np.isfinite(train_loss) or not np.isfinite(val_loss):
                     raise FloatingPointError(f"Nonfinite loss in {name}: {row}")
-                log.write(json.dumps(row, allow_nan=False) + "\n")
+                checkpoint_start = time.perf_counter()
                 selection_score = row[args.selection_metric]
                 if selection_score < best:
                     best = selection_score
@@ -556,6 +563,9 @@ def main(argv=None):
                 torch.save(latest, temporary)
                 temporary.replace(run / "training_last.pt")
                 del latest
+                row["timing"]["checkpoint_save_s"] = time.perf_counter() - checkpoint_start
+                row["timing"]["total_wall_s"] = time.monotonic() - start
+                log.write(json.dumps(row, allow_nan=False) + "\n")
                 summarize(report_out, records, manifest)
                 print(f"RESULT {name} epoch={epoch} train={train_loss:.6f} val={val_loss:.6f} "
                       f"pos={metrics['pos_mse']:.6f} rot={metrics['rot_mse']:.6f} "

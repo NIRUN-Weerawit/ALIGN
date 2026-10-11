@@ -369,16 +369,37 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
     """
     model.train()
     losses, actions_pred_list = [], []
+    train_wall_start = time.perf_counter()
+    data_wait_wall_s = 0.0
+    stage_events = {}
+
+    def stage_start():
+        if device.type != "cuda":
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def stage_end(name, start_event):
+        if start_event is None:
+            return
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        stage_events.setdefault(name, []).append((start_event, end_event))
+
     n_steps = min(max_steps, len(loader)) if max_steps else len(loader)
     pbar = tqdm(range(n_steps), total=n_steps, desc="  [train V4]", unit="batch",
                 leave=False, disable=not is_primary())
     step_iter = iter(loader)
 
     for _ in pbar:
+        data_wait_start = time.perf_counter()
         try:
             batch = next(step_iter)
         except StopIteration:
             break
+        data_wait_wall_s += time.perf_counter() - data_wait_start
+        segment_event = stage_start()
         Hs = args.history_size
         chunk_size = args.chunk_size
 
@@ -387,6 +408,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         if args.action_dim >= 7:
             dim_weights[6] = getattr(args, "gripper_loss_weight", 1.0)
 
+        feature_event = stage_start()
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
@@ -400,7 +422,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # print(f"seg_lens: {seg_lens}")
         # Reset memory bank at start of segment
         if model.use_memory_bank:
+            reset_event = stage_start()
             model.memory_module.reset(batch_size=seg_lens.shape[0], device=device)
+            stage_end("memory_reset_gpu_s", reset_event)
 
         # Pre-encode vision for the entire segment (vision is the bottleneck)
         # We process each timestep's frames through vision encoder
@@ -449,9 +473,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             states_seg.reshape(B * S, state_dim)
         ).reshape(B, S, -1)
         if state_visibility is not None:z_s_all = z_s_all*state_visibility[:,:,None]
+        stage_end("feature_encode_gpu_s", feature_event)
 
         # Stack: (B, S, V*P, raw_dim) and (B, S, state_dim)
         # z_s_all = torch.stack(z_s_all, dim=1)
+        patch_event = stage_start()
         z_v_mod_all = getattr(model,"encode_patch_sequence",model.vision_patch_encoder)(
             z_v_all.reshape(B * S, V * P, 768),
             z_s_all.reshape(B * S, -1),
@@ -460,6 +486,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             # Missing cameras supply neither CLS to Mamba nor biased patch outputs
             # to memory/head. Past observed cameras remain available causally.
             z_v_mod_all = (z_v_mod_all.reshape(B*S,V,P,-1)*visibility[:,:,None,None]).reshape(B,S,V*P,-1)
+        stage_end("patch_encode_gpu_s", patch_event)
 
         # Flatten patch axis into feature dim for head consumption (3D expected)
         # B_seg, S, N_tok, comp_dim = z_v_mod_all.shape
@@ -501,12 +528,14 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             # Scan each observation once; readout at t sees only the prefix through t.
             intent_sequence = None
+            intent_event = stage_start()
             if num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     intent_sequence = model.intention_encoder.forward_sequence(
                         z_v_CLS_all[:, :S - chunk_size + 1], z_s_all[:, :S - chunk_size + 1],
                         readout_start=Hs - 1,
                     )
+            stage_end("intent_scan_gpu_s", intent_event)
 
             for n in range(num_windows):
                 if model.use_history:
@@ -525,6 +554,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                     valid_mask_cpu = valid_mask_cpu & selected
                     if not bool(valid_mask_cpu.any()):
                         if model.use_memory_bank:
+                            observe_event = stage_start()
                             p_context = z_v_mod_all[:,current_t].flatten(1)
                             c_context = intent_sequence[:,current_t] if intent_sequence is not None else None
                             observed = current_t < seg_lens
@@ -534,6 +564,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                                     model.memory_module.observe_only(p_context,z_s_all[:,current_t],c_context,observed,timestamp)
                                 else:
                                     model.condition_actions(p_context[:,None],z_s_all[:,current_t:current_t+1],c_context,observed)
+                            stage_end("memory_observe_only_gpu_s", observe_event)
                         continue
                 if not bool(valid_mask_cpu.any()):
                     # No valid samples in this window, skip
@@ -553,6 +584,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                                         enabled=device.type == "cuda"):
                     intent_emb = intent_sequence[:, current_t] if intent_sequence is not None else None
                     B_seg, H_actual, VP, comp_dim = z_v_win.shape
+                    condition_event = stage_start()
                     z_v_win_for_head, z_s_win_for_head, h_for_head = model.condition_actions(
                         z_v_win.reshape(B_seg, H_actual, VP * comp_dim),
                         z_s_win, intent_emb, observed_mask=((current_t < seg_lens) &
@@ -560,6 +592,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                             if state_visibility is not None and visibility is not None else (current_t < seg_lens)),
                         **({"timestamp":batch["observation_timesteps"][:,current_t].to(device)} if "observation_timesteps" in batch else {}),
                     )
+                    stage_end("condition_and_memory_gpu_s", condition_event)
 
                     # Loss
                     if args.head_type in ("diffusion", "flow_matching"):
@@ -567,8 +600,10 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                             print(f"[DEBUG] z_v_win_for_head: {z_v_win_for_head.shape}, "
                                   f"z_s_win_for_head: {z_s_win_for_head.shape}, "
                                   f"h_for_head: {h_for_head.shape if h_for_head is not None else None}")
+                        head_condition_event = stage_start()
                         cond = (model.action_condition(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb)
                                 if text_emb is not None else model.intention_head(z_v_win_for_head, z_s_win_for_head, h_for_head))
+                        stage_end("head_condition_gpu_s", head_condition_event)
                         if getattr(args, "debug", False):
                             print(f"[DEBUG] cond: {cond.shape}, finite: {torch.isfinite(cond).all().item()}")
                         # Sample actions for the action mean (5-10x slower than loss compute).
@@ -589,26 +624,34 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                             pending_head_count += valid_count
                             loss = None
                             if len(pending_head_conds) >= head_window_batch_size:
+                                assemble_event = stage_start()
                                 group_cond = torch.cat(pending_head_conds, dim=0)
                                 group_target = torch.cat(pending_head_targets, dim=0)
+                                stage_end("loss_batch_assembly_gpu_s", assemble_event)
+                                loss_event = stage_start()
                                 group_loss = model.intention_head.loss(
                                     group_target, group_cond, dim_weights=dim_weights,
                                 )
+                                stage_end("diffusion_loss_gpu_s", loss_event)
                                 loss_accum.append(group_loss)
                                 valid_counts.append(pending_head_count)
                                 pending_head_conds.clear()
                                 pending_head_targets.clear()
                                 pending_head_count = 0
                         else:
+                            loss_event = stage_start()
                             loss = model.intention_head.loss(
                                 target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
                             )
+                            stage_end("diffusion_loss_gpu_s", loss_event)
                         if getattr(args, "debug", False):
                             print(f"[DEBUG] loss: {loss.item() if loss is not None else 'batched'}")
                     else:
+                        head_condition_event = stage_start()
                         actions_pred = model.predict_actions(
                             z_v_win_for_head, z_s_win_for_head, h_for_head,
                         )
+                        stage_end("head_condition_gpu_s", head_condition_event)
                         loss = F.mse_loss(actions_pred, target, reduction='none')
                         loss = loss[valid_mask].mean()
 
@@ -621,19 +664,26 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 last_actions_pred = actions_pred
 
             if pending_head_conds:
+                assemble_event = stage_start()
                 group_cond = torch.cat(pending_head_conds, dim=0)
                 group_target = torch.cat(pending_head_targets, dim=0)
+                stage_end("loss_batch_assembly_gpu_s", assemble_event)
+                loss_event = stage_start()
                 group_loss = model.intention_head.loss(
                     group_target, group_cond, dim_weights=dim_weights,
                 )
+                stage_end("diffusion_loss_gpu_s", loss_event)
                 loss_accum.append(group_loss)
                 valid_counts.append(pending_head_count)
 
         # One optimizer step per segment, averaged over valid sample/windows.
+        backward_event = stage_start()
         if loss_accum:
             total_loss = sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / sum(valid_counts)
             total_loss.backward()
         sync_and_step(model, optimizer, device, args.grad_clip)
+        stage_end("backward_optimizer_gpu_s", backward_event)
+        stage_end("segment_gpu_s", segment_event)
 
         avg_step_loss = float(total_loss.item()) if loss_accum else 0.0
         losses.append(avg_step_loss)
@@ -643,6 +693,19 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
     avg_loss = global_mean(losses, device)
     avg_action = global_mean(actions_pred_list, device, empty=0.0)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    gpu_stage_s = {
+        name: sum(start.elapsed_time(end) for start, end in events) / 1000.0
+        for name, events in stage_events.items()
+    }
+    measured_gpu_s = sum(value for name, value in gpu_stage_s.items() if name != "segment_gpu_s")
+    gpu_stage_s["other_gpu_s"] = max(0.0, gpu_stage_s.get("segment_gpu_s", 0.0) - measured_gpu_s)
+    args._last_stage_times = {
+        "train_wall_s": time.perf_counter() - train_wall_start,
+        "data_wait_wall_s": data_wait_wall_s,
+        **gpu_stage_s,
+    }
     return avg_loss, avg_action
 
 def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
