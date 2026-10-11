@@ -262,7 +262,9 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         """
         B, L, D = bank.shape
         if count == 0:
-            return bank
+            # Retrieval now also computes masked empty rows. Autograd may save
+            # these values before _store mutates the bank later in this forward.
+            return bank.clone()
         # Use bank positions 0..L-1 for PE (not the count, which can exceed L)
         # This ensures PE is consistent across overwrites
         pe = self._timestep_pe[:L, :D].unsqueeze(0).expand(B, -1, -1)  # (B, L, D)

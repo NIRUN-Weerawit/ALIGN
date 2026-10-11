@@ -1184,7 +1184,11 @@ def validate(model, loader, device, args):
         # Accumulate metrics across all windows in this segment
         if loss_accum:
             if args.head_type in ("diffusion", "flow_matching") and sample_conditions:
-                sampled = model.intention_head.sample(torch.cat(sample_conditions, dim=0))
+                # Preserve the sampling precision context used before batching.
+                # Diffusion overrides this internally with its FP32 denoiser;
+                # flow matching and visual attention still rely on CUDA AMP.
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    sampled = model.intention_head.sample(torch.cat(sample_conditions, dim=0))
                 metric_predictions = [sampled]
                 metric_targets = [torch.cat(sample_targets, dim=0)]
                 # Keep the existing avg-action diagnostic's last-window meaning.
