@@ -7,7 +7,7 @@ Profile recorded on 2026-10-11 from the no-intent-token, memory-enabled ablation
 | Stage | Seconds | Notes |
 |---|---:|---|
 | Training wall time | 62.35 | 32 batches |
-| DataLoader wait | 30.48 | Host wall time around `next(loader)`; includes data read/collation stalls |
+| DataLoader wait | 30.48 | Host wall time around `next(loader)`; includes feature memmap reads/copies, HDF5 state/action reads, and collation |
 | Memory observe-only updates | 10.92 | GPU event time for observations without a supervised action window |
 | Memory conditioning and retrieval | 8.32 | GPU event time at supervised anchors |
 | Backward and optimizer | 5.38 | GPU event time |
@@ -24,6 +24,6 @@ The two memory stages consumed 19.25 seconds, about 60% of measured segment GPU 
 
 ## Interpretation and limits
 
-The next useful optimization targets are reducing HDF5/DataLoader stalls and profiling the sequential memory observe/retrieval path. This sample does not justify changing the diffusion head. The first 32 batches are not a complete epoch, and another GPU workload was active, so use the per-epoch `timing` fields in the training `metrics.jsonl` for stable comparisons across complete runs.
+The next useful optimization targets are reducing input-pipeline wait and profiling the sequential memory observe/retrieval path. The profile uses precomputed per-episode `.npy` memmaps for visual features; HDF5 supplies state, gripper, action, and text data. The wait measurement cannot separate memmap page faults, array copies, HDF5 reads, and collation. This sample does not justify changing the diffusion head. The first 32 batches are not a complete epoch, and another GPU workload was active, so use the per-epoch `timing` fields in the training `metrics.jsonl` for stable comparisons across complete runs.
 
 The ablation runner now records wall time for training, DataLoader waits, validation, checkpoint saves, and total epoch time. `train_v4_epoch` records CUDA-event timings for feature encoding, patch encoding, intention scan, memory reset/update/conditioning, head conditioning, loss assembly, diffusion loss, backward/optimizer, and total segment work. The CUDA events synchronize only once at the end of the training epoch.
