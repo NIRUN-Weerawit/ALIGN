@@ -803,30 +803,18 @@ def run_model_in_sim(
                                          enabled=device.type == "cuda"):
                     with sdpa_kernel(backends=[SDPBackend.MATH]):
                         out = stream_out if stream_out is not None else model(f_t, s_t)
-                        h_current = out["h_seq"][:, -1]
                         intent_emb = out.get("intent_emb", None)
-                        # intent_emb = torch.zeros_like(intent_emb)
-                        # Memory bank step (if enabled)
-                        if getattr(model, 'use_memory_bank', False) and intent_emb is not None:
-                            z_v_current = out["z_v_pooled_seq"][:, -1]
-                            z_s_current = out["z_s_seq"][:, -1]
-                            z_v_fused, z_s_fused, intent_fused = model.memory_module(
-                                z_v_current, z_s_current, intent_emb,
-                            )
-                            h_for_head = intent_fused
-                        else:
-                            h_for_head = intent_emb if intent_emb is not None else None
-
-                        if model.head_type in ["diffusion", "flow_matching"]:
-                            a_model_full = model.sample_actions(
-                                out["z_v_pooled_seq"], out["z_s_seq"],
-                                h_for_head,
-                            )
-                        else:
-                            a_model_full = model.predict_actions(
-                                out["z_v_pooled_seq"], out["z_s_seq"],
-                                h_for_head,
-                            )
+                        # Use the same memory contract as training, including
+                        # perceptual/state retrieval without intention tokens.
+                        memory_context = {key: out[key] for key in ("observed_mask", "timestamp")
+                                          if key in out}
+                        visual, states, intent = model.condition_actions(
+                            out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
+                            **memory_context,
+                        )
+                        a_model_full = _predict_action_chunk(
+                            model, visual, states, intent, text_emb=text_emb,
+                        )
             inference_t1 = time.perf_counter()
 
             # Record this model call's index for "decay" mode weighting.

@@ -1,6 +1,8 @@
 """Regression tests for trajectory-evaluator action-head dispatch."""
 
 import torch
+import numpy as np
+import pytest
 import queue
 import threading
 
@@ -41,6 +43,58 @@ def test_text_condition_reaches_generative_sampler():
     model = TextModel("diffusion")
     assert _predict_action_chunk(model, None, None, None, marker).shape == (1, 10, 7)
     assert model.sample_calls == 1
+
+
+@pytest.mark.parametrize("head_type", ["diffusion", "flow_matching"])
+@pytest.mark.parametrize("use_text", [False, True])
+def test_sim_rollout_passes_text_and_conditions_memory_without_intent(monkeypatch, head_type, use_text):
+    from types import SimpleNamespace
+    import eval.eval_libero_v4_trajectory as evaluator
+    monkeypatch.setattr(evaluator, "get_sim_eef_pose", lambda obs, rotation_convention="libero": np.zeros(6, np.float32))
+    monkeypatch.setattr(evaluator, "get_sim_frame", lambda *args, **kwargs: np.zeros((4, 4, 3), np.uint8))
+    marker = torch.ones(1, 8)
+
+    class Env:
+        def reset(self):
+            return {}
+
+        def step(self, action):
+            return {}, 0.0, False, {}
+
+    class Model(DummyModel):
+        use_memory_bank = True
+        memory_mode = "legacy"
+
+        def __init__(self):
+            super().__init__(head_type)
+            self.text_condition = object() if use_text else None
+            self.memory_module = SimpleNamespace(reset=lambda **kwargs: None)
+            self.condition_calls = 0
+
+        def encode_task_text(self, texts):
+            assert texts == ["pick up the cup"]
+            return marker
+
+        def __call__(self, frames, states):
+            return {"z_v_pooled_seq": states.new_zeros(1, 1, 4),
+                    "z_s_seq": states, "h_seq": states.new_zeros(1, 1, 1),
+                    "intent_emb": None}
+
+        def condition_actions(self, visual, states, intent):
+            assert intent is None
+            self.condition_calls += 1
+            return visual + 1, states, intent
+
+        def sample_actions(self, visual, states, intent, *, text_emb=None):
+            assert torch.all(visual == 1)  # Retrieved features reach the head.
+            assert text_emb is (marker if use_text else None)
+            return super().sample_actions(visual, states, intent)
+
+    model = Model()
+    evaluator.run_model_in_sim(Env(), model, torch.device("cpu"), np.zeros((2, 7), np.float32),
+        chunk_size=4, max_steps=2, switch_at=0.0, use_camera=["wrist_image"],
+        task_text="pick up the cup")
+    assert model.condition_calls == model.sample_calls == 2
 
 
 def test_direct_head_uses_prediction_path():
