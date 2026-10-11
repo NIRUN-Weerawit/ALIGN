@@ -179,9 +179,16 @@ class LengthBucketBatchSampler(Sampler):
 
 
 def atomic_json(path, value):
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
     temporary.replace(path)
+
+
+def extend_resume_manifest(previous, current):
+    """Preserve run provenance while permitting a larger total epoch target."""
+    if current["epochs"] < previous["epochs"]:
+        raise ValueError("Resume epoch target cannot decrease; --epochs is the total target")
+    return dict(current, **{**previous, "epochs": current["epochs"]})
 
 
 def summarize(out, records, manifest):
@@ -280,7 +287,7 @@ def parse_args(argv=None):
     parser.add_argument("--output", required=True)
     parser.add_argument("--evaluate-existing", action="store_true")
     parser.add_argument("--resume", action="store_true",
-                        help="Continue from epoch checkpoints; preserve/restart attempts without optimizer state.")
+                        help="Continue from epoch checkpoints; --epochs may increase the total target. Preserve/restart attempts without optimizer state.")
     parser.add_argument("--temporal-sampling",choices=["crop","episode"],default="episode")
     parser.add_argument("--supervision-points",type=int,default=16)
     parser.add_argument("--observation-dropout-prob",type=float,default=0.,help="Training-only camera/all-view feature loss at supervised anchors; same masks across ablations")
@@ -451,7 +458,7 @@ def main(argv=None):
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
                                use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
                                length_bucket_multiplier=20)
-        for key in ("epochs", "max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
+        for key in ("max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
@@ -461,7 +468,14 @@ def main(argv=None):
                     "memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
-        manifest = dict(manifest, **previous)
+        manifest = extend_resume_manifest(previous, manifest)
+        atomic_json(out / "manifest.json", manifest)
+        if args.epochs > previous["epochs"]:
+            # Completion markers from the previous target must not describe an
+            # extended run as finished while its new epochs are in progress.
+            (out / "COMPLETE").unlink(missing_ok=True)
+            for name in args.variants:
+                (out / name / "COMPLETE").unlink(missing_ok=True)
     else:
         atomic_json(out / "manifest.json", manifest)
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)

@@ -6,7 +6,23 @@ from torch.utils.data import DataLoader
 
 from scripts.run_intention_ablation import (CachedEpisodes, LengthBucketBatchSampler,
     collate_segments, episode_split)
-from scripts.run_intention_ablation import parse_args
+from scripts.run_intention_ablation import parse_args, extend_resume_manifest
+
+
+@pytest.mark.parametrize("target", [80, 100])
+def test_resume_manifest_allows_same_or_larger_total_epochs(target):
+    original = dict(epochs=80, commit="original", lr=0.001)
+    current = dict(epochs=target, commit="resuming", lr=0.001, num_workers=4)
+    merged = extend_resume_manifest(original, current)
+    assert merged["epochs"] == target
+    assert merged["commit"] == "original"
+    assert merged["num_workers"] == 4
+    assert original["epochs"] == 80
+
+
+def test_resume_manifest_rejects_decreasing_total_epochs():
+    with pytest.raises(ValueError, match="total target"):
+        extend_resume_manifest(dict(epochs=80), dict(epochs=40))
 
 
 def test_sequential_cli_defaults_and_shared_overrides():
