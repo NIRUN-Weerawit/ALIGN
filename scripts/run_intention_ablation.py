@@ -382,12 +382,10 @@ def parse_args(argv=None):
     if args.segment_length < args.history_size + args.chunk_size:
         parser.error("Segment must contain both history and action chunk")
     if "plain_history" in args.variants:
-        if args.head_type != "diffusion" or args.plain_history_size < 2:
-            parser.error("plain_history requires diffusion and --plain-history-size >= 2")
+        if args.head_type != "diffusion":
+            parser.error("plain_history requires diffusion")
         if args.temporal_sampling != "episode":
             parser.error("plain_history requires episode sampling for causal start padding")
-        if args.segment_length < args.plain_history_size + args.chunk_size:
-            parser.error("Segment must contain the plain history and action chunk")
     if args.chunk_size < 4:
         parser.error("--chunk-size must be at least 4 for the generative U-Net")
     if args.head_d_model % 8:

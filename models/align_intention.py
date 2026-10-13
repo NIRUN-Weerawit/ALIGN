@@ -160,8 +160,8 @@ class ALIGNIntentionModel(nn.Module):
         if head_history_mode not in ("mean", "full"):
             raise ValueError("Unknown action-head history mode")
         if head_history_mode == "full" and (head_type != "diffusion" or
-                                            use_intent_tokens or use_memory_bank or history_size < 2):
-            raise ValueError("Full-history action conditioning requires plain diffusion and history_size >= 2")
+                                            use_intent_tokens or use_memory_bank or history_size < 1):
+            raise ValueError("Full-history action conditioning requires plain diffusion and positive history_size")
         self.head_history_mode = head_history_mode
         self.head_d_model = head_d_model
         self.head_nhead = head_nhead

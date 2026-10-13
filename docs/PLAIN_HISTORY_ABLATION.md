@@ -2,6 +2,11 @@
 
 The `plain_history` variant has no intention encoder and no memory bank. It
 keeps the last `--plain-history-size` encoded observations in temporal order.
+Set this flag to any positive frame count; `1` is a single-observation plain
+model, while larger values retain that many ordered observations. Use a
+separate `--output` directory for each count because checkpoint weights and
+the saved configuration depend on it. Evaluation reads the count from the
+checkpoint automatically.
 Each observation contributes its 4,096-dimensional compressed visual feature
 and 64-dimensional encoded robot state in the current LIBERO Goal setup.
 The diffusion U-Net conditions its FiLM blocks on the current observation and

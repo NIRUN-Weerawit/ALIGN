@@ -109,7 +109,8 @@ def test_full_history_start_padding_matches_streaming_window():
     torch.testing.assert_close(v[:, -1], visual[:, -1])
 
 
-def test_plain_history_stream_encodes_each_observation_once(monkeypatch):
+@pytest.mark.parametrize("history_size", [1, 3, 6])
+def test_plain_history_stream_encodes_each_observation_once(monkeypatch, history_size):
     import models.align_intention as module
     from models.align_intention import ALIGNIntentionModel
     from models.intention_stream import IntentionStream
@@ -117,7 +118,7 @@ def test_plain_history_stream_encodes_each_observation_once(monkeypatch):
 
     monkeypatch.setattr(module, "VisionEncoder", FakeVision)
     model = ALIGNIntentionModel(state_dim=8, mamba_output_dim=0, action_dim=7,
-        chunk_size=4, history_size=3, num_cameras=1, compressed_dim=4,
+        chunk_size=4, history_size=history_size, num_cameras=1, compressed_dim=4,
         head_type="diffusion", head_history_mode="full", head_d_model=8)
     model.eval()
     calls = []
@@ -126,15 +127,15 @@ def test_plain_history_stream_encodes_each_observation_once(monkeypatch):
         calls.append(frames.shape[0])
         return original(frames)
     monkeypatch.setattr(model, "_vision_forward", counted)
-    stream = IntentionStream(model, 3)
-    for step in range(3):
+    stream = IntentionStream(model, history_size)
+    for step in range(history_size):
         output = stream.observe(
             torch.full((1, 1, 4, 4, 3), step, dtype=torch.uint8),
             torch.full((1, 7), float(step)))
-        assert output["z_v_pooled_seq"].shape == (1, 3, 8)
-    assert calls == [1, 1, 1]
+        assert output["z_v_pooled_seq"].shape == (1, history_size, 8)
+    assert calls == [1] * history_size
     visual, states, intent = model.condition_actions(
         output["z_v_pooled_seq"], output["z_s_seq"])
     assert intent is None
-    assert model.action_condition(visual, states).shape == (1, 3, 16)
+    assert model.action_condition(visual, states).shape == (1, history_size, 16)
     assert model.sample_actions(visual, states).shape == (1, 4, 7)

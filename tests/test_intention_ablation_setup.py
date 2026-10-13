@@ -44,10 +44,11 @@ def test_sequential_cli_defaults_and_shared_overrides():
     assert args.gripper_loss_weight == 0.2 and args.chunk_size == 10
 
 
-def test_plain_history_variant_has_independent_window_and_requires_diffusion():
+@pytest.mark.parametrize("history_size", [1, 2, 4, 16])
+def test_plain_history_variant_has_independent_window_and_requires_diffusion(history_size):
     args = parse_args(["--output", "example", "--variants", "plain_history", "intent_memory",
-                       "--plain-history-size", "4"])
-    assert args.history_size == 1 and args.plain_history_size == 4
+                       "--plain-history-size", str(history_size)])
+    assert args.history_size == 1 and args.plain_history_size == history_size
     assert args.variants == ["plain_history", "intent_memory"]
     with pytest.raises(SystemExit):
         parse_args(["--output", "example", "--variants", "plain_history",
