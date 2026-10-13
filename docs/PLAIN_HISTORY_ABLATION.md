@@ -24,9 +24,11 @@ projection and cross-attention parameters; this comparison tests the complete
 history-head architecture rather than isolating memory capacity alone.
 
 Run directory: `checkpoints/piper_v4_ablation_use_text_plain_history_h4`.
-The `queue.sh` there waits for the four current held-out MuJoCo evaluations
-before starting training. Training progress and metrics are written to
-`run.log` and `plain_history/metrics.jsonl`.
+Training progress and metrics are written to `run.log` and
+`plain_history/metrics.jsonl`. The run resumes from the last complete epoch
+and runs under the `align-plain-history-h4` user service. The
+`align-plain-history-eval` service waits for training to complete, then runs
+the same 44 held-out MuJoCo episodes used by the baseline.
 
 The reproducible training command is:
 
@@ -45,6 +47,9 @@ python scripts/run_intention_ablation.py \
 Zero DataLoader workers avoids exhausting host shared memory on this 32 GB
 machine. Expandable CUDA segments reduces fragmentation across variable-length
 episode batches. Neither change alters the model or effective batch size.
+The DINOv2 sidecar is accessed through `data/libero_goal.dinov2`, which now
+points to a verified local copy on NVMe. The original external-drive target is
+preserved at `data/libero_goal.dinov2.external`.
 
 After training, evaluate the same 44 held-out episodes with `--switch-at 0.0`,
 `--val-episodes checkpoints/piper_v4_ablation_val_episodes.txt`, and
