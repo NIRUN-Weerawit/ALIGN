@@ -20,6 +20,41 @@ def segment():
                 observation_timesteps=torch.arange(6).expand(2, -1).float())
 
 
+def test_gradient_accumulation_matches_one_logical_batch(monkeypatch):
+    monkeypatch.setattr(align, "VisionEncoder", FakeVision)
+    batch = segment()
+    batch["states_segment"][1] *= 2
+    results = []
+    for split in (False, True):
+        torch.manual_seed(23)
+        model = align.ALIGNIntentionModel(state_dim=4, compressed_dim=4,
+            action_dim=7, use_intent_tokens=False, mamba_output_dim=0,
+            use_memory_bank=False, head_type="flow_matching", head_d_model=8,
+            chunk_size=4, history_size=1)
+        model._build_head_and_bank(8)
+
+        def loss(target, cond, dim_weights=None, sample_mask=None):
+            if sample_mask is not None:
+                target, cond = target[sample_mask], cond[sample_mask]
+            return cond.square().mean() + target.square().mean()
+
+        model.intention_head.loss = loss
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
+        args = SimpleNamespace(history_size=1, chunk_size=4, action_dim=7,
+            head_type="flow_matching", skip_nan=False, grad_clip=1.0,
+            no_sample_during_train=True, head_window_batch_size=2,
+            gradient_accum_steps=2 if split else 1)
+        if split:
+            batches = [{key: value[index:index + 1] for key, value in batch.items()}
+                       for index in range(2)]
+        else:
+            batches = [batch]
+        train_v4_epoch(model, batches, optimizer, torch.device("cpu"), args)
+        results.append([p.detach().clone() for p in model.parameters()])
+    for full, accumulated in zip(*results):
+        torch.testing.assert_close(full, accumulated, atol=1e-6, rtol=1e-6)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("head_type", ["diffusion", "flow_matching"])
 @pytest.mark.parametrize("memory", [False, True])

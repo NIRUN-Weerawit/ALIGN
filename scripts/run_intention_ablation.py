@@ -141,9 +141,13 @@ def collate_segments(items):
 
 class LengthBucketBatchSampler(Sampler):
     """Randomize inside length-sorted pools to limit padding between batches."""
-    def __init__(self, lengths, batch_size, seed, bucket_multiplier=20, drop_last=True):
+    def __init__(self, lengths, batch_size, seed, bucket_multiplier=20, drop_last=True,
+                 micro_batch_size=None):
         self.lengths = list(map(int, lengths))
         self.batch_size = int(batch_size)
+        self.micro_batch_size = int(micro_batch_size or batch_size)
+        if self.batch_size % self.micro_batch_size:
+            raise ValueError("batch_size must be divisible by micro_batch_size")
         self.seed = int(seed)
         self.bucket_size = max(self.batch_size, self.batch_size * int(bucket_multiplier))
         self.drop_last = bool(drop_last)
@@ -171,12 +175,14 @@ class LengthBucketBatchSampler(Sampler):
         if batches:
             permutation = torch.randperm(len(batches), generator=generator).tolist()
             for index in permutation:
-                yield batches[index]
+                group = batches[index]
+                for start in range(0, len(group), self.micro_batch_size):
+                    yield group[start:start + self.micro_batch_size]
 
     def __len__(self):
         if self.drop_last:
-            return len(self.lengths) // self.batch_size
-        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+            return (len(self.lengths) // self.batch_size) * (self.batch_size // self.micro_batch_size)
+        return (len(self.lengths) + self.micro_batch_size - 1) // self.micro_batch_size
 
 
 def atomic_json(path, value):
@@ -191,7 +197,7 @@ def extend_resume_manifest(previous, current):
         raise ValueError("Resume epoch target cannot decrease; --epochs is the total target")
     merged = dict(current, **previous)
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
-                "gpu_memory_fraction"):
+                "gpu_memory_fraction", "micro_batch_size"):
         if key in current:
             merged[key] = current[key]
     return merged
@@ -323,6 +329,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Optimizer steps per epoch; 0 uses the full training loader.")
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--micro-batch-size", type=int, default=None,
+                        help="Episodes loaded together; gradients accumulate to --batch-size before each optimizer step.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader processes; HDF5 handles are reopened per worker.")
     parser.add_argument("--prefetch-factor", type=int, default=1,
@@ -503,8 +511,10 @@ def main(argv=None):
     train_lengths = [dataset._get_episode_length(ep) if args.temporal_sampling == "episode"
                      else min(dataset._get_episode_length(ep), args.segment_length)
                      for ep in train_eps]
+    micro_batch_size = args.micro_batch_size or args.batch_size
     train_sampler = LengthBucketBatchSampler(
-        train_lengths, args.batch_size, args.seed, args.length_bucket_multiplier, drop_last=True)
+        train_lengths, args.batch_size, args.seed, args.length_bucket_multiplier,
+        drop_last=True, micro_batch_size=micro_batch_size)
     loader_options = dict(
         num_workers=args.num_workers,
         pin_memory=True,
@@ -515,7 +525,7 @@ def main(argv=None):
     train_loader = DataLoader(
         train_data, batch_sampler=train_sampler, collate_fn=collate_segments, **loader_options)
     val_loader = DataLoader(
-        val_data, batch_size=args.batch_size, shuffle=False, collate_fn=collate_segments,
+        val_data, batch_size=micro_batch_size, shuffle=False, collate_fn=collate_segments,
         **loader_options)
     records = (json.loads((out / "summary.json").read_text())
                if args.resume and (out / "summary.json").exists() else {})
@@ -594,7 +604,8 @@ def main(argv=None):
             action_dim=7, head_type=args.head_type, skip_nan=False, grad_clip=args.grad_clip,
             no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,
             gripper_loss_weight=args.gripper_loss_weight,
-            head_window_batch_size=args.head_window_batch_size)
+            head_window_batch_size=args.head_window_batch_size,
+            gradient_accum_steps=args.batch_size // micro_batch_size)
         run = out / name
         start_epoch = 1
         best = float("inf")

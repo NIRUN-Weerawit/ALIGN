@@ -40,13 +40,17 @@ python scripts/run_intention_ablation.py \
   --variants plain_history --use-task-text \
   --history-size 1 --plain-history-size 4 \
   --temporal-sampling episode --epochs 200 --batch-size 10 \
+  --micro-batch-size 2 \
   --num-workers 0 --compressed-dim 8 --lr 0.0002 \
   --gpu-memory-fraction 1.0 --seed 42
 ```
 
-Zero DataLoader workers avoids exhausting host shared memory on this 32 GB
-machine. Expandable CUDA segments reduces fragmentation across variable-length
-episode batches. Neither change alters the model or effective batch size.
+The 10-episode logical batch is loaded in five microbatches of two episodes,
+with gradients accumulated before each optimizer step. This bounds host
+shared-memory use for long episodes while retaining the optimizer batch size
+and episode groups. Zero DataLoader workers avoids additional prefetched
+batches on this 32 GB machine. Expandable CUDA segments reduces fragmentation
+across variable-length episode batches.
 The DINOv2 sidecar is accessed through `data/libero_goal.dinov2`, which now
 points to a verified local copy on NVMe. The original external-drive target is
 preserved at `data/libero_goal.dinov2.external`.

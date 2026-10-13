@@ -401,7 +401,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 leave=False, disable=not is_primary())
     step_iter = iter(loader)
 
-    for _ in pbar:
+    accumulation_steps = max(1, int(getattr(args, "gradient_accum_steps", 1)))
+    group_valid_count = 0
+    for step_index in pbar:
         data_wait_start = time.perf_counter()
         try:
             batch = next(step_iter)
@@ -503,7 +505,9 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # print(f"reshapedshapes: z_v_all: {z_v_all_stacked.shape}")
 
         total_loss = torch.tensor(0.0, device=device)
-        optimizer.zero_grad(set_to_none=True)
+        if step_index % accumulation_steps == 0:
+            optimizer.zero_grad(set_to_none=True)
+            group_valid_count = 0
 
         # Sequential T-loop
         last_actions_pred = None
@@ -692,12 +696,23 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 loss_accum.append(group_loss)
                 valid_counts.append(pending_head_count)
 
-        # One optimizer step per segment, averaged over valid sample/windows.
+        # Accumulate microbatches from one logical episode batch, weighting
+        # their gradients by the number of valid supervised anchors.
         backward_event = stage_start()
         if loss_accum:
-            total_loss = sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / sum(valid_counts)
-            total_loss.backward()
-        sync_and_step(model, optimizer, device, args.grad_clip)
+            valid_count = sum(valid_counts)
+            total_loss = sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / valid_count
+            if accumulation_steps > 1:
+                (total_loss * valid_count).backward()
+                group_valid_count += valid_count
+            else:
+                total_loss.backward()
+        if (step_index + 1) % accumulation_steps == 0 or step_index + 1 == n_steps:
+            if accumulation_steps > 1 and group_valid_count:
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(group_valid_count)
+            sync_and_step(model, optimizer, device, args.grad_clip)
         stage_end("backward_optimizer_gpu_s", backward_event)
         stage_end("segment_gpu_s", segment_event)
 

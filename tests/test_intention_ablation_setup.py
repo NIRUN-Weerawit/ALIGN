@@ -142,6 +142,19 @@ def test_length_bucket_sampler_is_reproducible_and_groups_lengths():
                for batch in even_batches)
 
 
+def test_microbatches_preserve_logical_episode_groups():
+    lengths = list(range(30))
+    full = LengthBucketBatchSampler(lengths, batch_size=10, seed=13)
+    micro = LengthBucketBatchSampler(lengths, batch_size=10, seed=13,
+                                     micro_batch_size=2)
+    full.set_epoch(4)
+    micro.set_epoch(4)
+    groups = list(full)
+    pieces = list(micro)
+    assert len(pieces) == len(micro) == len(groups) * 5
+    assert [sum(pieces[i:i + 5], []) for i in range(0, len(pieces), 5)] == groups
+
+
 def test_persistent_workers_observe_training_epoch_updates():
     train = CachedEpisodes(FakeDataset(), [0], 20, 42, True)
     loader = DataLoader(train, batch_size=1, shuffle=False, num_workers=1,
