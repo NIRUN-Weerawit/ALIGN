@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
+import zipfile
 
 import numpy as np
 import torch
@@ -589,6 +590,11 @@ def main(argv=None):
                 start_epoch = saved["epoch"] + 1
                 best = saved["best_loss"]
                 records[name] = saved["record"]
+                best_checkpoint = run / "intention_best.pt"
+                if not best_checkpoint.exists() or not zipfile.is_zipfile(best_checkpoint):
+                    print(f"RESUME {name}: best checkpoint missing or incomplete; "
+                          "next epoch will establish a new best", flush=True)
+                    best = float("inf")
                 # A metric written before an interrupted checkpoint save is replayed.
                 metric_file = run / "metrics.jsonl"
                 if metric_file.exists():
@@ -635,10 +641,13 @@ def main(argv=None):
                 checkpoint_start = time.perf_counter()
                 selection_score = row[args.selection_metric]
                 if selection_score < best:
+                    best_checkpoint = run / "intention_best.pt"
+                    temporary_best = run / "intention_best.pt.tmp"
+                    torch.save(dict(model_state_dict=model.state_dict(), config=config,
+                        epoch=epoch, val_loss=val_loss), temporary_best)
+                    temporary_best.replace(best_checkpoint)
                     best = selection_score
                     records[name] = dict(best=row, completed_epochs=epoch)
-                    torch.save(dict(model_state_dict=model.state_dict(), config=config,
-                        epoch=epoch, val_loss=val_loss), run / "intention_best.pt")
                 if args.keep_epoch_checkpoints:
                     torch.save(dict(model_state_dict={k:v for k,v in model.state_dict().items() if not k.startswith("vision_encoder.")},
                                     config=dict(config,frozen_vision_omitted=True),epoch=epoch,val_loss=val_loss),run/f"epoch_{epoch:03d}.pt")

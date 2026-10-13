@@ -1609,7 +1609,9 @@ def main():
                 "mean_model_err": float(np.mean(model_errs)) if model_errs else None,
             },
         }
-        summary_path = Path(args.checkpoint).with_suffix(f".mujoco_eval_{args.switch_at}.json")
+        eval_suffix = "_val" if args.val_episodes is not None else ""
+        summary_path = Path(args.checkpoint).with_suffix(
+            f".mujoco_eval_{args.switch_at}{eval_suffix}.json")
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         (Path(args.out_dir) / "result.json").write_text(json.dumps(summary, indent=2))
