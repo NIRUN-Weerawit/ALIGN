@@ -28,7 +28,8 @@ Training progress and metrics are written to `run.log` and
 `plain_history/metrics.jsonl`. The run resumes from the last complete epoch
 and runs under the `align-plain-history-h4` user service. The
 `align-plain-history-eval` service waits for training to complete, then runs
-the same 44 held-out MuJoCo episodes used by the baseline.
+the same 44 held-out MuJoCo episodes used by the baseline. It writes a paired
+task-success comparison to `heldout_comparison.md` in the run directory.
 
 The reproducible training command is:
 
