@@ -278,12 +278,14 @@ class DiffusionPolicyUNet1D(nn.Module):
     All conv blocks are FiLM-conditioned on (cond_global, t_emb).
     """
     def __init__(self, action_dim: int, cond_dim: int, time_dim: int = 64,
-                 hidden_dim: int = 128, n_groups: int = 8):
+                 hidden_dim: int = 128, n_groups: int = 8,
+                 history_size: int = 1):
         super().__init__()
         self.action_dim = action_dim
         self.cond_dim = cond_dim
         self.time_dim = time_dim
         self.hidden_dim = hidden_dim
+        self.history_size = history_size
 
         self.input_proj = nn.Conv1d(action_dim, hidden_dim,
                                     kernel_size=3, padding=1)
@@ -317,6 +319,16 @@ class DiffusionPolicyUNet1D(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
+        # Construct after the shared U-Net layers so identical seeds initialize
+        # those layers identically in plain and history ablations.
+        if history_size > 1:
+            history_width = hidden_dim * 4
+            self.history_projection = nn.Sequential(
+                nn.LayerNorm(cond_dim), nn.Linear(cond_dim, history_width))
+            self.history_position = nn.Embedding(history_size, history_width)
+            self.history_attention = nn.MultiheadAttention(
+                history_width, 4, batch_first=True)
+
     def configure_visual_attention(self,pool_dim,token_dim):
         self.visual_pool_dim,self.visual_token_dim = pool_dim,token_dim
         width = self.bottleneck.block[0].out_channels
@@ -339,10 +351,12 @@ class DiffusionPolicyUNet1D(nn.Module):
         """
         B, K, _ = x_t.shape
 
-        # cond: (B, 1, cond_dim) -> (B, cond_dim) for FiLM
+        # FiLM uses the current observation; attention below reads every
+        # ordered history token when this is the full-history variant.
         if cond.ndim == 3:
-            assert cond.shape[1] == 1, f"cond should be (B, 1, cond_dim), got {cond.shape}"
-            cond_global = cond.squeeze(1)  # (B, cond_dim)
+            assert cond.shape[1] == self.history_size, (
+                f"expected {self.history_size} history steps, got {cond.shape}")
+            cond_global = cond[:, -1]
         else:
             cond_global = cond  # (B, cond_dim)
 
@@ -369,6 +383,13 @@ class DiffusionPolicyUNet1D(nn.Module):
         x = self.enc4(x, cond_global, t_emb)
 
         x = self.bottleneck(x, cond_global, t_emb)
+        if hasattr(self, "history_attention"):
+            positions = torch.arange(self.history_size, device=cond.device)
+            history = self.history_projection(cond)
+            history = history + self.history_position(positions).unsqueeze(0)
+            context, _ = self.history_attention(
+                x.transpose(1, 2), history, history, need_weights=False)
+            x = x + context.transpose(1, 2)
         if hasattr(self,"visual_attention"):
             tokens = cond_global[:,:self.visual_pool_dim].reshape(B,-1,self.visual_token_dim)
             tokens = self.visual_projection(tokens)
@@ -461,7 +482,8 @@ class DiffusionPolicyHead(nn.Module):
     def __init__(self, cond_dim: int = 768, action_dim: int = 7,
                  hidden_dim: int = 128, num_inference_steps: int = 10,
                  time_dim: int = 64, chunk_size: int = 10,
-                 num_train_timesteps: int = None, loss_repeats: int = 1, clip_denoised: bool = False):
+                 num_train_timesteps: int = None, loss_repeats: int = 1,
+                 clip_denoised: bool = False, history_size: int = 1):
         super().__init__()
         self.action_dim = action_dim
         self.num_inference_steps = num_inference_steps
@@ -471,6 +493,7 @@ class DiffusionPolicyHead(nn.Module):
         self.time_dim = time_dim
         self.chunk_size = chunk_size
         self.cond_dim = cond_dim
+        self.history_size = history_size
 
         # Sinusoidal time embedding
         self.time_emb = nn.Sequential(
@@ -500,6 +523,7 @@ class DiffusionPolicyHead(nn.Module):
             cond_dim=cond_dim,
             time_dim=time_dim,
             hidden_dim=hidden_dim,
+            history_size=history_size,
         )
 
     def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
@@ -512,6 +536,13 @@ class DiffusionPolicyHead(nn.Module):
         uses FiLM to broadcast this across all K action steps.
         Intent tokens are pooled to a single vector.
         """
+        if self.history_size > 1:
+            if intent_emb is not None:
+                raise ValueError("Full-history diffusion currently supports plain models only")
+            if z_v_pooled_window.shape[1] != self.history_size or z_s_window.shape[1] != self.history_size:
+                raise ValueError("Full-history diffusion requires every visual and state step")
+            return torch.cat((z_v_pooled_window, z_s_window), dim=-1)
+
         parts = []
 
         # Mean-pool z_v_pooled across the K window to get a single per-step vector

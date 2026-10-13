@@ -77,6 +77,7 @@ class ALIGNIntentionModel(nn.Module):
         mamba_d_conv: int = 4,
         mamba_expand: int = 2,
         head_type: str = "diffusion",
+        head_history_mode: str = "mean",
         head_d_model: int = 384,
         head_nhead: int = 4,
         head_num_layers: int = 2,
@@ -156,6 +157,12 @@ class ALIGNIntentionModel(nn.Module):
         self.visual_token_attention = visual_token_attention
         self.diffusion_clip_sample = diffusion_clip_sample
         self.head_type = head_type
+        if head_history_mode not in ("mean", "full"):
+            raise ValueError("Unknown action-head history mode")
+        if head_history_mode == "full" and (head_type != "diffusion" or
+                                            use_intent_tokens or use_memory_bank or history_size < 2):
+            raise ValueError("Full-history action conditioning requires plain diffusion and history_size >= 2")
+        self.head_history_mode = head_history_mode
         self.head_d_model = head_d_model
         self.head_nhead = head_nhead
         self.head_num_layers = head_num_layers
@@ -281,6 +288,7 @@ class ALIGNIntentionModel(nn.Module):
                 clip_denoised=self.diffusion_clip_sample,
                 time_dim=64,
                 chunk_size=self.chunk_size,
+                history_size=self.history_size if self.head_history_mode == "full" else 1,
             )
         elif self.head_type == "flow_matching":
             cond_dim = pool_out_dim + self.state_dim + (self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0)

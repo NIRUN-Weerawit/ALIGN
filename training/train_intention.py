@@ -358,6 +358,15 @@ def build_model(args, num_cameras, device):
 # V4 Training — Sequential T-loop with persistent memory bank
 # ================================================================
 
+def _pad_full_history(visual, states, history_size):
+    """Match streaming inference by repeating the first observed feature at episode start."""
+    missing = history_size - visual.shape[1]
+    if missing > 0:
+        visual = torch.cat((visual[:, :1].expand(-1, missing, -1, -1), visual), dim=1)
+        states = torch.cat((states[:, :1].expand(-1, missing, -1), states), dim=1)
+    return visual, states
+
+
 def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
     """V4 training epoch with sequential T-loop and persistent memory bank.
 
@@ -517,7 +526,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         pending_head_targets = []
         pending_head_count = 0
         max_seg_len = S
-        if model.use_history:
+        full_history = getattr(model, "head_history_mode", "mean") == "full"
+        if model.use_history and not full_history:
             num_windows = max_seg_len - Hs - chunk_size + 2
         else:
             # No history: each timestep is independent
@@ -538,7 +548,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             stage_end("intent_scan_gpu_s", intent_event)
 
             for n in range(num_windows):
-                if model.use_history:
+                if full_history:
+                    current_t = n
+                    history_start = max(0, current_t - Hs + 1)
+                    history_end = current_t + 1
+                elif model.use_history:
                     # Build H-window ending at t+H-1
                     current_t = n + Hs - 1
                     history_start = current_t - Hs + 1
@@ -574,6 +588,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
 
                 z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
                 z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
+                if full_history:
+                    z_v_win, z_s_win = _pad_full_history(z_v_win, z_s_win, Hs)
 
                 # Target: C future actions from current time
                 target = actions_seg[:, current_t: current_t + chunk_size]
@@ -1075,7 +1091,8 @@ def validate(model, loader, device, args):
         padded_segment = 0
         genuine_segment = 0
         max_seg_len = S
-        if model.use_history:
+        full_history = getattr(model, "head_history_mode", "mean") == "full"
+        if model.use_history and not full_history:
             num_windows = max_seg_len - Hs - chunk_size + 2
         else:
             num_windows = max_seg_len - chunk_size + 1
@@ -1092,7 +1109,11 @@ def validate(model, loader, device, args):
                     )
 
             for n in range(num_windows):
-                if model.use_history:
+                if full_history:
+                    current_t = n
+                    history_start = max(0, current_t - Hs + 1)
+                    history_end = current_t + 1
+                elif model.use_history:
                     current_t = n + Hs - 1
                     history_start = current_t - Hs + 1
                     history_end = current_t + 1
@@ -1122,6 +1143,8 @@ def validate(model, loader, device, args):
 
                 z_v_win = z_v_mod_all[:, history_start:history_end]  # (B, H_actual, V*P, comp_dim)
                 z_s_win = z_s_all[:, history_start:history_end]  # (B, H_actual, state_dim)
+                if full_history:
+                    z_v_win, z_s_win = _pad_full_history(z_v_win, z_s_win, Hs)
 
                 # Forward through model
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16,

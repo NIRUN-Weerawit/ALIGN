@@ -137,6 +137,7 @@ def load_intention_model(
         head_num_layers=cfg["head_num_layers"],
         head_dim_ff=cfg["head_dim_ff"],
         head_type=cfg.get("head_type", "mamba"),
+        head_history_mode=cfg.get("head_history_mode", "mean"),
         use_text=cfg.get("use_text", False),
         text_dim=cfg.get("text_dim", 256),
         text_encoder_type=cfg.get("text_encoder_type", "clip"),

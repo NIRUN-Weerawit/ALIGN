@@ -672,7 +672,8 @@ def run_model_in_sim(
     observation_history = getattr(model, "history_size", chunk_size)
     intention_stream = (IntentionStream(model, getattr(model, "history_size", chunk_size))
                         if getattr(model, "intention_encoder", None) is not None or
-                           (getattr(model,"use_memory_bank",False) and getattr(model,"memory_mode","legacy")=="episodic") else None)
+                           (getattr(model,"use_memory_bank",False) and getattr(model,"memory_mode","legacy")=="episodic") or
+                           getattr(model, "head_history_mode", "mean") == "full" else None)
 
     # State buffer (K-window) — each entry is a (7,) state vector
     pose_buffer = []

@@ -203,9 +203,10 @@ def summarize(out, records, manifest):
     for name, record in records.items():
         r = record["best"]
         rows.append(f"| {name} | {r['epoch']} | {r['val/loss']:.6f} | {r['pos_mse']:.6f} | {r['rot_mse']:.6f} | {r['grip_mse']:.6f} | {r['grip_acc']:.3f} |")
-    rows += ["", "All variants use the same episode split, crop schedule, observation history,",
+    rows += ["", "All variants use the same episode split, crop schedule,",
              "batch order, optimizer budget, and validation RNG seeds. Intent-disabled variants",
              "omit the intention encoder; memory-only retrieves perceptual and state streams.",
+            "The plain_history variant uses its configured ordered feature/state window.",
              "The cached per-camera features bypass raw-image/cross-camera vision computation.",
              "Results use one training seed; model dimensions and optimizer budget are recorded in manifest.json.",
              "Fixed validation seeds make comparisons repeatable but do not remove seed uncertainty.",
@@ -238,6 +239,7 @@ def evaluate_existing(out):
         model = ALIGNIntentionModel(state_dim=config["state_dim"], mamba_output_dim=config["mamba_output_dim"],
             action_dim=7, chunk_size=config["chunk_size"], history_size=config["history_size"],
             num_cameras=len(cameras), compressed_dim=config["compressed_dim"], head_type=config["head_type"],
+            head_history_mode=config.get("head_history_mode", "mean"),
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
             use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
             text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
@@ -256,6 +258,7 @@ def evaluate_existing(out):
         model.to(device)
         model.vision_encoder = vision
         seed_everything(manifest["seed"] + 10000)
+        args.history_size = config["history_size"]
         val_loss, _, metrics = validate(model, loader, device, args)
         record["best"].update(metrics)
         record["best"]["val/loss"] = val_loss
@@ -346,14 +349,16 @@ def parse_args(argv=None):
     parser.add_argument("--gripper-threshold", type=float, default=0.5)
     parser.add_argument("--cpu-threads", type=int, default=2)
     parser.add_argument("--history-size", type=int, default=1)
+    parser.add_argument("--plain-history-size", type=int, default=4,
+                        help="Ordered visual/state window for the plain_history diffusion variant")
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--segment-length", type=int, default=20)
     parser.add_argument("--variants", nargs="+", default=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"])
-    parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"],
+    parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history"],
                         help="Train only this variant, retaining the ordered common initialization.")
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
     args = parser.parse_args(argv)
-    for name in ("epochs", "batch_size", "history_size", "chunk_size", "segment_length",
+    for name in ("epochs", "batch_size", "history_size", "plain_history_size", "chunk_size", "segment_length",
                  "state_dim", "compressed_dim", "head_d_model", "mamba_output_dim",
                  "mamba_d_state", "mamba_d_conv", "mamba_expand", "num_intent_tokens",
                  "intent_dim", "memory_bank_len", "cpu_threads", "head_window_batch_size"):
@@ -363,6 +368,13 @@ def parse_args(argv=None):
         parser.error("--num-workers must be nonnegative; prefetch and bucket multipliers must be positive")
     if args.segment_length < args.history_size + args.chunk_size:
         parser.error("Segment must contain both history and action chunk")
+    if "plain_history" in args.variants:
+        if args.head_type != "diffusion" or args.plain_history_size < 2:
+            parser.error("plain_history requires diffusion and --plain-history-size >= 2")
+        if args.temporal_sampling != "episode":
+            parser.error("plain_history requires episode sampling for causal start padding")
+        if args.segment_length < args.plain_history_size + args.chunk_size:
+            parser.error("Segment must contain the plain history and action chunk")
     if args.chunk_size < 4:
         parser.error("--chunk-size must be at least 4 for the generative U-Net")
     if args.head_d_model % 8:
@@ -453,13 +465,14 @@ def main(argv=None):
     if args.resume and (out / "manifest.json").exists():
         previous = json.loads((out / "manifest.json").read_text())
         legacy_defaults = dict(cameras=["image", "wrist_image"], validation_fraction=0.1,
+                               plain_history_size=4,
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
                                memory_perceptual_recency=0.,memory_field_masks=False,memory_pre_state_visual=False,memory_value_preserving=False,memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
                                use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
                                length_bucket_multiplier=20)
-        for key in ("max_steps", "history_size", "chunk_size", "segment_length", "batch_size",
+        for key in ("max_steps", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
@@ -509,15 +522,19 @@ def main(argv=None):
         records = {name: record for name, record in records.items() if name == args.worker_variant}
     shared_initialization = {}
     for name in args.variants:
-        if name not in {"no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"}:
+        if name not in {"no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history"}:
             raise ValueError(name)
         intent = name.startswith("intent_")
         memory = name.endswith("_memory") and not name.endswith("no_memory")
+        full_history = name == "plain_history"
+        variant_history_size = args.plain_history_size if full_history else args.history_size
         seed_everything(args.seed)
-        model = ALIGNIntentionModel(state_dim=args.state_dim, mamba_output_dim=args.mamba_output_dim,
-            action_dim=7, chunk_size=args.chunk_size, history_size=args.history_size,
+        model = ALIGNIntentionModel(state_dim=args.state_dim,
+            mamba_output_dim=0 if full_history else args.mamba_output_dim,
+            action_dim=7, chunk_size=args.chunk_size, history_size=variant_history_size,
             num_cameras=len(args.cameras), compressed_dim=args.compressed_dim,
-            head_type=args.head_type, head_d_model=args.head_d_model,
+            head_type=args.head_type, head_history_mode="full" if full_history else "mean",
+            head_d_model=args.head_d_model,
             mamba_d_state=args.mamba_d_state, mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
             use_intent_tokens=intent, num_intent_tokens=args.num_intent_tokens, intent_dim=args.intent_dim,
             use_memory_bank=memory, memory_bank_len=args.memory_bank_len,
@@ -568,7 +585,7 @@ def main(argv=None):
             del saved,source,own,matched
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, fused=True)
-        loop_args = SimpleNamespace(history_size=args.history_size, chunk_size=args.chunk_size,
+        loop_args = SimpleNamespace(history_size=variant_history_size, chunk_size=args.chunk_size,
             action_dim=7, head_type=args.head_type, skip_nan=False, grad_clip=args.grad_clip,
             no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,
             gripper_loss_weight=args.gripper_loss_weight,
@@ -610,7 +627,9 @@ def main(argv=None):
                 print(f"RESTART {name}: no optimizer checkpoint; preserved {archive.name}", flush=True)
         run.mkdir(exist_ok=True)
         config = dict(manifest, use_intent_tokens=intent, use_memory_bank=memory,
-                      use_history=True, mamba_output_dim=args.mamba_output_dim, action_dim=7,
+                      use_history=not full_history, mamba_output_dim=0 if full_history else args.mamba_output_dim,
+                      history_size=variant_history_size,
+                      head_history_mode="full" if full_history else "mean", action_dim=7,
                       num_cameras=len(args.cameras), model_class="ALIGNIntentionModel",
                       trainable_parameters=sum(p.numel() for p in params))
         atomic_json(run / "config.json", config)
