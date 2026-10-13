@@ -31,15 +31,20 @@ before starting training. Training progress and metrics are written to
 The reproducible training command is:
 
 ```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python scripts/run_intention_ablation.py \
   --data data/libero_goal.h5 --cache data/libero_goal.dinov2 \
   --output checkpoints/piper_v4_ablation_use_text_plain_history_h4 \
   --variants plain_history --use-task-text \
   --history-size 1 --plain-history-size 4 \
   --temporal-sampling episode --epochs 200 --batch-size 10 \
-  --num-workers 4 --compressed-dim 8 --lr 0.0002 \
-  --gpu-memory-fraction 0.9 --seed 42
+  --num-workers 0 --compressed-dim 8 --lr 0.0002 \
+  --gpu-memory-fraction 1.0 --seed 42
 ```
+
+Zero DataLoader workers avoids exhausting host shared memory on this 32 GB
+machine. Expandable CUDA segments reduces fragmentation across variable-length
+episode batches. Neither change alters the model or effective batch size.
 
 After training, evaluate the same 44 held-out episodes with `--switch-at 0.0`,
 `--val-episodes checkpoints/piper_v4_ablation_val_episodes.txt`, and

@@ -186,10 +186,15 @@ def atomic_json(path, value):
 
 
 def extend_resume_manifest(previous, current):
-    """Preserve run provenance while permitting a larger total epoch target."""
+    """Preserve model/split provenance while updating allowed runtime settings."""
     if current["epochs"] < previous["epochs"]:
         raise ValueError("Resume epoch target cannot decrease; --epochs is the total target")
-    return dict(current, **{**previous, "epochs": current["epochs"]})
+    merged = dict(current, **previous)
+    for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
+                "gpu_memory_fraction"):
+        if key in current:
+            merged[key] = current[key]
+    return merged
 
 
 def summarize(out, records, manifest):

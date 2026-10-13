@@ -11,12 +11,15 @@ from scripts.run_intention_ablation import parse_args, extend_resume_manifest
 
 @pytest.mark.parametrize("target", [80, 100])
 def test_resume_manifest_allows_same_or_larger_total_epochs(target):
-    original = dict(epochs=80, commit="original", lr=0.001)
-    current = dict(epochs=target, commit="resuming", lr=0.001, num_workers=4)
+    original = dict(epochs=80, commit="original", lr=0.001,
+                    num_workers=4, gpu_memory_fraction=0.9)
+    current = dict(epochs=target, commit="resuming", lr=0.001,
+                   num_workers=0, gpu_memory_fraction=1.0)
     merged = extend_resume_manifest(original, current)
     assert merged["epochs"] == target
     assert merged["commit"] == "original"
-    assert merged["num_workers"] == 4
+    assert merged["num_workers"] == 0
+    assert merged["gpu_memory_fraction"] == 1.0
     assert original["epochs"] == 80
 
 
