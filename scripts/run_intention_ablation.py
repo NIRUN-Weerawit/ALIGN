@@ -29,6 +29,8 @@ sys.path.insert(0, str(ROOT))
 from data.align_dataset import ALIGNDataset
 from models.align_intention import ALIGNIntentionModel
 from training.train_intention import train_v4_epoch, validate
+from training.plain_history_training import (SparseHistoryEpisodes,
+    collate_sparse_histories, plain_history_epoch)
 
 
 def seed_everything(seed):
@@ -197,7 +199,8 @@ def extend_resume_manifest(previous, current):
         raise ValueError("Resume epoch target cannot decrease; --epochs is the total target")
     merged = dict(current, **previous)
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
-                "gpu_memory_fraction", "micro_batch_size"):
+                "gpu_memory_fraction", "micro_batch_size", "pin_memory",
+                "plain_history_loader", "plain_head_batch_size"):
         if key in current:
             merged[key] = current[key]
     return merged
@@ -270,7 +273,14 @@ def evaluate_existing(out):
         model.vision_encoder = vision
         seed_everything(manifest["seed"] + 10000)
         args.history_size = config["history_size"]
-        val_loss, _, metrics = validate(model, loader, device, args)
+        if config.get("head_history_mode") == "full":
+            args.plain_head_batch_size = manifest.get("plain_head_batch_size", 32)
+            sparse_loader = DataLoader(SparseHistoryEpisodes(data, args.history_size),
+                batch_size=manifest.get("micro_batch_size") or manifest["batch_size"],
+                num_workers=0, pin_memory=False, collate_fn=collate_sparse_histories)
+            val_loss, _, metrics = plain_history_epoch(model, sparse_loader, device, args)
+        else:
+            val_loss, _, metrics = validate(model, loader, device, args)
         record["best"].update(metrics)
         record["best"]["val/loss"] = val_loss
         record["gripper_threshold"] = threshold
@@ -331,6 +341,12 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--micro-batch-size", type=int, default=None,
                         help="Episodes loaded together; gradients accumulate to --batch-size before each optimizer step.")
+    parser.add_argument("--plain-history-loader", choices=["sparse", "dense"], default="sparse",
+                        help="Sparse loads only selected anchor histories; dense retains the reference full-episode path.")
+    parser.add_argument("--plain-head-batch-size", type=int, default=32,
+                        help="Maximum supervised points per sparse diffusion loss/sampling call.")
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None,
+                        help="Pin CPU batches; default off for sparse history, on for dense loading.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader processes; HDF5 handles are reopened per worker.")
     parser.add_argument("--prefetch-factor", type=int, default=1,
@@ -371,6 +387,11 @@ def parse_args(argv=None):
                         help="Train only this variant, retaining the ordered common initialization.")
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
     args = parser.parse_args(argv)
+    if args.plain_head_batch_size < 1:
+        parser.error("--plain-head-batch-size must be positive")
+    if args.micro_batch_size is not None and (args.micro_batch_size < 1 or
+                                             args.batch_size % args.micro_batch_size):
+        parser.error("--micro-batch-size must be positive and divide --batch-size")
     for name in ("epochs", "batch_size", "history_size", "plain_history_size", "chunk_size", "segment_length",
                  "state_dim", "compressed_dim", "head_d_model", "mamba_output_dim",
                  "mamba_d_state", "mamba_d_conv", "mamba_expand", "num_intent_tokens",
@@ -520,11 +541,6 @@ def main(argv=None):
     )
     if args.num_workers > 0:
         loader_options.update(prefetch_factor=args.prefetch_factor, multiprocessing_context="spawn")
-    train_loader = DataLoader(
-        train_data, batch_sampler=train_sampler, collate_fn=collate_segments, **loader_options)
-    val_loader = DataLoader(
-        val_data, batch_size=micro_batch_size, shuffle=False, collate_fn=collate_segments,
-        **loader_options)
     records = (json.loads((out / "summary.json").read_text())
                if args.resume and (out / "summary.json").exists() else {})
     report_out = out
@@ -541,6 +557,16 @@ def main(argv=None):
         memory = name.endswith("_memory") and not name.endswith("no_memory")
         full_history = name == "plain_history"
         variant_history_size = args.plain_history_size if full_history else args.history_size
+        sparse_history = full_history and args.plain_history_loader == "sparse"
+        variant_options = dict(loader_options, pin_memory=(args.pin_memory
+            if args.pin_memory is not None else not sparse_history))
+        variant_train_data = SparseHistoryEpisodes(train_data, variant_history_size) if sparse_history else train_data
+        variant_val_data = SparseHistoryEpisodes(val_data, variant_history_size) if sparse_history else val_data
+        collator = collate_sparse_histories if sparse_history else collate_segments
+        train_loader = DataLoader(variant_train_data, batch_sampler=train_sampler,
+                                  collate_fn=collator, **variant_options)
+        val_loader = DataLoader(variant_val_data, batch_size=micro_batch_size,
+                                shuffle=False, collate_fn=collator, **variant_options)
         seed_everything(args.seed)
         model = ALIGNIntentionModel(state_dim=args.state_dim,
             mamba_output_dim=0 if full_history else args.mamba_output_dim,
@@ -603,6 +629,7 @@ def main(argv=None):
             no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,
             gripper_loss_weight=args.gripper_loss_weight,
             head_window_batch_size=args.head_window_batch_size,
+            plain_head_batch_size=args.plain_head_batch_size,
             gradient_accum_steps=args.batch_size // micro_batch_size)
         run = out / name
         start_epoch = 1
@@ -656,12 +683,17 @@ def main(argv=None):
                 seed_everything(args.seed + epoch)
                 start = time.monotonic()
                 train_start = time.perf_counter()
-                train_loss, _ = train_v4_epoch(model, train_loader, optimizer, device,
-                    loop_args, max_steps=args.max_steps)
+                if sparse_history:
+                    train_loss, _ = plain_history_epoch(model, train_loader, device,
+                        loop_args, optimizer=optimizer, max_steps=args.max_steps)
+                else:
+                    train_loss, _ = train_v4_epoch(model, train_loader, optimizer, device,
+                        loop_args, max_steps=args.max_steps)
                 train_wall_s = time.perf_counter() - train_start
                 seed_everything(args.seed + 10000)
                 val_start = time.perf_counter()
-                val_loss, _, metrics = validate(model, val_loader, device, loop_args)
+                val_loss, _, metrics = (plain_history_epoch(model, val_loader, device, loop_args)
+                                       if sparse_history else validate(model, val_loader, device, loop_args))
                 val_wall_s = time.perf_counter() - val_start
                 row = dict(epoch=epoch, **{"train/loss": train_loss, "val/loss": val_loss},
                     **metrics, elapsed_s=time.monotonic() - start,

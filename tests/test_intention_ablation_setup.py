@@ -28,6 +28,14 @@ def test_resume_manifest_rejects_decreasing_total_epochs():
         extend_resume_manifest(dict(epochs=80), dict(epochs=40))
 
 
+def test_sparse_history_controls_are_runtime_resume_settings():
+    merged = extend_resume_manifest(dict(epochs=200, plain_history_loader='dense',
+        pin_memory=True, plain_head_batch_size=2), dict(epochs=200,
+        plain_history_loader='sparse', pin_memory=False, plain_head_batch_size=32))
+    assert merged['plain_history_loader'] == 'sparse'
+    assert merged['pin_memory'] is False and merged['plain_head_batch_size'] == 32
+
+
 def test_sequential_cli_defaults_and_shared_overrides():
     defaults = parse_args(["--output", "example"])
     assert defaults.variants == ["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"]

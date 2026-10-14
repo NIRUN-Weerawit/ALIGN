@@ -14,7 +14,10 @@ uses cross-attention at the bottleneck to read the full ordered history.
 Task text, when enabled, is projected into the condition width and added to
 each history step.
 
-Training reads cached DINOv2 features once per episode segment. The first
+Training defaults to the sparse loader: it selects the same supervised
+anchors as the reference trainer, loads the union of their required history
+frames, and encodes each unique frame once. Packed observations avoid padding
+whole episodes to the longest episode in a batch. The first
 observation is repeated on the left until a complete history is available;
 this preserves the same action supervision anchors as a one-frame model.
 MuJoCo evaluation encodes each new camera frame once and retains encoded
@@ -47,6 +50,7 @@ python scripts/run_intention_ablation.py \
   --history-size 1 --plain-history-size 4 \
   --temporal-sampling episode --epochs 200 --batch-size 10 \
   --micro-batch-size 2 \
+  --plain-history-loader sparse --plain-head-batch-size 32 --no-pin-memory \
   --num-workers 0 --compressed-dim 8 --lr 0.0002 \
   --gpu-memory-fraction 1.0 --seed 42
 ```
@@ -60,6 +64,29 @@ across variable-length episode batches.
 The DINOv2 sidecar is accessed through `data/libero_goal.dinov2`, which now
 points to a verified local copy on NVMe. The original external-drive target is
 preserved at `data/libero_goal.dinov2.external`.
+
+Sparse loading is automatically enabled for `plain_history` only. Other
+variants retain the sequential episode path to build intent and memory.
+`--plain-head-batch-size` bounds supervised points per loss/sampling call;
+it does not change the optimizer batch. Pinning defaults off for the sparse
+loader to avoid a second large locked host allocation. `--pin-memory` enables
+it explicitly; `--plain-history-loader dense` retains the reference path.
+These runtime options can change when resuming an existing checkpoint.
+
+A GPU benchmark on ten identical epoch-60 microbatches (20 episodes, two
+optimizer updates, four-frame histories, warm cache, pinning off in both
+cases) measured 6.11 seconds dense versus 1.70 seconds sparse, about 3.6x
+faster. Cached feature payload fell from 3,701 MiB to 1,544 MiB; peak process
+RSS fell from 5.89 GiB to 2.29 GiB; peak GPU allocation fell from 1.61 GiB to
+0.56 GiB. This short benchmark is not a full-epoch throughput guarantee.
+Reproduce each mode with `scripts/benchmark_plain_history.py --run-directory
+checkpoints/piper_v4_ablation_use_text_plain_history_h4/plain_history --mode
+sparse --microbatches 10 --epoch 60 --output /tmp/benchmark.json`, then repeat
+with `--mode dense`.
+Condition/target and deterministic-gradient parity tests cover missing
+observations, initial padding, uneven episode lengths, and microbatch
+accumulation. Dropout/noise regrouping preserves their distributions but does
+not produce bit-identical stochastic training trajectories.
 
 After training, evaluate the same 44 held-out episodes with `--switch-at 0.0`,
 `--val-episodes checkpoints/piper_v4_ablation_val_episodes.txt`, and
