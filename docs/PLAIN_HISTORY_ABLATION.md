@@ -7,6 +7,11 @@ model, while larger values retain that many ordered observations. Use a
 separate `--output` directory for each count because checkpoint weights and
 the saved configuration depend on it. Evaluation reads the count from the
 checkpoint automatically.
+Diffusion cross-attention excludes the cuDNN SDPA backend because some
+GPU/PyTorch/cuDNN combinations cannot build an execution plan for its short
+action queries and history keys. Flash and efficient attention remain enabled,
+with PyTorch math attention available as a fallback. The backend selection is
+local to these attention calls and does not affect model/checkpoint structure.
 Each observation contributes its 4,096-dimensional compressed visual feature
 and 64-dimensional encoded robot state in the current LIBERO Goal setup.
 The diffusion U-Net conditions its FiLM blocks on the current observation and

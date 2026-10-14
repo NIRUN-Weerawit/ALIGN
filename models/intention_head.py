@@ -21,11 +21,25 @@ Output:
 """
 
 import math
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+
+
+def _diffusion_attention_backend(device):
+    """Avoid cuDNN SDPA plan failures for short action/history cross-attention.
+
+    Keep Flash/efficient attention available, with PyTorch math as a fallback.
+    The context restores the caller's backend settings on exit.
+    """
+    if device.type != "cuda":
+        return nullcontext()
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    return sdpa_kernel([SDPBackend.FLASH_ATTENTION,
+                        SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
 
 
 def _valid_loss_samples(actions_target, cond, sample_mask):
@@ -387,14 +401,16 @@ class DiffusionPolicyUNet1D(nn.Module):
             positions = torch.arange(self.history_size, device=cond.device)
             history = self.history_projection(cond)
             history = history + self.history_position(positions).unsqueeze(0)
-            context, _ = self.history_attention(
-                x.transpose(1, 2), history, history, need_weights=False)
+            with _diffusion_attention_backend(x.device):
+                context, _ = self.history_attention(
+                    x.transpose(1, 2), history, history, need_weights=False)
             x = x + context.transpose(1, 2)
         if hasattr(self,"visual_attention"):
             tokens = cond_global[:,:self.visual_pool_dim].reshape(B,-1,self.visual_token_dim)
             tokens = self.visual_projection(tokens)
             q = x.transpose(1,2)
-            context,_ = self.visual_attention(q,tokens,tokens,need_weights=False)
+            with _diffusion_attention_backend(q.device):
+                context,_ = self.visual_attention(q,tokens,tokens,need_weights=False)
             x = x + self.visual_output(context).transpose(1,2)
 
         x = self.up2(x, target_len=skip2.shape[-1])

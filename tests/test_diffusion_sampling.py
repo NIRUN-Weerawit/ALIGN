@@ -5,6 +5,35 @@ import torch
 from models.intention_head import DiffusionPolicyHead
 from data.gripper_state import executed_binary_gripper
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('history_size', [4, 8])
+def test_history_attention_excludes_cudnn_and_restores_backends(monkeypatch, history_size):
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    import torch.nn.functional as functional
+    head = DiffusionPolicyHead(cond_dim=32, hidden_dim=64, time_dim=64,
+        chunk_size=8, history_size=history_size, loss_repeats=4).cuda()
+    head.unet.configure_visual_attention(pool_dim=16, token_dim=4)
+    head.cuda()
+    condition = torch.randn(32, history_size, 32, device='cuda', requires_grad=True)
+    target = torch.randn(32, 8, 7, device='cuda')
+    original = functional.scaled_dot_product_attention
+    calls = []
+    def checked(*args, **kwargs):
+        assert not torch.backends.cuda.cudnn_sdp_enabled()
+        assert torch.backends.cuda.math_sdp_enabled()
+        calls.append(True)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(functional, 'scaled_dot_product_attention', checked)
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH]):
+        with torch.autocast('cuda', dtype=torch.bfloat16):
+            loss = head.loss(target, condition)
+        loss.backward()
+        assert torch.backends.cuda.cudnn_sdp_enabled()
+    assert len(calls) >= 2  # Both history and optional visual attention.
+    assert torch.isfinite(loss)
+    assert condition.grad is not None and torch.isfinite(condition.grad).all()
+
 @pytest.mark.parametrize('steps', [1, 4, 8, 10])
 def test_ddim_oracle_recovers_clean_actions_at_every_step_budget(steps):
     head = DiffusionPolicyHead(cond_dim=4, hidden_dim=8, time_dim=8, chunk_size=8)
