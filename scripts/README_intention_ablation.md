@@ -198,3 +198,9 @@ A fresh output directory is required for a corrected-input training comparison;
 resume rejects silently changing these settings. Old weights are not repaired by
 changing the loader. `--evaluate-existing` preserves the manifest's convention,
 including the legacy default when metadata is absent.
+
+Compression experiments should start with `--variants no_intent_no_memory
+--use-task-text`, changing only `--compressed-dim 8`, `16`, or `32` and using
+separate output directories. Full training and closed-loop evaluation are needed
+to select a width; short pilot errors are not simulator success rates. The flat
+memory architecture grows much faster with width than this plain baseline.
