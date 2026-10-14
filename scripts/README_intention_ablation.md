@@ -173,3 +173,18 @@ controlled rollout. This encoder is task-specific and is **not** pretrained
 CLIP or an unseen-language generalization test. The run does not mask text;
 compare it with the original no-text checkpoint and test wrong-task text to
 establish that the head actually uses the instruction.
+
+### Gripper state and transition supervision
+
+New runs default to `--gripper-state-source causal`: use measured gripper
+observations when available, otherwise the **previous** executed action command.
+The first frame uses the episode `initial_gripper` attribute (default 0). Neither
+the current action label nor a future command enters the state. This applies to
+dense and sparse cached loaders. Gripper commands use 0=closed, 1=open.
+
+Old ablation manifests predate this contract. To reproduce/resume their behavior,
+explicitly pass `--gripper-state-source legacy_zero`.
+A fresh output directory is required for a corrected-input training comparison;
+resume rejects silently changing these settings. Old weights are not repaired by
+changing the loader. `--evaluate-existing` preserves the manifest's convention,
+including the legacy default when metadata is absent.

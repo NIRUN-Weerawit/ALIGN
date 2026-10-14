@@ -485,7 +485,7 @@ class ALIGNDataset(Dataset):
         return np.concatenate([pose, [gripper]], axis=0).astype(np.float32)
 
     def _read_poses_gripper(self, ep_idx: int, start: int, count: int) -> np.ndarray:
-        """Read a (count,) gripper array from a dedicated /ep_XXX/gripper field.
+        """Read measured gripper state, falling back to the previous command.
 
         Handles the same cumulative-poses offset as `_read_poses` and pads
         with the last known state at episode boundaries.
@@ -499,12 +499,16 @@ class ALIGNDataset(Dataset):
                 offset = self._ep_pose_offsets[ep_idx]
                 abs_start = offset + start
                 arr = self._h5[f"{key}/gripper"]
-        except Exception:
-            return np.zeros(count, dtype=np.float32)
+        except KeyError:
+            return self._read_actions_gripper_col(ep_idx, start, count)
         chunk = np.asarray(arr[abs_start:abs_start + count], dtype=np.float32).reshape(-1)
         if len(chunk) < count:
+            if len(chunk):
+                last = chunk[-1]
+            else:
+                last = float(np.asarray(arr[-1]).reshape(-1)[0]) if len(arr) else 0.0
             chunk = np.concatenate(
-                [chunk, np.full(count - len(chunk), chunk[-1] if len(chunk) else 0.0, dtype=np.float32)]
+                [chunk, np.full(count - len(chunk), last, dtype=np.float32)]
             )
         return chunk
 
