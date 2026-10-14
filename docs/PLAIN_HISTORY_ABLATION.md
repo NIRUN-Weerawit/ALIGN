@@ -179,3 +179,6 @@ After training, evaluate the same 44 held-out episodes with `--switch-at 0.0`,
 `--val-episodes checkpoints/piper_v4_ablation_val_episodes.txt`, and
 `--n-episodes 44`. Compare task success, per-task failures, gripper behavior,
 and inference time with the text-conditioned intent-plus-memory model.
+Use `export PYTHONPATH=/home/whinnoy/.local/share/align/LIBERO` before simulator
+evaluation so the LIBERO source is importable. The post-training evaluation
+script exports this path and requires a fresh JSON result before comparing.
