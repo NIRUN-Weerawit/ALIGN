@@ -72,11 +72,13 @@ The DINOv2 sidecar is accessed through `data/libero_goal.dinov2`, which now
 points to a verified local copy on NVMe. The original external-drive target is
 preserved at `data/libero_goal.dinov2.external`.
 
-Sparse loading is automatically enabled for `plain_history` only. Other
-variants retain the sequential episode path to build intent and memory.
+Sparse loading is automatically enabled for `plain_history` and for the
+episode-sampled `no_intent_no_memory` baseline with history size one.
+Multi-frame mean-history baselines retain their original full-sequence path.
+Intent or memory variants retain every observation in the sequential episode path to build their state.
 `--plain-head-batch-size` bounds supervised points per loss/sampling call;
-it does not change the optimizer batch. Pinning defaults off for the sparse
-loader to avoid a second large locked host allocation. `--pin-memory` enables
+it does not change the optimizer batch. Pinning defaults off for all variants
+to avoid a second large locked host allocation. `--pin-memory` enables
 it explicitly; `--plain-history-loader dense` retains the reference path.
 These runtime options can change when resuming an existing checkpoint.
 
@@ -147,8 +149,12 @@ checkpoint and identical epoch-153 episode groups. Direct loading copies
 contiguous runs from each episode mmap straight into the final tensor. Worker
 output uses shared storage to avoid another copy across the IPC queue.
 `--plain-history-copy-mode materialized` retains the older extra-copy path
-for comparisons. Plain-history-only runs now default to one worker; explicit
-worker arguments and the defaults of other variants remain respected.
+for comparisons. All variants now default to one worker with prefetch one;
+explicit worker and pinning arguments remain respected. Full-sequence models
+also copy cached features directly into final batch storage and release mmap
+handles after each item. Their intent scans and memory writes are unchanged.
+`--cached-copy-mode` is an alias for the older copy-mode flag. Loading-stage
+profiling now works on the full-sequence training path too.
 
 | Loading configuration | Full training-pass wall time | Reduction |
 |---|---:|---:|
@@ -182,3 +188,18 @@ and inference time with the text-conditioned intent-plus-memory model.
 Use `export PYTHONPATH=/home/whinnoy/.local/share/align/LIBERO` before simulator
 evaluation so the LIBERO source is importable. The post-training evaluation
 script exports this path and requires a fresh JSON result before comparing.
+
+All-variant loading extension (2026-10-14)
+
+Cached loading benchmark across all four variants
+
+20 timed microbatches (40 episodes), five warmup microbatches, microbatch size two, fixed epoch-153 episode groups. Two trials reverse reference/optimized order. Fresh seeded architecture weights/optimizer from the same task-text configuration; this measures throughput, not learned policy quality. Native CUDA Mamba for intent variants. Reference: dense materialized copies, zero workers, unpinned. Optimized: direct copies, one persistent worker, prefetch one, unpinned; history-one stateless baseline uses sparse anchors. Other variants retain every chronological observation. Initialization, worker startup and validation excluded. GPU was shared with another workload, so small differences should be treated cautiously.
+
+| Variant | Reference mean | Optimized mean | Wall reduction |
+|---|---:|---:|---:|
+| no_intent_no_memory | 8.49 s | 1.35 s | 84.1% |
+| intent_no_memory | 8.67 s | 8.52 s | 1.8% |
+| no_intent_memory | 18.39 s | 18.02 s | 2.0% |
+| intent_memory | 20.76 s | 19.13 s | 7.9% |
+
+The trained intent_memory checkpoint also passed a native-Mamba optimized-loader smoke run (10 measured microbatches, 9.75 s). Regression checks: 126 passed, including exact batch equality, deterministic gradient/parameter updates, final memory contents, full causal observation coverage, spawned workers and sparse history-one mean/full-history validation. Sparse regrouping changes stochastic draws, so identical trained trajectories are not claimed.
