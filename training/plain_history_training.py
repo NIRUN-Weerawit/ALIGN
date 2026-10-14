@@ -11,20 +11,26 @@ from training.train_intention import sync_and_step
 
 class SparseHistoryEpisodes(Dataset):
     """Reuse the dense sampler's anchors/dropout, touching only their histories."""
-    def __init__(self, episodes, history_size):
+    def __init__(self, episodes, history_size, profile=False):
         self.episodes = episodes
         self.history_size = history_size
+        self.profile = profile
 
     def __len__(self):
         return len(self.episodes)
 
     def __getitem__(self, index):
+        before = time.perf_counter() if self.profile else 0.
         item = self.episodes[index]
+        prepared = time.perf_counter() if self.profile else 0.
         anchors = np.flatnonzero(item['loss_anchor_mask'])
         times = np.maximum(0, anchors[:, None] + np.arange(1 - self.history_size, 1))
         unique, inverse = np.unique(times, return_inverse=True)
+        selected = time.perf_counter() if self.profile else 0.
+        frames = item['frames_segment'][unique]
+        materialized = time.perf_counter() if self.profile else 0.
         result = dict(
-            frames=item['frames_segment'][unique],
+            frames=frames,
             states=item['states_segment'][unique],
             history_indices=inverse.reshape(times.shape),
             targets=item['actions_segment'][anchors[:, None] +
@@ -39,11 +45,18 @@ class SparseHistoryEpisodes(Dataset):
         handles = getattr(self.episodes.dataset, '_dinov2_memmaps', None)
         if handles is not None:
             handles.pop(self.episodes.episodes[index], None)
+        if self.profile:
+            result['data_stage_cpu_s'] = dict(
+                episode_metadata_and_mmap_wall_s=prepared-before,
+                history_selection_wall_s=selected-prepared,
+                feature_materialization_wall_s=materialized-selected,
+                target_and_mask_gather_wall_s=time.perf_counter()-materialized)
         return result
 
 
 def collate_sparse_histories(items):
     """Pack unique observations without padding to the longest episode."""
+    before = time.perf_counter() if 'data_stage_cpu_s' in items[0] else None
     offsets = np.cumsum([0] + [len(item['frames']) for item in items[:-1]])
     histories = np.concatenate([x['history_indices'] + offset
                                 for x, offset in zip(items, offsets)])
@@ -63,35 +76,57 @@ def collate_sparse_histories(items):
     for key in ('camera_mask', 'state_mask'):
         if key in items[0]:
             result[key] = torch.from_numpy(np.concatenate([x[key] for x in items]))
+    if before is not None:
+        result['data_stage_cpu_s'] = {
+            key: sum(x['data_stage_cpu_s'][key] for x in items)
+            for key in items[0]['data_stage_cpu_s']}
+        result['data_stage_cpu_s']['batch_pack_wall_s'] = time.perf_counter()-before
     return result
 
 
-def history_conditions(model, batch, device):
+def history_conditions(model, batch, device, stage_start=None, stage_end=None):
+    def start():
+        return stage_start() if stage_start else None
+    def end(name, before):
+        if stage_end:
+            stage_end(name, before)
     if model.use_memory_bank or model.intention_encoder is not None:
         raise ValueError('Sparse history requires a stateless plain model')
+    before = start()
     frames = batch['frames'].to(device, non_blocking=True)
     states = batch['states'].to(device, dtype=torch.float32, non_blocking=True)
+    # Transfer small bookkeeping/masks here as well, avoiding H2D hidden in
+    # the encoder stage. GPU events measure the stream without per-stage sync.
+    visibility = batch.get('camera_mask')
+    visibility = visibility.to(device) if visibility is not None else None
+    state_mask = batch.get('state_mask')
+    state_mask = state_mask.to(device) if state_mask is not None else None
+    indices = batch['history_indices'].to(device)
+    episode_indices = batch['episode_indices'].to(device)
+    end('host_to_device_gpu_s', before)
+    before = start()
     count, tokens, _ = frames.shape
     cameras = tokens // 257
     features = frames.reshape(count, cameras, 257, 768)
     patches = features[:, :, :-1].reshape(count, cameras * 256, 768)
-    visibility = batch.get('camera_mask')
     if visibility is not None:
-        visibility = visibility.to(device)
         visible_patches = visibility[:, :, None, None].expand(-1, -1, 256, 768).reshape(patches.shape)
         patches = torch.where(visible_patches, patches, torch.zeros_like(patches))
-    state_mask = batch.get('state_mask')
     if state_mask is not None:
-        state_mask = state_mask.to(device)
         states = torch.where(state_mask[:, None], states, torch.zeros_like(states))
+    end('patch_unpack_and_masks_gpu_s', before)
+    before = start()
     encoded_states = model.state_encoder(states)
     if state_mask is not None:
         encoded_states = encoded_states * state_mask[:, None]
+    end('state_encoder_gpu_s', before)
+    before = start()
     encoded_visual = model.encode_patch_sequence(patches, encoded_states)
+    end('patch_encoder_gpu_s', before)
+    before = start()
     if visibility is not None:
         encoded_visual = (encoded_visual.reshape(count, cameras, 256, -1) *
                           visibility[:, :, None, None]).reshape(count, cameras * 256, -1)
-    indices = batch['history_indices'].to(device)
     visual = encoded_visual.flatten(1)[indices]
     states = encoded_states[indices]
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
@@ -100,8 +135,10 @@ def history_conditions(model, batch, device):
             # The dense trainer encodes task text in FP32 before head AMP.
             with torch.amp.autocast('cuda', enabled=False):
                 text = model.encode_task_text(batch['texts'])
-            text = text[batch['episode_indices'].to(device)]
-        return model.action_condition(visual, states, text_emb=text)
+            text = text[episode_indices]
+        condition = model.action_condition(visual, states, text_emb=text)
+    end('history_gather_and_head_condition_gpu_s', before)
+    return condition
 
 
 def plain_history_epoch(model, loader, device, args, optimizer=None, max_steps=0):
@@ -111,6 +148,8 @@ def plain_history_epoch(model, loader, device, args, optimizer=None, max_steps=0
     start = time.perf_counter()
     data_wait = 0.
     events = {}
+    data_stages = {}
+    profile = getattr(args, 'profile_data_stages', False)
 
     def mark():
         if device.type != 'cuda':
@@ -139,13 +178,18 @@ def plain_history_epoch(model, loader, device, args, optimizer=None, max_steps=0
         if not training:
             genuine_windows += int(torch.unique(batch['anchor_timesteps']).numel())
         data_wait += time.perf_counter() - before
+        for name, seconds in batch.get('data_stage_cpu_s', {}).items():
+            data_stages[name] = data_stages.get(name, 0.) + float(seconds)
         if training and step % accumulation == 0:
             optimizer.zero_grad(set_to_none=True)
             group_count = 0
         with torch.set_grad_enabled(training):
             encode_start = mark()
-            condition = history_conditions(model, batch, device)
+            condition = history_conditions(model, batch, device,
+                mark if profile else None, finish if profile else None)
+            target_start = mark() if profile else None
             target = batch['targets'].to(device, non_blocking=True)
+            finish('target_host_to_device_gpu_s', target_start)
             finish('feature_and_condition_gpu_s', encode_start)
             count = target.shape[0]
             weighted_losses = []
@@ -189,6 +233,7 @@ def plain_history_epoch(model, loader, device, args, optimizer=None, max_steps=0
     if training:
         args._last_stage_times = dict(
             train_wall_s=time.perf_counter() - start, data_wait_wall_s=data_wait,
+            **data_stages,
             **{name: sum(a.elapsed_time(b) for a, b in pairs) / 1000
                for name, pairs in events.items()})
         return loss_sum / total_count, 0.

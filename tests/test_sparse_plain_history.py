@@ -32,9 +32,13 @@ class Features:
 @pytest.mark.parametrize('history', [1, 4, 20])
 def test_sparse_preserves_anchors_targets_and_dropout_histories(history):
     parent = CachedEpisodes(Features(), [0, 1], 20, 42, True, 'episode', 4, 4, .8, True)
-    sparse = SparseHistoryEpisodes(parent, history)
+    sparse = SparseHistoryEpisodes(parent, history, profile=True)
     items = [sparse[i] for i in range(2)]
     batch = collate_sparse_histories(items)
+    assert set(batch['data_stage_cpu_s']) == {
+        'episode_metadata_and_mmap_wall_s', 'history_selection_wall_s',
+        'feature_materialization_wall_s', 'target_and_mask_gather_wall_s', 'batch_pack_wall_s'}
+    assert all(value >= 0 for value in batch['data_stage_cpu_s'].values())
     expected = []
     for ep in range(2):
         dense = parent[ep]
@@ -79,7 +83,7 @@ def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accum
     args = SimpleNamespace(history_size=history, chunk_size=4, action_dim=7,
         head_type='diffusion', skip_nan=False, grad_clip=1., no_sample_during_train=True,
         head_window_batch_size=2, plain_head_batch_size=3, gripper_threshold=.5,
-        gradient_accum_steps=2 if accumulate else 1)
+        gradient_accum_steps=2 if accumulate else 1, profile_data_stages=True)
     dense_loss, _ = train_v4_epoch(reference, [dense], torch.optim.SGD(reference.parameters(), lr=.001), torch.device('cpu'), args)
     sparse_batches = [collate_sparse_histories([item]) for item in items] if accumulate else [sparse]
     sparse_loss, _ = plain_history_epoch(optimized, sparse_batches, torch.device('cpu'), args,

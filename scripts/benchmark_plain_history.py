@@ -34,6 +34,7 @@ def main():
     parser.add_argument('--microbatches', type=int, default=10)
     parser.add_argument('--epoch', type=int, default=60)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--profile-data-stages', action='store_true')
     args = parser.parse_args()
     cfg = json.loads((args.run_directory / 'config.json').read_text())
     torch.set_num_threads(cfg.get('cpu_threads', 2))
@@ -69,7 +70,8 @@ def main():
         cfg['batch_size'], cfg['seed'], cfg['length_bucket_multiplier'], micro_batch_size=micro)
     sampler.set_epoch(args.epoch)
     sparse = args.mode == 'sparse'
-    data = SparseHistoryEpisodes(parent, cfg['history_size']) if sparse else parent
+    data = SparseHistoryEpisodes(parent, cfg['history_size'],
+        profile=args.profile_data_stages) if sparse else parent
     payload = 0
     frame_count = 0
     def collate(items):
@@ -85,20 +87,34 @@ def main():
         action_dim=7, head_type='diffusion', skip_nan=False, grad_clip=cfg['grad_clip'],
         no_sample_during_train=True, head_window_batch_size=cfg['head_window_batch_size'],
         plain_head_batch_size=32, gradient_accum_steps=cfg['batch_size'] // micro,
+        profile_data_stages=args.profile_data_stages,
         gripper_loss_weight=cfg['gripper_loss_weight'], gripper_threshold=cfg['gripper_threshold'])
     seed_everything(cfg['seed'] + args.epoch)
     torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
+    def disk_read_bytes():
+        path = Path('/proc/self/io')
+        if not path.exists():
+            return None
+        return int(next(line.split(':')[1] for line in path.read_text().splitlines()
+                        if line.startswith('read_bytes:')))
+    initial_reads = disk_read_bytes()
+    initial_faults = resource.getrusage(resource.RUSAGE_SELF)
     if sparse:
         loss, _ = plain_history_epoch(model, loader, device, loop, optimizer, args.microbatches)
     else:
         loss, _ = train_v4_epoch(model, loader, optimizer, device, loop, args.microbatches)
     torch.cuda.synchronize()
+    final_reads = disk_read_bytes()
+    final_faults = resource.getrusage(resource.RUSAGE_SELF)
     result = dict(mode=args.mode, microbatches=args.microbatches, epoch=args.epoch,
         history_size=cfg['history_size'], wall_s=time.perf_counter() - start, loss=loss,
         frame_count=frame_count, feature_payload_mib=payload / 1024**2,
         peak_gpu_gib=torch.cuda.max_memory_allocated() / 1024**3,
         peak_process_rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2,
+        disk_read_mib=(final_reads-initial_reads)/1024**2 if initial_reads is not None else None,
+        major_page_faults=final_faults.ru_majflt-initial_faults.ru_majflt,
+        minor_page_faults=final_faults.ru_minflt-initial_faults.ru_minflt,
         timing=loop._last_stage_times)
     args.output.write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result), flush=True)

@@ -200,7 +200,7 @@ def extend_resume_manifest(previous, current):
     merged = dict(current, **previous)
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
                 "gpu_memory_fraction", "micro_batch_size", "pin_memory",
-                "plain_history_loader", "plain_head_batch_size"):
+                "plain_history_loader", "plain_head_batch_size", "profile_data_stages"):
         if key in current:
             merged[key] = current[key]
     return merged
@@ -347,6 +347,8 @@ def parse_args(argv=None):
                         help="Maximum supervised points per sparse diffusion loss/sampling call.")
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None,
                         help="Pin CPU batches; default off for sparse history, on for dense loading.")
+    parser.add_argument("--profile-data-stages", action="store_true",
+                        help="Record sparse cache materialization, packing and detailed CUDA-stage timings.")
     parser.add_argument("--num-workers", type=int, default=4,
                         help="DataLoader processes; HDF5 handles are reopened per worker.")
     parser.add_argument("--prefetch-factor", type=int, default=1,
@@ -560,8 +562,10 @@ def main(argv=None):
         sparse_history = full_history and args.plain_history_loader == "sparse"
         variant_options = dict(loader_options, pin_memory=(args.pin_memory
             if args.pin_memory is not None else not sparse_history))
-        variant_train_data = SparseHistoryEpisodes(train_data, variant_history_size) if sparse_history else train_data
-        variant_val_data = SparseHistoryEpisodes(val_data, variant_history_size) if sparse_history else val_data
+        variant_train_data = SparseHistoryEpisodes(train_data, variant_history_size,
+            profile=args.profile_data_stages) if sparse_history else train_data
+        variant_val_data = SparseHistoryEpisodes(val_data, variant_history_size,
+            profile=args.profile_data_stages) if sparse_history else val_data
         collator = collate_sparse_histories if sparse_history else collate_segments
         train_loader = DataLoader(variant_train_data, batch_sampler=train_sampler,
                                   collate_fn=collator, **variant_options)
@@ -630,6 +634,7 @@ def main(argv=None):
             gripper_loss_weight=args.gripper_loss_weight,
             head_window_batch_size=args.head_window_batch_size,
             plain_head_batch_size=args.plain_head_batch_size,
+            profile_data_stages=args.profile_data_stages,
             gradient_accum_steps=args.batch_size // micro_batch_size)
         run = out / name
         start_epoch = 1

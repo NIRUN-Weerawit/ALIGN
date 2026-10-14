@@ -101,6 +101,45 @@ Data wait fell from a 202.99-second median to 42.12 seconds; validation took
 gripper accuracy 0.93874, and peak GPU allocation 0.590 GiB. These measurements
 describe the first resumed epoch; they do not establish closed-loop success.
 
+Detailed loading profiles are enabled with `--profile-data-stages` on the
+runner or benchmark. The runner writes the additional stages to epoch
+`metrics.jsonl`; without the flag, per-item CPU timers and detailed CUDA
+events are omitted. CUDA events do not synchronize each individual stage.
+For workers > 0, CPU stage totals sum worker work and can overlap, so they
+should not be added to reconstruct main-process wall time.
+
+Two measured passes over the same 40 microbatches (80 episodes, seed/anchor
+epoch 153, four-frame history, zero workers, unpinned CPU batches) averaged:
+
+| Stage | Seconds | Clock |
+|---|---:|---|
+| Episode metadata and mmap setup | 0.15 | CPU wall |
+| Feature materialization | 4.60 | CPU wall |
+| Batch packing | 2.03 | CPU wall |
+| Host-to-GPU transfer | 0.84 | CUDA stream |
+| Unpacking, encoders, history/head condition | 0.76 | CUDA stream |
+| Diffusion loss | 0.88 | CUDA stream |
+| Backward and optimizer | 1.74 | CUDA stream |
+| Overall benchmark | 11.20 | Wall |
+
+Materialization includes disk/page-fault stalls and the initial NumPy gather
+copy. Packing is a second copy into contiguous batch storage. Each pass
+materialized 5.74 GiB of feature payload and incurred about 4.29 GiB of
+physical disk reads; repeating the sample did not produce a fully resident
+cache. Two existing jobs shared the GPU during profiling, so GPU timings
+include contention. The largest remaining opportunities are eliminating the
+extra packing copy and overlapping bounded loading with GPU work. CPU
+metadata/HDF5 setup and H2D transfer are smaller contributors in this sample.
+Raw measurements are saved in the run directory as `data_stage_profile.json`.
+
+```bash
+PYTORCH_ALLOC_CONF=expandable_segments:True \
+python scripts/benchmark_plain_history.py \
+  --run-directory checkpoints/piper_v4_ablation_use_text_plain_history_h4/plain_history \
+  --mode sparse --microbatches 40 --epoch 153 --profile-data-stages \
+  --output /tmp/plain_data_stages.json
+```
+
 After training, evaluate the same 44 held-out episodes with `--switch-at 0.0`,
 `--val-episodes checkpoints/piper_v4_ablation_val_episodes.txt`, and
 `--n-episodes 44`. Compare task success, per-task failures, gripper behavior,
