@@ -88,6 +88,14 @@ observations, initial padding, uneven episode lengths, and microbatch
 accumulation. Dropout/noise regrouping preserves their distributions but does
 not produce bit-identical stochastic training trajectories.
 
+The interrupted local run resumed from epoch 59 with sparse loading. Its
+first complete optimized epoch (60) took 62.83 seconds, compared with the
+293.32-second median of the preceding ten dense epochs (about 4.7x faster).
+Data wait fell from a 202.99-second median to 42.12 seconds; validation took
+6.55 seconds. Epoch 60 recorded validation loss 0.04922, position MSE 0.05406,
+gripper accuracy 0.93874, and peak GPU allocation 0.590 GiB. These measurements
+describe the first resumed epoch; they do not establish closed-loop success.
+
 After training, evaluate the same 44 held-out episodes with `--switch-at 0.0`,
 `--val-episodes checkpoints/piper_v4_ablation_val_episodes.txt`, and
 `--n-episodes 44`. Compare task success, per-task failures, gripper behavior,
