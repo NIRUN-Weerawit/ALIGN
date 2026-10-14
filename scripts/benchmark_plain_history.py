@@ -27,6 +27,28 @@ class UnusedCachedVision(torch.nn.Module):
         self.unused = torch.nn.Parameter(torch.empty(0), requires_grad=False)
 
 
+class CountingLoader:
+    def __init__(self, loader, mode, cameras):
+        self.loader, self.mode, self.cameras = loader, mode, cameras
+        self.payload = self.frames = 0
+        self.first_batch_wait_s = 0.
+    def __len__(self):
+        return len(self.loader)
+    def __iter__(self):
+        start = time.perf_counter()
+        first = True
+        for batch in self.loader:
+            if first:
+                self.first_batch_wait_s = time.perf_counter()-start
+                first = False
+            frames = batch['frames' if self.mode == 'sparse' else 'frames_segment']
+            self.payload += frames.numel() * frames.element_size()
+            self.frames += frames.numel() // (self.cameras * 257 * 768)
+            del frames
+            yield batch
+            del batch
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-directory', type=Path, required=True)
@@ -35,6 +57,12 @@ def main():
     parser.add_argument('--epoch', type=int, default=60)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--profile-data-stages', action='store_true')
+    parser.add_argument('--copy-mode', choices=['direct', 'materialized'], default='direct')
+    parser.add_argument('--num-workers', type=int, default=0)
+    parser.add_argument('--prefetch-factor', type=int, default=1)
+    parser.add_argument('--pin-memory', action='store_true')
+    parser.add_argument('--warmup-microbatches', type=int, default=0,
+                        help='Warm kernels and persistent workers before the timed sample.')
     args = parser.parse_args()
     cfg = json.loads((args.run_directory / 'config.json').read_text())
     torch.set_num_threads(cfg.get('cpu_threads', 2))
@@ -71,18 +99,14 @@ def main():
     sampler.set_epoch(args.epoch)
     sparse = args.mode == 'sparse'
     data = SparseHistoryEpisodes(parent, cfg['history_size'],
-        profile=args.profile_data_stages) if sparse else parent
-    payload = 0
-    frame_count = 0
-    def collate(items):
-        nonlocal payload, frame_count
-        batch = (collate_sparse_histories if sparse else collate_segments)(items)
-        frames = batch['frames' if sparse else 'frames_segment']
-        payload += frames.numel() * frames.element_size()
-        frame_count += frames.numel() // (cfg['num_cameras'] * 257 * 768)
-        return batch
-    # Disable pinning in both cases to isolate sparsity/vectorization.
-    loader = DataLoader(data, batch_sampler=sampler, num_workers=0, pin_memory=False, collate_fn=collate)
+        profile=args.profile_data_stages, copy_mode=args.copy_mode) if sparse else parent
+    options = dict(num_workers=args.num_workers, pin_memory=args.pin_memory)
+    if args.num_workers:
+        options.update(prefetch_factor=args.prefetch_factor, multiprocessing_context='spawn',
+                       persistent_workers=True)
+    loader = CountingLoader(DataLoader(data, batch_sampler=sampler,
+        collate_fn=collate_sparse_histories if sparse else collate_segments, **options),
+        args.mode, cfg['num_cameras'])
     loop = SimpleNamespace(history_size=cfg['history_size'], chunk_size=cfg['chunk_size'],
         action_dim=7, head_type='diffusion', skip_nan=False, grad_clip=cfg['grad_clip'],
         no_sample_during_train=True, head_window_batch_size=cfg['head_window_batch_size'],
@@ -90,6 +114,15 @@ def main():
         profile_data_stages=args.profile_data_stages,
         gripper_loss_weight=cfg['gripper_loss_weight'], gripper_threshold=cfg['gripper_threshold'])
     seed_everything(cfg['seed'] + args.epoch)
+    if args.warmup_microbatches:
+        if sparse:
+            plain_history_epoch(model, loader, device, loop, optimizer, args.warmup_microbatches)
+        else:
+            train_v4_epoch(model, loader, optimizer, device, loop, args.warmup_microbatches)
+        loader.payload = loader.frames = 0
+        loader.first_batch_wait_s = 0.
+        torch.cuda.synchronize()
+        seed_everything(cfg['seed'] + args.epoch)
     torch.cuda.reset_peak_memory_stats()
     start = time.perf_counter()
     def disk_read_bytes():
@@ -109,15 +142,21 @@ def main():
     final_faults = resource.getrusage(resource.RUSAGE_SELF)
     result = dict(mode=args.mode, microbatches=args.microbatches, epoch=args.epoch,
         history_size=cfg['history_size'], wall_s=time.perf_counter() - start, loss=loss,
-        frame_count=frame_count, feature_payload_mib=payload / 1024**2,
+        copy_mode=args.copy_mode, num_workers=args.num_workers, pin_memory=args.pin_memory,
+        warmup_microbatches=args.warmup_microbatches,
+        prefetch_factor=args.prefetch_factor, first_batch_wait_s=loader.first_batch_wait_s,
+        frame_count=loader.frames, feature_payload_mib=loader.payload / 1024**2,
         peak_gpu_gib=torch.cuda.max_memory_allocated() / 1024**3,
         peak_process_rss_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024**2,
-        disk_read_mib=(final_reads-initial_reads)/1024**2 if initial_reads is not None else None,
+        disk_read_mib=(final_reads-initial_reads)/1024**2
+            if initial_reads is not None and not args.num_workers else None,
         major_page_faults=final_faults.ru_majflt-initial_faults.ru_majflt,
         minor_page_faults=final_faults.ru_minflt-initial_faults.ru_minflt,
         timing=loop._last_stage_times)
     args.output.write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result), flush=True)
+    if loader.loader._iterator is not None:
+        loader.loader._iterator._shutdown_workers()
     dataset.close()
 
 
