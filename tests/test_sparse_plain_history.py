@@ -30,9 +30,10 @@ class Features:
 
 
 @pytest.mark.parametrize('history', [1, 4, 20])
-def test_sparse_preserves_anchors_targets_and_dropout_histories(history):
+@pytest.mark.parametrize('copy_mode', ['direct', 'materialized'])
+def test_sparse_preserves_anchors_targets_and_dropout_histories(history, copy_mode):
     parent = CachedEpisodes(Features(), [0, 1], 20, 42, True, 'episode', 4, 4, .8, True)
-    sparse = SparseHistoryEpisodes(parent, history, profile=True)
+    sparse = SparseHistoryEpisodes(parent, history, profile=True, copy_mode=copy_mode)
     items = [sparse[i] for i in range(2)]
     batch = collate_sparse_histories(items)
     assert set(batch['data_stage_cpu_s']) == {
@@ -57,10 +58,11 @@ def test_sparse_preserves_anchors_targets_and_dropout_histories(history):
 
 @pytest.mark.parametrize('history', [1, 4])
 @pytest.mark.parametrize('accumulate', [False, True])
-def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accumulate):
+@pytest.mark.parametrize('copy_mode', ['direct', 'materialized'])
+def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accumulate, copy_mode):
     monkeypatch.setattr(align, 'VisionEncoder', FakeVision)
     parent = CachedEpisodes(Features(), [0, 1], 20, 42, True, 'episode', 100, 4, .8, True)
-    items = [SparseHistoryEpisodes(parent, history)[i] for i in range(2)]
+    items = [SparseHistoryEpisodes(parent, history, copy_mode=copy_mode)[i] for i in range(2)]
     sparse = collate_sparse_histories(items)
     dense = collate_segments([parent[i] for i in range(2)])
     torch.manual_seed(4)
@@ -96,3 +98,24 @@ def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accum
     assert dense_val[0] == pytest.approx(sparse_val[0], rel=1e-6)
     for key in ('pos_mse', 'rot_mse', 'grip_mse', 'grip_acc'):
         assert dense_val[2][key] == pytest.approx(sparse_val[2][key], rel=1e-6)
+
+
+def test_direct_worker_batches_match_main_process_and_share_epoch():
+    from torch.utils.data import DataLoader
+    parent = CachedEpisodes(Features(), [0, 1], 20, 42, True, 'episode', 4, 4)
+    data = SparseHistoryEpisodes(parent, 4)
+    loader = DataLoader(data, batch_size=2, num_workers=1,
+        multiprocessing_context='spawn', persistent_workers=True,
+        prefetch_factor=1, collate_fn=collate_sparse_histories)
+    try:
+        for epoch in (1, 2):
+            parent.epoch = epoch
+            expected = collate_sparse_histories([data[i] for i in range(2)])
+            actual = next(iter(loader))
+            for key, value in expected.items():
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(actual[key], value, atol=0, rtol=0)
+            assert actual['frames'].is_shared()
+    finally:
+        if loader._iterator is not None:
+            loader._iterator._shutdown_workers()

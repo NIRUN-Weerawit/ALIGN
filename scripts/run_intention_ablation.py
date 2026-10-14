@@ -200,7 +200,8 @@ def extend_resume_manifest(previous, current):
     merged = dict(current, **previous)
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
                 "gpu_memory_fraction", "micro_batch_size", "pin_memory",
-                "plain_history_loader", "plain_head_batch_size", "profile_data_stages"):
+                "plain_history_loader", "plain_head_batch_size", "profile_data_stages",
+                "plain_history_copy_mode"):
         if key in current:
             merged[key] = current[key]
     return merged
@@ -349,8 +350,10 @@ def parse_args(argv=None):
                         help="Pin CPU batches; default off for sparse history, on for dense loading.")
     parser.add_argument("--profile-data-stages", action="store_true",
                         help="Record sparse cache materialization, packing and detailed CUDA-stage timings.")
-    parser.add_argument("--num-workers", type=int, default=4,
-                        help="DataLoader processes; HDF5 handles are reopened per worker.")
+    parser.add_argument("--plain-history-copy-mode", choices=['direct', 'materialized'], default='direct',
+                        help="Direct reads into final batch storage; materialized retains the extra-copy reference.")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader processes; default 1 for plain_history-only runs, otherwise 4. HDF5 handles reopen per worker.")
     parser.add_argument("--prefetch-factor", type=int, default=1,
                         help="Batches prefetched per worker when --num-workers is positive.")
     parser.add_argument("--length-bucket-multiplier", type=int, default=20,
@@ -389,6 +392,8 @@ def parse_args(argv=None):
                         help="Train only this variant, retaining the ordered common initialization.")
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
     args = parser.parse_args(argv)
+    if args.num_workers is None:
+        args.num_workers = 1 if set(args.variants) == {'plain_history'} else 4
     if args.plain_head_batch_size < 1:
         parser.error("--plain-head-batch-size must be positive")
     if args.micro_batch_size is not None and (args.micro_batch_size < 1 or
@@ -563,9 +568,9 @@ def main(argv=None):
         variant_options = dict(loader_options, pin_memory=(args.pin_memory
             if args.pin_memory is not None else not sparse_history))
         variant_train_data = SparseHistoryEpisodes(train_data, variant_history_size,
-            profile=args.profile_data_stages) if sparse_history else train_data
+            profile=args.profile_data_stages, copy_mode=args.plain_history_copy_mode) if sparse_history else train_data
         variant_val_data = SparseHistoryEpisodes(val_data, variant_history_size,
-            profile=args.profile_data_stages) if sparse_history else val_data
+            profile=args.profile_data_stages, copy_mode=args.plain_history_copy_mode) if sparse_history else val_data
         collator = collate_sparse_histories if sparse_history else collate_segments
         train_loader = DataLoader(variant_train_data, batch_sampler=train_sampler,
                                   collate_fn=collator, **variant_options)

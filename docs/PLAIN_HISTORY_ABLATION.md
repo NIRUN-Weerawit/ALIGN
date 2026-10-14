@@ -21,7 +21,8 @@ each history step.
 
 Training defaults to the sparse loader: it selects the same supervised
 anchors as the reference trainer, loads the union of their required history
-frames, and encodes each unique frame once. Packed observations avoid padding
+frames directly into final batch storage, and encodes each unique frame once.
+There is no intermediate per-episode feature gather allocation. Packed observations avoid padding
 whole episodes to the longest episode in a batch. The first
 observation is repeated on the left until a complete history is available;
 this preserves the same action supervision anchors as a one-frame model.
@@ -56,15 +57,16 @@ python scripts/run_intention_ablation.py \
   --temporal-sampling episode --epochs 200 --batch-size 10 \
   --micro-batch-size 2 \
   --plain-history-loader sparse --plain-head-batch-size 32 --no-pin-memory \
-  --num-workers 0 --compressed-dim 8 --lr 0.0002 \
+  --num-workers 1 --prefetch-factor 1 --compressed-dim 8 --lr 0.0002 \
   --gpu-memory-fraction 1.0 --seed 42
 ```
 
 The 10-episode logical batch is loaded in five microbatches of two episodes,
 with gradients accumulated before each optimizer step. This bounds host
 shared-memory use for long episodes while retaining the optimizer batch size
-and episode groups. Zero DataLoader workers avoids additional prefetched
-batches on this 32 GB machine. Expandable CUDA segments reduces fragmentation
+and episode groups. One worker with prefetch factor one bounds the queued
+batch count on this 32 GB machine; explicitly use `--num-workers 0` to disable
+prefetch. Expandable CUDA segments reduces fragmentation
 across variable-length episode batches.
 The DINOv2 sidecar is accessed through `data/libero_goal.dinov2`, which now
 points to a verified local copy on NVMe. The original external-drive target is
@@ -139,6 +141,39 @@ python scripts/benchmark_plain_history.py \
   --mode sparse --microbatches 40 --epoch 153 --profile-data-stages \
   --output /tmp/plain_data_stages.json
 ```
+
+The next loading optimization was checked against a frozen model/optimizer
+checkpoint and identical epoch-153 episode groups. Direct loading copies
+contiguous runs from each episode mmap straight into the final tensor. Worker
+output uses shared storage to avoid another copy across the IPC queue.
+`--plain-history-copy-mode materialized` retains the older extra-copy path
+for comparisons. Plain-history-only runs now default to one worker; explicit
+worker arguments and the defaults of other variants remain respected.
+
+| Loading configuration | Full training-pass wall time | Reduction |
+|---|---:|---:|
+| Materialized features, zero workers | 49.37 s | Reference |
+| Direct copies, zero workers | 36.64 s | 25.8% |
+| Direct copies, one worker/prefetch one | 27.81 s | 43.7% |
+
+Each pass contains 190 microbatches / 380 episodes, with five warmup
+microbatches before timing. Validation and initial worker startup are excluded.
+Zero-worker direct/reference runs performed similar physical disk reads
+(17,417 versus 17,253 MiB). In shorter warm-cache comparisons, direct/one
+worker took 7.44–7.58 seconds, versus 9.68 seconds materialized/zero workers;
+two workers took 7.48–7.51 seconds and offered no additional benefit. An
+initial cold-cache materialized sample took 24.74 seconds and is excluded
+from warm-cache comparisons. GPU workload contention remains a limitation.
+Parent RSS measurements exclude worker RSS, and main-process disk counters
+exclude worker reads. CPU profiling totals include overlapping worker work.
+Raw runs, logs and the comparison are in `loading_copy_benchmark/` under the
+run directory. Use the benchmark's `--copy-mode`, `--num-workers`,
+`--prefetch-factor`, and `--warmup-microbatches` flags to reproduce this.
+
+The local run completed 200 epochs using the preceding sparse loader. The
+automatic post-training evaluator then failed to import LIBERO. Its generated
+comparison reused an older evaluation and is marked invalid for the final
+run; the evaluation script now requires a fresh result before comparing.
 
 After training, evaluate the same 44 held-out episodes with `--switch-at 0.0`,
 `--val-episodes checkpoints/piper_v4_ablation_val_episodes.txt`, and

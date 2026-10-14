@@ -36,6 +36,16 @@ def test_sparse_history_controls_are_runtime_resume_settings():
     assert merged['pin_memory'] is False and merged['plain_head_batch_size'] == 32
 
 
+def test_plain_history_prefetch_defaults_and_explicit_override():
+    plain = parse_args(['--output', 'example', '--variants', 'plain_history'])
+    assert plain.num_workers == 1 and plain.prefetch_factor == 1
+    assert plain.plain_history_copy_mode == 'direct'
+    explicit = parse_args(['--output', 'example', '--variants', 'plain_history', '--num-workers', '0'])
+    assert explicit.num_workers == 0
+    mixed = parse_args(['--output', 'example', '--variants', 'plain_history', 'intent_memory'])
+    assert mixed.num_workers == 4
+
+
 def test_sequential_cli_defaults_and_shared_overrides():
     defaults = parse_args(["--output", "example"])
     assert defaults.variants == ["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"]

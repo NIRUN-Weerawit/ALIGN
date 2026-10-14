@@ -3,7 +3,7 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 from tqdm import tqdm
 
 from training.train_intention import sync_and_step
@@ -11,10 +11,13 @@ from training.train_intention import sync_and_step
 
 class SparseHistoryEpisodes(Dataset):
     """Reuse the dense sampler's anchors/dropout, touching only their histories."""
-    def __init__(self, episodes, history_size, profile=False):
+    def __init__(self, episodes, history_size, profile=False, copy_mode='direct'):
         self.episodes = episodes
         self.history_size = history_size
         self.profile = profile
+        if copy_mode not in ('direct', 'materialized'):
+            raise ValueError('Unknown sparse copy mode')
+        self.copy_mode = copy_mode
 
     def __len__(self):
         return len(self.episodes)
@@ -27,7 +30,8 @@ class SparseHistoryEpisodes(Dataset):
         times = np.maximum(0, anchors[:, None] + np.arange(1 - self.history_size, 1))
         unique, inverse = np.unique(times, return_inverse=True)
         selected = time.perf_counter() if self.profile else 0.
-        frames = item['frames_segment'][unique]
+        frames = (item['frames_segment'] if self.copy_mode == 'direct'
+                  else item['frames_segment'][unique])
         materialized = time.perf_counter() if self.profile else 0.
         result = dict(
             frames=frames,
@@ -36,12 +40,14 @@ class SparseHistoryEpisodes(Dataset):
             targets=item['actions_segment'][anchors[:, None] +
                                             np.arange(self.episodes.chunk_size)],
             anchors=anchors, text=item['text'])
+        if self.copy_mode == 'direct':
+            result['frame_indices'] = unique
         if 'observation_camera_mask' in item:
             result['camera_mask'] = item['observation_camera_mask'][unique]
         if 'observation_state_mask' in item:
             result['state_mask'] = item['observation_state_mask'][unique]
-        # All selected arrays above own their data. Drop the cached mmap
-        # reference so sparse reads do not retain hundreds of resident maps.
+        # A direct-read item retains its source view until collation. Dropping
+        # the cache reference releases that mmap as soon as the item is freed.
         handles = getattr(self.episodes.dataset, '_dinov2_memmaps', None)
         if handles is not None:
             handles.pop(self.episodes.episodes[index], None)
@@ -57,7 +63,7 @@ class SparseHistoryEpisodes(Dataset):
 def collate_sparse_histories(items):
     """Pack unique observations without padding to the longest episode."""
     before = time.perf_counter() if 'data_stage_cpu_s' in items[0] else None
-    offsets = np.cumsum([0] + [len(item['frames']) for item in items[:-1]])
+    offsets = np.cumsum([0] + [len(item['states']) for item in items[:-1]])
     histories = np.concatenate([x['history_indices'] + offset
                                 for x, offset in zip(items, offsets)])
     episodes = np.concatenate([np.full(len(x['anchors']), i, dtype=np.int64)
@@ -65,8 +71,34 @@ def collate_sparse_histories(items):
     anchors = np.concatenate([x['anchors'] for x in items])
     # Match the dense trainer's chronological anchor/episode ordering.
     order = np.lexsort((episodes, anchors))
+    direct = 'frame_indices' in items[0]
+    materialization_s = 0.
+    if direct:
+        shape = (sum(len(x['states']) for x in items), *items[0]['frames'].shape[1:])
+        if get_worker_info() is not None:
+            # Final worker output lives in shared memory, avoiding another
+            # feature copy when the tensor crosses the DataLoader IPC queue.
+            dtype = torch.from_numpy(items[0]['frames'][:0]).dtype
+            frames = torch.empty(shape, dtype=dtype).share_memory_()
+        else:
+            frames = torch.from_numpy(np.empty(shape, dtype=items[0]['frames'].dtype))
+        destination = frames.numpy()
+        read_start = time.perf_counter() if before is not None else 0.
+        for item, offset in zip(items, offsets):
+            indices = item['frame_indices']
+            boundaries = np.concatenate(([0], np.flatnonzero(np.diff(indices) != 1) + 1,
+                                          [len(indices)]))
+            for start, stop in zip(boundaries[:-1], boundaries[1:]):
+                # Copy contiguous runs straight from the mmap into final
+                # batch storage. No per-episode feature gather allocation.
+                np.copyto(destination[offset+start:offset+stop],
+                          item['frames'][indices[start]:indices[stop-1]+1])
+        if before is not None:
+            materialization_s = time.perf_counter()-read_start
+    else:
+        frames = torch.from_numpy(np.concatenate([x['frames'] for x in items]))
     result = dict(
-        frames=torch.from_numpy(np.concatenate([x['frames'] for x in items])),
+        frames=frames,
         states=torch.from_numpy(np.concatenate([x['states'] for x in items])),
         history_indices=torch.from_numpy(histories[order]),
         targets=torch.from_numpy(np.concatenate([x['targets'] for x in items])[order]),
@@ -80,7 +112,8 @@ def collate_sparse_histories(items):
         result['data_stage_cpu_s'] = {
             key: sum(x['data_stage_cpu_s'][key] for x in items)
             for key in items[0]['data_stage_cpu_s']}
-        result['data_stage_cpu_s']['batch_pack_wall_s'] = time.perf_counter()-before
+        result['data_stage_cpu_s']['feature_materialization_wall_s'] += materialization_s
+        result['data_stage_cpu_s']['batch_pack_wall_s'] = time.perf_counter()-before-materialization_s
     return result
 
 
