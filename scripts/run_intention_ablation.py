@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT))
 from data.align_dataset import ALIGNDataset
 from models.align_intention import ALIGNIntentionModel
 from training.train_intention import train_v4_epoch, validate
+from training.cached_loading import collate_cached_segments
 from training.plain_history_training import (SparseHistoryEpisodes,
     collate_sparse_histories, plain_history_epoch)
 
@@ -61,13 +62,14 @@ def episode_split(dataset, seed, fraction):
 
 
 class CachedEpisodes(Dataset):
-    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False):
+    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False, profile=False):
         self.dataset, self.episodes = dataset, episodes
         self.length, self.seed, self.training = length, seed, training
         self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
         self.temporal_sampling, self.supervision_points, self.chunk_size = temporal_sampling, supervision_points, chunk_size
         self.observation_dropout_prob = observation_dropout_prob
         self.drop_state_with_all_views = drop_state_with_all_views
+        self.profile = profile
 
     @property
     def epoch(self):
@@ -81,6 +83,7 @@ class CachedEpisodes(Dataset):
         return len(self.episodes)
 
     def __getitem__(self, index):
+        before = time.perf_counter() if self.profile else 0.
         ep = self.episodes[index]
         n = self.dataset._get_episode_length(ep)
         length = min(n, self.length)
@@ -116,6 +119,11 @@ class CachedEpisodes(Dataset):
                 else:visible[t,int(rng.integers(cameras))] = False
             result['observation_camera_mask'] = visible
             if self.drop_state_with_all_views:result['observation_state_mask'] = visible.any(1)
+        handles = getattr(self.dataset, '_dinov2_memmaps', None)
+        if handles is not None:
+            handles.pop(ep, None)
+        if self.profile:
+            result['data_stage_cpu_s'] = dict(episode_metadata_and_mmap_wall_s=time.perf_counter()-before)
         return result
 
 
@@ -239,8 +247,8 @@ def evaluate_existing(out):
         traj_window=manifest["segment_length"], dinov2_path=manifest["cache"])
     val_eps = [dataset._episode_keys.index(key) for key in manifest["val_episodes"]]
     data = CachedEpisodes(dataset, val_eps, manifest["segment_length"], manifest["seed"] + 1000, False, manifest.get("temporal_sampling","crop"),manifest.get("supervision_points",16),manifest["chunk_size"])
-    loader = DataLoader(data, batch_size=manifest["batch_size"], shuffle=False,
-        num_workers=0, pin_memory=True, collate_fn=collate_segments)
+    loader = DataLoader(data, batch_size=manifest.get('micro_batch_size') or manifest["batch_size"], shuffle=False,
+        num_workers=0, pin_memory=False, collate_fn=collate_cached_segments)
     args = SimpleNamespace(history_size=manifest["history_size"], chunk_size=manifest["chunk_size"],
         action_dim=7, head_type=manifest["head_type"], skip_nan=False, gripper_threshold=threshold,
         gripper_loss_weight=manifest.get("gripper_loss_weight", 0.01))
@@ -274,7 +282,8 @@ def evaluate_existing(out):
         model.vision_encoder = vision
         seed_everything(manifest["seed"] + 10000)
         args.history_size = config["history_size"]
-        if config.get("head_history_mode") == "full":
+        if (config.get("head_history_mode") == "full" or
+            (model.intention_encoder is None and not model.use_memory_bank and args.history_size == 1 and manifest.get('temporal_sampling') == 'episode')):
             args.plain_head_batch_size = manifest.get("plain_head_batch_size", 32)
             sparse_loader = DataLoader(SparseHistoryEpisodes(data, args.history_size),
                 batch_size=manifest.get("micro_batch_size") or manifest["batch_size"],
@@ -343,17 +352,17 @@ def parse_args(argv=None):
     parser.add_argument("--micro-batch-size", type=int, default=None,
                         help="Episodes loaded together; gradients accumulate to --batch-size before each optimizer step.")
     parser.add_argument("--plain-history-loader", choices=["sparse", "dense"], default="sparse",
-                        help="Sparse loads only selected anchor histories; dense retains the reference full-episode path.")
+                        help="Sparse loads selected anchors for plain_history and the episode-sampled stateless baseline with history 1. Other configurations retain full sequences.")
     parser.add_argument("--plain-head-batch-size", type=int, default=32,
                         help="Maximum supervised points per sparse diffusion loss/sampling call.")
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None,
-                        help="Pin CPU batches; default off for sparse history, on for dense loading.")
+                        help="Pin CPU batches; default off to bound host staging for every variant.")
     parser.add_argument("--profile-data-stages", action="store_true",
-                        help="Record sparse cache materialization, packing and detailed CUDA-stage timings.")
-    parser.add_argument("--plain-history-copy-mode", choices=['direct', 'materialized'], default='direct',
+                        help="Record cache materialization, packing and CUDA-stage timings for every variant.")
+    parser.add_argument("--cached-copy-mode", "--plain-history-copy-mode", dest='plain_history_copy_mode', choices=['direct', 'materialized'], default='direct',
                         help="Direct reads into final batch storage; materialized retains the extra-copy reference.")
-    parser.add_argument("--num-workers", type=int, default=None,
-                        help="DataLoader processes; default 1 for plain_history-only runs, otherwise 4. HDF5 handles reopen per worker.")
+    parser.add_argument("--num-workers", type=int, default=1,
+                        help="DataLoader processes; default 1 with bounded prefetch. HDF5 handles reopen per worker.")
     parser.add_argument("--prefetch-factor", type=int, default=1,
                         help="Batches prefetched per worker when --num-workers is positive.")
     parser.add_argument("--length-bucket-multiplier", type=int, default=20,
@@ -392,8 +401,6 @@ def parse_args(argv=None):
                         help="Train only this variant, retaining the ordered common initialization.")
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
     args = parser.parse_args(argv)
-    if args.num_workers is None:
-        args.num_workers = 1 if set(args.variants) == {'plain_history'} else 4
     if args.plain_head_batch_size < 1:
         parser.error("--plain-head-batch-size must be positive")
     if args.micro_batch_size is not None and (args.micro_batch_size < 1 or
@@ -534,6 +541,7 @@ def main(argv=None):
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
     train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob,args.drop_state_with_all_views)
     val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size)
+    train_data.profile = val_data.profile = args.profile_data_stages
     train_lengths = [dataset._get_episode_length(ep) if args.temporal_sampling == "episode"
                      else min(dataset._get_episode_length(ep), args.segment_length)
                      for ep in train_eps]
@@ -543,7 +551,7 @@ def main(argv=None):
         drop_last=True, micro_batch_size=micro_batch_size)
     loader_options = dict(
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         persistent_workers=args.num_workers > 0,
     )
     if args.num_workers > 0:
@@ -564,14 +572,17 @@ def main(argv=None):
         memory = name.endswith("_memory") and not name.endswith("no_memory")
         full_history = name == "plain_history"
         variant_history_size = args.plain_history_size if full_history else args.history_size
-        sparse_history = full_history and args.plain_history_loader == "sparse"
+        # Legacy multi-frame mean conditioning is not equivalent to the full-
+        # history sparse path; preserve its existing training behavior.
+        sparse_history = (full_history or (not intent and not memory and variant_history_size == 1 and args.temporal_sampling == 'episode')) and args.plain_history_loader == "sparse"
         variant_options = dict(loader_options, pin_memory=(args.pin_memory
-            if args.pin_memory is not None else not sparse_history))
+            if args.pin_memory is not None else False))
         variant_train_data = SparseHistoryEpisodes(train_data, variant_history_size,
             profile=args.profile_data_stages, copy_mode=args.plain_history_copy_mode) if sparse_history else train_data
         variant_val_data = SparseHistoryEpisodes(val_data, variant_history_size,
             profile=args.profile_data_stages, copy_mode=args.plain_history_copy_mode) if sparse_history else val_data
-        collator = collate_sparse_histories if sparse_history else collate_segments
+        collator = (collate_sparse_histories if sparse_history else
+                    collate_cached_segments if args.plain_history_copy_mode == 'direct' else collate_segments)
         train_loader = DataLoader(variant_train_data, batch_sampler=train_sampler,
                                   collate_fn=collator, **variant_options)
         val_loader = DataLoader(variant_val_data, batch_size=micro_batch_size,

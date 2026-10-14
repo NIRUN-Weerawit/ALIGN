@@ -56,10 +56,10 @@ def test_sparse_preserves_anchors_targets_and_dropout_histories(history, copy_mo
     assert len(batch['frames']) <= sum(len(parent[i]['frames_segment']) for i in range(2))
 
 
-@pytest.mark.parametrize('history', [1, 4])
+@pytest.mark.parametrize('history,head_mode', [(1, 'mean'), (1, 'full'), (4, 'full')])
 @pytest.mark.parametrize('accumulate', [False, True])
 @pytest.mark.parametrize('copy_mode', ['direct', 'materialized'])
-def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accumulate, copy_mode):
+def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accumulate, copy_mode, head_mode):
     monkeypatch.setattr(align, 'VisionEncoder', FakeVision)
     parent = CachedEpisodes(Features(), [0, 1], 20, 42, True, 'episode', 100, 4, .8, True)
     items = [SparseHistoryEpisodes(parent, history, copy_mode=copy_mode)[i] for i in range(2)]
@@ -68,7 +68,7 @@ def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accum
     torch.manual_seed(4)
     reference = align.ALIGNIntentionModel(state_dim=4, compressed_dim=4,
         mamba_output_dim=0, use_intent_tokens=False, use_memory_bank=False,
-        history_size=history, head_history_mode='full', head_type='diffusion',
+        history_size=history, head_history_mode=head_mode, head_type='diffusion',
         head_d_model=8, chunk_size=4)
     reference._build_head_and_bank(1024)
     for module in reference.modules():

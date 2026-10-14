@@ -43,7 +43,7 @@ def test_plain_history_prefetch_defaults_and_explicit_override():
     explicit = parse_args(['--output', 'example', '--variants', 'plain_history', '--num-workers', '0'])
     assert explicit.num_workers == 0
     mixed = parse_args(['--output', 'example', '--variants', 'plain_history', 'intent_memory'])
-    assert mixed.num_workers == 4
+    assert mixed.num_workers == 1
 
 
 def test_sequential_cli_defaults_and_shared_overrides():
@@ -51,7 +51,7 @@ def test_sequential_cli_defaults_and_shared_overrides():
     assert defaults.variants == ["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"]
     assert defaults.worker_variant is None
     assert defaults.history_size == 1 and defaults.epochs == 80 and defaults.max_steps == 0
-    assert defaults.num_workers == 4 and defaults.prefetch_factor == 1
+    assert defaults.num_workers == 1 and defaults.prefetch_factor == 1
     args = parse_args(["--output", "example", "--head-type", "flow_matching", "--lr", "0.0003",
                        "--state-dim", "32", "--compressed-dim", "8", "--intent-dim", "64",
                        "--num-intent-tokens", "2", "--memory-bank-len", "16", "--chunk-size", "10",

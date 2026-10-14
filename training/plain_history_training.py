@@ -3,10 +3,11 @@ import time
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, get_worker_info
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from training.train_intention import sync_and_step
+from training.cached_loading import allocate_feature_batch
 
 
 class SparseHistoryEpisodes(Dataset):
@@ -75,13 +76,7 @@ def collate_sparse_histories(items):
     materialization_s = 0.
     if direct:
         shape = (sum(len(x['states']) for x in items), *items[0]['frames'].shape[1:])
-        if get_worker_info() is not None:
-            # Final worker output lives in shared memory, avoiding another
-            # feature copy when the tensor crosses the DataLoader IPC queue.
-            dtype = torch.from_numpy(items[0]['frames'][:0]).dtype
-            frames = torch.empty(shape, dtype=dtype).share_memory_()
-        else:
-            frames = torch.from_numpy(np.empty(shape, dtype=items[0]['frames'].dtype))
+        frames = allocate_feature_batch(shape, items[0]['frames'].dtype)
         destination = frames.numpy()
         read_start = time.perf_counter() if before is not None else 0.
         for item, offset in zip(items, offsets):

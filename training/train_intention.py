@@ -381,6 +381,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
     train_wall_start = time.perf_counter()
     data_wait_wall_s = 0.0
     stage_events = {}
+    data_stages = {}
 
     def stage_start():
         if device.type != "cuda":
@@ -410,6 +411,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         except StopIteration:
             break
         data_wait_wall_s += time.perf_counter() - data_wait_start
+        for name, seconds in batch.get('data_stage_cpu_s', {}).items():
+            data_stages[name] = data_stages.get(name, 0.) + float(seconds)
         segment_event = stage_start()
         Hs = args.history_size
         chunk_size = args.chunk_size
@@ -420,9 +423,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             dim_weights[6] = getattr(args, "gripper_loss_weight", 1.0)
 
         feature_event = stage_start()
+        transfer_event = stage_start() if getattr(args, 'profile_data_stages', False) else None
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
+        stage_end('host_to_device_gpu_s', transfer_event)
         text_emb = model.encode_task_text(batch["texts"]) if getattr(model, "text_condition", None) is not None else None
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         # Keep length/anchor bookkeeping on CPU. Moving a tiny mask to CUDA is
@@ -721,6 +726,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
 
         pbar.set_postfix(mse=f"{avg_step_loss:.5f}")
+        del batch, frames_seg, z_v_all, z_v_CLS_all
 
     avg_loss = global_mean(losses, device)
     avg_action = global_mean(actions_pred_list, device, empty=0.0)
@@ -730,11 +736,13 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         name: sum(start.elapsed_time(end) for start, end in events) / 1000.0
         for name, events in stage_events.items()
     }
-    measured_gpu_s = sum(value for name, value in gpu_stage_s.items() if name != "segment_gpu_s")
+    measured_gpu_s = sum(value for name, value in gpu_stage_s.items()
+                        if name not in ("segment_gpu_s", "host_to_device_gpu_s"))
     gpu_stage_s["other_gpu_s"] = max(0.0, gpu_stage_s.get("segment_gpu_s", 0.0) - measured_gpu_s)
     args._last_stage_times = {
         "train_wall_s": time.perf_counter() - train_wall_start,
         "data_wait_wall_s": data_wait_wall_s,
+        **data_stages,
         **gpu_stage_s,
     }
     return avg_loss, avg_action
