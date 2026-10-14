@@ -182,8 +182,18 @@ The first frame uses the episode `initial_gripper` attribute (default 0). Neithe
 the current action label nor a future command enters the state. This applies to
 dense and sparse cached loaders. Gripper commands use 0=closed, 1=open.
 
+The default remains uniform sampling (`--gripper-transition-fraction 0`).
+Opt-in `--gripper-transition-fraction 0.25` reserves up to one quarter of episode
+training anchors for actual consecutive-command changes. Remaining anchors are
+sampled without replacement from the rest of the episode, retaining the same
+supervision budget. Episodes with few/no switches automatically use more uniform
+anchors. Validation stays uniformly sampled. This is an experimental learning
+setting; compare transition recall **and** false switches, not just overall
+accuracy. Use `--gripper-transition-fraction 0` for the uniform control or crop
+sampling.
+
 Old ablation manifests predate this contract. To reproduce/resume their behavior,
-explicitly pass `--gripper-state-source legacy_zero`.
+explicitly pass `--gripper-state-source legacy_zero --gripper-transition-fraction 0`.
 A fresh output directory is required for a corrected-input training comparison;
 resume rejects silently changing these settings. Old weights are not repaired by
 changing the loader. `--evaluate-existing` preserves the manifest's convention,

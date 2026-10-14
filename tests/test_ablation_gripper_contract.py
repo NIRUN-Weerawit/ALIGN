@@ -23,11 +23,13 @@ def test_missing_measured_gripper_is_causal_in_dense_and_sparse(tmp_path):
         dataset._read_frames_dinov2 = lambda ep, start, count, **kwargs: np.zeros((count, 2, 3), np.float32)
         dataset._read_poses = lambda ep, start, count: np.zeros((count, 6), np.float32)
         dataset._read_text = lambda ep: 'move'
-        dense = CachedEpisodes(dataset, [0], 20, 42, True, 'episode', 8, 4)
+        dense = CachedEpisodes(dataset, [0], 20, 42, True, 'episode', 8, 4,
+                               gripper_transition_fraction=.5)
         item = dense[0]
         expected = np.r_[1., actions[:-1, 6]]
         np.testing.assert_array_equal(item['states_segment'][:, 6], expected)
         assert item['states_segment'][4, 6] != actions[4, 6]
+        assert item['loss_anchor_mask'][[4, 10]].all()
         assert item['loss_anchor_mask'].sum() == 8
         sparse = SparseHistoryEpisodes(dense, 3)[0]
         times = np.maximum(0, sparse['anchors'][:, None] + np.arange(-2, 1))
@@ -39,3 +41,25 @@ def test_missing_measured_gripper_is_causal_in_dense_and_sparse(tmp_path):
         dense.gripper_state_source = 'legacy_zero'
         assert not dense[0]['states_segment'][:, 6].any()
         dataset._h5 = None
+
+
+def test_validation_anchor_distribution_unchanged():
+    from tests.test_intention_ablation_setup import FakeDataset
+    a = CachedEpisodes(FakeDataset(), [0], 100, 42, False, 'episode', 8, 4)
+    b = CachedEpisodes(FakeDataset(), [0], 100, 42, False, 'episode', 8, 4,
+                       gripper_transition_fraction=1.)
+    np.testing.assert_array_equal(a[0]['loss_anchor_mask'], b[0]['loss_anchor_mask'])
+
+
+def test_transition_sampling_cli_rejects_invalid_or_inactive_settings():
+    import pytest
+    from scripts.run_intention_ablation import parse_args
+    for value in ['-0.1', '1.1', 'nan']:
+        with pytest.raises(SystemExit):
+            parse_args(['--output', 'example', '--gripper-transition-fraction', value])
+    with pytest.raises(SystemExit):
+        parse_args(['--output', 'example', '--temporal-sampling', 'crop',
+                        '--gripper-transition-fraction', '.25'])
+    args = parse_args(['--output', 'example', '--temporal-sampling', 'crop',
+                       '--gripper-transition-fraction', '0'])
+    assert args.gripper_state_source == 'causal'

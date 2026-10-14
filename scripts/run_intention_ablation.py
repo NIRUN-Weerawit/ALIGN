@@ -62,7 +62,7 @@ def episode_split(dataset, seed, fraction):
 
 
 class CachedEpisodes(Dataset):
-    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False, profile=False, gripper_state_source="causal"):
+    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False, profile=False, gripper_transition_fraction=0.0, gripper_state_source="causal"):
         self.dataset, self.episodes = dataset, episodes
         self.length, self.seed, self.training = length, seed, training
         self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
@@ -70,6 +70,7 @@ class CachedEpisodes(Dataset):
         self.observation_dropout_prob = observation_dropout_prob
         self.drop_state_with_all_views = drop_state_with_all_views
         self.profile = profile
+        self.gripper_transition_fraction = gripper_transition_fraction
         self.gripper_state_source = gripper_state_source
 
     @property
@@ -107,6 +108,17 @@ class CachedEpisodes(Dataset):
             gripper = np.zeros_like(gripper)
         states = np.concatenate([poses[:, :6], gripper[:, None]], axis=1)
         actions = self.dataset._read_actions(ep, start, length)
+        if anchors is not None and self.training and self.gripper_transition_fraction > 0:
+            # Target changes identify supervision locations only; never enter inputs.
+            switches = np.flatnonzero(np.diff(actions[:, 6] > .5)) + 1
+            switches = switches[switches < available]
+            count = min(len(switches), int(round(anchors.sum() * self.gripper_transition_fraction)))
+            if count:
+                selected = rng.choice(switches, count, replace=False)
+                remaining = np.setdiff1d(np.arange(available), selected)
+                uniform = rng.choice(remaining, int(anchors.sum()) - count, replace=False)
+                anchors[:] = False
+                anchors[np.concatenate([selected, uniform])] = True
         result = dict(frames_segment=frames, states_segment=states.astype(np.float32),
                     actions_segment=actions.astype(np.float32), segment_len=length)
         result['text'] = self.dataset._read_text(ep) if hasattr(self.dataset, '_read_text') else ''
@@ -394,6 +406,8 @@ def parse_args(argv=None):
     parser.add_argument("--memory-bank-len", type=int, default=16)
     parser.add_argument("--gripper-state-source", choices=["causal", "legacy_zero"], default="causal",
                         help="Measured state or previous command; legacy_zero reproduces old ablation inputs")
+    parser.add_argument("--gripper-transition-fraction", type=float, default=0.0,
+                        help="Fraction of episode training anchors reserved for actual gripper switches")
     parser.add_argument("--gripper-loss-weight", type=float, default=1.0)
     parser.add_argument("--gripper-threshold", type=float, default=0.5)
     parser.add_argument("--cpu-threads", type=int, default=2)
@@ -431,6 +445,10 @@ def parse_args(argv=None):
         parser.error("--chunk-size must be at least 4 for the generative U-Net")
     if args.head_d_model % 8:
         parser.error("--head-d-model must be divisible by 8 for GroupNorm")
+    if not 0 <= args.gripper_transition_fraction <= 1:
+        parser.error("gripper-transition-fraction must be in [0, 1]")
+    if args.temporal_sampling != "episode" and args.gripper_transition_fraction:
+        parser.error("Transition sampling requires episode sampling; use --gripper-transition-fraction 0 for crops")
     if args.compressed_dim % 4 or args.state_dim % 4 or (args.intent_dim * args.num_intent_tokens) % 4:
         parser.error("Compressed/state/total intent dimensions must be divisible by 4 for attention")
     if len(set(args.cameras)) != len(args.cameras):
@@ -516,7 +534,7 @@ def main(argv=None):
         intention_recurrence="causal observation state across each segment")
     if args.resume and (out / "manifest.json").exists():
         previous = json.loads((out / "manifest.json").read_text())
-        legacy_defaults = dict(gripper_state_source="legacy_zero", cameras=["image", "wrist_image"], validation_fraction=0.1,
+        legacy_defaults = dict(gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
                                plain_history_size=4,
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
@@ -524,7 +542,7 @@ def main(argv=None):
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
                                use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
                                length_bucket_multiplier=20)
-        for key in ("gripper_state_source", "max_steps", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
+        for key in ("gripper_state_source", "gripper_transition_fraction", "max_steps", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
@@ -547,6 +565,7 @@ def main(argv=None):
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
     train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob,args.drop_state_with_all_views)
     val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size)
+    train_data.gripper_transition_fraction = args.gripper_transition_fraction
     train_data.gripper_state_source = val_data.gripper_state_source = args.gripper_state_source
     train_data.profile = val_data.profile = args.profile_data_stages
     train_lengths = [dataset._get_episode_length(ep) if args.temporal_sampling == "episode"
