@@ -39,3 +39,6 @@ graphify-out/
 docs/
 reports/
 paper/test_output/
+
+# Isolated optional XVLA evaluation runtime
+.venv-xvla-eval/

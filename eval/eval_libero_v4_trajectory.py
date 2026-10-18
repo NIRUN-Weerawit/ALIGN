@@ -112,7 +112,11 @@ def _live_view_show(frame: np.ndarray, step: int, title: str = "ALIGN Sim",
 def _live_view_close() -> None:
     """Close any open live-view windows."""
     if CV2_AVAILABLE:
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            # Headless OpenCV imports successfully but has no window backend.
+            pass
 
 
 # ================================================================
@@ -657,6 +661,8 @@ def run_model_in_sim(
     errors = []
     stored_actions = []
     success = 0
+    if hasattr(model, "reset_episode"):
+        model.reset_episode()
     text_emb = None
     if getattr(model, "text_condition", None) is not None:
         if not task_text:
@@ -799,23 +805,26 @@ def run_model_in_sim(
                         f_t, s_t, produce_intent=should_infer, store_memory=not should_infer,
                     )
         if should_infer:
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16,
-                                         enabled=device.type == "cuda"):
-                    with sdpa_kernel(backends=[SDPBackend.MATH]):
-                        out = stream_out if stream_out is not None else model(f_t, s_t)
-                        intent_emb = out.get("intent_emb", None)
-                        # Use the same memory contract as training, including
-                        # perceptual/state retrieval without intention tokens.
-                        memory_context = {key: out[key] for key in ("observed_mask", "timestamp")
-                                          if key in out}
-                        visual, states, intent = model.condition_actions(
-                            out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
-                            **memory_context,
-                        )
-                        a_model_full = _predict_action_chunk(
-                            model, visual, states, intent, text_emb=text_emb,
-                        )
+            if hasattr(model, "predict_sim_action_chunk"):
+                a_model_full = model.predict_sim_action_chunk(obs, task_text=task_text, env=env)
+            else:
+                with torch.no_grad():
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16,
+                                             enabled=device.type == "cuda"):
+                        with sdpa_kernel(backends=[SDPBackend.MATH]):
+                            out = stream_out if stream_out is not None else model(f_t, s_t)
+                            intent_emb = out.get("intent_emb", None)
+                            # Use the same memory contract as training, including
+                            # perceptual/state retrieval without intention tokens.
+                            memory_context = {key: out[key] for key in ("observed_mask", "timestamp")
+                                              if key in out}
+                            visual, states, intent = model.condition_actions(
+                                out["z_v_pooled_seq"], out["z_s_seq"], intent_emb,
+                                **memory_context,
+                            )
+                            a_model_full = _predict_action_chunk(
+                                model, visual, states, intent, text_emb=text_emb,
+                            )
             inference_t1 = time.perf_counter()
 
             # Record this model call's index for "decay" mode weighting.
@@ -892,7 +901,7 @@ def run_model_in_sim(
                 # No matching entries — shouldn't happen with ensemble != "none"
                 # if K >= H. Fall back to a zero action.
                 action_dim = (
-                    getattr(model.intention_head, "action_dim", None)
+                    getattr(getattr(model, "intention_head", None), "action_dim", None)
                     or 7  # default for LIBERO
                 )
                 a_model = np.zeros(action_dim, dtype=np.float32)
@@ -914,6 +923,10 @@ def run_model_in_sim(
         if debug and model_inferred_this_step:
             print(f"Step {step}: model re-inferred (buffer size: {len(pending_actions)})")
 
+        # Native policy chunks may contain absolute goals. Convert only when
+        # executing, using the current pose even when reusing a queued chunk.
+        if hasattr(model, "to_libero_action"):
+            a_model = model.to_libero_action(a_model, obs, env)
         # 5. Build the final action
         a_model_scaled = a_model.copy()
         a_model_scaled[:6] *= action_scale
@@ -1145,14 +1158,19 @@ def save_video_3panel(
 # Main evaluation
 # ================================================================
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Evaluate v4 intention model on LIBERO trajectory data."
+        description="Evaluate ALIGN or XVLA on LIBERO using the same simulator protocol."
     )
     parser.add_argument("--data", required=True,
                         help="Path to HDF5 dataset.")
     parser.add_argument("--checkpoint", required=True,
-                        help="Path to intention_best.pt")
+                        help="ALIGN .pt checkpoint, or XVLA HF snapshot/cache directory/repo ID")
+    parser.add_argument("--policy-type", choices=["align", "xvla"], default="align")
+    parser.add_argument("--hf-cache-dir", default=None, help="Hugging Face hub cache for XVLA")
+    parser.add_argument("--xvla-tokenizer", default=None, help="Local BART tokenizer snapshot for offline XVLA")
+    parser.add_argument("--xvla-dtype", choices=["float32", "bfloat16"], default=None)
+    parser.add_argument("--xvla-denoising-steps", type=int, default=None)
     parser.add_argument("--cameras", nargs="+", default=["image","wrist_image"],
                         help="Camera names (default: wrist_image). "
                              "MUST match the cameras used during training "
@@ -1241,7 +1259,11 @@ def main():
                              "a display (X-forwarding or local monitor). Press "
                              "'q' or ESC to close the window.")
     parser.add_argument("--rotation-convention",choices=["libero","shortest"],default="libero",help="LIBERO positive-X axis-angle branch; shortest reproduces the old incompatible input representation")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.policy_type == "xvla" and args.memory_intervention != "normal":
+        parser.error("XVLA does not support ALIGN memory interventions")
+    if args.policy_type == "xvla" and args.cameras != ["image", "wrist_image"]:
+        parser.error("XVLA LIBERO requires cameras in order: image wrist_image")
 
     if args.live_view and not CV2_AVAILABLE:
         print("  ⚠️  --live-view requested but opencv-python is not installed.")
@@ -1250,7 +1272,7 @@ def main():
         args.live_view = False
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    print(f"\n=== ALIGN v4 Trajectory Evaluation ===")
+    print(f"\n=== {args.policy_type.upper()} Trajectory Evaluation ===")
     print(f"  Data:        {args.data}")
     print(f"  Checkpoint:  {args.checkpoint}")
     print(f"  Device:      {device}")
@@ -1258,7 +1280,15 @@ def main():
     print(f"  Cameras:     {args.cameras}")
 
     # Load model
-    model, cfg = load_intention_model(args.checkpoint, device)
+    if args.policy_type == "xvla":
+        from eval.xvla_libero_adapter import XVLALiberoAdapter
+        model = XVLALiberoAdapter(args.checkpoint, device, cache_dir=args.hf_cache_dir,
+            tokenizer_path=args.xvla_tokenizer, dtype=args.xvla_dtype,
+            denoising_steps=args.xvla_denoising_steps)
+        cfg = dict(chunk_size=model.chunk_size, num_cameras=2, head_type="xvla", use_text=True)
+        print(f"  XVLA:        {model.metadata}")
+    else:
+        model, cfg = load_intention_model(args.checkpoint, device)
     chunk_size = cfg["chunk_size"]
     print(f"  Chunk (K):   {chunk_size}")
     print(f"  Head:        {cfg.get('head_type', 'mamba')}")
@@ -1269,7 +1299,9 @@ def main():
         print(f"  ⚠️  Camera count mismatch!")
         print(f"      Model expects {model_cameras} cameras, but you passed {args_cameras} ({args.cameras})")
         print(f"      Use --cameras to match the training config.")
-    if cfg.get("use_text", False):
+    if args.policy_type == "xvla":
+        print(f"  Text:        BART tokens (length={model.metadata['tokenizer_max_length']})")
+    elif cfg.get("use_text", False):
         print(f"  Text:        enabled (dim={cfg.get('text_dim', 256)})")
 
     # Auto-detect libero suite from dataset filename if not specified
@@ -1305,7 +1337,9 @@ def main():
 
     # Output directory for plots
     if args.out_dir is None:
-        args.out_dir = str(Path(args.checkpoint).parent) + "/" + str(args.switch_at)
+        args.out_dir = (str(Path("eval/libero_results/xvla_libero") / str(args.switch_at))
+                        if args.policy_type == "xvla" else
+                        str(Path(args.checkpoint).parent) + "/" + str(args.switch_at))
         
         # Make sure it exists
         Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -1598,6 +1632,9 @@ def main():
 
         # Save JSON summary
         summary = {
+            "policy_type": args.policy_type,
+            "policy_metadata": getattr(model, "metadata", {}),
+            "evaluation_args": vars(args),
             "checkpoint": args.checkpoint,
             "data": args.data,
             "alpha": args.alpha,
@@ -1611,8 +1648,9 @@ def main():
             },
         }
         eval_suffix = "_val" if args.val_episodes is not None else ""
-        summary_path = Path(args.checkpoint).with_suffix(
-            f".mujoco_eval_{args.switch_at}{eval_suffix}.json")
+        summary_path = (Path(args.out_dir) / f"xvla.mujoco_eval_{args.switch_at}{eval_suffix}.json"
+                        if args.policy_type == "xvla" else Path(args.checkpoint).with_suffix(
+                            f".mujoco_eval_{args.switch_at}{eval_suffix}.json"))
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
         (Path(args.out_dir) / "result.json").write_text(json.dumps(summary, indent=2))

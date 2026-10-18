@@ -1,0 +1,4 @@
+# Optional runtime; install separately from ALIGN training dependencies.
+# Reuse a compatible CUDA torch/torchvision installation.
+lerobot[xvla]==0.6.1
+transformers==5.5.4
