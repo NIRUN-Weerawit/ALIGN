@@ -49,14 +49,37 @@ retrieval and token-merge consolidation.
 
 ## EXP-D.5 — Intent embedding task clustering
 
-- **Setup**: load best checkpoint, run `forward_with_probe` on 50-100 held-out episodes per task (500-1000 episodes total), collect intent_emb per episode
-- **Metric**: silhouette score, 5-fold CV logistic regression accuracy, 5-fold CV KNN accuracy, K-means cluster purity (K=10), within-task and cross-task cosine similarity
-- **Expected (H1)**: silhouette > 0.1, logistic > 50% (5× chance), clear t-SNE clusters — intent tokens discover task structure without explicit supervision
-- **Expected (H2)**: clustering by sub-task phase rather than task identity — finer-grained abstraction
-- **Null (H3)**: silhouette ~ 0, classifier ~ 10% — opaque, requires CLIP anchor to force interpretable structure
-- **Script**: `tools/probe_intent_clustering.py` (IMPLEMENTED), reads from `--checkpoint`, outputs `results.json`, `intent_tsne.pdf`, `confusion_matrix.pdf`, `intent_embeddings.npz`
-- **Model change**: `forward_with_probe` added to `ALIGNIntentionModel` (no training impact, runs under `torch.no_grad()`)
-- **Priority**: HIGH — produces a strong figure for the paper, cheap to run
+- **Protocol updated 2026-10-18**: strict current-checkpoint encoder loading;
+  frozen causal observation recurrence with per-frame states, 21 progress
+  positions, and raw intention readouts before memory fusion. Task strings are
+  probe labels only. No policy architecture or training changes.
+- **Split**: checkpoint-recorded whole episodes, 384 train / 44 held-out in
+  LIBERO Goal. Fit scaling and logistic regression on training episodes only;
+  evaluate held-out task decoding at each position. Also evaluate a fixed
+  final-position decoder across time.
+- **Controls**: reset recurrence at each sampled frame, current CLS/state,
+  state alone, causal history mean, and optional random Mamba/readout using the
+  same trained state encoder.
+- **Metrics**: balanced task accuracy, stratified episode-bootstrap interval,
+  shuffled-label null; original-space cosine silhouette, train-fit K-means
+  held-out ARI/NMI, within/between task distances and distance to fixed late-task
+  centroids. Train-fit PCA trajectories and joint unlabeled t-SNE illustrate
+  geometry but do not establish task semantics.
+- **Interpretation**: task decoding, compact clusters, convergence, future-goal
+  representation, and causal action use are separate claims. Good task decoding
+  alone does not establish the latter two; poor clustering does not imply that
+  a text anchor is necessary. Phase and uncertainty may spread a task's tokens.
+- **Script/documentation**: `tools/probe_intent_clustering.py`,
+  `tools/README_intent_task_probe.md`.
+- **Run artifacts**: `reports/intent_task_probe_2026_10_18/` (regeneratable,
+  ignored by Git). The newer no-text intent-only checkpoint was initially
+  truncated; after readable copies arrived, its best file (epoch 164) was probed.
+- **Results**: [2026-10-18 diagnostic](intent_task_probe_results_2026_10_18.md).
+  Final balanced task decoding: 69.3% no-text intent+memory, 74.2% text-trained
+  intent+memory, 54.8% newer text-trained intent-only, 35.3% newer no-text
+  intent-only; chance 10%. Task structure
+  emerges, but compact stable task clusters and consistent recurrence gains
+  are not established. Current CLS/state reaches 97.5%.
 
 ## EXP-G — Inference speed measurement
 
