@@ -1,0 +1,252 @@
+{
+  "remote_base": "/data/wee_ucl/align-fast-checkpoint-20261018-v2",
+  "source": {
+    "commit": "d96181154370e99036b2768b38f257622070814e",
+    "source_sha256": "9371bd81ea77f6cbe4d3867f1705313e37ecc04f4ac18e57569674fa031d4378",
+    "working_tree_changes": true,
+    "description": "Fresh patch-memory checkpoint smoke test, including state-visual SDPA backend fix."
+  },
+  "command": [
+    "/home/wee_ucl/miniconda3/envs/align/bin/python",
+    "/data/wee_ucl/align-fast-checkpoint-20261018-v2/code/scripts/run_intention_ablation.py",
+    "--data",
+    "/mnt/bigdata/00_students/wee_ucl/ALIGN/data/libero_goal.h5",
+    "--cache",
+    "/mnt/bigdata/00_students/wee_ucl/ALIGN/data/libero_goal.dinov2",
+    "--output",
+    "/data/wee_ucl/align-fast-checkpoint-20261018-v2/results",
+    "--checkpoint-staging-dir",
+    "/data/wee_ucl/align-fast-checkpoint-20261018-v2/staging",
+    "--variants",
+    "intent_memory",
+    "--visual-context-mode",
+    "multiscale",
+    "--memory-intent-query",
+    "--memory-retrieval-depth",
+    "2",
+    "--compressed-dim",
+    "32",
+    "--history-size",
+    "1",
+    "--chunk-size",
+    "8",
+    "--temporal-sampling",
+    "crop",
+    "--segment-length",
+    "20",
+    "--max-steps",
+    "1",
+    "--max-val-batches",
+    "1",
+    "--batch-size",
+    "2",
+    "--micro-batch-size",
+    "2",
+    "--num-workers",
+    "0",
+    "--lr",
+    "0.0002",
+    "--gpu-memory-fraction",
+    "0.9",
+    "--profile-data-stages"
+  ],
+  "phases": [
+    {
+      "phase": "fresh",
+      "returncode": 0,
+      "wall_s": 72.08835286833346,
+      "recovery": {
+        "epoch": 2,
+        "bytes": 648821810,
+        "optimizer_steps": [
+          2
+        ]
+      },
+      "mirrored_sha256_match": true
+    },
+    {
+      "phase": "resume",
+      "returncode": 0,
+      "wall_s": 55.29475329071283,
+      "recovery": {
+        "epoch": 3,
+        "bytes": 648821938,
+        "optimizer_steps": [
+          3
+        ]
+      },
+      "mirrored_sha256_match": true
+    }
+  ],
+  "epochs": [
+    {
+      "epoch": 1,
+      "train/loss": 1.0084168910980225,
+      "val/loss": 0.9958601593971252,
+      "pos_mse": 1.0608409245808919,
+      "rot_mse": 1.0516232221554487,
+      "grip_mse": 0.5308799010056716,
+      "pos_mae": 0.9783335221119417,
+      "rot_mae": 1.0084889974349585,
+      "px_mse": 1.0329618453979492,
+      "py_mse": 1.0059205568753755,
+      "pz_mse": 1.143640371469351,
+      "rx_mse": 1.0041542786818285,
+      "ry_mse": 0.9949086262629583,
+      "rz_mse": 1.1558067615215595,
+      "grip_acc": 0.46634615384615385,
+      "gripper_padded_batches": 0,
+      "gripper_genuine_batches": 13,
+      "elapsed_s": 21.610721171833575,
+      "peak_gpu_gib": 2.722623825073242,
+      "timing": {
+        "train_wall_s": 17.082239154726267,
+        "data_wait_wall_s": 15.958851305767894,
+        "episode_metadata_and_mmap_wall_s": 15.764702337794006,
+        "feature_materialization_wall_s": 0.04262544494122267,
+        "padding_wall_s": 2.4709850549697876e-05,
+        "batch_pack_wall_s": 0.00034666433930397034,
+        "host_to_device_gpu_s": 0.011560383796691895,
+        "memory_reset_gpu_s": 0.0006526399850845337,
+        "feature_encode_gpu_s": 0.15156166076660157,
+        "patch_encode_gpu_s": 0.13764265441894533,
+        "intent_scan_gpu_s": 0.06590054321289063,
+        "condition_and_memory_gpu_s": 0.22989337062835694,
+        "head_condition_gpu_s": 0.00094319998472929,
+        "loss_batch_assembly_gpu_s": 0.0002165759988129139,
+        "diffusion_loss_gpu_s": 0.1380513916015625,
+        "backward_optimizer_gpu_s": 0.3566966857910156,
+        "segment_gpu_s": 1.116037841796875,
+        "other_gpu_s": 0.034479119408875825,
+        "val_wall_s": 4.528202636167407,
+        "checkpoint_save_s": 0.8734950162470341,
+        "total_wall_s": 22.484393121674657
+      },
+      "checkpoint_io": {
+        "staging_dir": "/data/wee_ucl/align-fast-checkpoint-20261018-v2/staging/c21a56f6e611be90/intent_memory",
+        "active": "training_last.pt",
+        "pending_files": 0,
+        "last_mirrored": {
+          "intention_best.pt": {
+            "epoch": 1,
+            "seconds": 0.14854815416038036
+          }
+        }
+      }
+    },
+    {
+      "epoch": 2,
+      "train/loss": 1.0120060443878174,
+      "val/loss": 0.9946923851966858,
+      "pos_mse": 1.0644214825752452,
+      "rot_mse": 1.055499492547451,
+      "grip_mse": 0.527441354898306,
+      "pos_mae": 0.9815382835192558,
+      "rot_mae": 1.0112945850078876,
+      "px_mse": 1.0377231011023889,
+      "py_mse": 1.0046388185941255,
+      "pz_mse": 1.1509025280292218,
+      "rx_mse": 1.0016507368821363,
+      "ry_mse": 1.007220561687763,
+      "rz_mse": 1.1576271790724535,
+      "grip_acc": 0.47115384615384615,
+      "gripper_padded_batches": 0,
+      "gripper_genuine_batches": 13,
+      "elapsed_s": 7.9900543401017785,
+      "peak_gpu_gib": 3.125441074371338,
+      "timing": {
+        "train_wall_s": 7.663434486836195,
+        "data_wait_wall_s": 7.172169110737741,
+        "episode_metadata_and_mmap_wall_s": 6.545584698207676,
+        "feature_materialization_wall_s": 0.03489730227738619,
+        "padding_wall_s": 3.663543611764908e-05,
+        "batch_pack_wall_s": 0.0003008861094713211,
+        "host_to_device_gpu_s": 0.014002847671508788,
+        "memory_reset_gpu_s": 0.0005007039904594421,
+        "feature_encode_gpu_s": 0.015906911849975586,
+        "patch_encode_gpu_s": 0.014167840003967286,
+        "intent_scan_gpu_s": 0.01199135971069336,
+        "condition_and_memory_gpu_s": 0.14915775871276857,
+        "head_condition_gpu_s": 0.0016687039956450463,
+        "loss_batch_assembly_gpu_s": 0.0003696000017225742,
+        "diffusion_loss_gpu_s": 0.05461721658706665,
+        "backward_optimizer_gpu_s": 0.20498480224609375,
+        "segment_gpu_s": 0.46159033203125,
+        "other_gpu_s": 0.008225434932857767,
+        "val_wall_s": 0.3262776220217347,
+        "checkpoint_save_s": 1.8056201003491879,
+        "total_wall_s": 9.795886717736721
+      },
+      "checkpoint_io": {
+        "staging_dir": "/data/wee_ucl/align-fast-checkpoint-20261018-v2/staging/c21a56f6e611be90/intent_memory",
+        "active": "training_last.pt",
+        "pending_files": 0,
+        "last_mirrored": {
+          "intention_best.pt": {
+            "epoch": 1,
+            "seconds": 0.14854815416038036
+          },
+          "training_last.pt": {
+            "epoch": 1,
+            "seconds": 0.4580853283405304
+          }
+        }
+      }
+    },
+    {
+      "epoch": 3,
+      "train/loss": 1.009891390800476,
+      "val/loss": 0.9906895160675049,
+      "pos_mse": 1.0628468195597331,
+      "rot_mse": 1.056321877699632,
+      "grip_mse": 0.5240384615384616,
+      "pos_mae": 0.9797643025716146,
+      "rot_mae": 1.011459081600874,
+      "px_mse": 1.0376147490281324,
+      "py_mse": 1.0066386002760668,
+      "pz_mse": 1.144287109375,
+      "rx_mse": 1.004138212937575,
+      "ry_mse": 1.0072430830735426,
+      "rz_mse": 1.1575843370877779,
+      "grip_acc": 0.47596153846153844,
+      "gripper_padded_batches": 0,
+      "gripper_genuine_batches": 13,
+      "elapsed_s": 13.114300743676722,
+      "peak_gpu_gib": 3.124464511871338,
+      "timing": {
+        "train_wall_s": 12.886998938396573,
+        "data_wait_wall_s": 11.769967459142208,
+        "episode_metadata_and_mmap_wall_s": 10.869009631685913,
+        "feature_materialization_wall_s": 0.054401068948209286,
+        "padding_wall_s": 9.923428297042847e-05,
+        "batch_pack_wall_s": 0.0006382530555129051,
+        "host_to_device_gpu_s": 0.01277683162689209,
+        "memory_reset_gpu_s": 0.0011690239906311036,
+        "feature_encode_gpu_s": 0.17103411865234375,
+        "patch_encode_gpu_s": 0.1287121887207031,
+        "intent_scan_gpu_s": 0.05895126342773437,
+        "condition_and_memory_gpu_s": 0.23103519535064698,
+        "head_condition_gpu_s": 0.0010032960027456283,
+        "loss_batch_assembly_gpu_s": 0.00021859199739992618,
+        "diffusion_loss_gpu_s": 0.12988179397583008,
+        "backward_optimizer_gpu_s": 0.35808969116210937,
+        "segment_gpu_s": 1.1090311279296876,
+        "other_gpu_s": 0.02893596464954329,
+        "val_wall_s": 0.2268926603719592,
+        "checkpoint_save_s": 1.1013300120830536,
+        "total_wall_s": 14.215787816792727
+      },
+      "checkpoint_io": {
+        "staging_dir": "/data/wee_ucl/align-fast-checkpoint-20261018-v2/staging/c21a56f6e611be90/intent_memory",
+        "active": "training_last.pt",
+        "pending_files": 0,
+        "last_mirrored": {}
+      }
+    }
+  ],
+  "files": {
+    "intention_best.pt": 217299099,
+    "training_last.pt": 648821938
+  },
+  "mirror_destination": "local SSD; NFS throughput was not measured in this test"
+}

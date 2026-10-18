@@ -236,3 +236,44 @@ Correct-history position/gripper prediction benefit is established in the develo
 - Each arm is configured for **100 full passes** over 384 training episodes at batch size 2: 192 optimizer batches per epoch, `--max-steps 0`, rather than the earlier 64-update pilot epoch. Validation runs after every epoch; `pos_mse` selects the best checkpoint. After both arms finish, the driver evaluates their selected checkpoints on the same ten LIBERO Goal handover tasks at seeds 43 and 44. Outputs and logs are under `checkpoints/task_text_100_epoch_20261010`.
 - A batch-size-4 preflight exhausted shared GPU memory after four batches, before any epoch/checkpoint completed. Its manifest/log are preserved as `with_text_b4_oom`; the main comparison restarted at the previously successful batch size 2. This is a resource adjustment, not a result. The existing unrelated GPU job is left running.
 - First full text epoch completed and saved `intention_best.pt` plus optimizer-bearing `training_last.pt`: validation position MSE **0.08073**, rotation MSE **0.00514**, gripper accuracy **85.8%**; elapsed **596 seconds** under GPU contention. This is only an initial training checkpoint. The no-text arm has not started, so no comparative conclusion is available yet.
+
+## 2026-10-18: explicit visual context, intention-guided visual query, depth two
+
+- Implemented the recorded multiscale plan: separate camera/grid patch context
+  reaches diffusion/flow U-Net stages with 2/4/8 action positions for chunk 8.
+  Memory uses patch-preserving retrieval; the global FiLM condition is retained.
+- Added opt-in current-intention projection into the visual retrieval query.
+  No task instruction is required. No-intent ablations still retrieve visual
+  and state features; raw stored values are unchanged by query conditioning.
+- Added configurable retrieval stacks, with new training CLIs defaulting to two
+  reads of the same bank and one final fusion/write. Old checkpoint defaults
+  remain depth one with their original first-block parameter names.
+- Threaded explicit context through training, grouped losses, validation, sparse
+  plain/history controls, evaluation and dependence/outage probes. Projected K/V
+  are reused across U-Net stages, diffusion noise repeats and sampling steps
+  without detaching training gradients. Intention-retrieval probe interventions
+  hold the head's cognitive condition fixed to isolate visual-query effects.
+- Verification: 156 regression tests passed in 21.47 seconds, including actual
+  CUDA BF16 training/validation with two-camera cached-feature shapes, production
+  evaluator checkpoint reconstruction, and existing gripper contracts. These
+  are synthetic-input implementation checks; no new policy-success result.
+- Flags, command and checkpoint/resume details:
+  [implementation note](visual_memory_implementation_2026_10_18.md).
+  Matched training and paired correct/wrong/empty-memory rollouts remain pending.
+
+## 2026-10-18: fresh Helios checkpoint smoke test completed
+
+- Abandoned old flat-memory recovery at the user's request; stopped controller
+  and transfer stayed stopped. Removed its unused local sparse partial.
+- Fresh patch-memory/intention-query/depth-two diffusion model (53.9M trainable
+  parameters, compression 32) trained for two single-batch epochs, then resumed
+  to epoch 3. Recovery epoch/AdamW steps advanced 2/2 to 3/3; staged and mirrored
+  best/recovery files matched by SHA-256. Local saves took 0.87–1.81 s, recovery
+  size 619 MiB. All checkpoint destinations in this test were local SSD.
+- Fixed a real H100 cuDNN SDPA plan error in the state/visual encoder using the
+  same supported backends as the action head. Added bounded validation for
+  smoke tests (full validation remains default) and source-snapshot provenance.
+- CUDA regression checks: 77 passed. The test has exited; GPU 0 is free.
+- Shared-storage input waits still dominate these tiny batches; policy quality
+  and full-epoch throughput were not assessed. [Measurements and reproduction
+  details](../reports/helios_fast_checkpoint_test_2026_10_18.md).

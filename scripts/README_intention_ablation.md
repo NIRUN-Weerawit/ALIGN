@@ -87,6 +87,79 @@ For the four-model sequential workflow, leave `--variants` and
 `--worker-variant` unset. Those options are retained for selected-model and
 parallel-worker workflows.
 
+### Checkpoints on shared storage
+
+When the output directory is on NFS, add:
+
+```bash
+--checkpoint-staging-dir /path/on/local-ssd/align-checkpoints
+```
+
+Checkpoint files are completed on fast local storage, then mirrored to the
+original output directory in a background thread. The mirror reads immutable
+files; training can continue without changing its snapshot. It coalesces pending
+`training_last.pt` and best-model generations if the network is slower than
+training, keeping the newest selected state. Explicit per-epoch archives are
+never discarded and apply backpressure when their queue fills. The previous NFS
+file stays valid until the new copy is complete and atomically renamed.
+
+Model tensors are copied to CPU once per epoch and shared by local best/archive/
+recovery saves. All saves omit reconstructible frozen vision weights. Optimizer
+state and tensor dtypes are preserved. Resume checks both local and output
+checkpoints and selects the highest saved epoch, loading through CPU/mmap rather
+than temporarily allocating the full checkpoint on CUDA. Summary metadata alone
+does not mark a variant complete.
+
+The staging location is a runtime setting and can be added when resuming an
+existing run. Keep all model, split and optimizer arguments unchanged. Reserve
+space for the current local checkpoint, an active mirror, and a new generation;
+best-model files add to that requirement. Disk exhaustion or mirror errors stop
+the run visibly while preserving previously completed files.
+
+On Helios the large existing flat-memory checkpoint needs more space than the
+free local SSD provides. `/dev/shm/wee_ucl-align-checkpoints` can be used while
+RAM capacity permits, but it is memory-backed storage: it survives a process
+restart, not a host reboot. Until a background copy finishes, NFS recovery may
+lag behind the newest local epoch. Normal completion waits for final mirroring.
+`checkpoint_io` in epoch metrics reports local staging, pending files, and the
+last successfully mirrored epochs. `checkpoint_save_s` measures foreground
+snapshot/local-save time; it does not claim the NFS copy is already finished.
+
+The existing synchronous save behavior remains available by omitting this flag.
+
+### Patch-memory full training on Helios
+
+The tested source snapshot is at
+`/data/wee_ucl/align-fast-checkpoint-20261018-v2/code`. From that directory,
+the following starts a new no-text intention/memory diffusion run. Checkpoints
+and their staging directory stay on local SSD; inputs remain on NFS.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/wee_ucl/miniconda3/envs/align/bin/python scripts/run_intention_ablation.py \
+  --data /mnt/bigdata/00_students/wee_ucl/ALIGN/data/libero_goal.h5 \
+  --cache /mnt/bigdata/00_students/wee_ucl/ALIGN/data/libero_goal.dinov2 \
+  --output /data/wee_ucl/align-runs/goal_patch_memory_c32_200ep \
+  --checkpoint-staging-dir /data/wee_ucl/align-checkpoint-staging \
+  --variants intent_memory \
+  --visual-context-mode multiscale --memory-intent-query \
+  --memory-retrieval-depth 2 --memory-bank-len 16 \
+  --compressed-dim 32 --num-intent-tokens 1 \
+  --history-size 1 --chunk-size 8 \
+  --temporal-sampling episode --supervision-points 16 \
+  --head-type diffusion --epochs 200 --max-steps 0 --max-val-batches 0 \
+  --batch-size 32 --micro-batch-size 2 --num-workers 2 --prefetch-factor 1 \
+  --lr 0.0002 --gripper-state-source causal --gripper-loss-weight 1.0 \
+  --gpu-memory-fraction 0.95 --profile-data-stages
+```
+
+This uses full episodes with ordered intention/memory accumulation and 16
+supervised action anchors per training episode, plus all 44 held-out episodes.
+Repeat with `--resume` to continue to the same or a larger total epoch target.
+The successful checkpoint/resume smoke test used 20-frame crops and one batch
+per phase; full-episode throughput and policy quality are not yet established.
+See [measured checkpoint test](../reports/helios_fast_checkpoint_test_2026_10_18.md).
+
 ### Sampling, gripper, and saved-head diagnostics
 
 Action chunk length is independent of denoising steps. Diffusion and flow
@@ -204,3 +277,18 @@ Compression experiments should start with `--variants no_intent_no_memory
 separate output directories. Full training and closed-loop evaluation are needed
 to select a width; short pilot errors are not simulator success rates. The flat
 memory architecture grows much faster with width than this plain baseline.
+
+### Short checkpoint smoke tests
+
+Use `--max-steps 1 --max-val-batches 1 --num-workers 0` with a fresh output
+directory to test training and checkpoint I/O on a small number of actual
+batches. Validation remains complete by default (`--max-val-batches 0`). A
+limited run is an infrastructure smoke test, not a policy-quality result.
+The validation limit is recorded in the manifest and must stay fixed on resume.
+After a successful run, repeat the command with `--resume --epochs N` to extend
+the total epoch target, keeping all model/data/training-budget settings fixed.
+
+An isolated deployed source snapshot may include `source_snapshot.json` at its
+root, containing the original `commit` and a `source_sha256` of the deployed
+source files. These are recorded as source provenance in the run manifest;
+normal Git checkouts continue to record their current HEAD.

@@ -1,0 +1,9 @@
+{
+  "protocol": "5 identical 40ms compute steps, 4MiB checkpoint, 400ms simulated shared-storage latency",
+  "sync_wall_s": 2.2115823599742725,
+  "staged_foreground_s": 0.22177192603703588,
+  "staged_total_including_flush_s": 0.8480385510483757,
+  "mirrored_generations": 2,
+  "final_epoch": 4,
+  "caveat": "Controlled overlap benchmark; not a measured Helios epoch speedup"
+}
