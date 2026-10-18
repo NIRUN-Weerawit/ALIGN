@@ -112,7 +112,7 @@ def collate_sparse_histories(items):
     return result
 
 
-def history_conditions(model, batch, device, stage_start=None, stage_end=None):
+def history_conditions(model, batch, device, stage_start=None, stage_end=None, return_context=False):
     def start():
         return stage_start() if stage_start else None
     def end(name, before):
@@ -166,7 +166,7 @@ def history_conditions(model, batch, device, stage_start=None, stage_end=None):
             text = text[episode_indices]
         condition = model.action_condition(visual, states, text_emb=text)
     end('history_gather_and_head_condition_gpu_s', before)
-    return condition
+    return (condition,model.action_context(visual)) if return_context else condition
 
 
 def plain_history_epoch(model, loader, device, args, optimizer=None, max_steps=0):
@@ -213,8 +213,8 @@ def plain_history_epoch(model, loader, device, args, optimizer=None, max_steps=0
             group_count = 0
         with torch.set_grad_enabled(training):
             encode_start = mark()
-            condition = history_conditions(model, batch, device,
-                mark if profile else None, finish if profile else None)
+            condition, visual_kwargs = history_conditions(model, batch, device,
+                mark if profile else None, finish if profile else None, return_context=True)
             target_start = mark() if profile else None
             target = batch['targets'].to(device, non_blocking=True)
             finish('target_host_to_device_gpu_s', target_start)
@@ -225,12 +225,13 @@ def plain_history_epoch(model, loader, device, args, optimizer=None, max_steps=0
                 for offset in range(0, count, args.plain_head_batch_size):
                     stop = min(count, offset + args.plain_head_batch_size)
                     loss_start = mark()
+                    context_slice = {key:value[offset:stop] for key,value in visual_kwargs.items()}
                     loss = model.intention_head.loss(target[offset:stop], condition[offset:stop],
-                                                    dim_weights=dim_weights)
+                                                    dim_weights=dim_weights,**context_slice)
                     weighted_losses.append(loss * (stop - offset))
                     finish('diffusion_loss_gpu_s', loss_start)
                     if not training:
-                        pred = model.intention_head.sample(condition[offset:stop]).float()
+                        pred = model.intention_head.sample(condition[offset:stop],**context_slice).float()
                         diff = (pred - target[offset:stop]).double()
                         chunk_squared = diff.square().sum((0, 1)).cpu().numpy()
                         chunk_absolute = diff.abs().sum((0, 1)).cpu().numpy()

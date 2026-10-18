@@ -21,25 +21,12 @@ Output:
 """
 
 import math
-from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-
-
-def _diffusion_attention_backend(device):
-    """Avoid cuDNN SDPA plan failures for short action/history cross-attention.
-
-    Keep Flash/efficient attention available, with PyTorch math as a fallback.
-    The context restores the caller's backend settings on exit.
-    """
-    if device.type != "cuda":
-        return nullcontext()
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    return sdpa_kernel([SDPBackend.FLASH_ATTENTION,
-                        SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+from models.attention_backend import attention_backend as _diffusion_attention_backend
 
 
 def _valid_loss_samples(actions_target, cond, sample_mask):
@@ -276,6 +263,60 @@ class MambaActionHead(nn.Module):
 # Diffusion Policy Head (Chi et al. 2023) — 1D Conditional U-Net
 # ================================================================
 
+class VisualActionAttention(nn.Module):
+    """Action positions query explicit visual tokens, with a residual update."""
+    def __init__(self, channels, width=128, heads=4):
+        super().__init__()
+        self.heads = heads
+        self.norm = nn.LayerNorm(channels)
+        self.query = nn.Linear(channels,width)
+        self.output = nn.Linear(width,channels)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, x, kv):
+        k,v = kv
+        q = self.query(self.norm(x.transpose(1,2)))
+        B,T,D = q.shape
+        q = q.reshape(B,T,self.heads,D//self.heads).transpose(1,2)
+        with _diffusion_attention_backend(q.device):
+            context = F.scaled_dot_product_attention(q,k,v,dropout_p=0.)
+        context = context.transpose(1,2).reshape(B,T,D)
+        return x + self.output(context).transpose(1,2)
+
+
+class VisualContextProjection(nn.Module):
+    """Shared K/V for camera-major patch tokens, reused at all action scales."""
+    def __init__(self, token_dim, num_cameras, width=128, heads=4):
+        super().__init__()
+        if num_cameras < 1 or width < 4 or width % heads or width % 4:
+            raise ValueError('Visual attention needs cameras and a width divisible by heads and four')
+        self.num_cameras,self.width,self.heads = num_cameras,width,heads
+        self.input = nn.Linear(token_dim,width)
+        self.camera = nn.Embedding(num_cameras,width)
+        self.position = SinusoidalPositionalEncoding(width//2)
+        self.norm = nn.LayerNorm(width)
+        self.key = nn.Linear(width,width)
+        self.value = nn.Linear(width,width)
+
+    def forward(self, tokens):
+        if tokens.ndim != 3 or tokens.shape[1] < 1 or tokens.shape[1] % self.num_cameras:
+            raise ValueError('Visual context must be [batch, cameras * patches, token_dim]')
+        B,N,_ = tokens.shape
+        patches = N//self.num_cameras
+        side = math.isqrt(patches)
+        if side*side != patches:
+            raise ValueError('Visual context requires a square patch grid per camera')
+        index = torch.arange(patches,device=tokens.device)
+        # Explicit 2D position and camera identity; no mean over patches.
+        xy = torch.cat([self.position(index//side),self.position(index%side)],dim=-1)
+        camera = self.camera(torch.arange(self.num_cameras,device=tokens.device))
+        embedding = (camera[:,None]+xy[None]).reshape(1,N,self.width)
+        context = self.norm(self.input(tokens)+embedding.to(tokens.dtype))
+        def split(x):return x.reshape(B,N,self.heads,self.width//self.heads).transpose(1,2)
+        return split(self.key(context)),split(self.value(context))
+
+
 class DiffusionPolicyUNet1D(nn.Module):
     """1D Conditional U-Net for Diffusion Policy (Chi et al. 2023).
 
@@ -352,8 +393,21 @@ class DiffusionPolicyUNet1D(nn.Module):
         nn.init.zeros_(self.visual_output.weight)
         nn.init.zeros_(self.visual_output.bias)
 
+    def configure_visual_context(self,token_dim,num_cameras,width=128):
+        self.visual_context_projection = VisualContextProjection(token_dim,num_cameras,width)
+        self.visual_context_blocks = nn.ModuleDict({
+            'bottleneck':VisualActionAttention(self.hidden_dim*4,width),
+            'decoder':VisualActionAttention(self.hidden_dim,width),
+            'output':VisualActionAttention(self.hidden_dim,width),
+        })
+
+    def prepare_visual_context(self,tokens):
+        if tokens is None:
+            raise ValueError('This head requires explicit visual patch context')
+        return self.visual_context_projection(tokens)
+
     def forward(self, x_t: torch.Tensor, cond: torch.Tensor,
-                t_emb: torch.Tensor) -> torch.Tensor:
+                t_emb: torch.Tensor, visual_context=None, visual_kv=None) -> torch.Tensor:
         """U-Net forward.
 
         Args:
@@ -364,6 +418,10 @@ class DiffusionPolicyUNet1D(nn.Module):
             (B, K, action_dim) — predicted noise
         """
         B, K, _ = x_t.shape
+        if hasattr(self,'visual_context_projection') and visual_kv is None:
+            visual_kv = self.prepare_visual_context(visual_context)
+        if visual_kv is not None and visual_kv[0].shape[0] != B:
+            raise ValueError('Visual context and action batches must match')
 
         # FiLM uses the current observation; attention below reads every
         # ordered history token when this is the full-history variant.
@@ -397,6 +455,8 @@ class DiffusionPolicyUNet1D(nn.Module):
         x = self.enc4(x, cond_global, t_emb)
 
         x = self.bottleneck(x, cond_global, t_emb)
+        if visual_kv is not None:
+            x = self.visual_context_blocks['bottleneck'](x,visual_kv)
         if hasattr(self, "history_attention"):
             positions = torch.arange(self.history_size, device=cond.device)
             history = self.history_projection(cond)
@@ -420,11 +480,15 @@ class DiffusionPolicyUNet1D(nn.Module):
         x = self.up1(x, target_len=skip1.shape[-1])
         x = torch.cat([x, skip1], dim=1)
         x = self.dec1(x, cond_global, t_emb)
+        if visual_kv is not None:
+            x = self.visual_context_blocks['decoder'](x,visual_kv)
 
         if x.shape[-1] != skip0.shape[-1]:
             x = nn.functional.interpolate(x, size=skip0.shape[-1], mode="linear")
         x = torch.cat([x, skip0], dim=1)
         x = self.dec0(x, cond_global, t_emb)
+        if visual_kv is not None:
+            x = self.visual_context_blocks['output'](x,visual_kv)
 
         x = self.output_proj(x)
         x = x.permute(0, 2, 1)
@@ -592,7 +656,7 @@ class DiffusionPolicyHead(nn.Module):
         )
 
     def predict_noise(self, x_t: torch.Tensor, t: torch.Tensor,
-                      cond: torch.Tensor) -> torch.Tensor:
+                      cond: torch.Tensor, visual_context=None, visual_kv=None) -> torch.Tensor:
         """Predict noise given noisy actions and timestep.
 
         Args:
@@ -601,12 +665,14 @@ class DiffusionPolicyHead(nn.Module):
             cond: (B, K, cond_dim) — per-step condition (preserved for FiLM)
         """
         t_emb = self.time_emb(t.float() / self.num_train_timesteps)  # (B, time_dim)
+        if visual_context is not None or visual_kv is not None:
+            return self.unet(x_t, cond, t_emb,visual_context=visual_context,visual_kv=visual_kv)
         return self.unet(x_t, cond, t_emb)
 
     def loss(self, actions_target: torch.Tensor,
              cond: torch.Tensor,
              dim_weights: Optional[torch.Tensor] = None,
-             sample_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+             sample_mask: Optional[torch.Tensor] = None, visual_context=None) -> torch.Tensor:
         """DDPM noise-prediction training loss.
 
         Args:
@@ -616,6 +682,13 @@ class DiffusionPolicyHead(nn.Module):
                          Defaults to equal weights, including gripper.
         """
         actions_target, cond = _valid_loss_samples(actions_target, cond, sample_mask)
+        visual_kwargs = {}
+        if visual_context is not None:
+            if sample_mask is not None:visual_context = visual_context[sample_mask.to(device=visual_context.device,dtype=torch.bool)]
+            # Identical context across noise draws: project once, then repeat
+            # K/V without detaching so every draw still trains the visual path.
+            visual_kwargs = {'visual_kv':tuple(value.repeat(self.loss_repeats,1,1,1)
+                for value in self.unet.prepare_visual_context(visual_context))}
         actions_target = actions_target.repeat(self.loss_repeats,1,1)
         cond = cond.repeat(self.loss_repeats,1,1)
         B, K = actions_target.shape[:2]
@@ -631,7 +704,7 @@ class DiffusionPolicyHead(nn.Module):
         noise = torch.randn_like(actions_target, dtype=torch.float32)
         x_t = alpha_bar_t.sqrt() * actions_target.float() + sigma_t * noise
 
-        predicted_noise = self.predict_noise(x_t, t_indices, cond)
+        predicted_noise = self.predict_noise(x_t, t_indices, cond,**visual_kwargs)
         err = (predicted_noise.float() - noise.float()) ** 2  # (B, K, D)
         if dim_weights is not None:
             err = err * dim_weights.unsqueeze(0).unsqueeze(0)  # broadcast
@@ -664,17 +737,21 @@ class DiffusionPolicyHead(nn.Module):
         return torch.linspace(last, first, steps, device=self.alpha_bar.device).round().long()
 
     @torch.no_grad()
-    def sample(self, cond: torch.Tensor, num_steps: int = None) -> torch.Tensor:
+    def sample(self, cond: torch.Tensor, num_steps: int = None, visual_context=None) -> torch.Tensor:
         """DDIM (eta=0); fewer steps subsample the full training noise grid."""
         timesteps = self.sampling_timesteps(num_steps)
         B, K, D = cond.shape[0], self.chunk_size, self.action_dim
         x = torch.randn(B, K, D, device=cond.device, dtype=torch.float32)
+        # Static visual K/V are projected once, not once per denoising step.
+        with torch.autocast(device_type=cond.device.type,enabled=False):
+            visual_kwargs = ({'visual_kv':self.unet.prepare_visual_context(visual_context.float())}
+                             if visual_context is not None else {})
         for j, index in enumerate(timesteps):
             t = index.expand(B)
             # Epsilon errors are amplified by 1/sqrt(alpha). Keep the
             # denoiser in FP32 even when conditioning was encoded under AMP.
             with torch.autocast(device_type=cond.device.type, enabled=False):
-                eps = self.predict_noise(x, t, cond.float()).float()
+                eps = self.predict_noise(x, t, cond.float(),**visual_kwargs).float()
             alpha = self.alpha_bar[index].float()
             previous = (self.alpha_bar[timesteps[j + 1]].float()
                         if j + 1 < len(timesteps) else alpha.new_tensor(1.0))
@@ -781,7 +858,7 @@ class FlowMatchingPolicyHead(nn.Module):
         )
 
     def predict_velocity(self, x_t: torch.Tensor, t: torch.Tensor,
-                          cond: torch.Tensor) -> torch.Tensor:
+                          cond: torch.Tensor, visual_context=None, visual_kv=None) -> torch.Tensor:
         """Predict the velocity field v(x_t, t).
 
         Args:
@@ -790,12 +867,14 @@ class FlowMatchingPolicyHead(nn.Module):
             cond: (B, 1, cond_dim) — per-step condition (broadcast across K)
         """
         t_emb = self.time_emb(t.float())  # (B, time_dim)
+        if visual_context is not None or visual_kv is not None:
+            return self.unet(x_t, cond, t_emb,visual_context=visual_context,visual_kv=visual_kv)
         return self.unet(x_t, cond, t_emb)
 
     def loss(self, actions_target: torch.Tensor,
              cond: torch.Tensor,
              dim_weights: Optional[torch.Tensor] = None,
-             sample_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+             sample_mask: Optional[torch.Tensor] = None, visual_context=None) -> torch.Tensor:
         """Flow-matching velocity-prediction training loss.
 
         For each sample:
@@ -815,6 +894,8 @@ class FlowMatchingPolicyHead(nn.Module):
             dim_weights: (action_dim,) optional per-dimension loss weights.
         """
         actions_target, cond = _valid_loss_samples(actions_target, cond, sample_mask)
+        if visual_context is not None and sample_mask is not None:
+            visual_context = visual_context[sample_mask.to(device=visual_context.device,dtype=torch.bool)]
         B, K, D = actions_target.shape
         device = actions_target.device
 
@@ -830,14 +911,15 @@ class FlowMatchingPolicyHead(nn.Module):
         # True velocity: derivative w.r.t. t is (noise - data).
         v_target = noise - actions_target.float()
 
-        v_pred = self.predict_velocity(x_t, t, cond)
+        v_pred = self.predict_velocity(x_t, t, cond,
+            **({'visual_context':visual_context} if visual_context is not None else {}))
         err = (v_pred.float() - v_target) ** 2  # (B, K, D)
         if dim_weights is not None:
             err = err * dim_weights.unsqueeze(0).unsqueeze(0)
         return err.mean()
 
     @torch.no_grad()
-    def sample(self, cond: torch.Tensor, num_steps: int = None) -> torch.Tensor:
+    def sample(self, cond: torch.Tensor, num_steps: int = None, visual_context=None) -> torch.Tensor:
         """ODE integration from noise (t=1) to data (t=0).
 
         Supports two solvers:
@@ -854,6 +936,8 @@ class FlowMatchingPolicyHead(nn.Module):
         x = torch.randn(B, K, D, device=device)
         # Timesteps from t=1 down to t=0, uniformly spaced (inclusive endpoints).
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
+        visual_kwargs = ({'visual_kv':self.unet.prepare_visual_context(visual_context)}
+                         if visual_context is not None else {})
 
         for i in range(num_steps):
             t_cur = timesteps[i]
@@ -861,7 +945,7 @@ class FlowMatchingPolicyHead(nn.Module):
             dt = t_next - t_cur  # negative (we go from t=1 to t=0)
 
             t_cur_batch = t_cur.expand(B)
-            v_cur = self.predict_velocity(x, t_cur_batch, cond)
+            v_cur = self.predict_velocity(x, t_cur_batch, cond,**visual_kwargs)
 
             if self.solver == "euler":
                 # x_{t+dt} = x_t + v * dt
@@ -871,7 +955,7 @@ class FlowMatchingPolicyHead(nn.Module):
                 x_euler = x + v_cur * dt
                 # Corrector: re-evaluate velocity at predicted point, average.
                 t_next_batch = t_next.expand(B)
-                v_next = self.predict_velocity(x_euler, t_next_batch, cond)
+                v_next = self.predict_velocity(x_euler, t_next_batch, cond,**visual_kwargs)
                 x = x + 0.5 * (v_cur + v_next) * dt
 
         return x

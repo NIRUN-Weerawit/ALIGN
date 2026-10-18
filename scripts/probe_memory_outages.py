@@ -85,7 +85,7 @@ def main():
                         if arm=='baseline':conditions['memory_bypass']=model.prepare_head_inputs(p,s)
                         for name,value in conditions.items():
                             seed_everything(manifest['seed']+20000+batch_index*100+t)
-                            action=model.intention_head.sample(model.intention_head(*value)).float()
+                            action=model.intention_head.sample(model.intention_head(*value),**model.action_context(value[0])).float()
                             pred=action[:,:,6]>.5;true=targets[:,:,6]>.5
                             counts={key:int(bits.sum()) for key,bits in [('tp',pred & true),('tn',~pred & ~true),('fp',pred & ~true),('fn',~pred & true)]}
                             row=dict(batch=batch_index,t=t,intervention=name,bank_count=model.memory_module._count.tolist(),

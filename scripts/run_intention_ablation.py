@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import gc
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from data.align_dataset import ALIGNDataset
 from models.align_intention import ALIGNIntentionModel
+from models.intention_future import add_future_arguments, validate_future_arguments, freeze_intent_backbone
+from training.checkpoint_io import CheckpointWriter, cpu_snapshot
 from training.train_intention import train_v4_epoch, validate
 from training.cached_loading import collate_cached_segments
 from training.plain_history_training import (SparseHistoryEpisodes,
@@ -39,6 +42,27 @@ def seed_everything(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+class LimitedBatches:
+    """Bound smoke-test validation without fetching an extra batch."""
+    def __init__(self, loader, limit=0):
+        self.loader, self.limit = loader, limit
+
+    def __len__(self):
+        return min(len(self.loader), self.limit) if self.limit else len(self.loader)
+
+    def __iter__(self):
+        return islice(self.loader, len(self))
+
+
+def source_provenance(root=ROOT):
+    """Support a documented source snapshot deployed without a Git checkout."""
+    snapshot = root / 'source_snapshot.json'
+    if snapshot.exists():
+        return json.loads(snapshot.read_text())
+    return {'commit': subprocess.check_output(
+        ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()}
 
 
 def episode_split(dataset, seed, fraction):
@@ -224,7 +248,7 @@ def extend_resume_manifest(previous, current):
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
                 "gpu_memory_fraction", "micro_batch_size", "pin_memory",
                 "plain_history_loader", "plain_head_batch_size", "profile_data_stages",
-                "plain_history_copy_mode"):
+                "plain_history_copy_mode", "checkpoint_staging_dir"):
         if key in current:
             merged[key] = current[key]
     return merged
@@ -235,6 +259,7 @@ def summarize(out, records, manifest):
     rows = ["# Intention/memory ablation", "",
             f"Dataset: `{manifest['data']}`. Held-out prediction metrics, not simulator success rates.", "",
             f"Epoch budget: {manifest['epochs']}; optimizer steps/epoch: {manifest['max_steps'] or 'full loader'}.",
+            f"Validation batches: {manifest.get('max_val_batches', 0) or 'full loader'}; limited runs are smoke tests only.",
             f"Provisional checkpoint selection: {manifest.get('selection_metric','val/loss')}; closed-loop selection is reported separately.", "",
             "| Variant | Epoch | Val loss | Position MSE | Rotation MSE | Gripper MSE | Gripper accuracy |",
             "|---|---:|---:|---:|---:|---:|---:|"]
@@ -265,6 +290,7 @@ def evaluate_existing(out):
     data.gripper_state_source = manifest.get("gripper_state_source", "legacy_zero")
     loader = DataLoader(data, batch_size=manifest.get('micro_batch_size') or manifest["batch_size"], shuffle=False,
         num_workers=0, pin_memory=False, collate_fn=collate_cached_segments)
+    loader = LimitedBatches(loader, manifest.get('max_val_batches', 0))
     args = SimpleNamespace(history_size=manifest["history_size"], chunk_size=manifest["chunk_size"],
         action_dim=7, head_type=manifest["head_type"], skip_nan=False, gripper_threshold=threshold,
         gripper_loss_weight=manifest.get("gripper_loss_weight", 0.01))
@@ -282,6 +308,9 @@ def evaluate_existing(out):
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
             use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
             text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
+            intent_future_weight=config.get('intent_future_weight',0.),
+            intent_future_horizons=config.get('intent_future_horizons',[16,64]),
+            intent_future_hidden_dim=config.get('intent_future_hidden_dim',256),
             num_intent_tokens=config.get("num_intent_tokens", 1), intent_dim=config["intent_dim"],
             mamba_d_state=config.get("mamba_d_state", 16), mamba_d_conv=config.get("mamba_d_conv", 4),
             mamba_expand=config.get("mamba_expand", 2),
@@ -289,9 +318,13 @@ def evaluate_existing(out):
             memory_mode=config.get("memory_mode","legacy"),memory_detach_writes=config.get("memory_detach_writes",False),
             memory_perceptual_recency=config.get("memory_perceptual_recency",0.),memory_field_masks=config.get("memory_field_masks",False),memory_pre_state_visual=config.get("memory_pre_state_visual",False),memory_value_preserving=config.get("memory_value_preserving",False),memory_patch_temporal=config.get("memory_patch_temporal",False),memory_context_only=config.get("memory_context_only",False),memory_write_fused=config.get("memory_write_fused",True),memory_patch_retrieval=config.get("memory_patch_retrieval",False),
             diffusion_train_steps=config.get("diffusion_train_steps",10),diffusion_loss_repeats=config.get("diffusion_loss_repeats",1),
+            visual_context_mode=config.get("visual_context_mode","none"),
+            memory_retrieval_depth=config.get("memory_retrieval_depth",1),memory_intent_query=config.get("memory_intent_query",False),
             visual_token_attention=config.get("visual_token_attention",False),diffusion_clip_sample=config.get("diffusion_clip_sample",False))
         model._build_head_and_bank(config.get("pool_out_dim", 256 * len(cameras) * config["compressed_dim"]))
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        incompatible = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if incompatible.unexpected_keys or any(not key.startswith("vision_encoder.") for key in incompatible.missing_keys):
+            raise ValueError("Checkpoint is missing trained parameters; evaluation aborted")
         vision = model.vision_encoder
         model.vision_encoder = torch.nn.Identity()
         model.to(device)
@@ -304,6 +337,7 @@ def evaluate_existing(out):
             sparse_loader = DataLoader(SparseHistoryEpisodes(data, args.history_size),
                 batch_size=manifest.get("micro_batch_size") or manifest["batch_size"],
                 num_workers=0, pin_memory=False, collate_fn=collate_sparse_histories)
+            sparse_loader = LimitedBatches(sparse_loader, manifest.get('max_val_batches', 0))
             val_loss, _, metrics = plain_history_epoch(model, sparse_loader, device, args)
         else:
             val_loss, _, metrics = validate(model, loader, device, args)
@@ -354,16 +388,22 @@ def parse_args(argv=None):
     parser.add_argument("--memory-context-only",action=argparse.BooleanOptionalAction,default=False,help="Experimental retrieved branch without a direct current-query residual; current features remain in the fusion gate")
     parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument("--visual-token-attention",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--visual-context-mode",choices=["none","multiscale"],default="none",help="Explicit patch tokens at three action U-Net scales; enables patch memory when used")
+    parser.add_argument("--memory-retrieval-depth",type=int,default=2,help="Sequential reads of the same past bank (legacy checkpoints use 1)")
+    parser.add_argument("--memory-intent-query",action=argparse.BooleanOptionalAction,default=False,help="Use inferred intention to guide visual retrieval; no-intent variants retain visual-only queries")
     parser.add_argument("--diffusion-clip-sample",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--diffusion-train-steps",type=int,default=100)
     parser.add_argument("--diffusion-loss-repeats",type=int,default=4)
     parser.add_argument("--warm-start",type=Path,help="Existing four-variant run; copy matching parameters, retain fresh diffusion schedule")
     parser.add_argument("--keep-epoch-checkpoints",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--checkpoint-staging-dir",default=None,help="Fast local checkpoint directory; mirror immutable files to output asynchronously. Resume prefers the highest saved epoch from local/output checkpoints.")
     parser.add_argument("--selection-metric",choices=["val/loss","pos_mse"],default="pos_mse",
                         help="Prediction-based provisional selection; closed-loop selection is separate")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--max-steps", type=int, default=0,
                         help="Optimizer steps per epoch; 0 uses the full training loader.")
+    parser.add_argument("--max-val-batches", type=int, default=0,
+                        help="Smoke-test validation batch limit; 0 preserves full validation. Must stay fixed on resume.")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--micro-batch-size", type=int, default=None,
                         help="Episodes loaded together; gradients accumulate to --batch-size before each optimizer step.")
@@ -420,7 +460,17 @@ def parse_args(argv=None):
     parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history"],
                         help="Train only this variant, retaining the ordered common initialization.")
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
+    add_future_arguments(parser)
     args = parser.parse_args(argv)
+    try:validate_future_arguments(args)
+    except ValueError as error:parser.error(str(error))
+    if args.freeze_intent_backbone and not (args.warm_start or args.resume):
+        parser.error('Freezing the backbone requires --warm-start or --resume; do not freeze a random encoder')
+    if args.intent_future_weight:
+        if any(not name.startswith('intent_') for name in args.variants):
+            parser.error('Future prediction requires intent variants: --variants intent_no_memory and/or intent_memory')
+        if args.temporal_sampling=='crop' and args.segment_length<args.history_size+max(args.intent_future_horizons):
+            parser.error('Cropped segments must include the longest future horizon after history; increase --segment-length or use episode sampling')
     if args.plain_head_batch_size < 1:
         parser.error("--plain-head-batch-size must be positive")
     if args.micro_batch_size is not None and (args.micro_batch_size < 1 or
@@ -455,14 +505,26 @@ def parse_args(argv=None):
         parser.error("Camera names must be unique")
     if not 0 < args.validation_fraction < 1 or not 0 < args.gpu_memory_fraction <= 1:
         parser.error("Validation fraction must be in (0, 1); GPU memory fraction in (0, 1]")
-    if args.lr <= 0 or min(args.weight_decay, args.grad_clip, args.gripper_loss_weight, args.max_steps) < 0:
-        parser.error("Learning rate must be positive; decay, clipping, loss weight and max steps must be nonnegative")
+    if args.lr <= 0 or min(args.weight_decay, args.grad_clip, args.gripper_loss_weight, args.max_steps, args.max_val_batches) < 0:
+        parser.error("Learning rate must be positive; decay, clipping, loss weight and batch/step limits must be nonnegative")
     if min(args.supervision_points,args.diffusion_train_steps,args.diffusion_loss_repeats)<1 or args.diffusion_train_steps<10:
         parser.error('Supervision points/repeats must be positive; diffusion schedule needs at least 10 steps')
     if not 0 <= args.observation_dropout_prob <= 1:
         parser.error("Observation dropout probability must be in [0,1]")
     if args.temporal_sampling=="episode" and args.history_size!=1:
         parser.error('Episode supervision currently requires history size 1')
+    if args.visual_context_mode == 'multiscale':
+        args.memory_patch_retrieval = True
+    if args.memory_retrieval_depth < 1:
+        parser.error('--memory-retrieval-depth must be positive')
+    if args.memory_mode == 'legacy' and (args.memory_retrieval_depth != 1 or args.memory_intent_query):
+        parser.error('Legacy memory requires depth 1 and no intention-guided query')
+    if args.visual_context_mode != 'none' and (args.visual_token_attention or args.head_type not in ('diffusion','flow_matching')):
+        parser.error('Multiscale context requires a generative head and replaces --visual-token-attention')
+    if args.visual_context_mode != 'none' and args.memory_mode != 'episodic':
+        parser.error('Multiscale visual memory requires episodic mode')
+    if args.visual_context_mode != 'none' and args.memory_value_preserving and not args.memory_patch_temporal:
+        parser.error('Multiscale raw-value memory requires --memory-patch-temporal')
     if args.memory_perceptual_recency<0 or (args.memory_perceptual_recency>0 and (args.memory_mode!="episodic" or not args.memory_value_preserving)):
         parser.error("Nonnegative perceptual recency requires episodic raw-value retrieval")
     if args.memory_field_masks and (args.memory_mode != "episodic" or args.memory_write_fused):
@@ -486,6 +548,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.checkpoint_staging_dir:
+        args.checkpoint_staging_dir = str(Path(args.checkpoint_staging_dir).expanduser().resolve())
     if not torch.cuda.is_available():
         raise RuntimeError("These ablations require a CUDA GPU")
     if args.evaluate_existing:
@@ -515,6 +579,10 @@ def main(argv=None):
         raise ValueError("Expected 257 DINOv2 tokens of width 768 per selected camera")
     pool_out_dim = (sample.shape[-2] - len(args.cameras)) * args.compressed_dim
     train_eps, val_eps = episode_split(dataset, args.seed, args.validation_fraction)
+    if args.intent_future_weight:
+        longest=max(dataset._get_episode_length(ep) for ep in train_eps)
+        if max(args.intent_future_horizons)+args.history_size>longest:
+            raise ValueError('The longest future horizon has no eligible training episode')
     text_vocab = (sorted({word for ep in train_eps for word in
                           re.findall(r"[a-z0-9]+", dataset._read_text(ep).lower())})
                   if args.use_task_text else [])
@@ -522,8 +590,8 @@ def main(argv=None):
         raise ValueError("Batch size exceeds the training episode count")
     if any(dataset._get_episode_length(ep) < args.history_size + args.chunk_size for ep in train_eps + val_eps):
         raise ValueError("An episode is too short for this history/chunk configuration")
-    manifest = dict(vars(args), commit=subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+    provenance = source_provenance()
+    manifest = dict(vars(args), commit=provenance['commit'], source_provenance=provenance,
         torch=str(torch.__version__), cuda=torch.version.cuda,
         gpu=torch.cuda.get_device_name(), split="task-stratified whole episodes",
         train_episodes=[dataset._episode_keys[ep] for ep in train_eps],
@@ -534,22 +602,25 @@ def main(argv=None):
         intention_recurrence="causal observation state across each segment")
     if args.resume and (out / "manifest.json").exists():
         previous = json.loads((out / "manifest.json").read_text())
-        legacy_defaults = dict(gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
+        legacy_defaults = dict(max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
                                plain_history_size=4,
                                weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                                mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
                                memory_perceptual_recency=0.,memory_field_masks=False,memory_pre_state_visual=False,memory_value_preserving=False,memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
+                               visual_context_mode="none",memory_retrieval_depth=1,memory_intent_query=False,
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
                                use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
                                length_bucket_multiplier=20)
-        for key in ("gripper_state_source", "gripper_transition_fraction", "max_steps", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
+        legacy_defaults.update(intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False)
+        for key in ("intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
+                    "gripper_state_source", "gripper_transition_fraction", "max_steps", "max_val_batches", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "use_task_text", "text_dim", "text_vocab",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
-                    "memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
+                    "visual_context_mode","memory_retrieval_depth","memory_intent_query","memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         manifest = extend_resume_manifest(previous, manifest)
@@ -613,6 +684,7 @@ def main(argv=None):
                                   collate_fn=collator, **variant_options)
         val_loader = DataLoader(variant_val_data, batch_size=micro_batch_size,
                                 shuffle=False, collate_fn=collator, **variant_options)
+        val_loader = LimitedBatches(val_loader, args.max_val_batches)
         seed_everything(args.seed)
         model = ALIGNIntentionModel(state_dim=args.state_dim,
             mamba_output_dim=0 if full_history else args.mamba_output_dim,
@@ -626,9 +698,13 @@ def main(argv=None):
             memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
             memory_perceptual_recency=args.memory_perceptual_recency,memory_field_masks=args.memory_field_masks,memory_pre_state_visual=args.memory_pre_state_visual,memory_value_preserving=args.memory_value_preserving,memory_patch_temporal=args.memory_patch_temporal,memory_context_only=args.memory_context_only,memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
             diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
+            visual_context_mode=getattr(args,"visual_context_mode","none"),
+            memory_retrieval_depth=getattr(args,"memory_retrieval_depth",1),memory_intent_query=getattr(args,"memory_intent_query",False),
             visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample,
             use_text=args.use_task_text,text_dim=args.text_dim,
-            text_encoder_type="bag" if args.use_task_text else "clip",text_vocab=text_vocab)
+            text_encoder_type="bag" if args.use_task_text else "clip",text_vocab=text_vocab,
+            intent_future_weight=args.intent_future_weight,intent_future_horizons=args.intent_future_horizons,
+            intent_future_hidden_dim=args.intent_future_hidden_dim)
         # Cached training never uses the raw-image modules. Keep them off GPU.
         model.vision_encoder.requires_grad_(False)
         vision = model.vision_encoder
@@ -663,11 +739,14 @@ def main(argv=None):
                 saved = torch.load(Path(args.warm_start)/name/"intention_best.pt",map_location="cpu",weights_only=True)
             source = saved["model_state_dict"]
             own = model.state_dict()
+            future_compatible=(saved['config'].get('intent_future_horizons',[16,64])==args.intent_future_horizons)
             matched = {k:v for k,v in source.items() if k in own and own[k].shape==v.shape
-                       and not k.startswith("vision_encoder.") and not k.endswith(("alpha_bar","sigma"))}
+                       and not k.startswith("vision_encoder.") and not k.endswith(("alpha_bar","sigma"))
+                       and (future_compatible or not k.startswith('intention_future_predictor.'))}
             model.load_state_dict(matched,strict=False)
             print(f"WARM START {name}: {len(matched)} parameters/buffers, fresh noise schedule",flush=True)
             del saved,source,own,matched
+        if args.freeze_intent_backbone:freeze_intent_backbone(model)
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, fused=True)
         loop_args = SimpleNamespace(history_size=variant_history_size, chunk_size=args.chunk_size,
@@ -679,23 +758,27 @@ def main(argv=None):
             profile_data_stages=args.profile_data_stages,
             gradient_accum_steps=args.batch_size // micro_batch_size)
         run = out / name
+        checkpoints = CheckpointWriter(run,args.checkpoint_staging_dir)
         start_epoch = 1
         best = float("inf")
         if args.resume and run.exists():
-            if records.get(name, {}).get("completed_epochs", 0) >= args.epochs:
-                print(f"SKIP completed {name}", flush=True)
-                del model, optimizer, params, vision
-                torch.cuda.empty_cache()
-                continue
-            last_checkpoint = run / "training_last.pt"
-            if last_checkpoint.exists():
-                saved = torch.load(last_checkpoint, map_location=device, weights_only=True)
+            last_checkpoint = checkpoints.resume_path()
+            if last_checkpoint is not None:
+                saved = torch.load(last_checkpoint, map_location="cpu", weights_only=True, mmap=True)
+                # With asynchronous mirroring, summary.json may be ahead of NFS
+                # weights after interruption. Only a complete checkpoint proves
+                # the requested epoch budget has been saved.
+                if saved["epoch"] >= args.epochs:
+                    print(f"SKIP completed {name} (checkpoint epoch {saved['epoch']})",flush=True)
+                    del model,optimizer,params,vision,saved
+                    torch.cuda.empty_cache()
+                    continue
                 model.load_state_dict(saved["model_state_dict"], strict=False)
                 optimizer.load_state_dict(saved["optimizer_state_dict"])
                 start_epoch = saved["epoch"] + 1
                 best = saved["best_loss"]
                 records[name] = saved["record"]
-                best_checkpoint = run / "intention_best.pt"
+                best_checkpoint = checkpoints.best_path()
                 if not best_checkpoint.exists() or not zipfile.is_zipfile(best_checkpoint):
                     print(f"RESUME {name}: best checkpoint missing or incomplete; "
                           "next epoch will establish a new best", flush=True)
@@ -723,8 +806,9 @@ def main(argv=None):
         atomic_json(run / "config.json", config)
         torch.cuda.reset_peak_memory_stats()
         print(f"START {name}: {config['trainable_parameters']:,} trainable parameters", flush=True)
-        with (run / "metrics.jsonl").open("a" if start_epoch > 1 else "w", buffering=1) as log:
+        with checkpoints, (run / "metrics.jsonl").open("a" if start_epoch > 1 else "w", buffering=1) as log:
             for epoch in range(start_epoch, args.epochs + 1):
+                checkpoints.raise_if_failed()
                 train_data.epoch = epoch
                 train_sampler.set_epoch(epoch)
                 seed_everything(args.seed + epoch)
@@ -743,6 +827,7 @@ def main(argv=None):
                                        if sparse_history else validate(model, val_loader, device, loop_args))
                 val_wall_s = time.perf_counter() - val_start
                 row = dict(epoch=epoch, **{"train/loss": train_loss, "val/loss": val_loss},
+                    **{'train/'+k:v for k,v in getattr(loop_args,'_last_future_metrics',{}).items()},
                     **metrics, elapsed_s=time.monotonic() - start,
                     peak_gpu_gib=torch.cuda.max_memory_allocated() / 1024 ** 3,
                     timing={**getattr(loop_args, "_last_stage_times", {}),
@@ -752,35 +837,37 @@ def main(argv=None):
                     raise FloatingPointError(f"Nonfinite loss in {name}: {row}")
                 checkpoint_start = time.perf_counter()
                 selection_score = row[args.selection_metric]
-                if selection_score < best:
-                    best_checkpoint = run / "intention_best.pt"
-                    temporary_best = run / "intention_best.pt.tmp"
-                    torch.save(dict(model_state_dict=model.state_dict(), config=config,
-                        epoch=epoch, val_loss=val_loss), temporary_best)
-                    temporary_best.replace(best_checkpoint)
+                improved = selection_score < best
+                if improved:
                     best = selection_score
                     records[name] = dict(best=row, completed_epochs=epoch)
-                if args.keep_epoch_checkpoints:
-                    torch.save(dict(model_state_dict={k:v for k,v in model.state_dict().items() if not k.startswith("vision_encoder.")},
-                                    config=dict(config,frozen_vision_omitted=True),epoch=epoch,val_loss=val_loss),run/f"epoch_{epoch:03d}.pt")
                 records[name]["completed_epochs"] = epoch
-                # Frozen raw vision is reconstructible and excluded to keep
-                # epoch recovery saves small. Seed/crop/order reset every epoch.
-                latest = dict(model_state_dict={key: value for key, value in model.state_dict().items()
-                                                if not key.startswith("vision_encoder.")},
-                              optimizer_state_dict=optimizer.state_dict(), epoch=epoch,
-                              best_loss=best, record=records[name])
-                temporary = run / "training_last.pt.tmp"
-                torch.save(latest, temporary)
-                temporary.replace(run / "training_last.pt")
-                del latest
+                # One immutable CPU snapshot shared by best/archive/recovery saves.
+                # Frozen DINO weights are reconstructible and omitted from all files.
+                snapshot = cpu_snapshot(dict(
+                    model_state_dict={key:value for key,value in model.state_dict().items()
+                                      if not key.startswith("vision_encoder.")},
+                    optimizer_state_dict=optimizer.state_dict(), record=records[name],
+                    config=dict(config,frozen_vision_omitted=True)))
+                evaluation = dict(model_state_dict=snapshot["model_state_dict"],
+                                  config=snapshot["config"],epoch=epoch,val_loss=val_loss)
+                if improved:
+                    checkpoints.save("intention_best.pt",evaluation)
+                if args.keep_epoch_checkpoints:
+                    checkpoints.save(f"epoch_{epoch:03d}.pt",evaluation)
+                latest = dict(snapshot,epoch=epoch,best_loss=best)
+                checkpoints.save("training_last.pt",latest)
+                del latest,snapshot,evaluation
+                row["checkpoint_io"] = checkpoints.status()
                 row["timing"]["checkpoint_save_s"] = time.perf_counter() - checkpoint_start
                 row["timing"]["total_wall_s"] = time.monotonic() - start
                 log.write(json.dumps(row, allow_nan=False) + "\n")
                 summarize(report_out, records, manifest)
                 print(f"RESULT {name} epoch={epoch} train={train_loss:.6f} val={val_loss:.6f} "
                       f"pos={metrics['pos_mse']:.6f} rot={metrics['rot_mse']:.6f} "
-                      f"grip_acc={metrics['grip_acc']:.3f} seconds={row['elapsed_s']:.1f}", flush=True)
+                      f"grip_acc={metrics['grip_acc']:.3f} seconds={row['timing']['total_wall_s']:.1f} "
+                      f"checkpoint={row['timing']['checkpoint_save_s']:.1f}s "
+                      f"mirror_pending={row['checkpoint_io']['pending_files']}", flush=True)
         del model, optimizer, params, vision
         torch.cuda.empty_cache()
     del train_loader, val_loader

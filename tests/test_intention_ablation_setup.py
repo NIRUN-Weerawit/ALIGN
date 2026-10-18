@@ -9,6 +9,33 @@ from scripts.run_intention_ablation import (CachedEpisodes, LengthBucketBatchSam
 from scripts.run_intention_ablation import parse_args, extend_resume_manifest
 
 
+def test_smoke_validation_limit_does_not_consume_extra_batches():
+    from scripts.run_intention_ablation import LimitedBatches
+    visited = []
+    class Loader:
+        def __len__(self): return 5
+        def __iter__(self):
+            for index in range(5):
+                visited.append(index)
+                yield index
+    limited = LimitedBatches(Loader(), 2)
+    assert len(limited) == 2 and list(limited) == [0, 1]
+    assert visited == [0, 1]
+    assert len(LimitedBatches(Loader(), 0)) == 5
+    assert list(LimitedBatches(Loader(), 9)) == list(range(5))
+    assert parse_args(['--output', 'example']).max_val_batches == 0
+    with pytest.raises(SystemExit):
+        parse_args(['--output', 'example', '--max-val-batches', '-1'])
+
+
+def test_deployed_snapshot_records_original_source_provenance(tmp_path):
+    import json
+    from scripts.run_intention_ablation import source_provenance
+    provenance = {'commit': 'original', 'source_sha256': 'dirty-source-digest'}
+    (tmp_path / 'source_snapshot.json').write_text(json.dumps(provenance))
+    assert source_provenance(tmp_path) == provenance
+
+
 @pytest.mark.parametrize("target", [80, 100])
 def test_resume_manifest_allows_same_or_larger_total_epochs(target):
     original = dict(epochs=80, commit="original", lr=0.001,

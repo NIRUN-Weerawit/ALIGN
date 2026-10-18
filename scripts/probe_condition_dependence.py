@@ -42,8 +42,10 @@ def load_model(path, cameras):
     for key, default in [('num_intent_tokens',1),('mamba_d_state',16),('mamba_d_conv',4),('mamba_expand',2)]:
         kwargs[key] = c.get(key, default)
     for key,default in [('memory_mode','legacy'),('memory_detach_writes',False),('memory_write_fused',True),
-                        ('memory_perceptual_recency',0.),('memory_field_masks',False),('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False),('use_text',False),('text_dim',128),('text_encoder_type','clip'),('text_vocab',None)]:
+                        ('visual_context_mode','none'),('memory_retrieval_depth',1),('memory_intent_query',False),('memory_perceptual_recency',0.),('memory_field_masks',False),('memory_pre_state_visual',False),('memory_value_preserving',False),('memory_patch_temporal',False),('memory_context_only',False),('memory_patch_retrieval',False),('diffusion_train_steps',10),('diffusion_loss_repeats',1),('visual_token_attention',False),('diffusion_clip_sample',False),('use_text',False),('text_dim',128),('text_encoder_type','clip'),('text_vocab',None)]:
         kwargs[key] = c.get(key,default)
+    for key,default in [('intent_future_weight',0.),('intent_future_horizons',[16,64]),('intent_future_hidden_dim',256)]:
+        kwargs[key]=c.get(key,default)
     model = ALIGNIntentionModel(action_dim=7, num_cameras=len(cameras), **kwargs)
     model._build_head_and_bank(c.get('pool_out_dim',256*len(cameras)*c['compressed_dim']))
     incompatible=model.load_state_dict(ckpt['model_state_dict'],strict=not c.get('frozen_vision_omitted',False))
@@ -112,9 +114,10 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     continue
                 after = snapshot(model.memory_module) if before is not None else None
                 def head(v,s,i,task=text_emb):
-                    return model.action_condition(v,s,i,task)
+                    return model.action_condition(v,s,i,task),model.action_context(v)
                 conds = {'baseline': head(*fused)}
-                conds['repeat_control'] = conds['baseline'].clone()
+                conds['repeat_control'] = (conds['baseline'][0].clone(),
+                    {key:value.clone() for key,value in conds['baseline'][1].items()})
                 if text_emb is not None:
                     conds['text_shuffle'] = head(*fused,task=text_emb[permutation])
                 if i is not None:
@@ -127,6 +130,14 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                     restore(model.memory_module,before,permutation)
                     conds['memory_shuffle'] = head(*model.condition_actions(p,s,i))
                     restore(model.memory_module,after)
+                    if i is not None and getattr(model,'memory_intent_query',False):
+                        for name,query in [('zero',torch.zeros_like(i)),('shuffle',i[permutation])]:
+                            restore(model.memory_module,before)
+                            changed = model.condition_actions(p,s,query)
+                            # Hold the head's cognitive condition fixed: isolate
+                            # the effect of intention on visual selection.
+                            conds['intent_retrieval_'+name] = head(changed[0],changed[1],fused[2])
+                        restore(model.memory_module,after)
                 if visual_occlusion:
                     for case in ['last_camera','all_visual','all_observation']:
                         missing = p.clone()
@@ -158,11 +169,11 @@ def evaluate_variant(model, loader, anchors, seed, episode_anchors=False, visual
                 inputs = [(model.intention_head.alpha_bar[k].sqrt()*target +
                           model.intention_head.sigma[k]*noise) for k in probe_indices]
                 outputs = {}
-                for name,cond in conds.items():
+                for name,(cond,visual_kwargs) in conds.items():
                     seed_everything(draw_seed)
-                    action = model.intention_head.sample(cond).float()
+                    action = model.intention_head.sample(cond,**visual_kwargs).float()
                     eps = torch.stack([model.intention_head.predict_noise(x,
-                        torch.full((B,),k,device='cuda',dtype=torch.long),cond).float()
+                        torch.full((B,),k,device='cuda',dtype=torch.long),cond,**visual_kwargs).float()
                         for k,x in zip(probe_indices,inputs)])
                     outputs[name] = (action,eps)
                 baseline, baseline_eps = outputs['baseline']

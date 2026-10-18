@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple
+from models.attention_backend import attention_backend
 
 try:
     from mamba_ssm import Mamba
@@ -144,8 +145,9 @@ class StateConditionalCrossAttn(nn.Module):
         q = self.q_proj(z_s).unsqueeze(1).expand(-1, N_pos, -1)  # (B, N_pos, D)
         k = v = z_v_comp                                         # patches as KV
 
-        attn_out, _ = self.cross_attn(q, k, v, need_weights=False,
-                                      key_padding_mask=None if token_mask is None else ~token_mask)                   # (B, N_pos, D)
+        with attention_backend(q.device):
+            attn_out, _ = self.cross_attn(q, k, v, need_weights=False,
+                                        key_padding_mask=None if token_mask is None else ~token_mask)
 
         out = z_v_comp + self.attn_scale * attn_out              # residual modulation
         out=self.norm(out)

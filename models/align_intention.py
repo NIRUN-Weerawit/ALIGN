@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import re
+import math
 from typing import Optional, Tuple, List
 
 from models.align_model import VisionEncoder, RobotStateEncoder
@@ -107,7 +108,13 @@ class ALIGNIntentionModel(nn.Module):
         diffusion_train_steps: int = 100,
         diffusion_loss_repeats: int = 4,
         visual_token_attention: bool = False,
+        visual_context_mode: str = "none",
+        memory_retrieval_depth: int = 1,
+        memory_intent_query: bool = False,
         diffusion_clip_sample: bool = True,
+        intent_future_weight: float = 0.,
+        intent_future_horizons=(16,64),
+        intent_future_hidden_dim: int = 256,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -128,12 +135,33 @@ class ALIGNIntentionModel(nn.Module):
             raise ValueError("Intent tokens require the Mamba history encoder")
         self.num_intent_tokens = num_intent_tokens
         self.intent_dim = intent_dim
+        if intent_future_weight < 0 or not math.isfinite(intent_future_weight):
+            raise ValueError('Future prediction weight must be finite and nonnegative')
+        if intent_future_weight and (not use_intent_tokens or mamba_output_dim<=0):
+            raise ValueError('Future prediction requires an active intention encoder')
+        self.intent_future_weight = intent_future_weight
         self.use_memory_bank = use_memory_bank
         self.memory_bank_len = memory_bank_len
         self.memory_mode = memory_mode
         self.memory_detach_writes = memory_detach_writes
         self.memory_write_fused = memory_write_fused
         self.memory_patch_retrieval = memory_patch_retrieval
+        if visual_context_mode not in ('none','multiscale'):
+            raise ValueError('Unknown visual context mode')
+        if visual_context_mode != 'none' and (head_type not in ('diffusion','flow_matching') or visual_token_attention):
+            raise ValueError('Explicit visual context requires a generative head and replaces legacy visual attention')
+        if visual_context_mode != 'none' and use_memory_bank:
+            if memory_mode != 'episodic':
+                raise ValueError('Explicit visual memory context requires episodic patch retrieval')
+            self.memory_patch_retrieval = memory_patch_retrieval = True
+        if not isinstance(memory_retrieval_depth,int) or memory_retrieval_depth < 1:
+            raise ValueError('Memory retrieval depth must be a positive integer')
+        if use_memory_bank and memory_mode != 'episodic' and (memory_retrieval_depth != 1 or memory_intent_query):
+            raise ValueError('Deeper/intention-guided retrieval requires episodic memory')
+        self.visual_context_mode = visual_context_mode
+        self.memory_retrieval_depth = memory_retrieval_depth
+        # The no-intent ablation still retrieves using visual/state features.
+        self.memory_intent_query = memory_intent_query and use_memory_bank and use_intent_tokens
         if memory_context_only and memory_mode != "episodic":
             raise ValueError("Context-only retrieval requires episodic memory")
         if memory_patch_temporal and (not memory_patch_retrieval or memory_mode != "episodic"):
@@ -239,6 +267,25 @@ class ALIGNIntentionModel(nn.Module):
         self._encoder_prefixes = {
             "vision_encoder.backbone", "state_encoder",
         }
+        self.intention_future_predictor = None
+        if intent_future_weight:
+            from models.intention_future import IntentionFuturePredictor
+            if not intent_future_horizons or min(intent_future_horizons)<1 or len(set(intent_future_horizons))!=len(intent_future_horizons):
+                raise ValueError('Future horizons must be unique positive offsets')
+            # Auxiliary initialization must not change subsequent policy/head
+            # initialization in an otherwise identical objective ablation.
+            with torch.random.fork_rng(devices=[]):
+                self.intention_future_predictor = IntentionFuturePredictor(
+                    intent_dim*num_intent_tokens,num_cameras,raw_dim,
+                    intent_future_horizons,intent_future_hidden_dim)
+            self._trainable_prefixes.add('intention_future_predictor')
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode and getattr(self,'_intent_backbone_frozen',False):
+            for module in [self.vision_encoder,self.vision_patch_encoder,self.state_encoder,self.intention_encoder]:
+                module.eval()
+        return self
 
     def _build_head_and_bank(self, pool_out_dim: int):
         """Build head and memory bank once pool_out_dim is known."""
@@ -310,6 +357,8 @@ class ALIGNIntentionModel(nn.Module):
 
         if self.visual_token_attention and hasattr(self.intention_head,"unet"):
             self.intention_head.unet.configure_visual_attention(pool_out_dim,self.compressed_dim)
+        if self.visual_context_mode == 'multiscale':
+            self.intention_head.unet.configure_visual_context(self.compressed_dim,self.num_cameras)
 
         # Move head to the same device as the rest of the model
         self.intention_head = self.intention_head.to(device)
@@ -318,7 +367,7 @@ class ALIGNIntentionModel(nn.Module):
         if self.use_memory_bank:
             cognitive_dim = self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0
             memory_class = EpisodicMemoryModule if self.memory_mode == "episodic" else PerceptualCognitiveMemoryModule
-            memory_kwargs = dict(perceptual_recency_scale=self.memory_perceptual_recency,mask_missing_fields=self.memory_field_masks,value_preserving=self.memory_value_preserving,patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
+            memory_kwargs = dict(retrieval_depth=self.memory_retrieval_depth,intent_query=self.memory_intent_query,perceptual_recency_scale=self.memory_perceptual_recency,mask_missing_fields=self.memory_field_masks,value_preserving=self.memory_value_preserving,patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
                                  patch_dim=self.compressed_dim if self.memory_patch_retrieval else None) if self.memory_mode == "episodic" else {}
             self.memory_module = memory_class(
                 perceptual_dim=pool_out_dim,
@@ -613,6 +662,17 @@ class ALIGNIntentionModel(nn.Module):
             cond = cond + self.text_condition(text_emb).unsqueeze(1)
         return cond
 
+    def action_context(self, visual):
+        """Explicit camera-major patches, separate from global/text conditioning.
+
+        Memory returns fused patch features at the current step. Plain history
+        keeps its ordered observations in global history attention and supplies
+        the current patch grid to this visual-detail pathway.
+        """
+        if self.visual_context_mode == 'none':
+            return {}
+        return {'visual_context':visual[:,-1].reshape(visual.shape[0],-1,self.compressed_dim)}
+
     # ----------------------------------------------------------------
     # Probe / interpretability forward
     # ----------------------------------------------------------------
@@ -708,7 +768,8 @@ class ALIGNIntentionModel(nn.Module):
                        text_emb: torch.Tensor = None) -> torch.Tensor:
         if isinstance(self.intention_head, (DiffusionPolicyHead, FlowMatchingPolicyHead)):
             cond = self.action_condition(z_v_pooled_window, z_s_window, intent_emb, text_emb)
-            return self.intention_head.sample(cond, num_steps=num_steps)
+            return self.intention_head.sample(cond, num_steps=num_steps,
+                                              **self.action_context(z_v_pooled_window))
         else:
             return self.intention_head(
                 z_v_pooled_window, z_s_window, intent_emb=intent_emb,

@@ -104,6 +104,8 @@ from tqdm import tqdm
 
 from data.align_dataset import ALIGNDataset, MultiALIGNDataset, head_collate, v4_segment_collate
 from models.align_intention import ALIGNIntentionModel
+from models.intention_future import (future_prediction_loss, FutureMetrics,
+    add_future_arguments, validate_future_arguments, freeze_intent_backbone)
 from training.wandb_utils import init_wandb
 
 
@@ -348,7 +350,12 @@ def build_model(args, num_cameras, device):
         memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
         memory_perceptual_recency=getattr(args,"memory_perceptual_recency",0.),memory_field_masks=getattr(args,"memory_field_masks",False),memory_pre_state_visual=getattr(args,"memory_pre_state_visual",False),memory_value_preserving=getattr(args,"memory_value_preserving",False),memory_patch_temporal=getattr(args,"memory_patch_temporal",False),memory_context_only=getattr(args,"memory_context_only",False),memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
         diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
+        visual_context_mode=getattr(args,"visual_context_mode","none"),
+        memory_retrieval_depth=getattr(args,"memory_retrieval_depth",1),memory_intent_query=getattr(args,"memory_intent_query",False),
         visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample,
+        intent_future_weight=getattr(args,'intent_future_weight',0.),
+        intent_future_horizons=getattr(args,'intent_future_horizons',[16,64]),
+        intent_future_hidden_dim=getattr(args,'intent_future_hidden_dim',256),
     )
     model = model.to(device)
     return model
@@ -377,6 +384,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
     Returns (avg_loss, avg_action_mean).
     """
     model.train()
+    future_weight=getattr(model,'intent_future_weight',0.)
+    future_stats=FutureMetrics(model.intention_future_predictor,device) if future_weight else None
     losses, actions_pred_list = [], []
     train_wall_start = time.perf_counter()
     data_wait_wall_s = 0.0
@@ -427,6 +436,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
+        future_state_targets=states_seg.detach() if future_weight else None
         stage_end('host_to_device_gpu_s', transfer_event)
         text_emb = model.encode_task_text(batch["texts"]) if getattr(model, "text_condition", None) is not None else None
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
@@ -467,6 +477,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             # print(f"raw z_v_all shape: {z_v_all.shape}")
 
         # Extract CLS tokens (last position per camera, NOT the last position overall).
+        future_cls_targets=(z_v_all.reshape(B,S,V,-1,768)[:,:,:,-1].detach()
+                            if future_weight else None)
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
         visibility = None
         if "observation_camera_mask" in batch:
@@ -533,6 +545,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         )
         pending_head_conds = []
         pending_head_targets = []
+        pending_visual_contexts = []
         pending_head_count = 0
         max_seg_len = S
         full_history = getattr(model, "head_history_mode", "mean") == "full"
@@ -555,6 +568,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         readout_start=Hs - 1,
                     )
             stage_end("intent_scan_gpu_s", intent_event)
+            future_anchors=torch.zeros((B,intent_sequence.shape[1]),dtype=torch.bool) if future_weight else None
 
             for n in range(num_windows):
                 if full_history:
@@ -628,6 +642,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                         head_condition_event = stage_start()
                         cond = (model.action_condition(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb)
                                 if text_emb is not None else model.intention_head(z_v_win_for_head, z_s_win_for_head, h_for_head))
+                        visual_kwargs = model.action_context(z_v_win_for_head) if hasattr(model,"action_context") else {}
                         stage_end("head_condition_gpu_s", head_condition_event)
                         if getattr(args, "debug", False):
                             print(f"[DEBUG] cond: {cond.shape}, finite: {torch.isfinite(cond).all().item()}")
@@ -645,6 +660,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                             assert actions_pred.shape == target.shape, f"actions_pred shape {actions_pred.shape} != target shape {target.shape}"
                         if batch_head_losses:
                             pending_head_conds.append(cond[valid_mask])
+                            if visual_kwargs:pending_visual_contexts.append(visual_kwargs["visual_context"][valid_mask])
                             pending_head_targets.append(target[valid_mask])
                             pending_head_count += valid_count
                             loss = None
@@ -656,17 +672,20 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                                 loss_event = stage_start()
                                 group_loss = model.intention_head.loss(
                                     group_target, group_cond, dim_weights=dim_weights,
+                                    **({"visual_context":torch.cat(pending_visual_contexts)} if pending_visual_contexts else {}),
                                 )
                                 stage_end("diffusion_loss_gpu_s", loss_event)
                                 loss_accum.append(group_loss)
                                 valid_counts.append(pending_head_count)
                                 pending_head_conds.clear()
                                 pending_head_targets.clear()
+                                pending_visual_contexts.clear()
                                 pending_head_count = 0
                         else:
                             loss_event = stage_start()
                             loss = model.intention_head.loss(
                                 target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
+                                **visual_kwargs,
                             )
                             stage_end("diffusion_loss_gpu_s", loss_event)
                         if getattr(args, "debug", False):
@@ -683,6 +702,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 if loss is not None and args.skip_nan and not torch.isfinite(loss):
                     continue
 
+                if future_weight:future_anchors[:,current_t]=valid_mask_cpu
+
                 if loss is not None:
                     loss_accum.append(loss)
                     valid_counts.append(valid_count)
@@ -696,6 +717,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                 loss_event = stage_start()
                 group_loss = model.intention_head.loss(
                     group_target, group_cond, dim_weights=dim_weights,
+                    **({"visual_context":torch.cat(pending_visual_contexts)} if pending_visual_contexts else {}),
                 )
                 stage_end("diffusion_loss_gpu_s", loss_event)
                 loss_accum.append(group_loss)
@@ -707,6 +729,14 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         if loss_accum:
             valid_count = sum(valid_counts)
             total_loss = sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / valid_count
+            action_loss=total_loss
+            if future_weight:
+                auxiliary,terms=future_prediction_loss(model,intent_sequence,future_cls_targets,
+                    future_state_targets,seg_lens_cpu,future_anchors,valid_count)
+                if not torch.isfinite(auxiliary):
+                    raise FloatingPointError('Nonfinite intention future loss; check valid future feature/state targets')
+                total_loss=total_loss+future_weight*auxiliary
+                future_stats.update(action_loss,auxiliary,valid_count,terms,future_weight)
             if accumulation_steps > 1:
                 (total_loss * valid_count).backward()
                 group_valid_count += valid_count
@@ -721,7 +751,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         stage_end("backward_optimizer_gpu_s", backward_event)
         stage_end("segment_gpu_s", segment_event)
 
-        avg_step_loss = float(total_loss.item()) if loss_accum else 0.0
+        avg_step_loss = float(action_loss.item()) if loss_accum else 0.0
         losses.append(avg_step_loss)
         actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
 
@@ -745,6 +775,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         **data_stages,
         **gpu_stage_s,
     }
+    args._last_future_metrics=future_stats.finish() if future_stats is not None else {}
     return avg_loss, avg_action
 
 def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
@@ -792,7 +823,8 @@ def train_one_epoch(model, loader, optimizer, device, args, max_steps=0):
                 actions_pred = model.sample_actions(
                     out["z_v_pooled_seq"], out["z_s_seq"], head_intent,
                 )
-                loss = model.intention_head.loss(target, cond, dim_weights=dim_weights)
+                loss = model.intention_head.loss(target, cond, dim_weights=dim_weights,
+                    **(model.action_context(out["z_v_pooled_seq"]) if hasattr(model,"action_context") else {}))
             else:
                 # V4 head expects intent_emb (3D or None), not h_current.
                 head_intent = intent_emb if intent_emb is not None and intent_emb.ndim == 3 else None
@@ -953,6 +985,7 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                         dim_weights[6] = getattr(args, "gripper_loss_weight", 1.0)
                     loss = model.intention_head.loss(
                         target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
+                        **(model.action_context(z_v_win) if hasattr(model,"action_context") else {}),
                     )
                 else:
                     actions_pred = model.predict_actions(z_v_win, z_s_win, intent_emb)
@@ -1008,6 +1041,8 @@ def validate(model, loader, device, args):
     per_dim_metrics: dict like {"pos_mse": 0.04, "rot_mse": 0.05, "grip_mse": 0.02}
     """
     model.eval()
+    future_weight=getattr(model,'intent_future_weight',0.)
+    future_stats=FutureMetrics(model.intention_future_predictor,device) if future_weight else None
     losses, actions_pred_list = [], []
     per_dim_squared = None  # will be sized to target.shape[-1]
     per_dim_abs = None
@@ -1036,6 +1071,7 @@ def validate(model, loader, device, args):
         frames_seg = torch.as_tensor(batch["frames_segment"]).to(device, non_blocking=True)  # (B, S, V, H, W, 3)
         states_seg = torch.as_tensor(batch["states_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         target_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
+        future_state_targets=states_seg.detach() if future_weight else None
 
         # Keep length/anchor filtering on CPU. Copying a tiny validity mask from
         # CUDA to ask whether it is empty would synchronize every T-loop step.
@@ -1061,6 +1097,8 @@ def validate(model, loader, device, args):
         # Extract CLS tokens (last position per camera, NOT the last position overall).
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
         # Total tokens per camera = P + 1
+        future_cls_targets=(z_v_all.reshape(B,S,V,-1,768)[:,:,:,-1].detach()
+                            if future_weight else None)
         visibility = None
         if "observation_camera_mask" in batch:
             visibility = torch.as_tensor(batch["observation_camera_mask"],device=device,dtype=torch.bool).reshape(B*S,V)
@@ -1106,6 +1144,7 @@ def validate(model, loader, device, args):
         loss_accum = []
         valid_counts = []
         sample_conditions = []
+        sample_visual_contexts = []
         sample_targets = []
         metric_predictions = []
         metric_targets = []
@@ -1131,6 +1170,7 @@ def validate(model, loader, device, args):
                         readout_start=Hs - 1,
                     )
 
+            future_anchors=torch.zeros((B,intent_sequence.shape[1]),dtype=torch.bool) if future_weight else None
             for n in range(num_windows):
                 if full_history:
                     current_t = n
@@ -1190,8 +1230,10 @@ def validate(model, loader, device, args):
                     if args.head_type in ("diffusion", "flow_matching"):
                         cond = (model.action_condition(z_v_win_for_head, z_s_win_for_head, h_for_head, text_emb)
                                 if text_emb is not None else model.intention_head(z_v_win_for_head, z_s_win_for_head, h_for_head))
+                        visual_kwargs = model.action_context(z_v_win_for_head) if hasattr(model,"action_context") else {}
                         loss = model.intention_head.loss(
                             target, cond, dim_weights=dim_weights, sample_mask=valid_mask,
+                            **visual_kwargs,
                         )
                     else:
                         actions_pred = model.predict_actions(
@@ -1206,12 +1248,14 @@ def validate(model, loader, device, args):
                 loss_accum.append(loss)
                 valid_count = int(valid_mask_cpu.sum())
                 valid_counts.append(valid_count)
+                if future_weight:future_anchors[:,current_t]=valid_mask_cpu
                 last_actions_pred = actions_pred
 
                 # Generative sampling uses a fixed number of denoising steps;
                 # sampling all valid anchors together improves GPU utilization.
                 if args.head_type in ("diffusion", "flow_matching"):
                     sample_conditions.append(cond[valid_mask])
+                    if visual_kwargs:sample_visual_contexts.append(visual_kwargs["visual_context"][valid_mask])
                     sample_targets.append(target[valid_mask])
                 else:
                     pred_valid = actions_pred[valid_mask]
@@ -1234,7 +1278,8 @@ def validate(model, loader, device, args):
                 # Diffusion overrides this internally with its FP32 denoiser;
                 # flow matching and visual attention still rely on CUDA AMP.
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-                    sampled = model.intention_head.sample(torch.cat(sample_conditions, dim=0))
+                    sampled = model.intention_head.sample(torch.cat(sample_conditions, dim=0),
+                        **({"visual_context":torch.cat(sample_visual_contexts)} if sample_visual_contexts else {}))
                 metric_predictions = [sampled]
                 metric_targets = [torch.cat(sample_targets, dim=0)]
                 # Keep the existing avg-action diagnostic's last-window meaning.
@@ -1265,6 +1310,11 @@ def validate(model, loader, device, args):
             grip_correct_total += float(grip_correct_segment.item())
             grip_total_total += grip_total_segment
             avg_window_loss = (sum(loss * count for loss, count in zip(loss_accum, valid_counts)) / sum(valid_counts)).item()
+            if future_weight:
+                auxiliary,terms=future_prediction_loss(model,intent_sequence,future_cls_targets,
+                    future_state_targets,seg_lens_cpu,future_anchors,sum(valid_counts))
+                future_stats.update(torch.as_tensor(avg_window_loss,device=device),auxiliary,
+                    sum(valid_counts),terms,future_weight)
             losses.append(avg_window_loss)
             actions_pred_list.append(actions_pred.detach().abs().mean().item() if actions_pred is not None else 0.0)
             pbar.set_postfix(mse=f"{avg_window_loss:.5f}")
@@ -1330,6 +1380,7 @@ def validate(model, loader, device, args):
             "gripper_genuine_batches": genuine_gripper_batches,
         }
 
+    if future_stats is not None:per_dim_metrics.update(future_stats.finish())
     return avg_loss, avg_action, per_dim_metrics
 
 
@@ -1410,6 +1461,9 @@ def parse_args():
     parser.add_argument("--memory-context-only",action=argparse.BooleanOptionalAction,default=False,help="Experimental historical-context branch without direct current-query residual")
     parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument("--visual-token-attention",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--visual-context-mode",choices=["none","multiscale"],default="none",help="Explicit patch tokens at three action U-Net scales; enables patch memory when used")
+    parser.add_argument("--memory-retrieval-depth",type=int,default=2,help="Sequential reads of the same past bank (legacy checkpoints use 1)")
+    parser.add_argument("--memory-intent-query",action=argparse.BooleanOptionalAction,default=False,help="Use inferred intention to guide visual retrieval; no-intent variants retain visual-only queries")
     parser.add_argument("--diffusion-clip-sample",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--diffusion-train-steps",type=int,default=100)
     parser.add_argument("--diffusion-loss-repeats",type=int,default=4)
@@ -1506,7 +1560,17 @@ def parse_args():
     # Other
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return parser.parse_args()
+    add_future_arguments(parser)
+    args=parser.parse_args()
+    try:validate_future_arguments(args)
+    except ValueError as error:parser.error(str(error))
+    if args.intent_future_weight and (not args.use_intent_tokens or not args.use_history):
+        parser.error('Future prediction requires intention tokens and history encoder')
+    if args.intent_future_weight and max(args.history_size*args.segment_max_mult,args.history_size+args.chunk_size)<args.history_size+max(args.intent_future_horizons):
+        parser.error('Segments cannot reach the longest future horizon; increase --segment-max-mult or use the episode-sampled ablation runner')
+    if args.freeze_intent_backbone:
+        parser.error('Use scripts/run_intention_ablation.py with --warm-start for a frozen-backbone pilot; this entry point has no checkpoint warm start')
+    return args
 
 
 def main():
@@ -1666,6 +1730,7 @@ def main():
         torch.manual_seed(args.seed + dist.get_rank())
         np.random.seed(args.seed + dist.get_rank())
     print(f"  Head built: pool_out_dim={pool_out_dim} (VP_tokens={N_tok_actual})")
+    if args.freeze_intent_backbone:freeze_intent_backbone(model)
     trainable = [p for p in model.parameters() if p.requires_grad]
     n_trainable = sum(p.numel() for p in trainable)
     n_total = sum(p.numel() for p in model.parameters())
@@ -1843,6 +1908,7 @@ def main():
             "val/action_mean": val_action,
             "epoch": epoch,
         }
+        log_dict.update({'train/'+k:v for k,v in getattr(args,'_last_future_metrics',{}).items()})
         # Add per-dim metrics (only if action_dim == 6)
         for k, v in val_per_dim.items():
             log_dict[f"val/{k}"] = v
@@ -1858,6 +1924,7 @@ def main():
             "elapsed_s": elapsed,
             "timestamp": datetime.now().isoformat(),
         }
+        log_record.update({'train/'+k:v for k,v in getattr(args,'_last_future_metrics',{}).items()})
         # Add per-dim to JSONL log
         for k, v in val_per_dim.items():
             log_record[f"val/{k}"] = v

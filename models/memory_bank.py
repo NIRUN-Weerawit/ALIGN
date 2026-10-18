@@ -31,8 +31,11 @@ class MemoryRetrieval(nn.Module):
         num_heads: attention heads (default 4)
         dropout: attention dropout
     """
-    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.0):
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.0,
+                 retrieval_depth: int = 1):
         super().__init__()
+        if not isinstance(retrieval_depth, int) or retrieval_depth < 1:
+            raise ValueError('Retrieval depth must be a positive integer')
         self.retrieval_attn = nn.MultiheadAttention(
             embed_dim=dim, num_heads=num_heads,
             dropout=dropout, batch_first=True,
@@ -49,11 +52,22 @@ class MemoryRetrieval(nn.Module):
         self.out_norm = nn.LayerNorm(dim)
         self.context_only = False
         self.value_preserving = False
+        # Preserve the original first-block parameter names for old checkpoints.
+        self.extra_layers = nn.ModuleList([
+            MemoryRetrieval(dim, num_heads, dropout) for _ in range(retrieval_depth - 1)
+        ])
 
     def forward(self, query: torch.Tensor, bank_kv: torch.Tensor,
                 bank_mask: Optional[torch.Tensor] = None,
                 bank_values: Optional[torch.Tensor] = None,
                 attention_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        result = self._forward_once(query, bank_kv, bank_mask, bank_values, attention_bias)
+        for layer in self.extra_layers:
+            result = layer(result, bank_kv, bank_mask, bank_values, attention_bias)
+        return result
+
+    def _forward_once(self, query, bank_kv, bank_mask=None, bank_values=None,
+                      attention_bias=None):
         """Retrieve from memory bank.
 
         Args:
@@ -502,7 +516,12 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
     Bank buffers are episode-local state, never checkpoint parameters.
     """
     def __init__(self, perceptual_dim, cognitive_dim, state_dim, bank_len=16,
-                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False, value_preserving=False, mask_missing_fields=False, perceptual_recency_scale=0.):
+                 num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False, value_preserving=False, mask_missing_fields=False, perceptual_recency_scale=0.,
+                 retrieval_depth=1, intent_query=False):
+        if not isinstance(retrieval_depth,int) or retrieval_depth < 1:
+            raise ValueError('Retrieval depth must be a positive integer')
+        if intent_query and cognitive_dim <= 0:
+            raise ValueError('Intention-guided retrieval requires cognitive intent tokens')
         if not __import__('math').isfinite(perceptual_recency_scale) or perceptual_recency_scale<0 or (perceptual_recency_scale>0 and not value_preserving):
             raise ValueError('Perceptual recency scale must be finite, nonnegative, and requires raw-value retrieval')
         if mask_missing_fields and write_fused:
@@ -526,14 +545,27 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
                 raise ValueError('Patch width must divide perceptual width and attention heads')
             self.perceptual_retrieval = MemoryRetrieval(patch_dim,num_heads)
             self.perceptual_gate = MemoryGateFusion(patch_dim)
-        for retrieval in [self.perceptual_retrieval,self.state_retrieval,self.cognitive_retrieval]:
+        for name in ['perceptual_retrieval','state_retrieval','cognitive_retrieval']:
+            retrieval = getattr(self,name)
             if retrieval is not None:
-                retrieval.context_only = context_only
-                retrieval.value_preserving = value_preserving
-                if value_preserving:
-                    retrieval.ffn.requires_grad_(False)
-                    retrieval.out_norm.requires_grad_(False)
-                    retrieval.retrieval_attn.out_proj.requires_grad_(False)
+                retrieval.extra_layers.extend([
+                    MemoryRetrieval(retrieval.retrieval_attn.embed_dim,num_heads)
+                    for _ in range(retrieval_depth-1)])
+                for block in [retrieval,*retrieval.extra_layers]:
+                    block.context_only = context_only
+                    block.value_preserving = value_preserving
+                    if value_preserving:
+                        block.ffn.requires_grad_(False)
+                        block.out_norm.requires_grad_(False)
+                        block.retrieval_attn.out_proj.requires_grad_(False)
+        self.retrieval_depth = retrieval_depth
+        self.intent_query = intent_query
+        if intent_query:
+            width = patch_dim if patch_dim is not None else perceptual_dim
+            self.visual_intent_norm = nn.LayerNorm(cognitive_dim)
+            self.visual_intent_projection = nn.Linear(cognitive_dim,width,bias=False)
+            # Start at the existing visual query; learn objective-dependent selection.
+            nn.init.zeros_(self.visual_intent_projection.weight)
         # Begin with balanced current/history fusion, rather than suppressing memory.
         for gate in [self.perceptual_gate,self.state_gate,self.cognitive_gate]:
             if gate is not None:
@@ -684,7 +716,11 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
         pmask,page=stream_context('perceptual')
         smask,sage=stream_context('state')
         query = p.reshape(B,-1,self.patch_dim) if self.patch_dim is not None else p
-        pr = self._retrieve(self.perceptual_retrieval,query,self.perceptual_bank,pmask,page)
+        retrieval_query = query
+        if self.intent_query and c is not None:
+            intent_bias = self.visual_intent_projection(self.visual_intent_norm(c.reshape(B,-1)))
+            retrieval_query = query + (intent_bias[:,None] if query.ndim==3 else intent_bias)
+        pr = self._retrieve(self.perceptual_retrieval,retrieval_query,self.perceptual_bank,pmask,page)
         pf = self.perceptual_gate(query,pr)
         if self.mask_missing_fields:
             present=pmask.any(1).unsqueeze(-1)

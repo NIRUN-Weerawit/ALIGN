@@ -142,6 +142,9 @@ def load_intention_model(
         text_dim=cfg.get("text_dim", 256),
         text_encoder_type=cfg.get("text_encoder_type", "clip"),
         text_vocab=cfg.get("text_vocab"),
+        intent_future_weight=cfg.get('intent_future_weight',0.),
+        intent_future_horizons=cfg.get('intent_future_horizons',[16,64]),
+        intent_future_hidden_dim=cfg.get('intent_future_hidden_dim',256),
         compressed_dim=cfg.get("compressed_dim", 16),
         # V4 args (default to False/0 for backward compat with V3 checkpoints)
         use_intent_tokens=cfg.get("use_intent_tokens", False),
@@ -161,6 +164,8 @@ def load_intention_model(
         memory_patch_retrieval=cfg.get("memory_patch_retrieval",False),
         diffusion_train_steps=cfg.get("diffusion_train_steps",10),
         diffusion_loss_repeats=cfg.get("diffusion_loss_repeats",1),
+        visual_context_mode=cfg.get("visual_context_mode","none"),
+        memory_retrieval_depth=cfg.get("memory_retrieval_depth",1),memory_intent_query=cfg.get("memory_intent_query",False),
         visual_token_attention=cfg.get("visual_token_attention",False),diffusion_clip_sample=cfg.get("diffusion_clip_sample",False),
     ).to(device)
 
