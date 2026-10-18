@@ -47,6 +47,43 @@ retrieval and token-merge consolidation.
 - **Null hypothesis**: similarity uniform → intent encodes action prior, not goal
 - **Script**: write `tools/probe_intent.py` to extract embeddings, write `paper/results/exp_c_intent.json`
 
+## EXP-C.1 — Frozen intention usage and history diagnosis, 2026-10-18
+
+- **Done**: compression-64 no-text/text-trained intent-only checkpoints,
+  epochs 164/200. Same 384/44 whole-episode split; five causal progress points.
+- **Head tests**: correct/zero/same-task/different-task/reset/recent/history
+  tokens, plus visual/state/instruction controls; three matched noise draws,
+  complete action chunks and whole-episode paired intervals. No clear pooled
+  task-specific advantage over natural donor tokens. Wrong instruction raises
+  text-trained action MSE from 0.01594 to 0.05013.
+- **History/readout**: last-observation Mamba output decodes tasks at 97.5%;
+  final intention projection at 35.3%/54.8%. A training-only PCA projection of
+  the pre-projection query output to the same 128 dimensions decodes at 97.5%
+  for both models. Eight-frame histories almost reproduce full-history actions.
+- **Conclusion**: task information remains available upstream; the learned
+  intention readout and weak task-specific use by the action head are priorities.
+  This is an offline diagnostic, not evidence of future-goal prediction or
+  simulator success. No training/architecture changes were made.
+- **Code**: `tools/assess_intention_usage.py`, instructions in
+  `tools/README_intention_usage.md`. Fifteen tests passed.
+- **Results**: [assessment](intention_usage_assessment_2026_10_18.md), raw
+  artifacts under `reports/intent_usage_assessment_2026_10_18/`.
+
+## EXP-C.2 — Predictive intention objective implementation, 2026-10-18
+
+- **Implemented, quality experiment pending**: opt-in multi-horizon future CLS,
+  visual-change and state-change prediction from the final intention embedding.
+  Future observations are detached targets only. No text masking was added.
+- **Options**: `--intent-future-weight`, `--intent-future-horizons`,
+  `--intent-future-hidden-dim`, plus warm-start `--freeze-intent-backbone` pilot.
+  Zero weight preserves existing policy initialization/objective/checkpoint keys.
+- **Verified**: 65 regression tests; no-text/text GPU smoke checks, resume,
+  frozen-encoder equality, projection updates and strict production inference
+  loading without future-predictor execution. Four/two optimizer steps only;
+  prediction still trails persistence, so no quality improvement is established.
+- **Results/details**: [implementation record](intention_future_implementation_2026_10_18.md),
+  [commands](../scripts/README_intention_future.md).
+
 ## EXP-D.5 — Intent embedding task clustering
 
 - **Protocol updated 2026-10-18**: strict current-checkpoint encoder loading;
