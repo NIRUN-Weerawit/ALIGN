@@ -140,7 +140,10 @@ def test_input_duration_is_padding_only_and_unavailable_anchors_rejected():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cuda_fused_scan_streaming_and_cpu_equations_match():
+def test_cuda_fused_scan_streaming_and_cpu_equations_match(monkeypatch):
+    # The production trainer enables TF32 at import. This equation-parity test
+    # compares FP32 CPU/CUDA math independently of other tests' import order.
+    monkeypatch.setattr(torch.backends.cuda.matmul, 'allow_tf32', False)
     model, x, lengths, anchors = toy(device="cuda")
     model.eval()
     out = model(x, lengths, anchors)

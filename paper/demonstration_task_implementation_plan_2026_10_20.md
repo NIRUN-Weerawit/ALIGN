@@ -9,8 +9,10 @@ for the selected temporal readout/decoder, frozen artifacts, and limitations.
 The causal prefix student milestone is also now implemented, trained, and
 confirmed. See [student results](task_context_student_results_2026_10_20.md):
 useful causal information passed; longer-history advantage over an independently
-trained 16-frame control did not. Student-conditioned policy training and actual
-handover evaluation below remain proposals.
+trained 16-frame control did not. The action-policy integration and bounded
+six-arm training pilot are now implemented; see
+[policy integration results](task_context_policy_integration_2026_10_20.md).
+Sustained policy training and closed-loop handover qualification remain pending.
 
 ## 1. Deliverable and scope
 

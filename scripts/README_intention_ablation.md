@@ -1,5 +1,9 @@
 # Sequential intention/memory ablations
 
+Pretrained task-context policy variants are also available. See the
+[context-policy integration guide](../tools/README_task_context_policy.md) for
+the protected pretraining split, new ablation arms, and checkpoint/rollout path.
+
 `run_intention_ablation.py` trains these four models **in sequence**, finishing
 all epochs of each before starting the next:
 

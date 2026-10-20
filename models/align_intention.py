@@ -115,6 +115,10 @@ class ALIGNIntentionModel(nn.Module):
         intent_future_weight: float = 0.,
         intent_future_horizons=(16,64),
         intent_future_hidden_dim: int = 256,
+        task_context_checkpoint: str = None,
+        task_context_config: dict = None,
+        task_context_trainable: bool = False,
+        task_context_initialization: str = "pretrained",
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -140,6 +144,20 @@ class ALIGNIntentionModel(nn.Module):
         if intent_future_weight and (not use_intent_tokens or mamba_output_dim<=0):
             raise ValueError('Future prediction requires an active intention encoder')
         self.intent_future_weight = intent_future_weight
+        self.task_context = None
+        if task_context_checkpoint or task_context_config:
+            if use_intent_tokens or use_text or intent_future_weight or head_type != 'diffusion' or head_history_mode != 'mean':
+                raise ValueError('Task context replaces legacy intent/text and requires the diffusion mean-condition head')
+            if memory_intent_query:
+                raise ValueError('Task-context memory currently retrieves visual/state evidence only')
+            from models.task_context_policy import TaskContextPolicyBranch
+            # Loading a new branch must not perturb common visual/state initialization.
+            with torch.random.fork_rng(devices=[]):
+                self.task_context = TaskContextPolicyBranch(task_context_checkpoint, task_context_config,
+                    task_context_trainable, task_context_initialization)
+            cfg = self.task_context.config['summary_config']
+            if cfg['cameras'] != num_cameras or cfg['raw_dim'] != raw_dim:
+                raise ValueError('Pretrained context camera count or DINO width differs')
         self.use_memory_bank = use_memory_bank
         self.memory_bank_len = memory_bank_len
         self.memory_mode = memory_mode
@@ -325,7 +343,14 @@ class ALIGNIntentionModel(nn.Module):
             )
         elif self.head_type == "diffusion":
             cond_dim = pool_out_dim + self.state_dim + (self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0)
-            self.intention_head = DiffusionPolicyHead(
+            if self.task_context is not None:
+                from models.task_context_policy import ContextDiffusionPolicyHead
+                head_class = ContextDiffusionPolicyHead
+                context_options = dict(context_tokens=self.task_context.config['encoder_config']['tokens'],
+                    context_dim=self.task_context.config['encoder_config']['token_dim'])
+            else:
+                head_class, context_options = DiffusionPolicyHead, {}
+            self.intention_head = head_class(
                 cond_dim=cond_dim,
                 action_dim=self.action_dim,
                 hidden_dim=self.head_d_model,
@@ -336,6 +361,7 @@ class ALIGNIntentionModel(nn.Module):
                 time_dim=64,
                 chunk_size=self.chunk_size,
                 history_size=self.history_size if self.head_history_mode == "full" else 1,
+                **context_options,
             )
         elif self.head_type == "flow_matching":
             cond_dim = pool_out_dim + self.state_dim + (self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0)
@@ -481,7 +507,12 @@ class ALIGNIntentionModel(nn.Module):
         self._build_head_and_bank(pool_out_dim)
 
         # Forward through intention encoder (uses CLS tokens)
-        if self.use_history:
+        if self.task_context is not None:
+            lengths = torch.full((B,), T, device=state_seq.device, dtype=torch.long)
+            ticks = torch.arange(T, device=state_seq.device).expand(B, -1)
+            context = self.task_context.sequence(z_v_all, z_v_CLS_all, state_seq, lengths, ticks)
+            h_seq, intent_emb = context.flatten(2), context[:, -1]
+        elif self.use_history:
             intent = self.forward_intent(z_v_CLS_all, z_s_seq)
             h_seq = intent["h_seq"]
             intent_emb = intent.get("intent_emb", None)
@@ -570,6 +601,11 @@ class ALIGNIntentionModel(nn.Module):
                 return z_v_pooled, z_s, h_new, h_states_new, intent_emb
             else:
                 h_new, h_states_new = result
+        elif self.task_context is not None:
+            context, h_states_new = self.task_context.step(z_v_patches, z_v_cls, robot_state, h_states)
+            h_new = context.flatten(1)
+            if produce_intent:
+                return z_v_pooled, z_s, h_new, h_states_new, context
         else:
             h_new = torch.zeros(z_s.shape[0], 1, device=z_s.device)
             h_states_new = h_states
@@ -622,11 +658,14 @@ class ALIGNIntentionModel(nn.Module):
         """
         if not self.use_memory_bank:
             return z_v_window, z_s_window, intent_emb
+        context = intent_emb if self.task_context is not None else None
         z_v, z_s, intent = self.memory_module(
-            z_v_window[:, -1], z_s_window[:, -1], intent_emb,
+            z_v_window[:, -1], z_s_window[:, -1], None if self.task_context is not None else intent_emb,
             observed_mask=observed_mask,
             **({"timestamp":timestamp} if self.memory_mode == "episodic" else {}),
         )
+        if self.task_context is not None:
+            intent = context
         if self.memory_pre_state_visual:
             current_state=z_s_window[:,-1]
             live_state=torch.where(current_state.ne(0).any(-1,keepdim=True),current_state,z_s)
@@ -745,7 +784,12 @@ class ALIGNIntentionModel(nn.Module):
         # ---- Intention encoder (Mamba + intent tokens) ----
         intent_emb = None
         h_seq = None
-        if self.use_history:
+        if self.task_context is not None:
+            lengths = torch.full((B,), T, device=state_seq.device, dtype=torch.long)
+            ticks = torch.arange(T, device=state_seq.device).expand(B, -1)
+            context = self.task_context.sequence(z_v_patches, z_v_CLS_all, state_seq, lengths, ticks)
+            h_seq, intent_emb = context.flatten(2), context[:, -1]
+        elif self.use_history:
             intent = self.forward_intent(z_v_CLS_all, z_s_seq)
             h_seq = intent["h_seq"]
             intent_emb = intent.get("intent_emb", None)

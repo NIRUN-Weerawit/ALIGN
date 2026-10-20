@@ -678,6 +678,7 @@ def run_model_in_sim(
     observation_history = getattr(model, "history_size", chunk_size)
     intention_stream = (IntentionStream(model, getattr(model, "history_size", chunk_size))
                         if getattr(model, "intention_encoder", None) is not None or
+                           getattr(model, 'task_context', None) is not None or
                            (getattr(model,"use_memory_bank",False) and getattr(model,"memory_mode","legacy")=="episodic") or
                            getattr(model, "head_history_mode", "mean") == "full" else None)
 
@@ -792,6 +793,12 @@ def run_model_in_sim(
         # With ensemble="uniform" / "decay", the buffer keeps K predictions
         # around for ensembling; we still call the model every H steps.
         model_inferred_this_step = False
+        context_handover = getattr(model, 'task_context', None) is not None and step == switch_step
+        if context_handover:
+            # Replan at authority transfer; queued human-phase predictions must
+            # not become the first autonomous action. Preserve all observed state.
+            pending_actions.clear()
+            pending_source_call_idx.clear()
         should_infer = (
             step % action_horizon == 0  # every action_horizon steps
             or not pending_actions      # buffer drained (only happens in "none")
@@ -804,6 +811,8 @@ def run_model_in_sim(
                     stream_out = intention_stream.observe(
                         f_t, s_t, produce_intent=should_infer, store_memory=not should_infer,
                     )
+            if context_handover:
+                intention_stream.freeze_task()
         if should_infer:
             if hasattr(model, "predict_sim_action_chunk"):
                 a_model_full = model.predict_sim_action_chunk(obs, task_text=task_text, env=env)

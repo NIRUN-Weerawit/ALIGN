@@ -1,0 +1,89 @@
+{
+  "arms": {
+    "no_intent_no_memory": {
+      "checkpoint": "checkpoints/task_context_policy_20261020/pilot_v3/no_intent_no_memory/intention_best.pt",
+      "sha256": "91e121bdac601bcd253b8bcb4f4853306ffdc5724e356ccd112da22c487fb2df",
+      "epochs": 3,
+      "optimizer_updates": 36,
+      "finite_losses": true,
+      "peak_gpu_gib": 0.18543624877929688
+    },
+    "no_intent_memory": {
+      "checkpoint": "checkpoints/task_context_policy_20261020/pilot_v3/no_intent_memory/intention_best.pt",
+      "sha256": "975ddaa471f08ad0322613af6056e5db01158835571bd5377493e7277231efb6",
+      "epochs": 3,
+      "optimizer_updates": 36,
+      "finite_losses": true,
+      "peak_gpu_gib": 2.108039379119873
+    },
+    "intent_no_memory": {
+      "checkpoint": "checkpoints/task_context_policy_20261020/pilot_v3/intent_no_memory/intention_best.pt",
+      "sha256": "55a3ad6ec976772c40e62eac04f0b75010b41b63338bff953ca227ff438e858d",
+      "epochs": 3,
+      "optimizer_updates": 36,
+      "finite_losses": true,
+      "peak_gpu_gib": 1.2121849060058594
+    },
+    "context_no_memory": {
+      "checkpoint": "checkpoints/task_context_policy_20261020/pilot_v3/context_no_memory/intention_best.pt",
+      "sha256": "7d277d3ab2387aa0dc7b1ff459dd7e14b79cf35885fbce97280b246a2831d408",
+      "epochs": 3,
+      "optimizer_updates": 36,
+      "finite_losses": true,
+      "peak_gpu_gib": 1.3604793548583984,
+      "summary_unchanged": true,
+      "encoder_unchanged": true,
+      "legacy_intention_encoder_absent": true,
+      "task_scale": 0.012714669108390808,
+      "execution_scale": 0.010596388950943947
+    },
+    "context_memory": {
+      "checkpoint": "checkpoints/task_context_policy_20261020/pilot_v3/context_memory/intention_best.pt",
+      "sha256": "d9533082247a6505c1366e6a91d32742de6ab2afa234f6b722a5e1ee1f753641",
+      "epochs": 3,
+      "optimizer_updates": 36,
+      "finite_losses": true,
+      "peak_gpu_gib": 2.4339823722839355,
+      "summary_unchanged": true,
+      "encoder_unchanged": true,
+      "legacy_intention_encoder_absent": true,
+      "task_scale": 0.012727743946015835,
+      "execution_scale": 0.010331989265978336
+    },
+    "context_scratch_no_memory": {
+      "checkpoint": "checkpoints/task_context_policy_20261020/pilot_v3/context_scratch_no_memory/intention_best.pt",
+      "sha256": "39625ca717252972bfa4da69bc2144bf2eb284a4495f2a5c19c249cb2249c779",
+      "epochs": 3,
+      "optimizer_updates": 36,
+      "finite_losses": true,
+      "peak_gpu_gib": 1.3830175399780273,
+      "summary_unchanged": true,
+      "encoder_unchanged": false,
+      "legacy_intention_encoder_absent": true,
+      "task_scale": 0.012792069464921951,
+      "execution_scale": 0.012764778919517994
+    }
+  },
+  "train_episodes": 340,
+  "development_episodes": 44,
+  "confirmation_episodes_excluded": 44,
+  "confirmation_opened": false,
+  "main_entrypoint_smoke_completed": true,
+  "tests_passed": 155,
+  "source_hashes": {
+    "models/task_context_policy.py": "7c0c0ed3d6e99bb496356a4114312345aeac73b04a75fe4983617effe2c5674f",
+    "models/align_intention.py": "8c5cb43a698287bd0eda79135a9224e97a8bbe75c280f1b451fbd7ed0e7a6554",
+    "models/intention_stream.py": "fc7f7877e82eb6be9e016757c05e10e2bd66c85d1f6f66999d63b61057d01fb8",
+    "data/task_context_policy_dataset.py": "f1050e898aad3877e0c7656ed1f5a605bac33a048f7bb0217e4e68d77b1051f8",
+    "training/train_intention.py": "2ba6ffddf3f7246505834b4c46b0d3ebfe892c517b4c83ff2740073a274f43cc",
+    "training/task_context_policy_evaluation.py": "bd0b8c15edf7a985b338be832914a0939b5a673d005ecfd70dad33652fd80a0f",
+    "scripts/run_intention_ablation.py": "157f0fa90c251edc4bb03ad2614060e3ed0fc6fa3a821ba6626f37dc4dac1609",
+    "eval/eval_intention.py": "a3007ebe9340554f3a4d41f7a8c6ec7bc01d9a83426c0338ea5f17af804b8646",
+    "tools/assess_task_context_policy.py": "7a651390637a5c0e4f60fd10b45463752fd03184a564d4b4332ae148b0e7151b",
+    "tests/test_task_context_policy.py": "6081bde082509538fde0f447bff30662b26b9cef5aaa371330dc648a11035511"
+  },
+  "pretrained_observer_sha256": "f97b16da0be2a74eebfc08bd6ea7eb7929f64757075d1620df123640a1859fb3",
+  "policy_checkpoints_published": false,
+  "scope": "Bounded integration pilot; no claim of converged policies, context performance gain, or closed-loop success.",
+  "source_snapshot_archive": "source_snapshot.tar.gz"
+}

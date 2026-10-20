@@ -204,6 +204,19 @@ def sync_and_step(model, optimizer, device, grad_clip):
 
 def build_datasets(args):
     """Build train and val datasets from one or more HDF5 files."""
+    if getattr(args, 'task_context_checkpoint', None):
+        if len(args.data) != 1 or not args.use_precomputed_dinov2 or not args.task_context_split_manifest:
+            raise ValueError('Context policy requires one cached dataset and its exact pretrained split manifest')
+        from data.task_context_policy_dataset import policy_episode_split
+        from scripts.run_intention_ablation import CachedEpisodes
+        bundle = torch.load(args.task_context_checkpoint, map_location='cpu', weights_only=True)
+        ds = ALIGNDataset(args.data[0], mode='head', cameras=args.cameras,
+            traj_window=args.chunk_size, dinov2_path=args.dinov2_path)
+        train, val, record = policy_episode_split(ds, args.task_context_split_manifest, bundle['metadata'])
+        args.task_context_split = record
+        return ds, CachedEpisodes(ds, train, args.chunk_size, args.seed, True,
+            temporal_sampling='episode', chunk_size=args.chunk_size), CachedEpisodes(ds, val, args.chunk_size,
+            args.seed, False, temporal_sampling='episode', chunk_size=args.chunk_size)
     # V4 mode: enabled if any V4 feature is on or segment args are set
     is_v4 = (
         getattr(args, "use_intent_tokens", False)
@@ -255,7 +268,11 @@ def build_loaders(train_ds, val_ds, args):
         or getattr(args, "segment_min_mult", 0) > 0
         or getattr(args, "segment_max_mult", 0) > 0
     )
-    if is_v4:
+    if getattr(args, 'task_context_checkpoint', None):
+        from training.cached_loading import collate_cached_segments
+        collate_fn = collate_cached_segments
+        is_v4 = True
+    elif is_v4:
         collate_fn = lambda b: v4_segment_collate(
             b, history_size=args.history_size, chunk_size=args.chunk_size,
             segment_min_mult=args.segment_min_mult,
@@ -274,7 +291,7 @@ def build_loaders(train_ds, val_ds, args):
         def collate_fn(batch):
             result = numpy_collate_fn(batch)
             return {
-                key: torch.from_numpy(value) if key in transfer_keys else value
+                key: torch.from_numpy(value) if key in transfer_keys and isinstance(value, np.ndarray) else value
                 for key, value in result.items()
             }
     train_sampler = (DistributedSampler(train_ds, shuffle=True, seed=args.seed)
@@ -356,6 +373,8 @@ def build_model(args, num_cameras, device):
         intent_future_weight=getattr(args,'intent_future_weight',0.),
         intent_future_horizons=getattr(args,'intent_future_horizons',[16,64]),
         intent_future_hidden_dim=getattr(args,'intent_future_hidden_dim',256),
+        task_context_checkpoint=getattr(args,'task_context_checkpoint',None),
+        task_context_trainable=getattr(args,'task_context_trainable',False),
     )
     model = model.to(device)
     return model
@@ -561,7 +580,10 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             # Scan each observation once; readout at t sees only the prefix through t.
             intent_sequence = None
             intent_event = stage_start()
-            if num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
+            if num_windows > 0 and getattr(model, 'task_context', None) is not None:
+                ticks = torch.as_tensor(batch['observation_timesteps'], device=device)
+                intent_sequence = model.task_context.sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
+            elif num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     intent_sequence = model.intention_encoder.forward_sequence(
                         z_v_CLS_all[:, :S - chunk_size + 1], z_s_all[:, :S - chunk_size + 1],
@@ -1163,7 +1185,10 @@ def validate(model, loader, device, args):
         # must reuse parameter casts rather than retaining a copy each.
         with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             intent_sequence = None
-            if num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
+            if num_windows > 0 and getattr(model, 'task_context', None) is not None:
+                ticks = torch.as_tensor(batch['observation_timesteps'], device=device)
+                intent_sequence = model.task_context.sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
+            elif num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     intent_sequence = model.intention_encoder.forward_sequence(
                         z_v_CLS_all[:, :S - chunk_size + 1], z_s_all[:, :S - chunk_size + 1],
@@ -1561,7 +1586,11 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     add_future_arguments(parser)
+    from data.task_context_policy_dataset import add_context_policy_arguments
+    add_context_policy_arguments(parser)
     args=parser.parse_args()
+    if args.task_context_checkpoint and (args.head_type != 'diffusion' or args.use_intent_tokens or args.use_text or args.history_size != 1 or args.memory_intent_query):
+        parser.error('Context policy needs diffusion, history size 1, no legacy intent/text or cognitive memory query')
     try:validate_future_arguments(args)
     except ValueError as error:parser.error(str(error))
     if args.intent_future_weight and (not args.use_intent_tokens or not args.use_history):
@@ -1651,6 +1680,9 @@ def main():
     # Data
     print("\n  Loading data...")
     full_ds, train_ds, val_ds = build_datasets(args)
+    if args.task_context_checkpoint:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        args.task_context_matmul_tf32 = False
     train_loader, val_loader = build_loaders(train_ds, val_ds, args)
     if not len(train_loader):
         raise ValueError("Training set is too small for the per-process batch size")
@@ -1788,21 +1820,31 @@ def main():
         print("  (DINOv2 backbone frozen)")
 
     # Optimizer — single LR group (only trainable params receive gradients).
+    if args.policy_warm_start:
+        from data.task_context_policy_dataset import warm_start_policy
+        print('Policy warm start:', warm_start_policy(model,args.policy_warm_start))
     # Fused AdamW keeps parameters and optimizer state in FP32; it changes only
     # kernel fusion/order. The resolved setting is recorded in config.json.
     adamw_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay}
     if args.fused_adamw:
         adamw_kwargs["fused"] = True
-    optimizer = torch.optim.AdamW(trainable, **adamw_kwargs)
+    from data.task_context_policy_dataset import policy_parameter_groups
+    optimizer = torch.optim.AdamW(policy_parameter_groups(model,args.lr), **adamw_kwargs)
     print(f"  Optimizer: 1 LR group (lr={args.lr:.2e}, {n_trainable:,} trainable params; "
           f"fused={args.fused_adamw})")
 
     # Save config snapshot
     config_snapshot = vars(args).copy()
+    from data.task_context_policy_dataset import context_policy_options
+    config_snapshot.update(context_policy_options(model))
     config_snapshot["num_cameras"] = num_cameras
     config_snapshot["n_trainable_params"] = n_trainable
     config_snapshot["n_total_params"] = n_total
     config_snapshot["model_class"] = "ALIGNIntentionModel"
+    config_snapshot['pool_out_dim'] = model.pool_out_dim
+    if args.task_context_checkpoint:
+        from scripts.run_intention_ablation import source_provenance
+        config_snapshot['source_provenance'] = source_provenance()
     if is_primary():
         with open(out_dir / "config.json", "w") as f:
             json.dump(config_snapshot, f, indent=2)
@@ -1816,6 +1858,7 @@ def main():
     is_v4 = (
         args.use_intent_tokens
         or args.use_memory_bank
+        or bool(args.task_context_checkpoint)
         or getattr(args, "segment_min_mult", 0) > 0
         or getattr(args, "segment_max_mult", 0) > 0
     )
@@ -1825,7 +1868,7 @@ def main():
     #   sequential state (no Mamba, no memory bank)
     # - V4 T-loop: needed when Mamba or memory bank is active
     # - V3: old V3 mode (for backward compatibility)
-    if is_v4 and not args.use_history and not args.use_memory_bank:
+    if is_v4 and not args.use_history and not args.use_memory_bank and not args.task_context_checkpoint:
         train_fn = train_v4_batched_epoch
         mode_str = "(V4 batched mode)"
     elif is_v4:
@@ -1864,6 +1907,8 @@ def main():
     else:
         args._profiler = None
     for epoch in range(1, args.epochs + 1):
+        if hasattr(train_ds, 'epoch'):
+            train_ds.epoch = epoch
         if isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
         t_start = time.time()

@@ -35,6 +35,8 @@ from training.train_intention import train_v4_epoch, validate
 from training.cached_loading import collate_cached_segments
 from training.plain_history_training import (SparseHistoryEpisodes,
     collate_sparse_histories, plain_history_epoch)
+from data.task_context_policy_dataset import (policy_episode_split, add_context_policy_arguments,
+    context_policy_options, policy_parameter_groups, warm_start_policy)
 
 
 def seed_everything(seed):
@@ -61,8 +63,14 @@ def source_provenance(root=ROOT):
     snapshot = root / 'source_snapshot.json'
     if snapshot.exists():
         return json.loads(snapshot.read_text())
+    import hashlib
+    names = ['models/align_intention.py','models/intention_head.py','models/memory_bank.py',
+        'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
+        'data/task_context_policy_dataset.py','training/train_intention.py','scripts/run_intention_ablation.py']
     return {'commit': subprocess.check_output(
-        ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()}
+        ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
+        'source_sha256': {name:hashlib.sha256((root/name).read_bytes()).hexdigest()
+                          for name in names if (root/name).is_file()}}
 
 
 def episode_split(dataset, seed, fraction):
@@ -305,6 +313,9 @@ def evaluate_existing(out):
             action_dim=7, chunk_size=config["chunk_size"], history_size=config["history_size"],
             num_cameras=len(cameras), compressed_dim=config["compressed_dim"], head_type=config["head_type"],
             head_history_mode=config.get("head_history_mode", "mean"),
+            task_context_config=config.get('task_context_config'),
+            task_context_trainable=config.get('task_context_trainable',False),
+            task_context_initialization=config.get('task_context_initialization','pretrained'),
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
             use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
             text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
@@ -457,11 +468,26 @@ def parse_args(argv=None):
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--segment-length", type=int, default=20)
     parser.add_argument("--variants", nargs="+", default=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"])
-    parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history"],
+    parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history", 'context_no_memory', 'context_memory', 'context_scratch_no_memory', 'context_scratch_memory'],
                         help="Train only this variant, retaining the ordered common initialization.")
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
     add_future_arguments(parser)
+    add_context_policy_arguments(parser)
     args = parser.parse_args(argv)
+    allowed = {'no_intent_no_memory','intent_no_memory','no_intent_memory','intent_memory','plain_history',
+        'context_no_memory','context_memory','context_scratch_no_memory','context_scratch_memory'}
+    if any(v not in allowed for v in args.variants):
+        parser.error('Unknown ablation variant')
+    context_variants = [v for v in args.variants if v.startswith('context_')]
+    if args.policy_warm_start and args.warm_start:
+        parser.error('Choose shared --policy-warm-start or per-variant --warm-start')
+    if context_variants:
+        if not args.task_context_checkpoint or not args.task_context_split_manifest:
+            parser.error('Context variants require --task-context-checkpoint and --task-context-split-manifest')
+        if args.temporal_sampling != 'episode' or args.history_size != 1 or args.head_type != 'diffusion' or args.use_task_text or args.memory_intent_query or args.intent_future_weight:
+            parser.error('Context variants require full episodes, history size 1, diffusion, no task text/legacy future loss/cognitive memory query')
+        if args.gripper_state_source != 'causal':
+            parser.error('Context variants require causal gripper state')
     try:validate_future_arguments(args)
     except ValueError as error:parser.error(str(error))
     if args.freeze_intent_backbone and not (args.warm_start or args.resume):
@@ -578,7 +604,15 @@ def main(argv=None):
     if sample.shape[-2:] != (257 * len(args.cameras), 768):
         raise ValueError("Expected 257 DINOv2 tokens of width 768 per selected camera")
     pool_out_dim = (sample.shape[-2] - len(args.cameras)) * args.compressed_dim
-    train_eps, val_eps = episode_split(dataset, args.seed, args.validation_fraction)
+    split_record = None
+    if args.task_context_checkpoint or args.task_context_split_manifest:
+        if not args.task_context_split_manifest:
+            raise ValueError('Pretrained context requires its exact split manifest for every arm')
+        metadata = (torch.load(args.task_context_checkpoint,map_location='cpu',weights_only=True)['metadata']
+                    if args.task_context_checkpoint else None)
+        train_eps, val_eps, split_record = policy_episode_split(dataset, args.task_context_split_manifest, metadata)
+    else:
+        train_eps, val_eps = episode_split(dataset, args.seed, args.validation_fraction)
     if args.intent_future_weight:
         longest=max(dataset._get_episode_length(ep) for ep in train_eps)
         if max(args.intent_future_horizons)+args.history_size>longest:
@@ -600,6 +634,13 @@ def main(argv=None):
         use_text=args.use_task_text, text_encoder_type="bag" if args.use_task_text else "clip",
         text_vocab=text_vocab,
         intention_recurrence="causal observation state across each segment")
+    manifest['task_context_split'] = split_record
+    if split_record is not None:
+        torch.backends.cuda.matmul.allow_tf32 = False
+    manifest['task_context_matmul_tf32'] = False if split_record is not None else None
+    from data.task_context_dataset import file_hash
+    manifest['task_context_bundle_sha256'] = file_hash(args.task_context_checkpoint) if args.task_context_checkpoint else None
+    manifest['policy_warm_start_sha256'] = file_hash(args.policy_warm_start) if args.policy_warm_start else None
     if args.resume and (out / "manifest.json").exists():
         previous = json.loads((out / "manifest.json").read_text())
         legacy_defaults = dict(max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
@@ -623,6 +664,12 @@ def main(argv=None):
                     "visual_context_mode","memory_retrieval_depth","memory_intent_query","memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
+        for key in ('task_context_checkpoint','task_context_split_manifest','task_context_trainable',
+                    'task_context_bundle_sha256','task_context_split','task_context_matmul_tf32'):
+            if previous.get(key, False if key == 'task_context_trainable' else None) != manifest[key]:
+                raise ValueError(f'Resume context configuration mismatch: {key}')
+        if previous.get('policy_warm_start_sha256') != manifest['policy_warm_start_sha256']:
+            raise ValueError('Policy warm-start weights changed on resume')
         manifest = extend_resume_manifest(previous, manifest)
         atomic_json(out / "manifest.json", manifest)
         if args.epochs > previous["epochs"]:
@@ -663,15 +710,18 @@ def main(argv=None):
         records = {name: record for name, record in records.items() if name == args.worker_variant}
     shared_initialization = {}
     for name in args.variants:
-        if name not in {"no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history"}:
+        if name not in {"no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history",
+                        'context_no_memory','context_memory','context_scratch_no_memory','context_scratch_memory'}:
             raise ValueError(name)
         intent = name.startswith("intent_")
         memory = name.endswith("_memory") and not name.endswith("no_memory")
         full_history = name == "plain_history"
+        context = name.startswith('context_')
+        scratch = name.startswith('context_scratch_')
         variant_history_size = args.plain_history_size if full_history else args.history_size
         # Legacy multi-frame mean conditioning is not equivalent to the full-
         # history sparse path; preserve its existing training behavior.
-        sparse_history = (full_history or (not intent and not memory and variant_history_size == 1 and args.temporal_sampling == 'episode')) and args.plain_history_loader == "sparse"
+        sparse_history = (full_history or (not intent and not context and not memory and variant_history_size == 1 and args.temporal_sampling == 'episode')) and args.plain_history_loader == "sparse"
         variant_options = dict(loader_options, pin_memory=(args.pin_memory
             if args.pin_memory is not None else False))
         variant_train_data = SparseHistoryEpisodes(train_data, variant_history_size,
@@ -704,7 +754,10 @@ def main(argv=None):
             use_text=args.use_task_text,text_dim=args.text_dim,
             text_encoder_type="bag" if args.use_task_text else "clip",text_vocab=text_vocab,
             intent_future_weight=args.intent_future_weight,intent_future_horizons=args.intent_future_horizons,
-            intent_future_hidden_dim=args.intent_future_hidden_dim)
+            intent_future_hidden_dim=args.intent_future_hidden_dim,
+            task_context_checkpoint=args.task_context_checkpoint if context else None,
+            task_context_trainable=args.task_context_trainable,
+            task_context_initialization='scratch' if scratch else 'pretrained')
         # Cached training never uses the raw-image modules. Keep them off GPU.
         model.vision_encoder.requires_grad_(False)
         vision = model.vision_encoder
@@ -721,6 +774,8 @@ def main(argv=None):
         with torch.no_grad():
             for key, value in model.state_dict().items():
                 if key.startswith("vision_encoder."):
+                    continue
+                if key.startswith('task_context.'):
                     continue
                 if key in shared_initialization and shared_initialization[key].shape == value.shape:
                     value.copy_(shared_initialization[key].to(value.device))
@@ -746,9 +801,11 @@ def main(argv=None):
             model.load_state_dict(matched,strict=False)
             print(f"WARM START {name}: {len(matched)} parameters/buffers, fresh noise schedule",flush=True)
             del saved,source,own,matched
+        if args.policy_warm_start:
+            print(f'POLICY WARM START {name}: {warm_start_policy(model,args.policy_warm_start)}',flush=True)
         if args.freeze_intent_backbone:freeze_intent_backbone(model)
         params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, fused=True)
+        optimizer = torch.optim.AdamW(policy_parameter_groups(model,args.lr), lr=args.lr, weight_decay=args.weight_decay, fused=True)
         loop_args = SimpleNamespace(history_size=variant_history_size, chunk_size=args.chunk_size,
             action_dim=7, head_type=args.head_type, skip_nan=False, grad_clip=args.grad_clip,
             no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,
@@ -773,7 +830,10 @@ def main(argv=None):
                     del model,optimizer,params,vision,saved
                     torch.cuda.empty_cache()
                     continue
-                model.load_state_dict(saved["model_state_dict"], strict=False)
+                incompatible = model.load_state_dict(saved["model_state_dict"], strict=False)
+                if model.task_context is not None and (incompatible.unexpected_keys or
+                        any(not k.startswith('vision_encoder.') for k in incompatible.missing_keys)):
+                    raise ValueError('Context resume checkpoint is missing trained parameters')
                 optimizer.load_state_dict(saved["optimizer_state_dict"])
                 start_epoch = saved["epoch"] + 1
                 best = saved["best_loss"]
@@ -803,6 +863,7 @@ def main(argv=None):
                       head_history_mode="full" if full_history else "mean", action_dim=7,
                       num_cameras=len(args.cameras), model_class="ALIGNIntentionModel",
                       trainable_parameters=sum(p.numel() for p in params))
+        config.update(context_policy_options(model))
         atomic_json(run / "config.json", config)
         torch.cuda.reset_peak_memory_stats()
         print(f"START {name}: {config['trainable_parameters']:,} trainable parameters", flush=True)

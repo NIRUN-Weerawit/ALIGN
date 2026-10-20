@@ -1,0 +1,54 @@
+{
+  "checkpoint": "checkpoints/task_context_policy_20261020/pilot_v3/context_no_memory/intention_best.pt",
+  "sha256": "7d277d3ab2387aa0dc7b1ff459dd7e14b79cf35885fbce97280b246a2831d408",
+  "episode": "ep_000002",
+  "actual_rgb_frames": true,
+  "steps": [
+    {
+      "frame": 0,
+      "actions_shape": [
+        1,
+        8,
+        7
+      ],
+      "context_shape": [
+        1,
+        5,
+        128
+      ],
+      "finite": true
+    },
+    {
+      "frame": 1,
+      "actions_shape": [
+        1,
+        8,
+        7
+      ],
+      "context_shape": [
+        1,
+        5,
+        128
+      ],
+      "finite": true
+    },
+    {
+      "frame": 2,
+      "actions_shape": [
+        1,
+        8,
+        7
+      ],
+      "context_shape": [
+        1,
+        5,
+        128
+      ],
+      "finite": true
+    }
+  ],
+  "recurrence_steps": 3,
+  "task_frozen_without_reset": true,
+  "passed": true,
+  "scope": "Checkpoint reconstruction, real DINO RGB extraction, causal context, handover snapshot, action generation; no simulator success claim."
+}

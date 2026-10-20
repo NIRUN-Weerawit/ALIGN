@@ -26,6 +26,7 @@ class IntentionStream:
         bank = getattr(self.model,"memory_module",None)
         # Cognitive raw writes need a readout even between action plans.
         produce_intent = produce_intent or (store_memory and getattr(bank,"_has_cognitive",False))
+        produce_intent = produce_intent or getattr(self.model, 'task_context', None) is not None
         visibility = {}
         if camera_mask is not None:visibility['camera_mask'] = camera_mask
         if state_mask is not None:visibility['state_mask'] = state_mask
@@ -40,7 +41,8 @@ class IntentionStream:
         timestamp = torch.full((B,),float(self.timestep),device=device)
         self.timestep += 1
         if store_memory and bank is not None and hasattr(bank,"observe_only"):
-            bank.observe_only(visual,state,result[4] if len(result)==5 else None,observed_mask=observed,timestamp=timestamp)
+            cognitive = (result[4] if len(result)==5 else None) if getattr(self.model,'task_context',None) is None else None
+            bank.observe_only(visual,state,cognitive,observed_mask=observed,timestamp=timestamp)
         if not self.visual:
             self.visual.extend([visual] * self.history_size)
             self.state.extend([state] * self.history_size)
@@ -51,3 +53,15 @@ class IntentionStream:
                 "z_s_seq": torch.stack(list(self.state), dim=1),
                 "h_seq": hidden.unsqueeze(1),
                 "intent_emb": result[4] if len(result) == 5 else None}
+
+    def freeze_task(self):
+        """Snapshot inferred task at requested handover; recurrence/execution continue."""
+        branch = getattr(self.model, 'task_context', None)
+        if branch is None:
+            raise ValueError('Task snapshot requires the task-context branch')
+        branch.freeze_task(self.cache)
+
+    def resume_human(self):
+        """Allow a human correction to update task inference without resetting history."""
+        if self.cache is not None and getattr(self.model, 'task_context', None) is not None:
+            self.cache.task_snapshot = None

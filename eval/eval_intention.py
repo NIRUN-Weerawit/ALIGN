@@ -100,6 +100,8 @@ def load_intention_model(
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = _merge_config(ckpt.get("config", {}))
+    if cfg.get('task_context_matmul_tf32') is not None:
+        torch.backends.cuda.matmul.allow_tf32 = bool(cfg['task_context_matmul_tf32'])
     if override_chunk_size is not None:
         cfg["chunk_size"] = override_chunk_size
     if override_num_cameras is not None:
@@ -146,6 +148,9 @@ def load_intention_model(
         intent_future_horizons=cfg.get('intent_future_horizons',[16,64]),
         intent_future_hidden_dim=cfg.get('intent_future_hidden_dim',256),
         compressed_dim=cfg.get("compressed_dim", 16),
+        task_context_config=cfg.get('task_context_config'),
+        task_context_trainable=cfg.get('task_context_trainable',False),
+        task_context_initialization=cfg.get('task_context_initialization','pretrained'),
         # V4 args (default to False/0 for backward compat with V3 checkpoints)
         use_intent_tokens=cfg.get("use_intent_tokens", False),
         num_intent_tokens=cfg.get("num_intent_tokens", 2),
@@ -171,24 +176,26 @@ def load_intention_model(
 
     # Build head and bank by probing vision output shape
     # Must happen BEFORE loading state dict so head/bank parameters exist
-    print(f"  Building head/bank (probing vision output shape)...")
+    print(f"  Building head/bank...")
     with torch.no_grad():
-        num_cam = cfg["num_cameras"]
-        comp_dim = cfg.get("compressed_dim", 16)
-        dummy = torch.randint(0, 256, (1, num_cam, 224, 224, 3), dtype=torch.uint8, device=device)
-        z_v_dummy = model._vision_forward(dummy)
-        if z_v_dummy.ndim == 2:
-            N_tok_actual = z_v_dummy.shape[0]
+        if cfg.get('pool_out_dim') is not None:
+            pool_out_dim = cfg['pool_out_dim']
         else:
-            N_tok_actual = z_v_dummy.shape[1]
-        pool_out_dim = (N_tok_actual - num_cam) * comp_dim
-        print(f"    pool_out_dim={pool_out_dim} (N_tok={N_tok_actual}, comp_dim={comp_dim})")
+            num_cam = cfg["num_cameras"]
+            comp_dim = cfg.get("compressed_dim", 16)
+            dummy = torch.randint(0, 256, (1, num_cam, 224, 224, 3), dtype=torch.uint8, device=device)
+            z_v_dummy = model._vision_forward(dummy)
+            N_tok_actual = z_v_dummy.shape[0] if z_v_dummy.ndim == 2 else z_v_dummy.shape[1]
+            pool_out_dim = (N_tok_actual - num_cam) * comp_dim
+        print(f"    pool_out_dim={pool_out_dim}")
         model._build_head_and_bank(pool_out_dim)
 
     # Load the state dict. We try a strict load first; if that fails
     # (e.g. checkpoint was trained with slightly different head config)
     # we fall back to a non-strict load and report mismatches.
     sd = ckpt.get("model_state_dict", ckpt)
+    if cfg.get('task_context_config') and not any(k.startswith('task_context.') for k in sd):
+        raise ValueError('Context policy checkpoint is missing its pretrained context weights')
     if cfg.get("frozen_vision_omitted",False):
         incompatible = model.load_state_dict(sd,strict=False)
         if incompatible.unexpected_keys or any(not key.startswith("vision_encoder.") for key in incompatible.missing_keys):
@@ -200,6 +207,8 @@ def load_intention_model(
         model.load_state_dict(sd, strict=True)
         print(f"  Loaded state_dict strictly ({len(sd)} tensors)")
     except RuntimeError as e:
+        if cfg.get('task_context_config'):
+            raise ValueError('Context policy checkpoint parameters do not match its saved architecture') from e
         print(f"  Strict load failed ({type(e).__name__}); "
               f"falling back to non-strict load.")
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -265,6 +274,9 @@ def evaluate(
         override_num_cameras=override_num_cameras,
     )
     chunk_size = cfg["chunk_size"]
+    if cfg.get('task_context_split'):
+        from training.task_context_policy_evaluation import evaluate_fixed_split
+        return evaluate_fixed_split(model, cfg, data_paths, batch_size, n_batches, device)
     # Use --cameras if provided, else let dataset auto-detect
     dataset_cameras = cameras  # rename to avoid shadowing the loop var
 

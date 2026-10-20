@@ -1,5 +1,8 @@
 # Causal task-context milestone
 
+For the opt-in main/ablation action-policy path, see the
+[policy integration guide](README_task_context_policy.md).
+
 The [measured results](../paper/task_context_student_results_2026_10_20.md)
 confirm useful prefix information. Longer history did not outperform the
 independently trained 16-frame control enough to pass its separate gate.
