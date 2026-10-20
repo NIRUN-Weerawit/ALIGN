@@ -1,0 +1,33 @@
+{
+  "artifacts": {
+    "full": {
+      "checkpoint_sha256": "a982f5c3ff1195e6fd1ed9f8bc4bf65051d6b7d46b6374448353b2cf306b6cbe",
+      "sources_match": true,
+      "epochs": 100,
+      "updates": 4300
+    },
+    "current": {
+      "checkpoint_sha256": "1d27c5f17258644401627ddfd7ec8c1a22017e71b7eb1f78652abbf4bd54fb10",
+      "sources_match": true,
+      "epochs": 100,
+      "updates": 4300
+    },
+    "short": {
+      "checkpoint_sha256": "45d40ce23cb5920b914030479f42cf88333b5a4f88e27dd482f7c49c403509aa",
+      "sources_match": true,
+      "epochs": 100,
+      "updates": 4300
+    }
+  },
+  "teacher_unchanged": true,
+  "student_frozen_hash_matches": true,
+  "inference_bundle_sha256": "f97b16da0be2a74eebfc08bd6ea7eb7929f64757075d1620df123640a1859fb3",
+  "frozen_training_sources_match": true,
+  "assessment_sources_match": true,
+  "train_only_latent_normalization_exact": true,
+  "prefix_cache_all_428_hashes_verified": true,
+  "documentation_links_valid": true,
+  "observer_streaming_passed": true,
+  "confirmation_information_passed": true,
+  "confirmation_history_advantage_passed": false
+}

@@ -1,0 +1,12 @@
+{
+  "status": "Development revision fixed before matched training and confirmation; original protocol retained",
+  "reason": "Initial NLL/512 run shows a large top-weight versus oracle-candidate error gap on development. Dividing joint mixture NLL by 512 also divides the mixture-weight learning signal by 512.",
+  "revision": "Add 0.2 detached-posterior responsibility cross entropy for mixture weights. Keep NLL, architecture, teacher, frozen summary, target space, anchors, losses, budgets, splits, gate thresholds, and top-weight evaluation unchanged.",
+  "parent_protocol": "protocol.json",
+  "arms": ["selector_full_seed42", "selector_current_seed42", "selector_short_seed42"],
+  "epochs_each": 100,
+  "updates_each": 4300,
+  "teacher_sha256": "1c872b39f44d910dca6ecd57217dd28f577a3a864b056de7ee507e19546f8910",
+  "prefix_manifest_sha256": "d85d458c52a676cc9a7554251621cd636f8def88bb4f0e1141c705287f261685",
+  "confirmation_status": "Student confirmation metrics not opened; full teacher previously characterized the same held-out episodes."
+}

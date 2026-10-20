@@ -1,0 +1,52 @@
+{
+  "episodes": 428,
+  "frames": 52042,
+  "target_manifest_sha256": "f5f54f2ac26fd957e0cfffc62558e9539a93d10c52d03e0b0018f259b4bc4dae",
+  "source_info_sha256": "474a374f45185fe3737a3904f075f99e1a106347c82caf8b2895331cba6d685e",
+  "fps": 20,
+  "raw_state_schema": {
+    "dtype": "float32",
+    "shape": [
+      8
+    ],
+    "names": {
+      "motors": [
+        "x",
+        "y",
+        "z",
+        "axis_angle1",
+        "axis_angle2",
+        "axis_angle3",
+        "gripper",
+        "gripper"
+      ]
+    },
+    "fps": 20
+  },
+  "raw_action_schema": {
+    "dtype": "float32",
+    "shape": [
+      7
+    ],
+    "names": {
+      "motors": [
+        "x",
+        "y",
+        "z",
+        "axis_angle1",
+        "axis_angle2",
+        "axis_angle3",
+        "gripper"
+      ]
+    },
+    "fps": 20
+  },
+  "gripper_in_used_hdf5": "Absent: previous recorded command used, with initial attribute or default 0. This is not a measured gripper state.",
+  "raw_gripper_candidate": "Two schema-listed channels exist upstream but their physical semantics were not audited or used in this experiment.",
+  "success_flags_in_used_hdf5": false,
+  "approved_terminal_intervals": 0,
+  "human_commands_verified": false,
+  "object_geometry_targets_available": false,
+  "force_targets_available": false,
+  "grouping": "Hashed source task descriptions used only as offline labels, not model input"
+}

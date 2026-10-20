@@ -1,0 +1,37 @@
+{
+  "path": "checkpoints/task_context_student_20261020/observer_frozen.pt",
+  "sha256": "f97b16da0be2a74eebfc08bd6ea7eb7929f64757075d1620df123640a1859fb3",
+  "teacher_sha256": "1c872b39f44d910dca6ecd57217dd28f577a3a864b056de7ee507e19546f8910",
+  "student_sha256": "a982f5c3ff1195e6fd1ed9f8bc4bf65051d6b7d46b6374448353b2cf306b6cbe",
+  "confirmation_sha256": "9a23beec23d8828baaed3030a78800793f2dd85ca5d7530a41797256ae220037",
+  "target_manifest_sha256": "f5f54f2ac26fd957e0cfffc62558e9539a93d10c52d03e0b0018f259b4bc4dae",
+  "prefix_manifest_sha256": "d85d458c52a676cc9a7554251621cd636f8def88bb4f0e1141c705287f261685",
+  "causal_information_gate": {
+    "passed": true,
+    "rule": "Causal audit; middle-prefix terminal/procedure >=10% below train-mean context, paired benefit CI>0, >=50% of teacher-over-mean benefit retained."
+  },
+  "history_advantage_gate": {
+    "passed": false,
+    "rule": "Information gate plus >=5% terminal AND procedure gain over both independently trained current/16-frame controls, paired CI>0; wrong-history continuation worse than same-task history."
+  },
+  "input_contract": "Frozen normalized CLS/2x2 slots in manifest camera order; translation+two matrix columns+previous-gripper fallback; elapsed seconds.",
+  "cameras": [
+    "image",
+    "wrist_image"
+  ],
+  "fps": 20.0,
+  "limitations": [
+    "No verified raw human commands are encoder inputs.",
+    "Unannotated terminal intervals are observed outcomes, not approved goals.",
+    "Episode split is not a verified scene/operator-disjoint split.",
+    "Task grouping uses hashed descriptions as offline labels only.",
+    "Procedure anchors supervise realized traces, not hidden constraints.",
+    "Confirmation split previously characterized for teacher; not a fresh final task benchmark.",
+    "No physical handover, action-head fine-tuning, or closed-loop success evaluation.",
+    "Known-task episode split; current scenes often identify task. Task/procedure constraints not verified.",
+    "Donor histories preserve current summaries but are not physically matched histories; transitions may be unnatural.",
+    "Mixture weights are not calibrated task correctness or takeover probabilities.",
+    "One training seed; four components can collapse; confirmation remains the teacher's previously characterized episode split."
+  ],
+  "contract": "Offline-validated causal representation pilot only. No action head, automatic takeover, or success probability."
+}

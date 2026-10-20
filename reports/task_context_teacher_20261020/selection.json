@@ -1,0 +1,35 @@
+{
+  "selected_checkpoint": "/home/whinnoy/ALIGN/checkpoints/task_context_teacher_20261020/teacher_frozen.pt",
+  "sha256": "1c872b39f44d910dca6ecd57217dd28f577a3a864b056de7ee507e19546f8910",
+  "teacher_epoch": 78,
+  "development_report": "development_temporal_seed42.json",
+  "confirmation_report": "confirmation_temporal_seed42.json",
+  "trials": [
+    {
+      "name": "learned_pooling",
+      "development_gate": false
+    },
+    {
+      "name": "quarter_pooling",
+      "development_gate": false
+    },
+    {
+      "name": "quarter_pooling_temporal_decoder",
+      "development_gate": true,
+      "confirmation_gate": true
+    }
+  ],
+  "confirmation_reused_for_tuning": false,
+  "representation": [
+    4,
+    128
+  ],
+  "training_seed": 42,
+  "limitations": [
+    "No verified raw human commands are encoder inputs.",
+    "Unannotated terminal intervals are observed outcomes, not approved goals.",
+    "Episode split is not a verified scene/operator-disjoint split.",
+    "Task grouping uses hashed descriptions as offline labels only.",
+    "Procedure anchors supervise realized traces, not hidden constraints."
+  ]
+}

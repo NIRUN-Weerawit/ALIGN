@@ -1,0 +1,413 @@
+{
+  "bundle_sha256": "f97b16da0be2a74eebfc08bd6ea7eb7929f64757075d1620df123640a1859fb3",
+  "student_sha256": "a982f5c3ff1195e6fd1ed9f8bc4bf65051d6b7d46b6374448353b2cf306b6cbe",
+  "split": "confirmation",
+  "episodes": 44,
+  "frames": 5255,
+  "max_absolute_error": 9.447336196899414e-06,
+  "tolerance": 0.0002,
+  "passed": true,
+  "observer_step_ms": {
+    "p50": 1.6060699708759785,
+    "p95": 13.543944212142378
+  },
+  "latency_scope": "Frozen summary, state normalization, encoder/readout, input validation; preloaded DINO spatial slots. Excludes DINO extraction and action generation; shared GPU.",
+  "rows": [
+    {
+      "key": "ep_000019",
+      "frames": 100,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 2.0265579223632812e-06,
+        "execution_token": 3.874301910400391e-06
+      }
+    },
+    {
+      "key": "ep_000025",
+      "frames": 116,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 1.9073486328125e-06,
+        "execution_token": 5.781650543212891e-06
+      }
+    },
+    {
+      "key": "ep_000030",
+      "frames": 185,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 1.0728836059570312e-06,
+        "execution_token": 9.447336196899414e-06
+      }
+    },
+    {
+      "key": "ep_000031",
+      "frames": 131,
+      "max_absolute_error": {
+        "tokens": 1.9073486328125e-06,
+        "logits": 2.0265579223632812e-06,
+        "execution_token": 4.410743713378906e-06
+      }
+    },
+    {
+      "key": "ep_000045",
+      "frames": 91,
+      "max_absolute_error": {
+        "tokens": 1.1920928955078125e-06,
+        "logits": 2.1457672119140625e-06,
+        "execution_token": 2.86102294921875e-06
+      }
+    },
+    {
+      "key": "ep_000046",
+      "frames": 154,
+      "max_absolute_error": {
+        "tokens": 7.152557373046875e-07,
+        "logits": 1.8030405044555664e-06,
+        "execution_token": 2.9802322387695312e-06
+      }
+    },
+    {
+      "key": "ep_000049",
+      "frames": 156,
+      "max_absolute_error": {
+        "tokens": 7.152557373046875e-07,
+        "logits": 7.152557373046875e-07,
+        "execution_token": 3.4570693969726562e-06
+      }
+    },
+    {
+      "key": "ep_000058",
+      "frames": 141,
+      "max_absolute_error": {
+        "tokens": 1.0728836059570312e-06,
+        "logits": 1.430511474609375e-06,
+        "execution_token": 2.7641654014587402e-06
+      }
+    },
+    {
+      "key": "ep_000062",
+      "frames": 77,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 9.5367431640625e-07,
+        "execution_token": 2.4437904357910156e-06
+      }
+    },
+    {
+      "key": "ep_000068",
+      "frames": 90,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 2.384185791015625e-06,
+        "execution_token": 3.4570693969726562e-06
+      }
+    },
+    {
+      "key": "ep_000096",
+      "frames": 92,
+      "max_absolute_error": {
+        "tokens": 1.1920928955078125e-06,
+        "logits": 1.9073486328125e-06,
+        "execution_token": 3.2186508178710938e-06
+      }
+    },
+    {
+      "key": "ep_000112",
+      "frames": 96,
+      "max_absolute_error": {
+        "tokens": 1.043081283569336e-06,
+        "logits": 1.1920928955078125e-06,
+        "execution_token": 3.933906555175781e-06
+      }
+    },
+    {
+      "key": "ep_000114",
+      "frames": 97,
+      "max_absolute_error": {
+        "tokens": 1.1920928955078125e-06,
+        "logits": 1.9073486328125e-06,
+        "execution_token": 3.4570693969726562e-06
+      }
+    },
+    {
+      "key": "ep_000117",
+      "frames": 128,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 9.5367431640625e-07,
+        "execution_token": 2.7418136596679688e-06
+      }
+    },
+    {
+      "key": "ep_000126",
+      "frames": 99,
+      "max_absolute_error": {
+        "tokens": 8.344650268554688e-07,
+        "logits": 1.475214958190918e-06,
+        "execution_token": 3.4570693969726562e-06
+      }
+    },
+    {
+      "key": "ep_000143",
+      "frames": 84,
+      "max_absolute_error": {
+        "tokens": 1.7881393432617188e-06,
+        "logits": 1.6391277313232422e-06,
+        "execution_token": 3.2186508178710938e-06
+      }
+    },
+    {
+      "key": "ep_000164",
+      "frames": 123,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 1.7881393432617188e-06,
+        "execution_token": 4.589557647705078e-06
+      }
+    },
+    {
+      "key": "ep_000169",
+      "frames": 186,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 9.5367431640625e-07,
+        "execution_token": 7.778406143188477e-06
+      }
+    },
+    {
+      "key": "ep_000217",
+      "frames": 100,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 2.086162567138672e-06,
+        "execution_token": 3.6954879760742188e-06
+      }
+    },
+    {
+      "key": "ep_000242",
+      "frames": 92,
+      "max_absolute_error": {
+        "tokens": 1.430511474609375e-06,
+        "logits": 1.9669532775878906e-06,
+        "execution_token": 3.337860107421875e-06
+      }
+    },
+    {
+      "key": "ep_000249",
+      "frames": 92,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 1.0132789611816406e-06,
+        "execution_token": 2.2649765014648438e-06
+      }
+    },
+    {
+      "key": "ep_000278",
+      "frames": 96,
+      "max_absolute_error": {
+        "tokens": 1.2218952178955078e-06,
+        "logits": 1.1920928955078125e-06,
+        "execution_token": 3.516674041748047e-06
+      }
+    },
+    {
+      "key": "ep_000283",
+      "frames": 98,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 1.430511474609375e-06,
+        "execution_token": 3.635883331298828e-06
+      }
+    },
+    {
+      "key": "ep_000291",
+      "frames": 95,
+      "max_absolute_error": {
+        "tokens": 1.7881393432617188e-06,
+        "logits": 2.086162567138672e-06,
+        "execution_token": 2.9802322387695312e-06
+      }
+    },
+    {
+      "key": "ep_000303",
+      "frames": 100,
+      "max_absolute_error": {
+        "tokens": 1.1920928955078125e-06,
+        "logits": 1.9073486328125e-06,
+        "execution_token": 4.351139068603516e-06
+      }
+    },
+    {
+      "key": "ep_000304",
+      "frames": 158,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 1.430511474609375e-06,
+        "execution_token": 4.291534423828125e-06
+      }
+    },
+    {
+      "key": "ep_000314",
+      "frames": 185,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 1.1920928955078125e-06,
+        "execution_token": 3.5874545574188232e-06
+      }
+    },
+    {
+      "key": "ep_000316",
+      "frames": 152,
+      "max_absolute_error": {
+        "tokens": 7.152557373046875e-07,
+        "logits": 1.1920928955078125e-06,
+        "execution_token": 3.814697265625e-06
+      }
+    },
+    {
+      "key": "ep_000321",
+      "frames": 91,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 2.1457672119140625e-06,
+        "execution_token": 3.993511199951172e-06
+      }
+    },
+    {
+      "key": "ep_000325",
+      "frames": 98,
+      "max_absolute_error": {
+        "tokens": 1.2814998626708984e-06,
+        "logits": 2.384185791015625e-06,
+        "execution_token": 3.0994415283203125e-06
+      }
+    },
+    {
+      "key": "ep_000336",
+      "frames": 141,
+      "max_absolute_error": {
+        "tokens": 1.1920928955078125e-06,
+        "logits": 1.9073486328125e-06,
+        "execution_token": 2.8312206268310547e-06
+      }
+    },
+    {
+      "key": "ep_000337",
+      "frames": 89,
+      "max_absolute_error": {
+        "tokens": 7.748603820800781e-07,
+        "logits": 2.6300549507141113e-06,
+        "execution_token": 2.86102294921875e-06
+      }
+    },
+    {
+      "key": "ep_000358",
+      "frames": 194,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 9.5367431640625e-07,
+        "execution_token": 5.7220458984375e-06
+      }
+    },
+    {
+      "key": "ep_000367",
+      "frames": 89,
+      "max_absolute_error": {
+        "tokens": 7.152557373046875e-07,
+        "logits": 1.9073486328125e-06,
+        "execution_token": 2.6226043701171875e-06
+      }
+    },
+    {
+      "key": "ep_000368",
+      "frames": 94,
+      "max_absolute_error": {
+        "tokens": 1.0728836059570312e-06,
+        "logits": 1.341104507446289e-06,
+        "execution_token": 2.771615982055664e-06
+      }
+    },
+    {
+      "key": "ep_000381",
+      "frames": 110,
+      "max_absolute_error": {
+        "tokens": 1.1026859283447266e-06,
+        "logits": 1.0728836059570312e-06,
+        "execution_token": 3.330409526824951e-06
+      }
+    },
+    {
+      "key": "ep_000382",
+      "frames": 175,
+      "max_absolute_error": {
+        "tokens": 1.1920928955078125e-06,
+        "logits": 1.2218952178955078e-06,
+        "execution_token": 3.2186508178710938e-06
+      }
+    },
+    {
+      "key": "ep_000383",
+      "frames": 202,
+      "max_absolute_error": {
+        "tokens": 7.152557373046875e-07,
+        "logits": 9.5367431640625e-07,
+        "execution_token": 7.212162017822266e-06
+      }
+    },
+    {
+      "key": "ep_000394",
+      "frames": 153,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 9.5367431640625e-07,
+        "execution_token": 3.300607204437256e-06
+      }
+    },
+    {
+      "key": "ep_000407",
+      "frames": 114,
+      "max_absolute_error": {
+        "tokens": 1.6093254089355469e-06,
+        "logits": 2.1457672119140625e-06,
+        "execution_token": 3.5762786865234375e-06
+      }
+    },
+    {
+      "key": "ep_000408",
+      "frames": 111,
+      "max_absolute_error": {
+        "tokens": 1.1920928955078125e-06,
+        "logits": 2.2351741790771484e-06,
+        "execution_token": 3.598630428314209e-06
+      }
+    },
+    {
+      "key": "ep_000414",
+      "frames": 103,
+      "max_absolute_error": {
+        "tokens": 8.344650268554688e-07,
+        "logits": 2.0265579223632812e-06,
+        "execution_token": 2.682209014892578e-06
+      }
+    },
+    {
+      "key": "ep_000417",
+      "frames": 98,
+      "max_absolute_error": {
+        "tokens": 1.1324882507324219e-06,
+        "logits": 2.2649765014648438e-06,
+        "execution_token": 3.3527612686157227e-06
+      }
+    },
+    {
+      "key": "ep_000421",
+      "frames": 79,
+      "max_absolute_error": {
+        "tokens": 9.5367431640625e-07,
+        "logits": 9.5367431640625e-07,
+        "execution_token": 2.9206275939941406e-06
+      }
+    }
+  ]
+}

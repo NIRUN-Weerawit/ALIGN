@@ -1,0 +1,54 @@
+{
+  "cache": "reports/task_context_student_20261020/prefix_cache",
+  "teacher": "checkpoints/task_context_teacher_20261020/teacher_frozen.pt",
+  "output": "checkpoints/task_context_student_20261020/profile_full_seed42",
+  "history": "full",
+  "window": 16,
+  "epochs": 3,
+  "batch_size": 8,
+  "anchors": 16,
+  "seed": 42,
+  "lr": 0.0001,
+  "future_weight": 0.2,
+  "outcome_weight": 0.2,
+  "evaluate_every": 3,
+  "max_steps": 100,
+  "device": "cuda",
+  "memory_fraction": 0.24,
+  "model_config": {
+    "width": 256,
+    "tokens": 4,
+    "token_dim": 128,
+    "modes": 4,
+    "layers": 2,
+    "d_state": 16,
+    "d_conv": 4,
+    "expand": 2,
+    "execution_dim": 128,
+    "visual_width": 1536,
+    "horizons": [
+      16,
+      64
+    ],
+    "history": "full",
+    "window": 16
+  },
+  "manifest_sha256": "d85d458c52a676cc9a7554251621cd636f8def88bb4f0e1141c705287f261685",
+  "teacher_sha256": "1c872b39f44d910dca6ecd57217dd28f577a3a864b056de7ee507e19546f8910",
+  "source_hashes": {
+    "models/task_context_encoder.py": "4f3c71f1cdbe1dd7859709914422db2eb3ae433da57ece551cb673dd3a49aed1",
+    "data/task_context_prefix_dataset.py": "cd99dff95aa3acf73e2d91df56869d0410cd39b252066f574b4383ffc6e72f4f",
+    "training/train_task_context_encoder.py": "34b04813c78e1044fd2be773884b5c11ae179ff4ebf4f847ea39714b61880287"
+  },
+  "parameters": 3972760,
+  "evaluation_fractions": [
+    0.0,
+    0.1,
+    0.25,
+    0.4,
+    0.5,
+    0.7,
+    0.9
+  ],
+  "contract": "Causal observation-only prefix. Frozen teacher labels; top-weight evaluation; no policy fine-tuning."
+}

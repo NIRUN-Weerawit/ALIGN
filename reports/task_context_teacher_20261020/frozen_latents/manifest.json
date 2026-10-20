@@ -1,0 +1,26 @@
+{
+  "schema": "align-privileged-task-tokens-v1",
+  "teacher_sha256": "1c872b39f44d910dca6ecd57217dd28f577a3a864b056de7ee507e19546f8910",
+  "target_manifest_sha256": "f5f54f2ac26fd957e0cfffc62558e9539a93d10c52d03e0b0018f259b4bc4dae",
+  "gate_report_sha256": "de998e119929b782d48aa6604b1a2f5effe49a1a8cf84b3d56b4313bf3c5627e",
+  "teacher_epoch": 78,
+  "shape": [
+    4,
+    128
+  ],
+  "splits": {
+    "train": {
+      "episodes": 340,
+      "sha256": "e4de78f9ae0c3e71b509ac7372dfc094191efc5b2a8c59eb70088ce5f12fb6e3"
+    },
+    "development": {
+      "episodes": 44,
+      "sha256": "be46eff05ad5a927ac540a56b766cfb47a15c7b165b68544617e79e5a40cfb56"
+    },
+    "confirmation": {
+      "episodes": 44,
+      "sha256": "b6ad1d8a48aabb75754f39bd61d958e93caea9009ebd8b3ca7b6fccf2aa98aac"
+    }
+  },
+  "contract": "Whole-episode privileged supervision only. Not a causal deployment input; preserve split boundaries."
+}

@@ -1,0 +1,24 @@
+{
+  "schema": "align-completed-demonstration-gate-v1",
+  "seed": 42,
+  "epochs_per_arm": 80,
+  "optimizer_updates_per_arm": 3440,
+  "splits": {
+    "train": 340,
+    "development": 44,
+    "confirmation": 44
+  },
+  "primary_gate": [
+    "terminal/procedure MSE at least 10% below independently trained current and constant controls with positive paired intervals",
+    "wrong-task continuation MSE exceeds correct and same-task donor continuation MSE with positive paired intervals",
+    "teacher task probe above 10% chance"
+  ],
+  "confirmation_rule": "Only after development gate passes; checkpoints and target manifest must remain identical",
+  "scope": "Completed demonstrations and oracle continuation; no causal inference or closed-loop success claim",
+  "code_hashes": {
+    "data/task_context_dataset.py": "57b1413dc9a4da751d666f12e6b38d2971e3c0d1f7c96796533a010c3a263b2d",
+    "models/task_context_teacher.py": "a90f7266af92dff5115d338b2e90aa248192b2a5a67c8fe6e644ccd06998799d",
+    "training/train_task_context_teacher.py": "9eb5b8fecbf188510979bafb13b5f13ee1e4fabee9f6334f71cd4a57418cdeb8",
+    "tools/assess_task_context_teacher.py": "24ae9b047f52f8b0f7d735845e3679ce2dc00324b9d980f60716adfe33f5ba70"
+  }
+}

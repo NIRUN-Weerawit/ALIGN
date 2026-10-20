@@ -1,0 +1,651 @@
+{
+  "split": "development",
+  "manifest_sha256": "f5f54f2ac26fd957e0cfffc62558e9539a93d10c52d03e0b0018f259b4bc4dae",
+  "checkpoints": {
+    "full": {
+      "path": "/home/whinnoy/ALIGN/checkpoints/task_context_teacher_20261020/quarters_seed42/teacher_best.pt",
+      "sha256": "eff7796c22be8d43f95550d2ff04f22136ae0bd2c70d06ad8a33ff505176f63c"
+    },
+    "current": {
+      "path": "/home/whinnoy/ALIGN/checkpoints/task_context_teacher_20261020/current_seed42/teacher_best.pt",
+      "sha256": "b7871e974943ff215ee77517bb020e6ffe22bc7a949563c68b73c08f6fcd7c23"
+    },
+    "constant": {
+      "path": "/home/whinnoy/ALIGN/checkpoints/task_context_teacher_20261020/constant_seed42/teacher_best.pt",
+      "sha256": "d471144480be58805bde0163e638247742627ac39a256cf0c4d7c5ff00f877bb"
+    }
+  },
+  "teacher_epoch": 80,
+  "teacher_pooling": "quarters",
+  "assessment_sha256": "042bbd2838b891b04af1ac9ab49bb8e77ea41e7d9997c37641063cddc12cba41",
+  "summary": {
+    "correct": {
+      "action_normalized": 0.22992263734340668,
+      "position": 0.03364656865596771,
+      "rotation": 0.0020362939685583115,
+      "gripper": 0.016317032277584076,
+      "gripper_accuracy": 0.9810606241226196,
+      "terminal": 0.24671243131160736,
+      "procedure": 0.31440451741218567,
+      "procedure_state": 0.13902483880519867,
+      "ddim_position": 0.22170081734657288,
+      "ddim_rotation": 0.14239336550235748,
+      "ddim_gripper": 0.14005154371261597,
+      "ddim_gripper_accuracy": 0.8248106241226196
+    },
+    "same_task": {
+      "action_normalized": 0.2735685110092163,
+      "position": 0.03873429819941521,
+      "rotation": 0.0023585567250847816,
+      "gripper": 0.016328886151313782,
+      "gripper_accuracy": 0.9810606241226196,
+      "terminal": 0.2746019959449768,
+      "procedure": 0.32481029629707336,
+      "procedure_state": 0.2415105700492859,
+      "ddim_position": 0.22619256377220154,
+      "ddim_rotation": 0.14361236989498138,
+      "ddim_gripper": 0.141266867518425,
+      "ddim_gripper_accuracy": 0.8257575631141663
+    },
+    "wrong_task": {
+      "action_normalized": 0.687653124332428,
+      "position": 0.1072838082909584,
+      "rotation": 0.005790978670120239,
+      "gripper": 0.0210502278059721,
+      "gripper_accuracy": 0.9839015603065491,
+      "terminal": 0.8890632390975952,
+      "procedure": 0.6192054152488708,
+      "procedure_state": 1.4988129138946533,
+      "ddim_position": 0.26957619190216064,
+      "ddim_rotation": 0.14025996625423431,
+      "ddim_gripper": 0.1435885727405548,
+      "ddim_gripper_accuracy": 0.821969747543335
+    },
+    "train_mean": {
+      "action_normalized": 0.5123858451843262,
+      "position": 0.08801453560590744,
+      "rotation": 0.004144336562603712,
+      "gripper": 0.019267790019512177,
+      "gripper_accuracy": 0.9839015603065491,
+      "terminal": 0.5825002193450928,
+      "procedure": 0.5186949372291565,
+      "procedure_state": 0.9174003601074219,
+      "ddim_position": 0.21786759793758392,
+      "ddim_rotation": 0.10771746188402176,
+      "ddim_gripper": 0.12139008194208145,
+      "ddim_gripper_accuracy": 0.8418560028076172
+    },
+    "current": {
+      "action_normalized": 0.2662542164325714,
+      "position": 0.03835047781467438,
+      "rotation": 0.0023330440744757652,
+      "gripper": 0.01716051809489727,
+      "gripper_accuracy": 0.9801136255264282,
+      "terminal": 0.32059091329574585,
+      "procedure": 0.3450617790222168,
+      "procedure_state": 0.2300563007593155,
+      "ddim_position": 0.24055439233779907,
+      "ddim_rotation": 0.14681124687194824,
+      "ddim_gripper": 0.14982090890407562,
+      "ddim_gripper_accuracy": 0.8134469985961914
+    },
+    "constant": {
+      "action_normalized": 0.26365554332733154,
+      "position": 0.04180169478058815,
+      "rotation": 0.002116597257554531,
+      "gripper": 0.02019546926021576,
+      "gripper_accuracy": 0.9753788113594055,
+      "terminal": 0.5391026139259338,
+      "procedure": 0.4635618329048157,
+      "procedure_state": 0.8810722231864929,
+      "ddim_position": 0.2153860628604889,
+      "ddim_rotation": 0.09963857382535934,
+      "ddim_gripper": 0.12597975134849548,
+      "ddim_gripper_accuracy": 0.84375
+    }
+  },
+  "paired_episode_contrasts": {
+    "action_normalized": {
+      "wrong_minus_correct": {
+        "mean": 0.4577304720878601,
+        "ci95": [
+          0.3597507305443287,
+          0.5603769108653067
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.41408464312553406,
+        "ci95": [
+          0.3143973134458065,
+          0.5203633561730384
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.03633153811097145,
+        "ci95": [
+          0.01839281087741256,
+          0.05810828991234303
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 0.033732879906892776,
+        "ci95": [
+          0.006743339786771685,
+          0.06367340348660944
+        ],
+        "episodes": 44
+      }
+    },
+    "position": {
+      "wrong_minus_correct": {
+        "mean": 0.07363724708557129,
+        "ci95": [
+          0.05471944492310286,
+          0.09514920953661202
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.06854952126741409,
+        "ci95": [
+          0.04970207791775465,
+          0.08997998367995022
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.00470390822738409,
+        "ci95": [
+          0.000959800774580799,
+          0.009078570292331277
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 0.008155123330652714,
+        "ci95": [
+          0.0012801940290955828,
+          0.016502132732421158
+        ],
+        "episodes": 44
+      }
+    },
+    "rotation": {
+      "wrong_minus_correct": {
+        "mean": 0.0037546842359006405,
+        "ci95": [
+          0.0025134267751127483,
+          0.0050690767355263235
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.0034324214793741703,
+        "ci95": [
+          0.002175982075277716,
+          0.004776848503388464
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.0002967500186059624,
+        "ci95": [
+          8.060359286901079e-05,
+          0.0005356237204978242
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 8.030318713281304e-05,
+        "ci95": [
+          -0.00021447951221489347,
+          0.0003556406147254165
+        ],
+        "episodes": 44
+      }
+    },
+    "gripper": {
+      "wrong_minus_correct": {
+        "mean": 0.0047331941314041615,
+        "ci95": [
+          0.002296239318093285,
+          0.007629449886735529
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.004721342585980892,
+        "ci95": [
+          0.0022198154765646905,
+          0.007641891029197721
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.0008434837800450623,
+        "ci95": [
+          -0.0005022025725338608,
+          0.0025234618864487853
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 0.0038784376811236143,
+        "ci95": [
+          0.0013554277567891404,
+          0.007109779573511331
+        ],
+        "episodes": 44
+      }
+    },
+    "gripper_accuracy": {
+      "wrong_minus_correct": {
+        "mean": 0.0028409077785909176,
+        "ci95": [
+          -0.001893941662274301,
+          0.007575757335871458
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.0028409091755747795,
+        "ci95": [
+          -0.0028409091755747795,
+          0.008522724732756615
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": -0.0009469701326452196,
+        "ci95": [
+          -0.004734850977547467,
+          0.0028409103397279978
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": -0.005681818351149559,
+        "ci95": [
+          -0.01515151560306549,
+          0.0028409077785909176
+        ],
+        "episodes": 44
+      }
+    },
+    "terminal": {
+      "wrong_minus_correct": {
+        "mean": 0.6423507332801819,
+        "ci95": [
+          0.5699235588312149,
+          0.7172859504818916
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.6144611835479736,
+        "ci95": [
+          0.542593240737915,
+          0.6895074859261513
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.0738784670829773,
+        "ci95": [
+          0.05164219690486789,
+          0.09730606209486721
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 0.29239022731781006,
+        "ci95": [
+          0.2669169045984745,
+          0.31828853860497475
+        ],
+        "episodes": 44
+      }
+    },
+    "procedure": {
+      "wrong_minus_correct": {
+        "mean": 0.3048008680343628,
+        "ci95": [
+          0.27315924912691114,
+          0.3373432099819183
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.2943951189517975,
+        "ci95": [
+          0.2631670095026493,
+          0.3267677217721939
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.030657261610031128,
+        "ci95": [
+          0.022576395655050874,
+          0.03898730408400297
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 0.14915724098682404,
+        "ci95": [
+          0.1359202429652214,
+          0.16230243146419523
+        ],
+        "episodes": 44
+      }
+    },
+    "procedure_state": {
+      "wrong_minus_correct": {
+        "mean": 1.3597880601882935,
+        "ci95": [
+          1.032149150967598,
+          1.696036475896835
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 1.2573024034500122,
+        "ci95": [
+          0.931344160437584,
+          1.5937637656927108
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.09103147685527802,
+        "ci95": [
+          0.06802558824419976,
+          0.11667702626436949
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 0.7420473098754883,
+        "ci95": [
+          0.5338349357247353,
+          0.965517620742321
+        ],
+        "episodes": 44
+      }
+    },
+    "ddim_position": {
+      "wrong_minus_correct": {
+        "mean": 0.047875355929136276,
+        "ci95": [
+          0.028496455447748304,
+          0.06849934123456478
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.043383605778217316,
+        "ci95": [
+          0.023768805200234056,
+          0.06345507707446812
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.018853595480322838,
+        "ci95": [
+          0.007777849258854985,
+          0.029569785110652443
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": -0.006314762402325869,
+        "ci95": [
+          -0.02633485901169479,
+          0.014749796292744562
+        ],
+        "episodes": 44
+      }
+    },
+    "ddim_rotation": {
+      "wrong_minus_correct": {
+        "mean": -0.002133413916453719,
+        "ci95": [
+          -0.013599706976674498,
+          0.009519292367622252
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": -0.0033524183090776205,
+        "ci95": [
+          -0.014779987558722495,
+          0.007765320269390939
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.004417874850332737,
+        "ci95": [
+          -0.004259367205668241,
+          0.012584722740575672
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": -0.042754802852869034,
+        "ci95": [
+          -0.05783174810931087,
+          -0.029272464569658044
+        ],
+        "episodes": 44
+      }
+    },
+    "ddim_gripper": {
+      "wrong_minus_correct": {
+        "mean": 0.0035370297264307737,
+        "ci95": [
+          -0.009002270712517201,
+          0.016929560899734495
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": 0.00232169427908957,
+        "ci95": [
+          -0.009623761847615242,
+          0.014471180387772613
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": 0.009769364260137081,
+        "ci95": [
+          -0.0017304999899351967,
+          0.021092969737946988
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": -0.014071795158088207,
+        "ci95": [
+          -0.028179112821817398,
+          0.0001926817221828951
+        ],
+        "episodes": 44
+      }
+    },
+    "ddim_gripper_accuracy": {
+      "wrong_minus_correct": {
+        "mean": -0.0028409077785909176,
+        "ci95": [
+          -0.022727273451164366,
+          0.017045451374724508
+        ],
+        "episodes": 44
+      },
+      "wrong_minus_same_task": {
+        "mean": -0.0037878805305808783,
+        "ci95": [
+          -0.022750956611707784,
+          0.01515151560306549
+        ],
+        "episodes": 44
+      },
+      "current_minus_full": {
+        "mean": -0.011363636702299118,
+        "ci95": [
+          -0.030303025618195534,
+          0.006628787145018578
+        ],
+        "episodes": 44
+      },
+      "constant_minus_full": {
+        "mean": 0.018939394503831863,
+        "ci95": [
+          -0.005681819748133421,
+          0.044507578015327454
+        ],
+        "episodes": 44
+      }
+    }
+  },
+  "task_probe": {
+    "task_tokens": 1.0,
+    "current_summary": 0.8200000000000001
+  },
+  "gate": {
+    "passed": false,
+    "requirements": {
+      "terminal_10pct_better_than_current": true,
+      "terminal_current_paired_positive": true,
+      "terminal_10pct_better_than_constant": true,
+      "terminal_constant_paired_positive": true,
+      "procedure_10pct_better_than_current": false,
+      "procedure_current_paired_positive": true,
+      "procedure_10pct_better_than_constant": true,
+      "procedure_constant_paired_positive": true,
+      "wrong_task_harms_continuation": true,
+      "task_specific_donor_effect": true,
+      "task_decodable_above_chance": true
+    },
+    "scope": "Useful information in completed demonstrated outcomes/procedure traces and oracle continuation. No causal intent or robot-success claim."
+  },
+  "protocol": {
+    "anchors": [
+      0.1,
+      0.4,
+      0.7
+    ],
+    "donor_seed": 20261020,
+    "bootstrap": "10000 whole-episode paired resamples; pointwise intervals",
+    "action_noise": "Matched initial DDIM noise per episode batch across conditions and references",
+    "same_task_donors": [
+      "ep_000160",
+      "ep_000060",
+      "ep_000057",
+      "ep_000215",
+      "ep_000033",
+      "ep_000130",
+      "ep_000174",
+      "ep_000374",
+      "ep_000177",
+      "ep_000177",
+      "ep_000271",
+      "ep_000211",
+      "ep_000313",
+      "ep_000060",
+      "ep_000008",
+      "ep_000225",
+      "ep_000002",
+      "ep_000115",
+      "ep_000024",
+      "ep_000177",
+      "ep_000424",
+      "ep_000370",
+      "ep_000032",
+      "ep_000167",
+      "ep_000172",
+      "ep_000225",
+      "ep_000374",
+      "ep_000293",
+      "ep_000174",
+      "ep_000065",
+      "ep_000115",
+      "ep_000186",
+      "ep_000060",
+      "ep_000320",
+      "ep_000413",
+      "ep_000225",
+      "ep_000211",
+      "ep_000320",
+      "ep_000413",
+      "ep_000170",
+      "ep_000188",
+      "ep_000033",
+      "ep_000343",
+      "ep_000370"
+    ],
+    "wrong_task_donors": [
+      "ep_000343",
+      "ep_000032",
+      "ep_000343",
+      "ep_000130",
+      "ep_000215",
+      "ep_000370",
+      "ep_000008",
+      "ep_000343",
+      "ep_000065",
+      "ep_000286",
+      "ep_000424",
+      "ep_000130",
+      "ep_000060",
+      "ep_000177",
+      "ep_000184",
+      "ep_000184",
+      "ep_000293",
+      "ep_000211",
+      "ep_000186",
+      "ep_000206",
+      "ep_000078",
+      "ep_000225",
+      "ep_000225",
+      "ep_000005",
+      "ep_000006",
+      "ep_000159",
+      "ep_000159",
+      "ep_000115",
+      "ep_000225",
+      "ep_000186",
+      "ep_000374",
+      "ep_000170",
+      "ep_000293",
+      "ep_000225",
+      "ep_000051",
+      "ep_000170",
+      "ep_000206",
+      "ep_000215",
+      "ep_000186",
+      "ep_000320",
+      "ep_000057",
+      "ep_000177",
+      "ep_000172",
+      "ep_000211"
+    ]
+  },
+  "limitations": [
+    "No verified raw human commands are encoder inputs.",
+    "Unannotated terminal intervals are observed outcomes, not approved goals.",
+    "Episode split is not a verified scene/operator-disjoint split.",
+    "Task grouping uses hashed descriptions as offline labels only.",
+    "Procedure anchors supervise realized traces, not hidden constraints."
+  ],
+  "endpoint_baselines": {
+    "current_image_persistence": 0.7835557379505851,
+    "train_population_delta": 0.5368833562189882
+  }
+}
