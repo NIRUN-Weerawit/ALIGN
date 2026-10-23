@@ -1,5 +1,12 @@
 # Sequential intention/memory ablations
 
+For `data/libero_goal.h5`, this ablation runner defaults to the exact Piper
+384 training and 44 held-out episodes saved in
+`configs/splits/libero_goal_piper_384_44.json`, regardless of seed or
+`--validation-fraction`. Context-token variants also default to the matching
+pretrained target manifest when an observer checkpoint is supplied. This split
+default applies to the ablation and context-token paths.
+
 Pretrained task-context policy variants are also available. See the
 [context-policy integration guide](../tools/README_task_context_policy.md) for
 the protected pretraining split, new ablation arms, and checkpoint/rollout path.

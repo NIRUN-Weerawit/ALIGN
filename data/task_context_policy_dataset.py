@@ -26,15 +26,18 @@ def policy_episode_split(dataset, path, observer_metadata=None, allow_unbound_ma
             observer_target_manifest_sha256=observer_metadata['target_manifest_sha256'],
             policy_manifest_sha256=m['manifest_sha256'])
     mapping = {k:i for i,k in enumerate(dataset._episode_keys)}
+    from data.training_split import validation_partition
+    evaluation_partition = validation_partition(partitions)
     for k in flat:
         if dataset._get_episode_length(mapping[k]) != m['episodes'][k]['length']:
             raise ValueError(f'Policy dataset episode length differs from pretraining: {k}')
     record: dict = dict(path=str(path.resolve()), sha256=file_hash(path), manifest_sha256=m['manifest_sha256'],
         train_episodes=partitions['train'], development_episodes=partitions['development'],
         confirmation_episodes=partitions['confirmation'], fps=m['fps'], cameras=m['cameras'])
+    record['evaluation_partition'] = evaluation_partition
     if override is not None:
         record['split_override'] = override
-    return [mapping[k] for k in partitions['train']], [mapping[k] for k in partitions['development']], record
+    return [mapping[k] for k in partitions['train']], [mapping[k] for k in partitions[evaluation_partition]], record
 
 
 def add_context_policy_arguments(parser):

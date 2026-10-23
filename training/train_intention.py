@@ -204,6 +204,8 @@ def sync_and_step(model, optimizer, device, grad_clip):
 
 def build_datasets(args):
     """Build train and val datasets from one or more HDF5 files."""
+    from data.training_split import resolve_context_manifest
+    resolve_context_manifest(args)
     if getattr(args, 'task_context_checkpoint', None):
         if len(args.data) != 1 or not args.use_precomputed_dinov2 or not args.task_context_split_manifest:
             raise ValueError('Context policy requires one cached dataset and its exact pretrained split manifest')

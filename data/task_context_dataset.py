@@ -84,7 +84,7 @@ def grouped_split(groups, seed, development_fraction=.1, confirmation_fraction=.
 
 def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
                   terminal_tail=8, action_horizon=8, procedure_points=8,
-                  annotations=None, block_size=16):
+                  annotations=None, block_size=16, split_mode='auto'):
     data, cache, output = Path(data).resolve(), Path(cache).resolve(), Path(output)
     if output.exists():
         raise FileExistsError(f"Target directory already exists: {output}")
@@ -123,7 +123,10 @@ def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
                 state_gripper="measured" if "gripper" in group else "previous_recorded_action",
                 timestamp_source="recorded" if "timestamps" in group else "index_over_declared_fps",
                 annotations=spec)
-    split = grouped_split(groups, seed)
+    from data.training_split import piper_partition
+    fixed = piper_partition(list(episodes), {k:v['length'] for k,v in episodes.items()}, str(data)) if split_mode == 'auto' else None
+    split = (dict(train=fixed[0], development=[], confirmation=fixed[1])
+             if fixed is not None else grouped_split(groups, seed))
     group_ids = {g: i for i, g in enumerate(sorted(set(groups.values())))}
     output.mkdir(parents=True)
     files = {}

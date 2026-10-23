@@ -65,6 +65,7 @@ def source_provenance(root=ROOT):
         return json.loads(snapshot.read_text())
     import hashlib
     names = ['models/align_intention.py','models/intention_head.py','models/memory_bank.py',
+        'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
         'data/task_context_policy_dataset.py','training/train_intention.py','scripts/run_intention_ablation.py']
     return {'commit': subprocess.check_output(
@@ -74,6 +75,10 @@ def source_provenance(root=ROOT):
 
 
 def episode_split(dataset, seed, fraction):
+    from data.training_split import piper_episode_indices
+    fixed = piper_episode_indices(dataset)
+    if fixed is not None:
+        return fixed
     tasks = defaultdict(list)
     for ep, key in enumerate(dataset._episode_keys):
         text = dataset._h5[f"{key}/texts"][()]
@@ -474,6 +479,9 @@ def parse_args(argv=None):
     add_future_arguments(parser)
     add_context_policy_arguments(parser)
     args = parser.parse_args(argv)
+    from data.training_split import resolve_context_manifest
+    try:resolve_context_manifest(args)
+    except ValueError as error:parser.error(str(error))
     allowed = {'no_intent_no_memory','intent_no_memory','no_intent_memory','intent_memory','plain_history',
         'context_history','context_no_memory','context_memory','context_scratch_no_memory','context_scratch_memory'}
     if any(v not in allowed for v in args.variants):

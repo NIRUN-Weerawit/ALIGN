@@ -75,10 +75,11 @@ def load_checkpoint(path,device='cpu'):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--targets',required=True)
+    from data.training_split import PIPER_TARGETS, validate_goal_training_manifest, validation_partition
+    p.add_argument('--targets',default=str(PIPER_TARGETS.parent))
     p.add_argument('--output',required=True)
     p.add_argument('--mode',choices=['full','current','constant'],default='full')
-    p.add_argument('--epochs',type=int,default=40)
+    p.add_argument('--epochs',type=int,default=80)
     p.add_argument('--batch-size',type=int,default=8)
     p.add_argument('--anchors',type=int,default=4)
     p.add_argument('--seed',type=int,default=42)
@@ -92,6 +93,9 @@ def main():
     p.add_argument('--max-steps',type=int,default=0)
     p.add_argument('--evaluate-every',type=int,default=2)
     p.add_argument('--memory-fraction',type=float,default=.24)
+    p.add_argument('--final-refit',action=argparse.BooleanOptionalAction,default=True,
+        help='Fixed-budget training with no validation or checkpoint selection; requires empty development split')
+    p.add_argument('--allow-legacy-split',action='store_true',help='Explicitly reproduce a non-Piper historical Goal cache')
     args=p.parse_args()
     if min(args.epochs,args.batch_size,args.anchors,args.width,args.evaluate_every)<=0 or args.diffusion_weight<0:
         p.error('Invalid training configuration')
@@ -106,9 +110,12 @@ def main():
         torch.backends.cuda.enable_cudnn_sdp(False)
     seed_all(args.seed)
     train=TaskContextEpisodes(args.targets,'train',anchors=args.anchors,seed=args.seed,verify=True)
-    development=TaskContextEpisodes(args.targets,'development',anchors=3,seed=args.seed,verify=True)
+    if not args.allow_legacy_split:validate_goal_training_manifest(train.manifest)
+    if args.final_refit and train.manifest['split']['development']:
+        raise ValueError('Final refit requires an empty development split')
+    development=None if args.final_refit else TaskContextEpisodes(args.targets,validation_partition(train.manifest['split']),anchors=3,seed=args.seed,verify=True)
     train_loader=make_loader(train,args.batch_size,True,args.seed)
-    val_loader=make_loader(development,args.batch_size)
+    val_loader=None if args.final_refit else make_loader(development,args.batch_size)
     model=TaskContextTeacher(cameras=len(train.manifest['cameras']),width=args.width,
         horizon=train.manifest['action_horizon'],procedure_points=train.manifest['procedure_points'],
         diffusion_width=args.diffusion_width,pooling=args.pooling,decoder_style=args.decoder_style).to(device)
@@ -119,6 +126,7 @@ def main():
     del actions
     optimizer=torch.optim.AdamW(model.parameters(),lr=args.lr,weight_decay=1e-4)
     config=dict(vars(args),model_config=model.config,manifest_sha256=train.manifest['manifest_sha256'],
+        checkpoint_selection='fixed_budget_final' if args.final_refit else 'development',
         source_hashes={name:file_hash(ROOT/name) for name in ['data/task_context_dataset.py','models/task_context_teacher.py','training/train_task_context_teacher.py']},
         parameters=sum(v.numel() for v in model.parameters()),
         contract='Completed-demonstration oracle; observation-only; no causal takeover claim')
@@ -144,7 +152,7 @@ def main():
             if args.max_steps and step>=args.max_steps:break
         row=dict(epoch=epoch+1,steps=step,elapsed_s=time.perf_counter()-start,
             train={k:v/count for k,v in sums.items()})
-        if (epoch+1)%args.evaluate_every==0 or epoch==0 or epoch+1==args.epochs or (args.max_steps and step>=args.max_steps):
+        if not args.final_refit and ((epoch+1)%args.evaluate_every==0 or epoch==0 or epoch+1==args.epochs or (args.max_steps and step>=args.max_steps)):
             metrics,rows=evaluate(model,val_loader,device,args.mode)
             row['development']=metrics
             if metrics['selection']<best:
@@ -158,7 +166,13 @@ def main():
         print(json.dumps(row),flush=True)
         with (output/'metrics.jsonl').open('a') as f:f.write(json.dumps(row)+'\n')
         if args.max_steps and step>=args.max_steps:break
-    print(json.dumps(dict(completed=True,best_selection=best,steps=step,elapsed_s=time.perf_counter()-start)),flush=True)
+    if args.final_refit:
+        checkpoint=dict(model={k:v.detach().cpu().clone() for k,v in model.state_dict().items()},
+            model_config=model.config,config=config,epoch=epoch+1,steps=step,
+            checkpoint_selection='fixed_budget_final')
+        temporary=output/'final.tmp'
+        torch.save(checkpoint,temporary);temporary.replace(output/'teacher_final.pt')
+    print(json.dumps(dict(completed=True,best_selection=None if args.final_refit else best,steps=step,elapsed_s=time.perf_counter()-start)),flush=True)
 
 
 if __name__=='__main__':main()

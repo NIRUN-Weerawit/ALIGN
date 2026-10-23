@@ -21,7 +21,8 @@ def evaluate_fixed_split(model, cfg, paths, batch_size, n_batches, device):
         traj_window=cfg['chunk_size'], dinov2_path=cache)
     if set(ds._episode_keys) != set(record['train_episodes'] + record['development_episodes'] + record['confirmation_episodes']):
         raise ValueError('Evaluation episodes differ from the saved pretraining split')
-    indices = [ds._episode_keys.index(k) for k in record['development_episodes']]
+    partition = record.get('evaluation_partition', 'development')
+    indices = [ds._episode_keys.index(k) for k in record[partition + '_episodes']]
     dataset = CachedEpisodes(ds, indices, cfg['chunk_size'], cfg['seed'] + 1000, False,
         temporal_sampling='episode', supervision_points=cfg.get('supervision_points',16), chunk_size=cfg['chunk_size'])
     loader = LimitedBatches(DataLoader(dataset, batch_size=batch_size, num_workers=0,
@@ -33,5 +34,5 @@ def evaluate_fixed_split(model, cfg, paths, batch_size, n_batches, device):
         loss, _, metrics = validate(model, loader, device, args)
     finally:
         ds.close()
-    return dict(validation_loss=loss, **metrics, split='saved development episodes',
-        confirmation_opened=False, split_manifest_sha256=record['manifest_sha256'])
+    return dict(validation_loss=loss, **metrics, split=f'saved {partition} episodes',
+        confirmation_opened=partition == 'confirmation', split_manifest_sha256=record['manifest_sha256'])

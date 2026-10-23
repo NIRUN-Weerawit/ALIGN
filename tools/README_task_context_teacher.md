@@ -165,6 +165,76 @@ teacher/target hashes. It produces separate train/development/confirmation token
 arrays and a provenance manifest. These tokens are privileged training targets,
 and must never be substituted for a causal deployed encoder's predictions.
 
+## Fixed-budget teacher/student refit on 384 episodes
+
+After choosing the architecture and training budgets, refit both stages from
+scratch on the original train + development episodes. The same original 44
+confirmation keys remain excluded from normalization fitting, optimization, and
+checkpoint selection. The development partition is empty; each trainer's
+`--final-refit` mode saves its final checkpoint without running validation.
+
+```bash
+/home/whinnoy/.venvs/align-ablation/bin/python -u tools/refit_task_context.py \
+  --source-targets reports/task_context_teacher_20261020/targets \
+  --report-dir reports/task_context_refit_384_20261023 \
+  --checkpoint-dir checkpoints/task_context_refit_384_20261023 \
+  --teacher-epochs 80 --student-epochs 100 --seed 42 --device cuda
+```
+
+Choose new output directories for another run. The runner reuses immutable raw
+episode targets through symlinks, refits normalization on 384 episodes, trains
+the teacher for 3,840 updates, rebuilds frozen labels and prefix summaries, and
+trains the student for 4,800 updates. It exports `teacher_frozen.pt`,
+`student_frozen.pt`, and `observer_frozen.pt`. Only after fixing both checkpoints
+does it assess the 44 held-out episodes and verify cached/streaming parity.
+`status.json`, stage logs, `protocol.json`, source snapshots, `split.json`,
+`heldout.json`, and `observer_verification.json` record the result.
+
+This dedicated refit export records fixed-budget selection, without claiming
+to repeat or pass the original controlled information gates. The original
+gate-bound exporters keep their existing requirements. The 44 episodes have
+previously been assessed in the original representation study; they are held
+out from this refit's fitting, but are not a newly collected test set.
+
+The new teacher defines a new latent space. Train new downstream action policies
+and task-label estimators against the new observer; do not replace the observer
+inside an existing trained action policy. Its split manifest is
+`reports/task_context_refit_384_20261023/targets/manifest.json`, with 384 train,
+zero development, and 44 confirmation episodes. Policy training/evaluation code
+that requires a nonempty development partition needs an explicit compatible
+protocol before using this manifest.
+
+## Matching the existing Piper ablation split
+
+New context-token target builds use the saved Piper 384/44 split by default
+for `data/libero_goal.h5`. The teacher and student CLIs default to the Piper
+target and prefix caches and use fixed-budget final refits. The action-policy
+context variants use this same manifest. Use explicit paths and
+`--allow-legacy-split` to reproduce an older context-token run.
+
+To refit using Piper's exact episode assignments instead of merging the original
+context split, supply its policy manifest:
+
+```bash
+/home/whinnoy/.venvs/align-ablation/bin/python -u tools/refit_task_context.py \
+  --source-targets reports/task_context_teacher_20261020/targets \
+  --split-manifest checkpoints/piper_v4_ablation_no_text_2/manifest.json \
+  --report-dir reports/task_context_piper_384_20261023 \
+  --checkpoint-dir checkpoints/task_context_piper_384_20261023 \
+  --teacher-epochs 80 --student-epochs 100 --seed 42 --device cuda
+```
+
+The runner validates 384 unique `train_episodes` and 44 unique `val_episodes`,
+disjointness, complete source-episode coverage, and camera order. It preserves
+the exact lists, maps policy validation keys to the refit's `confirmation`
+partition, and leaves development empty. Normalization and all optimization
+use only the specified 384 keys. The reference manifest is copied into the report
+and its SHA256 is bound into the target manifest, protocol, and observer metadata.
+This command trains both models from scratch with the same fixed budgets and
+post-training verification as the original refit workflow above. New frozen
+teacher labels and prefix summaries are rebuilt; no earlier fitted teacher,
+student, or normalization is reused.
+
 ## Checks
 
 ```bash
