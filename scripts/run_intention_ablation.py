@@ -321,6 +321,8 @@ def evaluate_existing(out):
             task_context_config=config.get('task_context_config'),
             task_context_trainable=config.get('task_context_trainable',False),
             task_context_initialization=config.get('task_context_initialization','pretrained'),
+            task_context_fusion=config.get('task_context_fusion','additive'),
+            task_context_fusion_dim=config.get('task_context_fusion_dim',128),
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
             use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
             text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
@@ -487,6 +489,10 @@ def parse_args(argv=None):
     if any(v not in allowed for v in args.variants):
         parser.error('Unknown ablation variant')
     context_variants = [v for v in args.variants if v.startswith('context_')]
+    if args.task_context_fusion != 'additive' and not context_variants:
+        parser.error('Non-additive task-context fusion requires a context variant')
+    if args.task_context_fusion_dim < 1 or (args.task_context_fusion == 'cross_attention' and args.task_context_fusion_dim % 4):
+        parser.error('Task-context fusion width must be positive and divisible by 4 for cross-attention')
     if args.policy_warm_start and args.warm_start:
         parser.error('Choose shared --policy-warm-start or per-variant --warm-start')
     if context_variants:
@@ -616,7 +622,7 @@ def main(argv=None):
     if args.task_context_checkpoint or args.task_context_split_manifest:
         if not args.task_context_split_manifest:
             raise ValueError('Pretrained context requires its exact split manifest for every arm')
-        metadata = (torch.load(args.task_context_checkpoint,map_location='cpu',weights_only=True)['metadata']
+        metadata = (torch.load(args.task_context_checkpoint,map_location='cpu',weights_only=False)['metadata']
                     if args.task_context_checkpoint else None)
         train_eps, val_eps, split_record = policy_episode_split(dataset, args.task_context_split_manifest, metadata,
             allow_unbound_manifest=args.task_context_split_override)
@@ -661,13 +667,14 @@ def main(argv=None):
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
                                use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
                                length_bucket_multiplier=20)
-        legacy_defaults.update(intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False)
+        legacy_defaults.update(intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False,
+                               task_context_fusion='additive',task_context_fusion_dim=128)
         for key in ("intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
                     "gripper_state_source", "gripper_transition_fraction", "max_steps", "max_val_batches", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
-                    "use_task_text", "text_dim", "text_vocab",
+                    "use_task_text", "text_dim", "text_vocab", "task_context_fusion", "task_context_fusion_dim",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
                     "visual_context_mode","memory_retrieval_depth","memory_intent_query","memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
@@ -766,7 +773,9 @@ def main(argv=None):
             intent_future_hidden_dim=args.intent_future_hidden_dim,
             task_context_checkpoint=args.task_context_checkpoint if context else None,
             task_context_trainable=args.task_context_trainable,
-            task_context_initialization='scratch' if scratch else 'pretrained')
+            task_context_initialization='scratch' if scratch else 'pretrained',
+            task_context_fusion=args.task_context_fusion if context else 'additive',
+            task_context_fusion_dim=args.task_context_fusion_dim)
         # Cached training never uses the raw-image modules. Keep them off GPU.
         model.vision_encoder.requires_grad_(False)
         vision = model.vision_encoder
