@@ -212,7 +212,8 @@ def build_datasets(args):
         bundle = torch.load(args.task_context_checkpoint, map_location='cpu', weights_only=True)
         ds = ALIGNDataset(args.data[0], mode='head', cameras=args.cameras,
             traj_window=args.chunk_size, dinov2_path=args.dinov2_path)
-        train, val, record = policy_episode_split(ds, args.task_context_split_manifest, bundle['metadata'])
+        train, val, record = policy_episode_split(ds, args.task_context_split_manifest, bundle['metadata'],
+            allow_unbound_manifest=getattr(args, 'task_context_split_override', False))
         args.task_context_split = record
         return ds, CachedEpisodes(ds, train, args.chunk_size, args.seed, True,
             temporal_sampling='episode', chunk_size=args.chunk_size), CachedEpisodes(ds, val, args.chunk_size,
