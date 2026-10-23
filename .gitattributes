@@ -1,3 +1,4 @@
 /checkpoints/task_context_student_20261020/*.pt filter=lfs diff=lfs merge=lfs -text
 /checkpoints/task_context_student_20261020/**/student_best.pt filter=lfs diff=lfs merge=lfs -text
 /checkpoints/task_context_teacher_20261020/teacher_frozen.pt filter=lfs diff=lfs merge=lfs -text
+/checkpoints/task_context_piper_384_20261023/*.pt filter=lfs diff=lfs merge=lfs -text

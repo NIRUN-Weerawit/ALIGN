@@ -1,0 +1,30 @@
+{
+  "schema": "align-task-context-fixed-refit-v1",
+  "seed": 42,
+  "teacher_epochs": 80,
+  "student_epochs": 100,
+  "train_episodes": 384,
+  "development_episodes": 0,
+  "heldout_episodes": 44,
+  "teacher_updates": 3840,
+  "student_updates": 4800,
+  "checkpoint_selection": "fixed_budget_final",
+  "initialize": "from_scratch",
+  "split_reference": {
+    "path": "/home/whinnoy/ALIGN/checkpoints/piper_v4_ablation_no_text_2/manifest.json",
+    "sha256": "a1b1bc6a951ecdf30fe80ababbbc0450b736abc45a328c48f34010f690c6db0d",
+    "rule": "Exact policy train_episodes; policy val_episodes held out as confirmation"
+  },
+  "heldout_rule": "Exact policy val_episodes; excluded from normalization fitting, optimization, and selection.",
+  "assessment": "After both final checkpoints are fixed; no metric-driven retries.",
+  "source_hashes": {
+    "tools/refit_task_context.py": "8e06ac99be335aa16b0c40e6298cef4c11af7fe0aab3af4dd6a7250c42940ea4",
+    "training/train_task_context_teacher.py": "9fdbf4f85cca3cc3e84b8d4d4f93c7bbd3d0bd348a3c583fdd548bdb5c2c0983",
+    "training/train_task_context_encoder.py": "162c06894b2580a89dcac81f1b80e039b131a56856a09275e62ca5c785f5069e",
+    "data/task_context_dataset.py": "57b1413dc9a4da751d666f12e6b38d2971e3c0d1f7c96796533a010c3a263b2d",
+    "data/task_context_prefix_dataset.py": "cd99dff95aa3acf73e2d91df56869d0410cd39b252066f574b4383ffc6e72f4f",
+    "models/task_context_teacher.py": "cfec5c41208281b948b869a606d07e019eb89678aed09051d3a78fb0e4a17030",
+    "models/task_context_encoder.py": "ab554b7de0882f48c6f5163f3b211a9a13edd81bafe4c82a93b8b2ece7e358b4",
+    "models/task_context_observer.py": "4e95da3937a56018e27c2e657dbf9f0cb5ad596ee1f6ee362064422c9f8ac83d"
+  }
+}

@@ -1,0 +1,110 @@
+{
+  "passed": true,
+  "train_episodes": 384,
+  "heldout_episodes": 44,
+  "matched_ablation_manifests": 20,
+  "shared_evaluation_list_match": true,
+  "heldout_in_training": 0,
+  "comparisons": [
+    {
+      "run": "piper_v4_ablation_no_text_1",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_2",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_2_old",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_4_cp_dim_64",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_4_cp_dim_64_bastet",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_5_cp_32_bastet",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_5_cp_32_helios",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_5_cp_8_bastet",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_5_cp_8_bastet_2",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_no_text_5_cp_8_helios",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_1",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_2",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_4_cp_dim_64_bastet",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_5_cp_32_helios",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_5_cp_8_helios",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_plain_history_h20_helios",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_plain_history_h4",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_plain_history_h4_helios",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_plain_history_h60_haruka",
+      "train_match": true,
+      "heldout_match": true
+    },
+    {
+      "run": "piper_v4_ablation_use_text_plain_history_h8_helios",
+      "train_match": true,
+      "heldout_match": true
+    }
+  ]
+}
