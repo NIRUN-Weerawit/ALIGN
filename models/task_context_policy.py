@@ -143,24 +143,90 @@ class TaskContextPolicyBranch(nn.Module):
     @staticmethod
     def freeze_task(cache):
         if cache is None or cache.last_task is None:
-            raise ValueError("Observe a human prefix before freezing task context")
+            raise ValueError("Observe at least one frame before saving task context")
         cache.task_snapshot = cache.last_task.detach().clone()
 
 
 class ContextDiffusionPolicyHead(DiffusionPolicyHead):
-    """Same live visual/state condition width; separately normalized context residuals."""
-    def __init__(self, *args, context_tokens=4, context_dim=128, **kwargs):
+    """Live condition plus task/execution residuals and optional learned interaction.
+
+    The default preserves the original parameter names and computation. Optional
+    fusion modules start as the same additive model, so a common pretrained head
+    provides an identical starting policy for controlled fine-tuning experiments.
+    Inputs are visual/state windows with shape ``(B, H, C)`` and a context payload
+    ``(B, task_tokens + 1, context_dim)``. The output has shape ``(B, H_cond, C)``;
+    the mean-condition head uses ``H_cond = 1``.
+    """
+    FUSION_MODES = ('additive', 'gated_residual', 'film', 'cross_attention')
+
+    def __init__(self, *args, context_tokens=4, context_dim=128,
+                 context_fusion='additive', context_fusion_dim=128, **kwargs):
+        if context_fusion not in self.FUSION_MODES:
+            raise ValueError(f'Unknown task-context fusion: {context_fusion}')
+        if not isinstance(context_fusion_dim, int) or isinstance(context_fusion_dim, bool) or context_fusion_dim < 1:
+            raise ValueError('Task-context fusion width must be a positive integer')
+        if context_fusion == 'cross_attention' and context_fusion_dim % 4:
+            raise ValueError('Task-context attention width must be divisible by four')
         super().__init__(*args, **kwargs)
         self.context_tokens, self.context_dim = context_tokens, context_dim
+        self.context_fusion = context_fusion
+        self.context_fusion_dim = context_fusion_dim
         self.context_task = nn.Sequential(nn.LayerNorm(context_tokens * context_dim), nn.Linear(context_tokens * context_dim, self.cond_dim))
         self.context_execution = nn.Sequential(nn.LayerNorm(context_dim), nn.Linear(context_dim, self.cond_dim))
         self.context_task_scale = nn.Parameter(torch.tensor(.01))
         self.context_execution_scale = nn.Parameter(torch.tensor(.01))
 
-    def _build_per_step_cond(self, visual, states, intent_emb=None):
+        if context_fusion == 'gated_residual':
+            self.context_gate = nn.Sequential(nn.LayerNorm(self.cond_dim),
+                nn.Linear(self.cond_dim, context_fusion_dim), nn.SiLU(),
+                nn.Linear(context_fusion_dim, self.cond_dim))
+            nn.init.zeros_(self.context_gate[-1].weight)
+            nn.init.zeros_(self.context_gate[-1].bias)
+        elif context_fusion == 'film':
+            self.context_film = nn.Sequential(nn.LayerNorm(context_tokens * context_dim),
+                nn.Linear(context_tokens * context_dim, context_fusion_dim), nn.SiLU(),
+                nn.Linear(context_fusion_dim, 2 * self.cond_dim))
+            nn.init.zeros_(self.context_film[-1].weight)
+            nn.init.zeros_(self.context_film[-1].bias)
+        elif context_fusion == 'cross_attention':
+            self.context_query = nn.Sequential(nn.LayerNorm(self.cond_dim),
+                nn.Linear(self.cond_dim, context_fusion_dim))
+            self.context_key_value = nn.Sequential(nn.LayerNorm(context_dim),
+                nn.Linear(context_dim, context_fusion_dim))
+            self.context_attention = nn.MultiheadAttention(context_fusion_dim, 4,
+                dropout=0., batch_first=True)
+            self.context_attention_output = nn.Linear(context_fusion_dim, self.cond_dim)
+            nn.init.zeros_(self.context_attention_output.weight)
+            nn.init.zeros_(self.context_attention_output.bias)
+
+    def conditioning_components(self, visual, states, intent_emb=None):
+        """Return live, complete task, and execution terms with shape ``(B, H, C)``.
+
+        All optional task interactions belong to the task contribution, making
+        removal controls well-defined for every fusion mode.
+        """
         if intent_emb is None or intent_emb.shape[-2:] != (self.context_tokens + 1, self.context_dim):
             raise ValueError("Context policy requires task tokens and one execution token")
         current = super()._build_per_step_cond(visual, states, None)
         task = self.context_task(intent_emb[:, :self.context_tokens].flatten(1))[:, None]
         execution = self.context_execution(intent_emb[:, -1])[:, None]
-        return current + self.context_task_scale * task + self.context_execution_scale * execution
+        task = self.context_task_scale * task
+        execution = self.context_execution_scale * execution
+        if self.context_fusion == 'gated_residual':
+            # Unit gate at initialization; each observation can learn which task
+            # features are relevant without freezing the live execution branch.
+            task = task * (2 * self.context_gate(current).sigmoid())
+        if self.context_fusion == 'film':
+            scale, shift = self.context_film(intent_emb[:, :self.context_tokens].flatten(1)).chunk(2, -1)
+            normalized = F.layer_norm(current, (self.cond_dim,))
+            task = task + scale[:, None].tanh() * normalized + shift[:, None].tanh()
+        elif self.context_fusion == 'cross_attention':
+            query = self.context_query(current)
+            task_keys = self.context_key_value(intent_emb[:, :self.context_tokens])
+            read, _ = self.context_attention(query, task_keys, task_keys, need_weights=False)
+            task = task + self.context_attention_output(read)
+        return current, task.expand_as(current), execution.expand_as(current)
+
+    def _build_per_step_cond(self, visual, states, intent_emb=None):
+        current, task, execution = self.conditioning_components(visual, states, intent_emb)
+        return current + task + execution

@@ -151,6 +151,8 @@ def load_intention_model(
         task_context_config=cfg.get('task_context_config'),
         task_context_trainable=cfg.get('task_context_trainable',False),
         task_context_initialization=cfg.get('task_context_initialization','pretrained'),
+        task_context_fusion=cfg.get('task_context_fusion','additive'),
+        task_context_fusion_dim=cfg.get('task_context_fusion_dim',128),
         # V4 args (default to False/0 for backward compat with V3 checkpoints)
         use_intent_tokens=cfg.get("use_intent_tokens", False),
         num_intent_tokens=cfg.get("num_intent_tokens", 2),

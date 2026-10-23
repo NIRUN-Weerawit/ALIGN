@@ -378,6 +378,8 @@ def build_model(args, num_cameras, device):
         intent_future_hidden_dim=getattr(args,'intent_future_hidden_dim',256),
         task_context_checkpoint=getattr(args,'task_context_checkpoint',None),
         task_context_trainable=getattr(args,'task_context_trainable',False),
+        task_context_fusion=getattr(args,'task_context_fusion','additive'),
+        task_context_fusion_dim=getattr(args,'task_context_fusion_dim',128),
     )
     model = model.to(device)
     return model
@@ -1592,6 +1594,10 @@ def parse_args():
     from data.task_context_policy_dataset import add_context_policy_arguments
     add_context_policy_arguments(parser)
     args=parser.parse_args()
+    if args.task_context_fusion != 'additive' and not args.task_context_checkpoint:
+        parser.error('Non-additive task-context fusion requires --task-context-checkpoint')
+    if args.task_context_fusion_dim < 1 or (args.task_context_fusion == 'cross_attention' and args.task_context_fusion_dim % 4):
+        parser.error('Task-context fusion width must be positive and divisible by 4 for cross-attention')
     if args.task_context_checkpoint and (args.head_type != 'diffusion' or args.use_intent_tokens or args.use_text or args.history_size != 1 or args.memory_intent_query):
         parser.error('Context policy needs diffusion, history size 1, no legacy intent/text or cognitive memory query')
     try:validate_future_arguments(args)

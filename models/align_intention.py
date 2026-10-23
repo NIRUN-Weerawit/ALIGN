@@ -119,6 +119,8 @@ class ALIGNIntentionModel(nn.Module):
         task_context_config: dict = None,
         task_context_trainable: bool = False,
         task_context_initialization: str = "pretrained",
+        task_context_fusion: str = "additive",
+        task_context_fusion_dim: int = 128,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -144,6 +146,16 @@ class ALIGNIntentionModel(nn.Module):
         if intent_future_weight and (not use_intent_tokens or mamba_output_dim<=0):
             raise ValueError('Future prediction requires an active intention encoder')
         self.intent_future_weight = intent_future_weight
+        if task_context_fusion not in ('additive', 'gated_residual', 'film', 'cross_attention'):
+            raise ValueError('Unknown task context fusion mode')
+        if not isinstance(task_context_fusion_dim, int) or isinstance(task_context_fusion_dim, bool) or task_context_fusion_dim < 1:
+            raise ValueError('Task context fusion width must be a positive integer')
+        if task_context_fusion == 'cross_attention' and task_context_fusion_dim % 4:
+            raise ValueError('Cross-attention task context fusion width must be divisible by 4')
+        if task_context_fusion != 'additive' and not (task_context_checkpoint or task_context_config):
+            raise ValueError('Task context fusion requires a task context checkpoint or config')
+        self.task_context_fusion = task_context_fusion
+        self.task_context_fusion_dim = task_context_fusion_dim
         self.task_context = None
         if task_context_checkpoint or task_context_config:
             if use_intent_tokens or use_text or intent_future_weight or head_type != 'diffusion':
@@ -347,7 +359,9 @@ class ALIGNIntentionModel(nn.Module):
                 from models.task_context_policy import ContextDiffusionPolicyHead
                 head_class = ContextDiffusionPolicyHead
                 context_options = dict(context_tokens=self.task_context.config['encoder_config']['tokens'],
-                    context_dim=self.task_context.config['encoder_config']['token_dim'])
+                    context_dim=self.task_context.config['encoder_config']['token_dim'],
+                    context_fusion=self.task_context_fusion,
+                    context_fusion_dim=self.task_context_fusion_dim)
             else:
                 head_class, context_options = DiffusionPolicyHead, {}
             self.intention_head = head_class(

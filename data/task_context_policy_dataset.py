@@ -47,6 +47,10 @@ def add_context_policy_arguments(parser):
         help='Allow a split manifest that is not hash-bound to the observer bundle (e.g. repointing to another '
              "family's train/val episodes). All other manifest checks still apply; the override is recorded in the checkpoint config.")
     parser.add_argument('--task-context-trainable', action='store_true', help='Fine-tune causal encoder with action loss; frozen summary is retained')
+    parser.add_argument('--task-context-fusion', choices=('additive', 'gated_residual', 'film', 'cross_attention'),
+        default='additive', help='How task/execution tokens condition the diffusion action head')
+    parser.add_argument('--task-context-fusion-dim', type=int, default=128,
+        help='Hidden width for learned task-context fusion (positive, divisible by 4 for cross-attention)')
     parser.add_argument('--policy-warm-start', default=None, help='Copy shape-compatible common policy weights from an existing checkpoint; context weights remain from the observer')
 
 
@@ -54,7 +58,9 @@ def context_policy_options(model):
     branch = getattr(model, 'task_context', None)
     return dict(task_context_config=branch.config if branch is not None else None,
         task_context_trainable=branch.trainable if branch is not None else False,
-        task_context_initialization=branch.initialization if branch is not None else 'pretrained')
+        task_context_initialization=branch.initialization if branch is not None else 'pretrained',
+        task_context_fusion=getattr(model, 'task_context_fusion', 'additive'),
+        task_context_fusion_dim=getattr(model, 'task_context_fusion_dim', 128))
 
 
 def policy_parameter_groups(model, lr):
