@@ -211,7 +211,8 @@ def build_datasets(args):
             raise ValueError('Context policy requires one cached dataset and its exact pretrained split manifest')
         from data.task_context_policy_dataset import policy_episode_split
         from scripts.run_intention_ablation import CachedEpisodes
-        bundle = torch.load(args.task_context_checkpoint, map_location='cpu', weights_only=True)
+        from models.task_context_observer import load_observer_bundle
+        bundle = load_observer_bundle(args.task_context_checkpoint)
         ds = ALIGNDataset(args.data[0], mode='head', cameras=args.cameras,
             traj_window=args.chunk_size, dinov2_path=args.dinov2_path)
         train, val, record = policy_episode_split(ds, args.task_context_split_manifest, bundle['metadata'],

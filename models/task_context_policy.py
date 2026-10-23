@@ -5,7 +5,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from models.task_context_observer import TaskContextObserver
+from models.task_context_observer import TaskContextObserver, load_observer_bundle
 from models.task_context_encoder import TaskContextEncoder
 from models.intention_head import DiffusionPolicyHead
 
@@ -57,7 +57,7 @@ class TaskContextPolicyBranch(nn.Module):
             if not checkpoint:
                 raise ValueError("Context needs a pretrained observer bundle or saved configuration")
             from data.task_context_dataset import file_hash
-            bundle = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            bundle = load_observer_bundle(checkpoint)
             if bundle.get("schema") != "align-causal-task-observer-v1":
                 raise ValueError("Expected an exported causal observer bundle")
             config = dict(summary_config=bundle["summary_config"], encoder_config=bundle["encoder_config"],

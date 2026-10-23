@@ -622,7 +622,8 @@ def main(argv=None):
     if args.task_context_checkpoint or args.task_context_split_manifest:
         if not args.task_context_split_manifest:
             raise ValueError('Pretrained context requires its exact split manifest for every arm')
-        metadata = (torch.load(args.task_context_checkpoint,map_location='cpu',weights_only=True)['metadata']
+        from models.task_context_observer import load_observer_bundle
+        metadata = (load_observer_bundle(args.task_context_checkpoint)['metadata']
                     if args.task_context_checkpoint else None)
         train_eps, val_eps, split_record = policy_episode_split(dataset, args.task_context_split_manifest, metadata,
             allow_unbound_manifest=args.task_context_split_override)

@@ -1,5 +1,6 @@
 """Portable frozen-summary + causal-encoder inference; no controller integration."""
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -50,8 +51,21 @@ class TaskContextObserver(nn.Module):
         return result
 
 
+def load_observer_bundle(path):
+    """Load a frozen observer, diagnosing a Git LFS pointer before torch.load."""
+    path = Path(path)
+    with path.open("rb") as stream:
+        prefix = stream.read(64)
+    if prefix.startswith(b"version https://git-lfs.github.com/spec/v1"):
+        raise ValueError(
+            f"{path} is a Git LFS pointer, not the observer checkpoint. "
+            "Run `git lfs pull` in the ALIGN repository, then retry."
+        )
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
 def load_observer(path, device="cpu"):
-    bundle = torch.load(path, map_location="cpu", weights_only=True)
+    bundle = load_observer_bundle(path)
     if bundle["schema"] != "align-causal-task-observer-v1":
         raise ValueError("Unknown task observer bundle")
     model = TaskContextObserver(bundle["summary_config"], bundle["encoder_config"])
