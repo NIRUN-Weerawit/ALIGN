@@ -277,7 +277,7 @@ def summarize(out, records, manifest):
     rows += ["", "All variants use the same episode split, crop schedule,",
              "batch order, optimizer budget, and validation RNG seeds. Intent-disabled variants",
              "omit the intention encoder; memory-only retrieves perceptual and state streams.",
-            "The plain_history variant uses its configured ordered feature/state window.",
+            "The plain_history and context_history variants use their configured ordered feature/state window.",
              "The cached per-camera features bypass raw-image/cross-camera vision computation.",
              "Results use one training seed; model dimensions and optimizer budget are recorded in manifest.json.",
              "Fixed validation seeds make comparisons repeatable but do not remove seed uncertainty.",
@@ -342,7 +342,7 @@ def evaluate_existing(out):
         model.vision_encoder = vision
         seed_everything(manifest["seed"] + 10000)
         args.history_size = config["history_size"]
-        if (config.get("head_history_mode") == "full" or
+        if model.task_context is None and (config.get("head_history_mode") == "full" or
             (model.intention_encoder is None and not model.use_memory_bank and args.history_size == 1 and manifest.get('temporal_sampling') == 'episode')):
             args.plain_head_batch_size = manifest.get("plain_head_batch_size", 32)
             sparse_loader = DataLoader(SparseHistoryEpisodes(data, args.history_size),
@@ -464,18 +464,18 @@ def parse_args(argv=None):
     parser.add_argument("--cpu-threads", type=int, default=2)
     parser.add_argument("--history-size", type=int, default=1)
     parser.add_argument("--plain-history-size", type=int, default=4,
-                        help="Ordered visual/state window for the plain_history diffusion variant")
+                        help="Ordered visual/state window for the plain_history and context_history diffusion variants")
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--segment-length", type=int, default=20)
     parser.add_argument("--variants", nargs="+", default=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"])
-    parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history", 'context_no_memory', 'context_memory', 'context_scratch_no_memory', 'context_scratch_memory'],
+    parser.add_argument("--worker-variant", choices=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history", 'context_history', 'context_no_memory', 'context_memory', 'context_scratch_no_memory', 'context_scratch_memory'],
                         help="Train only this variant, retaining the ordered common initialization.")
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
     add_future_arguments(parser)
     add_context_policy_arguments(parser)
     args = parser.parse_args(argv)
     allowed = {'no_intent_no_memory','intent_no_memory','no_intent_memory','intent_memory','plain_history',
-        'context_no_memory','context_memory','context_scratch_no_memory','context_scratch_memory'}
+        'context_history','context_no_memory','context_memory','context_scratch_no_memory','context_scratch_memory'}
     if any(v not in allowed for v in args.variants):
         parser.error('Unknown ablation variant')
     context_variants = [v for v in args.variants if v.startswith('context_')]
@@ -512,11 +512,11 @@ def parse_args(argv=None):
         parser.error("--num-workers must be nonnegative; prefetch and bucket multipliers must be positive")
     if args.segment_length < args.history_size + args.chunk_size:
         parser.error("Segment must contain both history and action chunk")
-    if "plain_history" in args.variants:
+    if any(name in args.variants for name in ("plain_history", "context_history")):
         if args.head_type != "diffusion":
-            parser.error("plain_history requires diffusion")
+            parser.error("History variants require diffusion")
         if args.temporal_sampling != "episode":
-            parser.error("plain_history requires episode sampling for causal start padding")
+            parser.error("History variants require episode sampling for causal start padding")
     if args.chunk_size < 4:
         parser.error("--chunk-size must be at least 4 for the generative U-Net")
     if args.head_d_model % 8:
@@ -711,17 +711,17 @@ def main(argv=None):
     shared_initialization = {}
     for name in args.variants:
         if name not in {"no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory", "plain_history",
-                        'context_no_memory','context_memory','context_scratch_no_memory','context_scratch_memory'}:
+                        'context_history','context_no_memory','context_memory','context_scratch_no_memory','context_scratch_memory'}:
             raise ValueError(name)
         intent = name.startswith("intent_")
         memory = name.endswith("_memory") and not name.endswith("no_memory")
-        full_history = name == "plain_history"
+        full_history = name in ("plain_history", "context_history")
         context = name.startswith('context_')
         scratch = name.startswith('context_scratch_')
         variant_history_size = args.plain_history_size if full_history else args.history_size
-        # Legacy multi-frame mean conditioning is not equivalent to the full-
-        # history sparse path; preserve its existing training behavior.
-        sparse_history = (full_history or (not intent and not context and not memory and variant_history_size == 1 and args.temporal_sampling == 'episode')) and args.plain_history_loader == "sparse"
+        # Context encoders must scan every real observation, including frames
+        # between supervised windows. Sparse history loading would skip them.
+        sparse_history = ((full_history and not context) or (not intent and not context and not memory and variant_history_size == 1 and args.temporal_sampling == 'episode')) and args.plain_history_loader == "sparse"
         variant_options = dict(loader_options, pin_memory=(args.pin_memory
             if args.pin_memory is not None else False))
         variant_train_data = SparseHistoryEpisodes(train_data, variant_history_size,

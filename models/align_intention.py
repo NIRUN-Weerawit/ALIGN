@@ -146,8 +146,8 @@ class ALIGNIntentionModel(nn.Module):
         self.intent_future_weight = intent_future_weight
         self.task_context = None
         if task_context_checkpoint or task_context_config:
-            if use_intent_tokens or use_text or intent_future_weight or head_type != 'diffusion' or head_history_mode != 'mean':
-                raise ValueError('Task context replaces legacy intent/text and requires the diffusion mean-condition head')
+            if use_intent_tokens or use_text or intent_future_weight or head_type != 'diffusion':
+                raise ValueError('Task context replaces legacy intent/text and requires the diffusion head')
             if memory_intent_query:
                 raise ValueError('Task-context memory currently retrieves visual/state evidence only')
             from models.task_context_policy import TaskContextPolicyBranch
@@ -207,7 +207,7 @@ class ALIGNIntentionModel(nn.Module):
             raise ValueError("Unknown action-head history mode")
         if head_history_mode == "full" and (head_type != "diffusion" or
                                             use_intent_tokens or use_memory_bank or history_size < 1):
-            raise ValueError("Full-history action conditioning requires plain diffusion and positive history_size")
+            raise ValueError("Full-history action conditioning requires diffusion without legacy intent/memory and positive history_size")
         self.head_history_mode = head_history_mode
         self.head_d_model = head_d_model
         self.head_nhead = head_nhead

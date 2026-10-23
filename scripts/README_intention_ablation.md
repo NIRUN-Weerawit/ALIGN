@@ -3,6 +3,11 @@
 Pretrained task-context policy variants are also available. See the
 [context-policy integration guide](../tools/README_task_context_policy.md) for
 the protected pretraining split, new ablation arms, and checkpoint/rollout path.
+`--variants context_no_memory context_history --plain-history-size 4` compares
+current-observation context conditioning against context tokens plus an ordered
+four-frame visual/state window at the action head. Supply the observer checkpoint
+and protected split manifest as described in that guide. The context encoder
+still observes the full causal episode; `context_history` adds no memory bank.
 
 `run_intention_ablation.py` trains these four models **in sequence**, finishing
 all epochs of each before starting the next:

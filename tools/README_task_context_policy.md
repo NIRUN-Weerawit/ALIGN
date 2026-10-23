@@ -62,9 +62,39 @@ Those limits are recorded; these are not full-dataset epochs.
 | `intent_no_memory` | Original intention encoder | Off |
 | `intent_memory` | Original intention encoder | On |
 | `context_no_memory` | Pretrained context | Off |
+| `context_history` | Pretrained context + ordered visual/state window at the action head | Off |
 | `context_memory` | Pretrained context | On |
 | `context_scratch_no_memory` | New context, action-only training from scratch | Off |
 | `context_scratch_memory` | New context, action-only training from scratch | On |
+
+`context_history` reuses the `plain_history` action-head attention over an ordered
+window of visual features and robot states. Set its length with
+`--plain-history-size` (default 4), keeping `--history-size 1` for the other
+context variants. The current task/execution tokens condition every history row;
+the decoder attends to the rows with learned temporal positions. At episode start,
+the first observation pads the head window. The context encoder still processes
+each real observation once across the complete causal episode, including frames
+between supervised anchors. This variant always uses the dense episode loader,
+even when `--plain-history-loader sparse` is selected for other arms. It adds no
+separate memory bank and keeps the observer frozen by default.
+
+To compare against the current-observation context policy:
+
+```bash
+python scripts/run_intention_ablation.py \
+  --data data/libero_goal.h5 --cache data/libero_goal.dinov2.external \
+  --output checkpoints/context_history_comparison \
+  --task-context-checkpoint checkpoints/task_context_student_20261020/observer_frozen.pt \
+  --task-context-split-manifest reports/task_context_teacher_20261020/targets/manifest.json \
+  --variants context_no_memory context_history --plain-history-size 4 \
+  --epochs 80 --batch-size 2 --micro-batch-size 1 --num-workers 0 \
+  --head-window-batch-size 8 --diffusion-loss-repeats 1 \
+  --gpu-memory-fraction 0.24
+```
+
+Saved checkpoints record the actual history length and support the existing
+trajectory evaluator without extra history flags. This is an available training
+variant; its effect on simulator success requires training and paired rollouts.
 
 Scratch controls share the frozen observation summary/normalization but initialize
 the causal backbone/readouts afresh. During trainable-context training, a
