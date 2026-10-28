@@ -4,6 +4,18 @@ Date: 2026-10-20. Status: opt-in integration implemented and verified on real
 cached training data and live RGB feature extraction. The bounded policy pilot
 is complete. Full action-policy training and closed-loop qualification remain.
 
+Update, 2026-10-21: the user has completed the 200-epoch `context_no_memory`
+policy run. An archived paired evaluation recorded 3/44 from autonomous start
+and 17/44 after a 40% expert prefix, including failed expert replays. The prefix
+result file has since been replaced with a different comparison episode set;
+see the provenance notice in
+[trained-policy results and reflection](task_context_policy_results_2026_10_21.md)
+before interpreting the current files together. The independent
+[task-token diagnostic](task_context_token_probe_2026_10_21.md) measures task
+information on the protected 44 development episodes.
+The pilot results below remain historical integration evidence, not the final
+trained-policy measurements or a matched demonstration of context benefit.
+
 ## Architecture and training path
 
 `ALIGNIntentionModel` can now instantiate the pretrained context branch in place
