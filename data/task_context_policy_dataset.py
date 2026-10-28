@@ -46,17 +46,20 @@ def add_context_policy_arguments(parser):
     parser.add_argument('--task-context-split-override', action='store_true',
         help='Allow a split manifest that is not hash-bound to the observer bundle (e.g. repointing to another '
              "family's train/val episodes). All other manifest checks still apply; the override is recorded in the checkpoint config.")
+    parser.add_argument('--num-task-tokens','--task-context-tokens',type=int,default=None,
+        help='Expected task-token count; inferred from observer when omitted. Requires matching pretraining.')
     parser.add_argument('--task-context-trainable', action='store_true', help='Fine-tune causal encoder with action loss; frozen summary is retained')
     parser.add_argument('--task-context-fusion', choices=('additive', 'gated_residual', 'film', 'cross_attention'),
-        default='additive', help='How task/execution tokens condition the diffusion action head')
+        default='additive', help='Context conditioning; aci selects alternating action-to-context/observation attention')
     parser.add_argument('--task-context-fusion-dim', type=int, default=128,
-        help='Hidden width for learned task-context fusion (positive, divisible by 4 for cross-attention)')
+        help='Hidden width for context fusion/ACI attention (divisible by 4 for attention modes)')
     parser.add_argument('--policy-warm-start', default=None, help='Copy shape-compatible common policy weights from an existing checkpoint; context weights remain from the observer')
 
 
 def context_policy_options(model):
     branch = getattr(model, 'task_context', None)
-    return dict(task_context_config=branch.config if branch is not None else None,
+    return dict(task_context_tokens=branch.config['encoder_config']['tokens'] if branch is not None else None,
+        task_context_config=branch.config if branch is not None else None,
         task_context_trainable=branch.trainable if branch is not None else False,
         task_context_initialization=branch.initialization if branch is not None else 'pretrained',
         task_context_fusion=getattr(model, 'task_context_fusion', 'additive'),

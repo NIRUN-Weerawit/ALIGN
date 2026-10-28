@@ -84,6 +84,8 @@ def main():
     p.add_argument('--anchors',type=int,default=4)
     p.add_argument('--seed',type=int,default=42)
     p.add_argument('--lr',type=float,default=1e-4)
+    p.add_argument('--num-task-tokens','--task-context-tokens',type=int,default=4,
+        help='Number of task-token slots in each whole-demonstration representation')
     p.add_argument('--width',type=int,default=256)
     p.add_argument('--diffusion-width',type=int,default=64)
     p.add_argument('--diffusion-weight',type=float,default=1.)
@@ -97,7 +99,7 @@ def main():
         help='Fixed-budget training with no validation or checkpoint selection; requires empty development split')
     p.add_argument('--allow-legacy-split',action='store_true',help='Explicitly reproduce a non-Piper historical Goal cache')
     args=p.parse_args()
-    if min(args.epochs,args.batch_size,args.anchors,args.width,args.evaluate_every)<=0 or args.diffusion_weight<0:
+    if min(args.epochs,args.batch_size,args.anchors,args.width,args.evaluate_every,args.num_task_tokens)<=0 or args.diffusion_weight<0:
         p.error('Invalid training configuration')
     output=Path(args.output)
     if output.exists():raise FileExistsError(f'Use a new run directory: {output}')
@@ -116,7 +118,7 @@ def main():
     development=None if args.final_refit else TaskContextEpisodes(args.targets,validation_partition(train.manifest['split']),anchors=3,seed=args.seed,verify=True)
     train_loader=make_loader(train,args.batch_size,True,args.seed)
     val_loader=None if args.final_refit else make_loader(development,args.batch_size)
-    model=TaskContextTeacher(cameras=len(train.manifest['cameras']),raw_dim=train.manifest['feature_shape'][-1],width=args.width,
+    model=TaskContextTeacher(tokens=args.num_task_tokens,cameras=len(train.manifest['cameras']),raw_dim=train.manifest['feature_shape'][-1],width=args.width,
         horizon=train.manifest['action_horizon'],procedure_points=train.manifest['procedure_points'],
         diffusion_width=args.diffusion_width,pooling=args.pooling,decoder_style=args.decoder_style).to(device)
     actions=np.concatenate([np.load(train.root/f'{key}.npz')['actions'] for key in train.keys])

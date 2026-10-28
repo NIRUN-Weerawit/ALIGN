@@ -44,6 +44,8 @@ class TaskContextTeacher(nn.Module):
                  layers=2, heads=4, horizon=8, procedure_points=8, diffusion_width=64,
                  pooling="learned", decoder_style="flat"):
         super().__init__()
+        if not isinstance(tokens,int) or isinstance(tokens,bool) or tokens < 1:
+            raise ValueError("Task-token count must be a positive integer")
         if pooling not in ('learned','quarters'):raise ValueError('Unknown temporal pooling')
         if decoder_style not in ('flat','temporal'):raise ValueError('Unknown target decoder')
         self.config = dict(cameras=cameras,raw_dim=raw_dim,width=width,tokens=tokens,token_dim=token_dim,

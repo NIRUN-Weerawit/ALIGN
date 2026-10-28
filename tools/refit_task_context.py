@@ -177,13 +177,14 @@ def main():
     parser.add_argument('--split-manifest', default=str(PIPER_SPLIT), help='Policy manifest specifying exact 384 train_episodes and 44 val_episodes (default: canonical Piper split)')
     parser.add_argument('--report-dir', required=True)
     parser.add_argument('--checkpoint-dir', required=True)
+    parser.add_argument('--num-task-tokens','--task-context-tokens',type=int,default=4)
     parser.add_argument('--teacher-epochs', type=int, default=80)
     parser.add_argument('--student-epochs', type=int, default=100)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', default='cuda')
     a = parser.parse_args()
-    if min(a.teacher_epochs, a.student_epochs) < 1:
-        parser.error('Epoch budgets must be positive')
+    if min(a.teacher_epochs, a.student_epochs, a.num_task_tokens) < 1:
+        parser.error('Epoch budgets and task-token count must be positive')
     report, checkpoints = Path(a.report_dir).resolve(), Path(a.checkpoint_dir).resolve()
     source_manifest = json.loads((Path(a.source_targets) / 'manifest.json').read_text())
     split_reference = None
@@ -215,7 +216,7 @@ def main():
     if split_reference:
         shutil.copyfile(a.split_manifest, report / 'policy_split_reference.json')
     write_json(protocol_path, dict(schema='align-task-context-fixed-refit-v1', seed=a.seed,
-        teacher_epochs=a.teacher_epochs, student_epochs=a.student_epochs,
+        teacher_epochs=a.teacher_epochs, student_epochs=a.student_epochs, num_task_tokens=a.num_task_tokens,
         train_episodes=384, development_episodes=0, heldout_episodes=44,
         teacher_updates=a.teacher_epochs * 48, student_updates=a.student_epochs * 48,
         checkpoint_selection='fixed_budget_final', initialize='from_scratch',
@@ -241,7 +242,7 @@ def main():
         teacher_run, student_run = checkpoints / 'teacher', checkpoints / 'student'
         run('train_teacher', ['training/train_task_context_teacher.py', '--targets', str(targets),
             '--output', str(teacher_run), '--epochs', str(a.teacher_epochs), '--seed', str(a.seed),
-            '--mode', 'full', '--pooling', 'quarters', '--decoder-style', 'temporal',
+            '--num-task-tokens', str(a.num_task_tokens), '--mode', 'full', '--pooling', 'quarters', '--decoder-style', 'temporal',
             '--final-refit', '--device', a.device])
         teacher = checkpoints / 'teacher_frozen.pt'
         shutil.copyfile(teacher_run / 'teacher_final.pt', teacher)

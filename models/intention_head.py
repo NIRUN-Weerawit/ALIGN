@@ -618,9 +618,9 @@ class DiffusionPolicyHead(nn.Module):
         """
         if self.history_size > 1:
             if intent_emb is not None:
-                raise ValueError("Full-history diffusion currently supports plain models only")
+                raise ValueError("Full-history conditioning does not accept legacy intent tokens")
             if z_v_pooled_window.shape[1] != self.history_size or z_s_window.shape[1] != self.history_size:
-                raise ValueError("Full-history diffusion requires every visual and state step")
+                raise ValueError("Full-history conditioning requires every visual and state step")
             return torch.cat((z_v_pooled_window, z_s_window), dim=-1)
 
         parts = []
@@ -774,7 +774,7 @@ class FlowMatchingPolicyHead(nn.Module):
     continuous action trajectory. The network predicts the velocity field
     v(x_t, t) of a linear ODE that transports noise (t=1) to data (t=0).
 
-    Loss: MSE between predicted velocity and true velocity (target - noise).
+    Loss: MSE between predicted velocity and true velocity (noise - target).
     Sampling: Euler ODE integration with optional Heun correction.
 
     Args:
@@ -785,7 +785,10 @@ class FlowMatchingPolicyHead(nn.Module):
         time_dim:          sinusoidal time embedding dim (default 64)
         chunk_size:        K — number of future actions per chunk
         solver:            "euler" or "heun" ODE solver (default "euler")
-        sigma_min:         minimum noise level for v-prediction (default 0.0)
+        sigma_min:         residual noise at the data endpoint (default 0.0)
+        loss_repeats:      independent time/noise draws per action chunk
+        clip_denoised:     clip terminal actions to their normalized bounds
+        history_size:      ordered observation window (1 uses mean conditioning)
 
     Note: Reuses the same 1D U-Net architecture as DiffusionPolicyHead. The
     difference is only the training target (velocity vs. noise) and the
@@ -794,10 +797,21 @@ class FlowMatchingPolicyHead(nn.Module):
     def __init__(self, cond_dim: int = 768, action_dim: int = 7,
                  hidden_dim: int = 128, num_inference_steps: int = 10,
                  time_dim: int = 64, chunk_size: int = 10,
-                 solver: str = "euler", sigma_min: float = 0.0):
+                 solver: str = "euler", sigma_min: float = 0.0,
+                 loss_repeats: int = 1, clip_denoised: bool = False,
+                 history_size: int = 1):
         super().__init__()
         if solver not in ("euler", "heun"):
             raise ValueError(f"solver must be 'euler' or 'heun' (got {solver!r})")
+        for name, value in (("num_inference_steps", num_inference_steps),
+                            ("loss_repeats", loss_repeats), ("history_size", history_size)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if not math.isfinite(sigma_min) or not 0 <= sigma_min < 1:
+            raise ValueError("sigma_min must be finite and in [0, 1)")
+        self.loss_repeats = loss_repeats
+        self.clip_denoised = clip_denoised
+        self.history_size = history_size
         self.action_dim = action_dim
         self.num_inference_steps = num_inference_steps
         self.time_dim = time_dim
@@ -822,40 +836,12 @@ class FlowMatchingPolicyHead(nn.Module):
             cond_dim=cond_dim,
             time_dim=time_dim,
             hidden_dim=hidden_dim,
+            history_size=history_size,
         )
 
-    def _build_per_step_cond(self, z_v_pooled_window: torch.Tensor,
-                              z_s_window: torch.Tensor,
-                              intent_emb: torch.Tensor = None) -> torch.Tensor:
-        """Build per-step condition (B, 1, cond_dim). Same as DiffusionPolicyHead."""
-        parts = []
-
-        if z_v_pooled_window is not None:
-            z_v_pooled_mean = z_v_pooled_window.mean(dim=1, keepdim=True)  # (B, 1, pool_out_dim)
-            parts.append(z_v_pooled_mean)
-
-        if z_s_window is not None:
-            z_s_last = z_s_window[:, -1:, :]  # (B, 1, state_dim)
-            parts.append(z_s_last)
-
-        if intent_emb is not None:
-            if intent_emb.ndim == 3:
-                intent_stacked = intent_emb.reshape(intent_emb.shape[0], -1)
-            else:
-                intent_stacked = intent_emb
-            intent_pooled = intent_stacked.unsqueeze(1)  # (B, 1, intent_dim * N)
-            parts.append(intent_pooled)
-
-        cond = torch.cat(parts, dim=-1)  # (B, 1, cond_dim)
-        return cond
-
-    def forward(self, z_v_pooled_window: torch.Tensor,
-                z_s_window: torch.Tensor,
-                intent_emb: torch.Tensor = None) -> torch.Tensor:
-        """Build per-step condition. Returns cond for loss/sample."""
-        return self._build_per_step_cond(
-            z_v_pooled_window, z_s_window, intent_emb,
-        )
+    # Keep observation ordering and legacy intent flattening identical to DDPM.
+    _build_per_step_cond = DiffusionPolicyHead._build_per_step_cond
+    forward = DiffusionPolicyHead.forward
 
     def predict_velocity(self, x_t: torch.Tensor, t: torch.Tensor,
                           cond: torch.Tensor, visual_context=None, visual_kv=None) -> torch.Tensor:
@@ -880,8 +866,8 @@ class FlowMatchingPolicyHead(nn.Module):
         For each sample:
           - Sample t ~ Uniform[0, 1].
           - Sample noise eps ~ N(0, I).
-          - Interpolated point: x_t = (1 - t) * actions_target + t * eps.
-          - Target velocity: v_target = eps - actions_target.
+          - Interpolated point: x_t = (1 - t) * actions_target + (sigma_min + (1 - sigma_min) * t) * eps.
+          - Target velocity: v_target = (1 - sigma_min) * eps - actions_target.
           - Predicted velocity: v_pred = predict_velocity(x_t, t, cond).
           - Loss = MSE(v_pred, v_target).
 
@@ -894,25 +880,31 @@ class FlowMatchingPolicyHead(nn.Module):
             dim_weights: (action_dim,) optional per-dimension loss weights.
         """
         actions_target, cond = _valid_loss_samples(actions_target, cond, sample_mask)
-        if visual_context is not None and sample_mask is not None:
-            visual_context = visual_context[sample_mask.to(device=visual_context.device,dtype=torch.bool)]
-        B, K, D = actions_target.shape
+        visual_kwargs = {}
+        if visual_context is not None:
+            if sample_mask is not None:
+                visual_context = visual_context[sample_mask.to(device=visual_context.device, dtype=torch.bool)]
+            # Project once; every independent noise draw still trains this path.
+            visual_kwargs = {'visual_kv': tuple(value.repeat(self.loss_repeats, 1, 1, 1)
+                for value in self.unet.prepare_visual_context(visual_context))}
+        actions_target = actions_target.repeat(self.loss_repeats, 1, 1)
+        cond = cond.repeat(self.loss_repeats, 1, 1)
+        B = actions_target.shape[0]
         device = actions_target.device
 
         # Sample t in (0, 1) per sample (continuous-time formulation).
-        # Use uniform [0, 1] with anti-aliased epsilon to avoid t=0 and t=1 exactly.
+        # Avoid both endpoints during training, preserving the original time grid.
         t = torch.rand(B, device=device, dtype=torch.float32) * (1 - 1e-3) + 5e-4
         # Broadcast to (B, 1, 1) for per-step multiplication.
         t_b = t[:, None, None]
 
         noise = torch.randn_like(actions_target, dtype=torch.float32)
-        # Linear interpolant: x_t = (1 - t) * data + t * noise.
-        x_t = (1.0 - t_b) * actions_target.float() + t_b * noise
-        # True velocity: derivative w.r.t. t is (noise - data).
-        v_target = noise - actions_target.float()
+        # Noise at t=1, data plus optional residual noise at t=0.
+        x_t = (1.0 - t_b) * actions_target.float() + (self.sigma_min + (1.0 - self.sigma_min) * t_b) * noise
+        # Derivative of the interpolant with respect to increasing t.
+        v_target = (1.0 - self.sigma_min) * noise - actions_target.float()
 
-        v_pred = self.predict_velocity(x_t, t, cond,
-            **({'visual_context':visual_context} if visual_context is not None else {}))
+        v_pred = self.predict_velocity(x_t, t, cond, **visual_kwargs)
         err = (v_pred.float() - v_target) ** 2  # (B, K, D)
         if dim_weights is not None:
             err = err * dim_weights.unsqueeze(0).unsqueeze(0)
@@ -929,15 +921,18 @@ class FlowMatchingPolicyHead(nn.Module):
         """
         if num_steps is None:
             num_steps = self.num_inference_steps
+        if not isinstance(num_steps, int) or isinstance(num_steps, bool) or num_steps < 1:
+            raise ValueError("num_steps must be a positive integer")
         B, K, D = cond.shape[0], self.chunk_size, self.action_dim
         device = cond.device
 
         # Start from noise (t = 1).
-        x = torch.randn(B, K, D, device=device)
+        x = torch.randn(B, K, D, device=device, dtype=torch.float32)
         # Timesteps from t=1 down to t=0, uniformly spaced (inclusive endpoints).
         timesteps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
-        visual_kwargs = ({'visual_kv':self.unet.prepare_visual_context(visual_context)}
-                         if visual_context is not None else {})
+        with torch.autocast(device_type=device.type, enabled=False):
+            visual_kwargs = ({'visual_kv': self.unet.prepare_visual_context(visual_context.float())}
+                             if visual_context is not None else {})
 
         for i in range(num_steps):
             t_cur = timesteps[i]
@@ -945,7 +940,8 @@ class FlowMatchingPolicyHead(nn.Module):
             dt = t_next - t_cur  # negative (we go from t=1 to t=0)
 
             t_cur_batch = t_cur.expand(B)
-            v_cur = self.predict_velocity(x, t_cur_batch, cond,**visual_kwargs)
+            with torch.autocast(device_type=device.type, enabled=False):
+                v_cur = self.predict_velocity(x, t_cur_batch, cond.float(), **visual_kwargs).float()
 
             if self.solver == "euler":
                 # x_{t+dt} = x_t + v * dt
@@ -955,9 +951,15 @@ class FlowMatchingPolicyHead(nn.Module):
                 x_euler = x + v_cur * dt
                 # Corrector: re-evaluate velocity at predicted point, average.
                 t_next_batch = t_next.expand(B)
-                v_next = self.predict_velocity(x_euler, t_next_batch, cond,**visual_kwargs)
+                with torch.autocast(device_type=device.type, enabled=False):
+                    v_next = self.predict_velocity(x_euler, t_next_batch, cond.float(), **visual_kwargs).float()
                 x = x + 0.5 * (v_cur + v_next) * dt
 
+        if self.clip_denoised:
+            # Clip only the terminal action; intermediate ODE states include noise.
+            x = x.clamp(-1., 1.)
+            if self.action_dim >= 7:
+                x[..., 6] = x[..., 6].clamp(0., 1.)
         return x
 
 

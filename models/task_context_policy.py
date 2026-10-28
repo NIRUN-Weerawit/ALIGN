@@ -1,4 +1,4 @@
-"""Opt-in causal context conditioning for ALIGN's existing diffusion policy."""
+"""Opt-in causal context conditioning for ALIGN's generative action policies."""
 from dataclasses import dataclass
 
 import torch
@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 from models.task_context_observer import TaskContextObserver, load_observer_bundle
 from models.task_context_encoder import TaskContextEncoder
-from models.intention_head import DiffusionPolicyHead
+from models.intention_head import DiffusionPolicyHead, FlowMatchingPolicyHead
 
 
 def rotation_columns(rotvec):
@@ -112,9 +112,9 @@ class TaskContextPolicyBranch(nn.Module):
         encoder = self.observer.encoder
         # Read at every real time. Padding readout indices are clamped and then
         # excluded by the production action-anchor mask; no future is consulted.
-        anchors = torch.arange(state.shape[1], device=state.device)[None].expand(len(state), -1)
+        anchors = torch.arange(summaries.shape[1], device=summaries.device)[None].expand(len(summaries), -1)
         anchors = torch.minimum(anchors, lengths[:, None] - 1)
-        with torch.set_grad_enabled(self.training and self.trainable), torch.autocast(device_type=state.device.type, enabled=False):
+        with torch.set_grad_enabled(self.training and self.trainable), torch.autocast(device_type=summaries.device.type, enabled=False):
             out = encoder(summaries, lengths, anchors)
             task = out['tokens']
             if self.training and self.trainable:
@@ -147,7 +147,7 @@ class TaskContextPolicyBranch(nn.Module):
         cache.task_snapshot = cache.last_task.detach().clone()
 
 
-class ContextDiffusionPolicyHead(DiffusionPolicyHead):
+class ContextPolicyConditioning:
     """Live condition plus task/execution residuals and optional learned interaction.
 
     The default preserves the original parameter names and computation. Optional
@@ -230,3 +230,11 @@ class ContextDiffusionPolicyHead(DiffusionPolicyHead):
     def _build_per_step_cond(self, visual, states, intent_emb=None):
         current, task, execution = self.conditioning_components(visual, states, intent_emb)
         return current + task + execution
+
+
+class ContextDiffusionPolicyHead(ContextPolicyConditioning, DiffusionPolicyHead):
+    """DDPM action decoder with shared task/execution-token conditioning."""
+
+
+class ContextFlowMatchingPolicyHead(ContextPolicyConditioning, FlowMatchingPolicyHead):
+    """Flow action decoder with the same task/execution-token conditioning."""

@@ -54,7 +54,7 @@ def main():
         exported[split]=dict(episodes=len(keys),sha256=file_hash(path))
     manifest=dict(schema='align-privileged-task-tokens-v1',teacher_sha256=digest,
         target_manifest_sha256=report['manifest_sha256'],gate_report_sha256=file_hash(args.gate_report),
-        teacher_epoch=checkpoint['epoch'],shape=[4,128],splits=exported,
+        teacher_epoch=checkpoint['epoch'],shape=[model.config["tokens"],model.config["token_dim"]],splits=exported,
         contract='Whole-episode privileged supervision only. Not a causal deployment input; preserve split boundaries.')
     (output/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     print(json.dumps(manifest,indent=2),flush=True)

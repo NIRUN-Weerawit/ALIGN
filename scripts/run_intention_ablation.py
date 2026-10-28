@@ -28,6 +28,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from data.align_dataset import ALIGNDataset
+from models.flow_policy_config import (add_flow_policy_arguments, flow_policy_options,
+    validate_flow_policy_arguments, LEGACY_FLOW_DEFAULTS)
 from models.align_intention import ALIGNIntentionModel
 from models.intention_future import add_future_arguments, validate_future_arguments, freeze_intent_backbone
 from training.checkpoint_io import CheckpointWriter, cpu_snapshot
@@ -64,7 +66,7 @@ def source_provenance(root=ROOT):
     if snapshot.exists():
         return json.loads(snapshot.read_text())
     import hashlib
-    names = ['models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
+    names = ['models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
         'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
         'data/task_context_policy_dataset.py','training/train_intention.py','scripts/run_intention_ablation.py']
@@ -319,6 +321,7 @@ def evaluate_existing(out):
             num_cameras=len(cameras), compressed_dim=config["compressed_dim"], head_type=config["head_type"],
             head_history_mode=config.get("head_history_mode", "mean"),
             task_context_config=config.get('task_context_config'),
+            task_context_tokens=config.get('task_context_tokens',config.get('num_task_tokens')),
             task_context_trainable=config.get('task_context_trainable',False),
             task_context_initialization=config.get('task_context_initialization','pretrained'),
             task_context_fusion=config.get('task_context_fusion','additive'),
@@ -326,6 +329,7 @@ def evaluate_existing(out):
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
             use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
             text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
+            text_model_name=config.get("text_model_name","distilbert/distilbert-base-uncased"),text_model_revision=config.get("text_model_revision","main"),text_max_length=config.get("text_max_length",128),
             intent_future_weight=config.get('intent_future_weight',0.),
             intent_future_horizons=config.get('intent_future_horizons',[16,64]),
             intent_future_hidden_dim=config.get('intent_future_hidden_dim',256),
@@ -335,6 +339,7 @@ def evaluate_existing(out):
             use_memory_bank=config["use_memory_bank"], memory_bank_len=config["memory_bank_len"],
             memory_mode=config.get("memory_mode","legacy"),memory_detach_writes=config.get("memory_detach_writes",False),
             memory_perceptual_recency=config.get("memory_perceptual_recency",0.),memory_field_masks=config.get("memory_field_masks",False),memory_pre_state_visual=config.get("memory_pre_state_visual",False),memory_value_preserving=config.get("memory_value_preserving",False),memory_patch_temporal=config.get("memory_patch_temporal",False),memory_context_only=config.get("memory_context_only",False),memory_write_fused=config.get("memory_write_fused",True),memory_patch_retrieval=config.get("memory_patch_retrieval",False),
+            **flow_policy_options(config),
             diffusion_train_steps=config.get("diffusion_train_steps",10),diffusion_loss_repeats=config.get("diffusion_loss_repeats",1),
             visual_context_mode=config.get("visual_context_mode","none"),
             memory_retrieval_depth=config.get("memory_retrieval_depth",1),memory_intent_query=config.get("memory_intent_query",False),
@@ -409,6 +414,7 @@ def parse_args(argv=None):
     parser.add_argument("--visual-context-mode",choices=["none","multiscale"],default="none",help="Explicit patch tokens at three action U-Net scales; enables patch memory when used")
     parser.add_argument("--memory-retrieval-depth",type=int,default=2,help="Sequential reads of the same past bank (legacy checkpoints use 1)")
     parser.add_argument("--memory-intent-query",action=argparse.BooleanOptionalAction,default=False,help="Use inferred intention to guide visual retrieval; no-intent variants retain visual-only queries")
+    add_flow_policy_arguments(parser)
     parser.add_argument("--diffusion-clip-sample",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--diffusion-train-steps",type=int,default=100)
     parser.add_argument("--diffusion-loss-repeats",type=int,default=4)
@@ -471,7 +477,7 @@ def parse_args(argv=None):
     parser.add_argument("--cpu-threads", type=int, default=2)
     parser.add_argument("--history-size", type=int, default=1)
     parser.add_argument("--plain-history-size", type=int, default=4,
-                        help="Ordered visual/state window for the plain_history and context_history diffusion variants")
+                        help="Ordered visual/state window for the plain_history and context_history generative variants")
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--segment-length", type=int, default=20)
     parser.add_argument("--variants", nargs="+", default=["no_intent_no_memory", "intent_no_memory", "no_intent_memory", "intent_memory"])
@@ -482,8 +488,14 @@ def parse_args(argv=None):
     add_context_policy_arguments(parser)
     from models.vision_config import add_vision_arguments, feature_width
     add_vision_arguments(parser)
+    from models.task_text_encoder import add_task_text_arguments
+    add_task_text_arguments(parser)
     args = parser.parse_args(argv)
     args.raw_dim = feature_width(args.vision_backbone,args.raw_dim)
+    try:validate_flow_policy_arguments(args)
+    except ValueError as error:parser.error(str(error))
+    if args.num_task_tokens is not None and (args.num_task_tokens<1 or not args.task_context_checkpoint):
+        parser.error("--num-task-tokens must be positive and requires --task-context-checkpoint")
     from data.training_split import resolve_context_manifest
     try:resolve_context_manifest(args)
     except ValueError as error:parser.error(str(error))
@@ -494,15 +506,15 @@ def parse_args(argv=None):
     context_variants = [v for v in args.variants if v.startswith('context_')]
     if args.task_context_fusion != 'additive' and not context_variants:
         parser.error('Non-additive task-context fusion requires a context variant')
-    if args.task_context_fusion_dim < 1 or (args.task_context_fusion == 'cross_attention' and args.task_context_fusion_dim % 4):
+    if args.task_context_fusion_dim < 1 or (args.task_context_fusion in ('cross_attention') and args.task_context_fusion_dim % 4):
         parser.error('Task-context fusion width must be positive and divisible by 4 for cross-attention')
     if args.policy_warm_start and args.warm_start:
         parser.error('Choose shared --policy-warm-start or per-variant --warm-start')
     if context_variants:
         if not args.task_context_checkpoint or not args.task_context_split_manifest:
             parser.error('Context variants require --task-context-checkpoint and --task-context-split-manifest')
-        if args.temporal_sampling != 'episode' or args.history_size != 1 or args.head_type != 'diffusion' or args.use_task_text or args.memory_intent_query or args.intent_future_weight:
-            parser.error('Context variants require full episodes, history size 1, diffusion, no task text/legacy future loss/cognitive memory query')
+        if args.temporal_sampling != 'episode' or args.history_size != 1 or args.head_type not in ('diffusion', 'flow_matching') or args.use_task_text or args.memory_intent_query or args.intent_future_weight:
+            parser.error('Context variants require full episodes, history size 1, diffusion/flow matching, no task text/legacy future loss/cognitive memory query')
         if args.gripper_state_source != 'causal':
             parser.error('Context variants require causal gripper state')
     try:validate_future_arguments(args)
@@ -530,8 +542,8 @@ def parse_args(argv=None):
     if args.segment_length < args.history_size + args.chunk_size:
         parser.error("Segment must contain both history and action chunk")
     if any(name in args.variants for name in ("plain_history", "context_history")):
-        if args.head_type != "diffusion":
-            parser.error("History variants require diffusion")
+        if args.head_type not in ("diffusion", "flow_matching"):
+            parser.error("History variants require diffusion or flow matching")
         if args.temporal_sampling != "episode":
             parser.error("History variants require episode sampling for causal start padding")
     if args.chunk_size < 4:
@@ -640,7 +652,7 @@ def main(argv=None):
             raise ValueError('The longest future horizon has no eligible training episode')
     text_vocab = (sorted({word for ep in train_eps for word in
                           re.findall(r"[a-z0-9]+", dataset._read_text(ep).lower())})
-                  if args.use_task_text else [])
+                  if args.use_task_text and args.text_encoder_type == "bag" else [])
     if len(train_eps) < args.batch_size:
         raise ValueError("Batch size exceeds the training episode count")
     if any(dataset._get_episode_length(ep) < args.history_size + args.chunk_size for ep in train_eps + val_eps):
@@ -652,7 +664,7 @@ def main(argv=None):
         train_episodes=[dataset._episode_keys[ep] for ep in train_eps],
         val_episodes=[dataset._episode_keys[ep] for ep in val_eps],
         num_cameras=len(args.cameras), pool_out_dim=pool_out_dim, frozen_cached_vision=True,
-        use_text=args.use_task_text, text_encoder_type="bag" if args.use_task_text else "clip",
+        use_text=args.use_task_text, text_encoder_type=args.text_encoder_type if args.use_task_text else "clip",
         text_vocab=text_vocab,
         intention_recurrence="causal observation state across each segment")
     manifest['task_context_split'] = split_record
@@ -673,9 +685,10 @@ def main(argv=None):
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
                                use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
                                length_bucket_multiplier=20)
-        legacy_defaults.update(vision_backbone="dinov2_vitb14",raw_dim=768,intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False,
+        legacy_defaults.update(LEGACY_FLOW_DEFAULTS)
+        legacy_defaults.update(text_encoder_type="bag" if previous.get("use_task_text",False) else "clip",text_model_name="distilbert/distilbert-base-uncased",text_model_revision="main",text_max_length=128,vision_backbone="dinov2_vitb14",raw_dim=768,intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False,
                                task_context_fusion='additive',task_context_fusion_dim=128)
-        for key in ("vision_backbone","raw_dim","intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
+        for key in (*LEGACY_FLOW_DEFAULTS, "text_encoder_type","text_model_name","text_model_revision","text_max_length","vision_backbone","raw_dim","intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
                     "gripper_state_source", "gripper_transition_fraction", "max_steps", "max_val_batches", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
@@ -684,6 +697,8 @@ def main(argv=None):
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
                     "visual_context_mode","memory_retrieval_depth","memory_intent_query","memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
+            if key in LEGACY_FLOW_DEFAULTS and args.head_type != "flow_matching":
+                continue
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
         for key in ('task_context_checkpoint','task_context_split_manifest','task_context_trainable',
@@ -769,15 +784,18 @@ def main(argv=None):
             use_memory_bank=memory, memory_bank_len=args.memory_bank_len,
             memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
             memory_perceptual_recency=args.memory_perceptual_recency,memory_field_masks=args.memory_field_masks,memory_pre_state_visual=args.memory_pre_state_visual,memory_value_preserving=args.memory_value_preserving,memory_patch_temporal=args.memory_patch_temporal,memory_context_only=args.memory_context_only,memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
+            **flow_policy_options(vars(args)),
             diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
             visual_context_mode=getattr(args,"visual_context_mode","none"),
             memory_retrieval_depth=getattr(args,"memory_retrieval_depth",1),memory_intent_query=getattr(args,"memory_intent_query",False),
             visual_token_attention=args.visual_token_attention,diffusion_clip_sample=args.diffusion_clip_sample,
             use_text=args.use_task_text,text_dim=args.text_dim,
-            text_encoder_type="bag" if args.use_task_text else "clip",text_vocab=text_vocab,
+            text_model_name=args.text_model_name,text_model_revision=args.text_model_revision,text_max_length=args.text_max_length,
+            text_encoder_type=args.text_encoder_type if args.use_task_text else "clip",text_vocab=text_vocab,
             intent_future_weight=args.intent_future_weight,intent_future_horizons=args.intent_future_horizons,
             intent_future_hidden_dim=args.intent_future_hidden_dim,
             task_context_checkpoint=args.task_context_checkpoint if context else None,
+            task_context_tokens=args.num_task_tokens if context else None,
             task_context_trainable=args.task_context_trainable,
             task_context_initialization='scratch' if scratch else 'pretrained',
             task_context_fusion=args.task_context_fusion if context else 'additive',

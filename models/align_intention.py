@@ -87,6 +87,9 @@ class ALIGNIntentionModel(nn.Module):
         text_dim: int = 256,
         text_encoder_type: str = "clip",
         text_vocab: Optional[List[str]] = None,
+        text_model_name: str = "distilbert/distilbert-base-uncased",
+        text_model_revision: str = "main",
+        text_max_length: int = 128,
         compressed_dim: int = 16,
         raw_dim: int = None,
         vision_backbone: str = "dinov2_vitb14",
@@ -106,6 +109,11 @@ class ALIGNIntentionModel(nn.Module):
         memory_pre_state_visual: bool = False,
         memory_field_masks: bool = False,
         memory_perceptual_recency: float = 0.,
+        flow_inference_steps: int = 10,
+        flow_solver: str = "euler",
+        flow_loss_repeats: int = 1,
+        flow_clip_sample: bool = False,
+        flow_sigma_min: float = 0.0,
         diffusion_train_steps: int = 100,
         diffusion_loss_repeats: int = 4,
         visual_token_attention: bool = False,
@@ -117,6 +125,7 @@ class ALIGNIntentionModel(nn.Module):
         intent_future_horizons=(16,64),
         intent_future_hidden_dim: int = 256,
         task_context_checkpoint: str = None,
+        task_context_tokens: int = None,
         task_context_config: dict = None,
         task_context_trainable: bool = False,
         task_context_initialization: str = "pretrained",
@@ -154,16 +163,21 @@ class ALIGNIntentionModel(nn.Module):
             raise ValueError('Unknown task context fusion mode')
         if not isinstance(task_context_fusion_dim, int) or isinstance(task_context_fusion_dim, bool) or task_context_fusion_dim < 1:
             raise ValueError('Task context fusion width must be a positive integer')
-        if task_context_fusion == 'cross_attention' and task_context_fusion_dim % 4:
+        if task_context_fusion in ('cross_attention') and task_context_fusion_dim % 4:
             raise ValueError('Cross-attention task context fusion width must be divisible by 4')
         if task_context_fusion != 'additive' and not (task_context_checkpoint or task_context_config):
             raise ValueError('Task context fusion requires a task context checkpoint or config')
+        if task_context_tokens is not None:
+            if not isinstance(task_context_tokens,int) or isinstance(task_context_tokens,bool) or task_context_tokens<1:
+                raise ValueError("Task-token count must be a positive integer")
+            if not (task_context_checkpoint or task_context_config):
+                raise ValueError("Task-token count requires a task-context observer")
         self.task_context_fusion = task_context_fusion
         self.task_context_fusion_dim = task_context_fusion_dim
         self.task_context = None
         if task_context_checkpoint or task_context_config:
-            if use_intent_tokens or use_text or intent_future_weight or head_type != 'diffusion':
-                raise ValueError('Task context replaces legacy intent/text and requires the diffusion head')
+            if use_intent_tokens or use_text or intent_future_weight or head_type not in ('diffusion', 'flow_matching'):
+                raise ValueError('Task context replaces legacy intent/text and requires a diffusion or flow-matching head')
             if memory_intent_query:
                 raise ValueError('Task-context memory currently retrieves visual/state evidence only')
             from models.task_context_policy import TaskContextPolicyBranch
@@ -171,6 +185,9 @@ class ALIGNIntentionModel(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 self.task_context = TaskContextPolicyBranch(task_context_checkpoint, task_context_config,
                     task_context_trainable, task_context_initialization)
+            actual_tokens=self.task_context.config['encoder_config']['tokens']
+            if task_context_tokens is not None and actual_tokens != task_context_tokens:
+                raise ValueError(f'Requested {task_context_tokens} task tokens but observer has {actual_tokens}; pretrain a matching teacher/student')
             cfg = self.task_context.config['summary_config']
             if cfg['cameras'] != num_cameras or cfg['raw_dim'] != raw_dim:
                 raise ValueError('Pretrained context camera count or DINO width differs')
@@ -214,6 +231,11 @@ class ALIGNIntentionModel(nn.Module):
         self.memory_perceptual_recency = memory_perceptual_recency
         self.memory_field_masks = memory_field_masks
         self.memory_pre_state_visual = memory_pre_state_visual
+        self.flow_inference_steps = flow_inference_steps
+        self.flow_solver = flow_solver
+        self.flow_loss_repeats = flow_loss_repeats
+        self.flow_clip_sample = flow_clip_sample
+        self.flow_sigma_min = flow_sigma_min
         self.diffusion_train_steps = diffusion_train_steps
         self.diffusion_loss_repeats = diffusion_loss_repeats
         self.visual_token_attention = visual_token_attention
@@ -221,9 +243,9 @@ class ALIGNIntentionModel(nn.Module):
         self.head_type = head_type
         if head_history_mode not in ("mean", "full"):
             raise ValueError("Unknown action-head history mode")
-        if head_history_mode == "full" and (head_type != "diffusion" or
+        if head_history_mode == "full" and (head_type not in ("diffusion", "flow_matching") or
                                             use_intent_tokens or use_memory_bank or history_size < 1):
-            raise ValueError("Full-history action conditioning requires diffusion without legacy intent/memory and positive history_size")
+            raise ValueError("Full-history action conditioning requires diffusion/flow matching without legacy intent/memory and positive history_size")
         self.head_history_mode = head_history_mode
         self.head_d_model = head_d_model
         self.head_nhead = head_nhead
@@ -286,6 +308,11 @@ class ALIGNIntentionModel(nn.Module):
             if head_type not in ("diffusion", "flow_matching"):
                 raise ValueError("Bag task text currently supports generative action heads")
             self.text_encoder = TaskWordEncoder(text_vocab, text_dim)
+        elif use_text and text_encoder_type == "distilbert":
+            from models.task_text_encoder import DistilBertTaskEncoder
+            if head_type not in ("diffusion", "flow_matching"):
+                raise ValueError("DistilBERT text requires a generative action head")
+            self.text_encoder = DistilBertTaskEncoder(text_dim,text_model_name,text_max_length,text_model_revision)
         elif use_text and text_encoder_type == "clip":
             from models.align_model import TextEncoder
             self.text_encoder = TextEncoder(embed_dim=text_dim)
@@ -358,45 +385,37 @@ class ALIGNIntentionModel(nn.Module):
                 mamba_expand=self.mamba_expand,
                 use_intent=self.use_intent_tokens,
             )
-        elif self.head_type == "diffusion":
+        elif self.head_type in ("diffusion", "flow_matching"):
             cond_dim = pool_out_dim + self.state_dim + (self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0)
+            head_class = DiffusionPolicyHead if self.head_type == "diffusion" else FlowMatchingPolicyHead
+            context_options = {}
             if self.task_context is not None:
-                from models.task_context_policy import ContextDiffusionPolicyHead
-                head_class = ContextDiffusionPolicyHead
+                from models.task_context_policy import ContextDiffusionPolicyHead, ContextFlowMatchingPolicyHead
+                head_class = ContextDiffusionPolicyHead if self.head_type == "diffusion" else ContextFlowMatchingPolicyHead
                 context_options = dict(context_tokens=self.task_context.config['encoder_config']['tokens'],
                     context_dim=self.task_context.config['encoder_config']['token_dim'],
                     context_fusion=self.task_context_fusion,
                     context_fusion_dim=self.task_context_fusion_dim)
-            else:
-                head_class, context_options = DiffusionPolicyHead, {}
+            objective_options = (dict(num_inference_steps=10,
+                num_train_timesteps=self.diffusion_train_steps,
+                loss_repeats=self.diffusion_loss_repeats,
+                clip_denoised=self.diffusion_clip_sample) if self.head_type == "diffusion" else
+                dict(num_inference_steps=self.flow_inference_steps, solver=self.flow_solver,
+                     loss_repeats=self.flow_loss_repeats, clip_denoised=self.flow_clip_sample,
+                     sigma_min=self.flow_sigma_min))
             self.intention_head = head_class(
                 cond_dim=cond_dim,
                 action_dim=self.action_dim,
                 hidden_dim=self.head_d_model,
-                num_inference_steps=10,
-                num_train_timesteps=self.diffusion_train_steps,
-                loss_repeats=self.diffusion_loss_repeats,
-                clip_denoised=self.diffusion_clip_sample,
                 time_dim=64,
                 chunk_size=self.chunk_size,
                 history_size=self.history_size if self.head_history_mode == "full" else 1,
-                **context_options,
-            )
-        elif self.head_type == "flow_matching":
-            cond_dim = pool_out_dim + self.state_dim + (self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0)
-            self.intention_head = FlowMatchingPolicyHead(
-                cond_dim=cond_dim,
-                action_dim=self.action_dim,
-                hidden_dim=self.head_d_model,
-                num_inference_steps=10,
-                time_dim=64,
-                chunk_size=self.chunk_size,
-                solver="euler",
+                **context_options, **objective_options,
             )
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
 
-        if self.use_text and self.text_encoder_type == "bag":
+        if self.use_text and self.text_encoder_type in ("bag", "distilbert"):
             self.text_condition = nn.Linear(self.text_dim, cond_dim, bias=False).to(device)
             nn.init.zeros_(self.text_condition.weight)
 
@@ -864,3 +883,5 @@ class ALIGNIntentionModel(nn.Module):
     def unfreeze_all(self):
         for p in self.parameters():
             p.requires_grad = True
+        if self.text_encoder_type == "distilbert" and self.text_encoder is not None:
+            self.text_encoder.backbone.requires_grad_(False)

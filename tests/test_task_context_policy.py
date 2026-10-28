@@ -40,12 +40,12 @@ def bundle(tmp_path):
     return path
 
 
-def make_model(monkeypatch, bundle, memory=False, initialization='pretrained'):
+def make_model(monkeypatch, bundle, memory=False, initialization='pretrained', head_type='diffusion'):
     import models.align_intention as module
     monkeypatch.setattr(module,'VisionEncoder',FakeVision)
     model=module.ALIGNIntentionModel(state_dim=8,mamba_output_dim=16,num_cameras=1,
         compressed_dim=4,action_dim=7,chunk_size=4,history_size=1,head_d_model=8,
-        diffusion_loss_repeats=1,use_memory_bank=memory,memory_bank_len=3,
+        head_type=head_type,diffusion_loss_repeats=1,use_memory_bank=memory,memory_bank_len=3,
         task_context_checkpoint=str(bundle),task_context_initialization=initialization)
     model._build_head_and_bank(256*4)
     return model
@@ -91,10 +91,11 @@ def test_frozen_context_sequence_matches_stream_and_ignores_future(bundle):
 
 
 @pytest.mark.parametrize('memory',[False,True])
-def test_policy_context_gradients_memory_and_self_contained_reload(monkeypatch,bundle,memory):
+@pytest.mark.parametrize('head_type', ['diffusion', 'flow_matching'])
+def test_policy_context_gradients_memory_and_self_contained_reload(monkeypatch,bundle,memory,head_type):
     from data.task_context_policy_dataset import context_policy_options
     import models.align_intention as module
-    model=make_model(monkeypatch,bundle,memory)
+    model=make_model(monkeypatch,bundle,memory,head_type=head_type)
     model.train()
     assert model.intention_encoder is None
     assert not model.task_context.observer.encoder.training
@@ -114,7 +115,7 @@ def test_policy_context_gradients_memory_and_self_contained_reload(monkeypatch,b
     # Reconstruction uses config and policy weights, never the original artifact path.
     clone=module.ALIGNIntentionModel(state_dim=8,mamba_output_dim=16,num_cameras=1,
         compressed_dim=4,action_dim=7,chunk_size=4,history_size=1,head_d_model=8,
-        diffusion_loss_repeats=1,use_memory_bank=memory,memory_bank_len=3,**cfg)
+        head_type=head_type,diffusion_loss_repeats=1,use_memory_bank=memory,memory_bank_len=3,**cfg)
     clone._build_head_and_bank(1024)
     clone.load_state_dict(model.state_dict(),strict=True)
     torch.testing.assert_close(clone.task_context.sequence(patches,cls,state,lengths,ticks),
@@ -207,7 +208,7 @@ def test_handover_freezes_task_preserves_execution_and_replans_queue(monkeypatch
         def reset(self):clock[0]=0;return dict(step=0)
         def step(self,action):clock[0]+=1;return dict(step=clock[0]),0.,False,{}
     result=evaluator.run_model_in_sim(Env(),model,torch.device('cpu'),np.zeros((6,7),dtype='f4'),
-        chunk_size=4,max_steps=6,switch_at=.5,action_horizon=2,use_camera=['image'])
+        chunk_size=4,max_steps=6,switch_at=.5,task_context_mode='handover',action_horizon=2,use_camera=['image'])
     assert result['switch_step']==3 and calls==[0,2,3,4]
     assert steps==list(range(1,7))
     torch.testing.assert_close(payloads[3][:,:4],payloads[4][:,:4])

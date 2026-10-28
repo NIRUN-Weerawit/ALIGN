@@ -90,14 +90,13 @@ def test_sequential_cli_defaults_and_shared_overrides():
 
 
 @pytest.mark.parametrize("history_size", [1, 2, 4, 16])
-def test_plain_history_variant_has_independent_window_and_requires_diffusion(history_size):
+@pytest.mark.parametrize("head_type", ["diffusion", "flow_matching"])
+def test_plain_history_variant_has_independent_window_for_both_heads(history_size, head_type):
     args = parse_args(["--output", "example", "--variants", "plain_history", "intent_memory",
-                       "--plain-history-size", str(history_size)])
+                       "--plain-history-size", str(history_size), "--head-type", head_type])
     assert args.history_size == 1 and args.plain_history_size == history_size
     assert args.variants == ["plain_history", "intent_memory"]
-    with pytest.raises(SystemExit):
-        parse_args(["--output", "example", "--variants", "plain_history",
-                    "--head-type", "flow_matching"])
+    assert args.head_type == head_type
 
 
 @pytest.mark.parametrize("options", [["--history-size", "0"], ["--head-d-model", "10"],

@@ -15,11 +15,11 @@ from tests.test_task_context_policy import FakeVision, bundle
 from training.train_intention import train_v4_epoch, validate
 
 
-def make_model(monkeypatch, bundle, history=4, mode='full'):
+def make_model(monkeypatch, bundle, history=4, mode='full', head_type='diffusion'):
     monkeypatch.setattr(align, 'VisionEncoder', FakeVision)
     model = align.ALIGNIntentionModel(state_dim=8, compressed_dim=4,
         mamba_output_dim=0, use_intent_tokens=False, use_memory_bank=False,
-        history_size=history, head_history_mode=mode, head_type='diffusion',
+        history_size=history, head_history_mode=mode, head_type=head_type,
         head_d_model=8, chunk_size=4, action_dim=7, diffusion_loss_repeats=1,
         task_context_checkpoint=str(bundle))
     model._build_head_and_bank(1024)
@@ -27,10 +27,11 @@ def make_model(monkeypatch, bundle, history=4, mode='full'):
 
 
 @pytest.mark.parametrize('history', [1, 4, 16])
-def test_context_history_cli_and_worker(history):
+@pytest.mark.parametrize('head_type', ['diffusion', 'flow_matching'])
+def test_context_history_cli_and_worker(head_type, history):
     args = parse_args(['--output', 'unused', '--variants', 'context_no_memory',
         'context_history', '--worker-variant', 'context_history',
-        '--plain-history-size', str(history),
+        '--plain-history-size', str(history), '--head-type', head_type,
         '--task-context-checkpoint', 'observer.pt',
         '--task-context-split-manifest', 'manifest.json'])
     assert args.worker_variant == 'context_history'
@@ -39,8 +40,9 @@ def test_context_history_cli_and_worker(history):
         parse_args(['--output', 'unused', '--variants', 'context_history'])
 
 
-def test_context_history_preserves_frame_order_and_context(monkeypatch, bundle):
-    model = make_model(monkeypatch, bundle).eval()
+@pytest.mark.parametrize('head_type', ['diffusion', 'flow_matching'])
+def test_context_history_preserves_frame_order_and_context(head_type, monkeypatch, bundle):
+    model = make_model(monkeypatch, bundle, head_type=head_type).eval()
     assert model.intention_encoder is None and model.memory_module is None
     assert all(not p.requires_grad for p in model.task_context.parameters())
     visual, states, context = torch.randn(2, 4, 1024), torch.randn(2, 4, 8), torch.randn(2, 5, 4)
@@ -56,7 +58,7 @@ def test_context_history_preserves_frame_order_and_context(monkeypatch, bundle):
         # dependence rather than mistaking that initialization for invariance.
         model.intention_head.unet.output_proj.weight.normal_(std=.1)
     noisy, timestep = torch.randn(2, 4, 7), torch.full((2,), 5, dtype=torch.long)
-    predict = model.intention_head.predict_noise
+    predict = model.intention_head.predict_noise if head_type == 'diffusion' else model.intention_head.predict_velocity
     expected = predict(noisy, timestep, cond)
     reordered = model.action_condition(visual[:, [2, 1, 0, 3]], states[:, [2, 1, 0, 3]], context)
     assert not torch.allclose(expected, predict(noisy, timestep, reordered))
@@ -70,8 +72,9 @@ def test_context_history_preserves_frame_order_and_context(monkeypatch, bundle):
 
 
 @pytest.mark.parametrize('history', [1, 4, 20])
-def test_dense_training_and_validation_match_causal_stream(monkeypatch, bundle, history):
-    model = make_model(monkeypatch, bundle, history=history)
+@pytest.mark.parametrize('head_type', ['diffusion', 'flow_matching'])
+def test_dense_training_and_validation_match_causal_stream(head_type, monkeypatch, bundle, history):
+    model = make_model(monkeypatch, bundle, history=history, head_type=head_type)
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0.
@@ -100,7 +103,7 @@ def test_dense_training_and_validation_match_causal_stream(monkeypatch, bundle, 
     model.intention_head.loss = lambda target, cond, **kwargs: cond.square().mean()
     model.intention_head.sample = lambda cond: cond.new_zeros((len(cond), 4, 7))
     args = SimpleNamespace(history_size=history, chunk_size=4, action_dim=7,
-        head_type='diffusion', skip_nan=False, grad_clip=1.,
+        head_type=head_type, skip_nan=False, grad_clip=1.,
         no_sample_during_train=True, head_window_batch_size=2, gripper_threshold=.5)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.)
     train_loss, _ = train_v4_epoch(model, [batch], optimizer, torch.device('cpu'), args)
@@ -115,12 +118,13 @@ def test_dense_training_and_validation_match_causal_stream(monkeypatch, bundle, 
     assert model.intention_head.context_task[1].weight.grad.abs().sum() > 0
 
 
-def test_context_history_production_checkpoint_reload(monkeypatch, bundle, tmp_path):
+@pytest.mark.parametrize('head_type', ['diffusion', 'flow_matching'])
+def test_context_history_production_checkpoint_reload(head_type, monkeypatch, bundle, tmp_path):
     from eval.eval_intention import load_intention_model
-    model = make_model(monkeypatch, bundle).eval()
+    model = make_model(monkeypatch, bundle, head_type=head_type).eval()
     config = dict(state_dim=8, compressed_dim=4, mamba_output_dim=0,
         action_dim=7, chunk_size=4, history_size=4, head_history_mode='full',
-        head_type='diffusion', head_d_model=8, num_cameras=1,
+        head_type=head_type, head_d_model=8, num_cameras=1,
         diffusion_train_steps=100, diffusion_loss_repeats=1, pool_out_dim=1024,
         frozen_vision_omitted=True, **context_policy_options(model))
     state = {k: v for k, v in model.state_dict().items() if not k.startswith('vision_encoder.')}
@@ -143,12 +147,13 @@ def test_context_history_production_checkpoint_reload(monkeypatch, bundle, tmp_p
 
 
 @pytest.mark.parametrize('history,mode', [(4, 'full'), (1, 'mean')])
-def test_ablation_reevaluation_keeps_context_on_dense_episode_path(monkeypatch, bundle, tmp_path, history, mode):
+@pytest.mark.parametrize('head_type', ['diffusion', 'flow_matching'])
+def test_ablation_reevaluation_keeps_context_on_dense_episode_path(head_type, monkeypatch, bundle, tmp_path, history, mode):
     import scripts.run_intention_ablation as script
-    model = make_model(monkeypatch, bundle, history=history, mode=mode)
+    model = make_model(monkeypatch, bundle, history=history, mode=mode, head_type=head_type)
     config = dict(state_dim=8, compressed_dim=4, mamba_output_dim=0,
         chunk_size=4, history_size=history, head_history_mode=mode,
-        head_type='diffusion', head_d_model=8, intent_dim=128,
+        head_type=head_type, head_d_model=8, intent_dim=128,
         use_intent_tokens=False, use_memory_bank=False, memory_bank_len=16,
         pool_out_dim=1024, **context_policy_options(model))
     run = tmp_path / 'context_history'
@@ -157,7 +162,7 @@ def test_ablation_reevaluation_keeps_context_on_dense_episode_path(monkeypatch, 
         run / 'intention_best.pt')
     manifest = dict(data='fake.h5', cache='fake.cache', cameras=['image'],
         segment_length=20, seed=42, temporal_sampling='episode',
-        chunk_size=4, batch_size=1, history_size=1, head_type='diffusion',
+        chunk_size=4, batch_size=1, history_size=1, head_type=head_type,
         val_episodes=['ep_0'], epochs=1, max_steps=1)
     (tmp_path / 'manifest.json').write_text(json.dumps(manifest))
     (tmp_path / 'summary.json').write_text(json.dumps({'context_history': {'best': {'epoch': 1}}}))

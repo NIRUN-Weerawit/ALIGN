@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader, random_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from models.flow_policy_config import flow_policy_options
 from models.align_intention import ALIGNIntentionModel
 from data.align_dataset import ALIGNDataset, head_collate
 
@@ -146,11 +147,15 @@ def load_intention_model(
         text_dim=cfg.get("text_dim", 256),
         text_encoder_type=cfg.get("text_encoder_type", "clip"),
         text_vocab=cfg.get("text_vocab"),
+        text_model_name=cfg.get("text_model_name","distilbert/distilbert-base-uncased"),
+        text_model_revision=cfg.get("text_model_revision","main"),
+        text_max_length=cfg.get("text_max_length",128),
         intent_future_weight=cfg.get('intent_future_weight',0.),
         intent_future_horizons=cfg.get('intent_future_horizons',[16,64]),
         intent_future_hidden_dim=cfg.get('intent_future_hidden_dim',256),
         compressed_dim=cfg.get("compressed_dim", 16),
         task_context_config=cfg.get('task_context_config'),
+        task_context_tokens=cfg.get('task_context_tokens',cfg.get('num_task_tokens')),
         task_context_trainable=cfg.get('task_context_trainable',False),
         task_context_initialization=cfg.get('task_context_initialization','pretrained'),
         task_context_fusion=cfg.get('task_context_fusion','additive'),
@@ -171,6 +176,7 @@ def load_intention_model(
         memory_patch_temporal=cfg.get("memory_patch_temporal",False),
         memory_context_only=cfg.get("memory_context_only",False),
         memory_patch_retrieval=cfg.get("memory_patch_retrieval",False),
+        **flow_policy_options(cfg),
         diffusion_train_steps=cfg.get("diffusion_train_steps",10),
         diffusion_loss_repeats=cfg.get("diffusion_loss_repeats",1),
         visual_context_mode=cfg.get("visual_context_mode","none"),

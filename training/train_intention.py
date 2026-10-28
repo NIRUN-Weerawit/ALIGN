@@ -103,6 +103,8 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from data.align_dataset import ALIGNDataset, MultiALIGNDataset, head_collate, v4_segment_collate
+from models.flow_policy_config import (add_flow_policy_arguments, flow_policy_options,
+    validate_flow_policy_arguments)
 from models.align_intention import ALIGNIntentionModel
 from models.intention_future import (future_prediction_loss, FutureMetrics,
     add_future_arguments, validate_future_arguments, freeze_intent_backbone)
@@ -367,6 +369,10 @@ def build_model(args, num_cameras, device):
         head_dim_ff=args.head_dim_ff,
         use_text=args.use_text,
         text_dim=args.text_dim,
+        text_encoder_type=getattr(args,"text_encoder_type","clip"),
+        text_model_name=getattr(args,"text_model_name","distilbert/distilbert-base-uncased"),
+        text_model_revision=getattr(args,"text_model_revision","main"),
+        text_max_length=getattr(args,"text_max_length",128),
         compressed_dim=args.compressed_dim,
         # V4 args
         use_intent_tokens=args.use_intent_tokens,
@@ -376,6 +382,7 @@ def build_model(args, num_cameras, device):
         memory_bank_len=args.memory_bank_len,
         memory_mode=args.memory_mode,memory_detach_writes=args.memory_detach_writes,
         memory_perceptual_recency=getattr(args,"memory_perceptual_recency",0.),memory_field_masks=getattr(args,"memory_field_masks",False),memory_pre_state_visual=getattr(args,"memory_pre_state_visual",False),memory_value_preserving=getattr(args,"memory_value_preserving",False),memory_patch_temporal=getattr(args,"memory_patch_temporal",False),memory_context_only=getattr(args,"memory_context_only",False),memory_write_fused=args.memory_write_fused,memory_patch_retrieval=args.memory_patch_retrieval,
+        **flow_policy_options(vars(args)),
         diffusion_train_steps=args.diffusion_train_steps,diffusion_loss_repeats=args.diffusion_loss_repeats,
         visual_context_mode=getattr(args,"visual_context_mode","none"),
         memory_retrieval_depth=getattr(args,"memory_retrieval_depth",1),memory_intent_query=getattr(args,"memory_intent_query",False),
@@ -384,6 +391,7 @@ def build_model(args, num_cameras, device):
         intent_future_horizons=getattr(args,'intent_future_horizons',[16,64]),
         intent_future_hidden_dim=getattr(args,'intent_future_hidden_dim',256),
         task_context_checkpoint=getattr(args,'task_context_checkpoint',None),
+        task_context_tokens=getattr(args,'num_task_tokens',None),
         task_context_trainable=getattr(args,'task_context_trainable',False),
         task_context_fusion=getattr(args,'task_context_fusion','additive'),
         task_context_fusion_dim=getattr(args,'task_context_fusion_dim',128),
@@ -1501,6 +1509,7 @@ def parse_args():
     parser.add_argument("--visual-context-mode",choices=["none","multiscale"],default="none",help="Explicit patch tokens at three action U-Net scales; enables patch memory when used")
     parser.add_argument("--memory-retrieval-depth",type=int,default=2,help="Sequential reads of the same past bank (legacy checkpoints use 1)")
     parser.add_argument("--memory-intent-query",action=argparse.BooleanOptionalAction,default=False,help="Use inferred intention to guide visual retrieval; no-intent variants retain visual-only queries")
+    add_flow_policy_arguments(parser)
     parser.add_argument("--diffusion-clip-sample",action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument("--diffusion-train-steps",type=int,default=100)
     parser.add_argument("--diffusion-loss-repeats",type=int,default=4)
@@ -1532,7 +1541,7 @@ def parse_args():
                         help="WIP: reserved for semantic anchoring; currently not connected to training.")
 
     # Text modality (optional)
-    parser.add_argument("--use-text", action="store_true", default=False,
+    parser.add_argument("--use-text", "--use-task-text", action="store_true", default=False,
                         help="WIP: constructs a text encoder, but semantic supervision is not connected.")
     parser.add_argument("--text-dim", type=int, default=256,
                         help="Text encoder output dim (default 256).")
@@ -1602,14 +1611,20 @@ def parse_args():
     add_context_policy_arguments(parser)
     from models.vision_config import add_vision_arguments, feature_width
     add_vision_arguments(parser)
+    from models.task_text_encoder import add_task_text_arguments
+    add_task_text_arguments(parser,allow_bag=False)
     args=parser.parse_args()
     args.raw_dim=feature_width(args.vision_backbone,args.raw_dim)
+    try:validate_flow_policy_arguments(args)
+    except ValueError as error:parser.error(str(error))
+    if args.num_task_tokens is not None and (args.num_task_tokens<1 or not args.task_context_checkpoint):
+        parser.error("--num-task-tokens must be positive and requires --task-context-checkpoint")
     if args.task_context_fusion != 'additive' and not args.task_context_checkpoint:
         parser.error('Non-additive task-context fusion requires --task-context-checkpoint')
-    if args.task_context_fusion_dim < 1 or (args.task_context_fusion == 'cross_attention' and args.task_context_fusion_dim % 4):
+    if args.task_context_fusion_dim < 1 or (args.task_context_fusion in ('cross_attention') and args.task_context_fusion_dim % 4):
         parser.error('Task-context fusion width must be positive and divisible by 4 for cross-attention')
-    if args.task_context_checkpoint and (args.head_type != 'diffusion' or args.use_intent_tokens or args.use_text or args.history_size != 1 or args.memory_intent_query):
-        parser.error('Context policy needs diffusion, history size 1, no legacy intent/text or cognitive memory query')
+    if args.task_context_checkpoint and (args.head_type not in ('diffusion', 'flow_matching') or args.use_intent_tokens or args.use_text or args.history_size != 1 or args.memory_intent_query):
+        parser.error('Context policy needs diffusion or flow matching, history size 1, no legacy intent/text or cognitive memory query')
     try:validate_future_arguments(args)
     except ValueError as error:parser.error(str(error))
     if args.intent_future_weight and (not args.use_intent_tokens or not args.use_history):
@@ -1734,7 +1749,7 @@ def main():
     if model.text_encoder is not None:
         for p in model.text_encoder.projection.parameters():
             p.requires_grad = True
-        print("  Text encoder: CLIP frozen, projection trainable")
+        print(f"  Text encoder: {model.text_encoder_type} frozen, projection trainable")
     # State encoder and vision projection are trainable by default (no action needed)
     print("  Trainable: vision projection + state encoder + intention encoder + head"
           + (" + text projection" if model.text_encoder is not None else ""))
