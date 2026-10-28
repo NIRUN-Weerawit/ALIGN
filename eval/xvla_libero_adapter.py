@@ -181,12 +181,17 @@ class XVLALiberoAdapter(torch.nn.Module):
         self._text_cache.clear()
 
     @torch.inference_mode()
-    def predict_sim_action_chunk(self, obs, *, task_text, env):
+    def predict_sim_action_chunk(self, obs, *, task_text, env, proprio=None):
         if not task_text:
             raise ValueError('XVLA LIBERO requires the task instruction')
         controller = simulator_controller(env)
         batch = {key: value.to(self.device) for key, value in
                  native_observation(obs, controller.ee_ori_mat).items()}
+        if proprio is not None:
+            proprio = torch.as_tensor(proprio, dtype=torch.float32, device=self.device)
+            if proprio.shape != (20,) or not torch.isfinite(proprio).all():
+                raise ValueError('XVLA proprio override must be a finite 20-D state')
+            batch['observation.state'] = proprio.unsqueeze(0)
         if task_text not in self._text_cache:
             tokens = self.tokenizer(task_text, **self.token_options)
             self._text_cache[task_text] = tokens['input_ids'].to(self.device)

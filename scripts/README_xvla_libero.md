@@ -1,5 +1,62 @@
 # XVLA LIBERO through ALIGN's simulator evaluator
 
+## Native XVLA control on the same 44 cases
+
+Use `eval/eval_xvla_libero_native.py` for the author client's native absolute
+OSC control, full 30-action chunks, 10 delta-mode settling steps, and previous
+chunk target as proprioception. The Goal limit is 800 policy steps, excluding
+settling. There is no expert prefix, delta conversion, or action ensembling.
+The default episode file is the same 44-case held-out list used in ALIGN.
+
+From `/home/whinnoy/ALIGN`:
+
+```bash
+export PYTHONPATH=/home/whinnoy/.local/share/align/LIBERO
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export HF_HUB_CACHE=/media/whinnoy/Extreme-Linux/huggingface/hub
+
+.venv-xvla-eval/bin/python eval/eval_xvla_libero_native.py \
+  --checkpoint "$HF_HUB_CACHE/models--lerobot--xvla-libero/snapshots/12e8783e996944f5c97e490d37d4c145484ed70a" \
+  --hf-cache-dir "$HF_HUB_CACHE" \
+  --data data/libero_goal.h5 \
+  --val-episodes checkpoints/piper_v4_ablation_val_episodes.txt \
+  --reference-results checkpoints/xvla/1000/xvla.mujoco_eval_0.0_val.json \
+  --device cuda --dtype bfloat16 \
+  --out-dir eval/libero_results/xvla_native_goal_44
+```
+
+`--reference-results` checks the complete episode/task selection and reuses its
+recorded per-episode seeds. Without it, the evaluator derives the same seeds
+from `--seed 42` and each episode key. Add `--validate-only` to check selection
+without loading weights or starting a simulator; add `--n-episodes 1
+--max-steps 31` and a separate output directory for an integration smoke test.
+`--save-video` optionally writes both camera views.
+
+The HDF5 currently has no demonstration simulator initial states. These are
+the same 44 episode/task labels and seeded reset procedure, **not the original
+demonstration states or the official benchmark's fixed states**. Settling also
+changes the pose at which the policy starts relative to the old evaluator.
+The script saves the pre-settling states to `initial_states.npz`; subsequent
+runs can pass `--initial-states <that-file>` to pair their resets explicitly.
+It uses an embedded HDF `initial_sim_state` when available, unless overridden
+by the supplied NPZ. Exact historical states cannot be recovered from seeds
+alone across different simulator versions or reset implementations.
+
+The default `--proprio-mode author` follows the released author client's
+previous-chunk-final-target convention. Use `--proprio-mode measured` for the
+LeRobot port's current measured-pose convention; record this as a separate
+experiment. Native action execution and complete chunks apply to both modes.
+
+Outputs include an atomically updated `xvla_native_eval.json`, total and per-task
+success counts, reset states, and each episode's raw EE6D chunks, executed
+absolute commands and measured pre-action positions in NPZ files. Success uses
+LIBERO's task predicate, never timeout alone. Completed episode results remain
+available if a later episode fails. Existing result directories are protected
+from overwriting; use a new `--out-dir` for each run.
+
+## Shared ALIGN rollout protocol
+
 Use `lerobot/xvla-libero` as a policy backend in
 `eval/eval_libero_v4_trajectory.py`. ALIGN remains the default backend.
 Both backends share task matching, HDF5 episode selection, per-episode reset
