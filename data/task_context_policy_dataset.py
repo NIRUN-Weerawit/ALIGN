@@ -49,7 +49,7 @@ def add_context_policy_arguments(parser):
     parser.add_argument('--num-task-tokens','--task-context-tokens',type=int,default=None,
         help='Expected task-token count; inferred from observer when omitted. Requires matching pretraining.')
     parser.add_argument('--task-context-trainable', action='store_true', help='Fine-tune causal encoder with action loss; frozen summary is retained')
-    parser.add_argument('--task-context-fusion', choices=('additive', 'gated_residual', 'film', 'cross_attention'),
+    parser.add_argument('--task-context-fusion', choices=('additive', 'gated_residual', 'film', 'cross_attention', 'aci'),
         default='additive', help='Context conditioning; aci selects alternating action-to-context/observation attention')
     parser.add_argument('--task-context-fusion-dim', type=int, default=128,
         help='Hidden width for context fusion/ACI attention (divisible by 4 for attention modes)')

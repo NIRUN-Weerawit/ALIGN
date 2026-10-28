@@ -66,7 +66,7 @@ def source_provenance(root=ROOT):
     if snapshot.exists():
         return json.loads(snapshot.read_text())
     import hashlib
-    names = ['models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
+    names = ['models/context_aci_head.py','models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
         'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
         'data/task_context_policy_dataset.py','training/train_intention.py','scripts/run_intention_ablation.py']
@@ -506,7 +506,10 @@ def parse_args(argv=None):
     context_variants = [v for v in args.variants if v.startswith('context_')]
     if args.task_context_fusion != 'additive' and not context_variants:
         parser.error('Non-additive task-context fusion requires a context variant')
-    if args.task_context_fusion_dim < 1 or (args.task_context_fusion in ('cross_attention') and args.task_context_fusion_dim % 4):
+    if args.task_context_fusion == 'aci' and ('context_history' in args.variants or args.history_size != 1 or
+            args.visual_token_attention or args.visual_context_mode != 'none'):
+        parser.error('ACI requires history-size 1 and no additional visual-attention mode')
+    if args.task_context_fusion_dim < 1 or (args.task_context_fusion in ('cross_attention', 'aci') and args.task_context_fusion_dim % 4):
         parser.error('Task-context fusion width must be positive and divisible by 4 for cross-attention')
     if args.policy_warm_start and args.warm_start:
         parser.error('Choose shared --policy-warm-start or per-variant --warm-start')

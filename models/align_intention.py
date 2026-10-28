@@ -159,11 +159,11 @@ class ALIGNIntentionModel(nn.Module):
         if intent_future_weight and (not use_intent_tokens or mamba_output_dim<=0):
             raise ValueError('Future prediction requires an active intention encoder')
         self.intent_future_weight = intent_future_weight
-        if task_context_fusion not in ('additive', 'gated_residual', 'film', 'cross_attention'):
+        if task_context_fusion not in ('additive', 'gated_residual', 'film', 'cross_attention', 'aci'):
             raise ValueError('Unknown task context fusion mode')
         if not isinstance(task_context_fusion_dim, int) or isinstance(task_context_fusion_dim, bool) or task_context_fusion_dim < 1:
             raise ValueError('Task context fusion width must be a positive integer')
-        if task_context_fusion in ('cross_attention') and task_context_fusion_dim % 4:
+        if task_context_fusion in ('cross_attention', 'aci') and task_context_fusion_dim % 4:
             raise ValueError('Cross-attention task context fusion width must be divisible by 4')
         if task_context_fusion != 'additive' and not (task_context_checkpoint or task_context_config):
             raise ValueError('Task context fusion requires a task context checkpoint or config')
@@ -172,6 +172,9 @@ class ALIGNIntentionModel(nn.Module):
                 raise ValueError("Task-token count must be a positive integer")
             if not (task_context_checkpoint or task_context_config):
                 raise ValueError("Task-token count requires a task-context observer")
+        if task_context_fusion == 'aci' and (history_size != 1 or head_history_mode != 'mean'
+                or visual_token_attention or visual_context_mode != 'none'):
+            raise ValueError('ACI requires history_size=1, mean head history, and no additional visual-attention mode')
         self.task_context_fusion = task_context_fusion
         self.task_context_fusion_dim = task_context_fusion_dim
         self.task_context = None
@@ -396,6 +399,11 @@ class ALIGNIntentionModel(nn.Module):
                     context_dim=self.task_context.config['encoder_config']['token_dim'],
                     context_fusion=self.task_context_fusion,
                     context_fusion_dim=self.task_context_fusion_dim)
+            if self.task_context is not None and self.task_context_fusion == 'aci':
+                from models.context_aci_head import ACIContextDiffusionPolicyHead, ACIContextFlowMatchingPolicyHead
+                head_class = ACIContextDiffusionPolicyHead if self.head_type == 'diffusion' else ACIContextFlowMatchingPolicyHead
+                context_options.update(state_dim=self.state_dim, visual_token_dim=self.compressed_dim,
+                    num_cameras=self.num_cameras)
             objective_options = (dict(num_inference_steps=10,
                 num_train_timesteps=self.diffusion_train_steps,
                 loss_repeats=self.diffusion_loss_repeats,

@@ -1621,7 +1621,10 @@ def parse_args():
         parser.error("--num-task-tokens must be positive and requires --task-context-checkpoint")
     if args.task_context_fusion != 'additive' and not args.task_context_checkpoint:
         parser.error('Non-additive task-context fusion requires --task-context-checkpoint')
-    if args.task_context_fusion_dim < 1 or (args.task_context_fusion in ('cross_attention') and args.task_context_fusion_dim % 4):
+    if args.task_context_fusion == 'aci' and (args.history_size != 1 or
+            args.visual_token_attention or args.visual_context_mode != 'none'):
+        parser.error('ACI requires history-size 1 and no additional visual-attention mode')
+    if args.task_context_fusion_dim < 1 or (args.task_context_fusion in ('cross_attention', 'aci') and args.task_context_fusion_dim % 4):
         parser.error('Task-context fusion width must be positive and divisible by 4 for cross-attention')
     if args.task_context_checkpoint and (args.head_type not in ('diffusion', 'flow_matching') or args.use_intent_tokens or args.use_text or args.history_size != 1 or args.memory_intent_query):
         parser.error('Context policy needs diffusion or flow matching, history size 1, no legacy intent/text or cognitive memory query')
