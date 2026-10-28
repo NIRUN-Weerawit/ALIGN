@@ -1,41 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Evaluate ALIGN v4 intention model on LIBERO trajectory data.
+"""Evaluate expert-prefix handover in LIBERO with an audited saved episode split.
 
-This script replays a LIBERO trajectory (frames + states + actions) and
-compares the v4 intention model's predicted actions to:
-  1. Expert actions (ground truth)
-  2. Noised human actions (simulated user mistakes)
+Saved development episodes are selected automatically. Expert replay runs
+independently of video and shares its initial simulator state with the policy.
+Only task completion after actual handover is attributed to the policy.
+Context updates from the start. Freeze mode retains the highest-score snapshot
+seen so far and replaces it only when a strictly higher decoder score arrives.
+Policy and expert replay episodes end immediately on task success.
 
-For each timestep, the v4 model takes the K past (frames, states) and
-predicts K future actions. We compare:
-  - prediction[k=0]   vs.  expert[k=0]    (next action)
-  - prediction[k=0]   vs.  noised[k=0]    (noisy human action)
-
-Metrics:
-  - Per-dim MSE/RMSE/MAE between predicted and expert
-  - Per-step MSE for k=0..K-1 (action chunking quality)
-  - Step-1 cosine alignment
-  - Error reduction: how much better is the prediction vs. the noised action?
-
-Usage:
-    # Single checkpoint
-    python eval/eval_libero_v4_trajectory.py \
-        --data data/libero_object.h5 \
-        --checkpoint checkpoints/v4/libero_object/run_1/intention_best.pt \
-        --n-episodes 5 --noise-std 0.05
-
-    # With text
-    python eval/eval_libero_v4_trajectory.py \
-        --data data/libero_object.h5 \
-        --checkpoint checkpoints/v4/libero_object/run_1/intention_best.pt \
-        --task-text "pick up the cup"
-
-Outputs:
-  - Per-episode summary printed to stdout
-  - Per-dim, per-step, error-reduction metrics
-  - JSON summary saved to <checkpoint>.traj_eval.json
-  - Trajectory plots (predicted vs. expert vs. noised)
+Use --preflight-only for split/input checks, --replay-only for simulator replay
+validation without loading DINO, or --task-context-mode dynamic for a paired
+comparison against frozen task inference. Results and action traces are written
+inside --out-dir; historical checkpoint sidecars are preserved.
 """
 
 import argparse
@@ -63,6 +40,24 @@ from torch.nn.attention import SDPBackend, sdpa_kernel  # noqa: E402
 
 from data.align_dataset import ALIGNDataset, head_collate
 from eval.eval_intention import load_intention_model
+from eval.libero_protocol import (select_evaluation_episodes, context_handover_mode,
+    reset_simulation, load_initial_sim_state, task_succeeded, assess_expert_replay)
+from eval.task_estimation import TaskLabelEstimator, TaskEstimationTrace, PeakTaskSnapshot, summarize_task_estimation
+from eval.evaluation_summary import write_evaluation_summary, render_evaluation_summary
+
+
+def summarize_task_success(episode_results):
+    """Count successful evaluated episodes per task, including zero-win tasks."""
+    tasks = {}
+    for episode in episode_results:
+        task = episode.get("task_name", "?")
+        counts = tasks.setdefault(task, {"success_count": 0, "n_episodes": 0})
+        counts["n_episodes"] += 1
+        counts["success_count"] += int(bool(episode.get("success", False)))
+    return {
+        task: dict(counts, success_rate=counts["success_count"] / counts["n_episodes"])
+        for task, counts in sorted(tasks.items())
+    }
 from data.gripper_state import previous_gripper_commands, carry_gripper_state, executed_binary_gripper
 
 # MuJoCo / LIBERO imports (optional — only needed for --use-mujoco)
@@ -185,6 +180,8 @@ def load_trajectory(h5_path: str, episode_key: str,
             "poses": poses,
             "text": text,
             "cam_name": cam_list[0] if len(cam_list) == 1 else cam_list,
+            "initial_sim_state": (np.asarray(group['initial_sim_state'][()])
+                                  if 'initial_sim_state' in group else None),
         }
 
 
@@ -375,18 +372,12 @@ def get_sim_frame(env, key: str = "agentview_image",
     # Get observation
     try:
         obs = env.env._get_observations() if hasattr(env, "env") else env._get_observations()
-    except Exception:
-        img = np.zeros((render_size, render_size, 3), dtype=np.uint8)
+    except Exception as error:
+        raise RuntimeError(f'Cannot obtain simulator camera {sim_key}') from error
     else:
         img = obs.get(sim_key)
         if img is None:
-            # Fallback to any available camera
-            for k in ["agentview_image", "robot0_eye_in_hand_image"]:
-                img = obs.get(k)
-                if img is not None:
-                    break
-        if img is None:
-            img = np.zeros((render_size, render_size, 3), dtype=np.uint8)
+            raise ValueError(f'Simulator observation is missing required camera {sim_key}')
         if isinstance(img, torch.Tensor):
             img = img.cpu().numpy()
         if img.ndim == 4:
@@ -405,12 +396,14 @@ def get_sim_eef_pose(obs: dict, rotation_convention: str = "libero") -> np.ndarr
 
     Returns (6,) array: [x, y, z, rx, ry, rz] in world frame.
     """
-    pos = obs.get("robot0_eef_pos", np.zeros(3))
-    quat = obs.get("robot0_eef_quat", np.zeros(4))  # (x,y,z,w)
+    pos = obs['robot0_eef_pos']
+    quat = obs['robot0_eef_quat']  # (x,y,z,w)
     if isinstance(pos, torch.Tensor):
         pos = pos.cpu().numpy()
     if isinstance(quat, torch.Tensor):
         quat = quat.cpu().numpy()
+    if not np.isfinite(pos).all() or not np.isfinite(quat).all() or np.linalg.norm(quat) < 1e-8:
+        raise ValueError('Simulator EEF observation must contain a finite pose and valid quaternion')
     aa = quat_to_axisangle(quat,rotation_convention)
     return np.concatenate([pos, aa]).astype(np.float32)
 
@@ -486,6 +479,8 @@ def run_replay_in_sim(
     flip_horizontal: bool = False,
     live_view: bool = False,
     rotation_convention: str = "libero",
+    initial_sim_state=None,
+    record_frames: bool = True,
 ) -> Dict:
     """Replay dataset's expert actions in MuJoCo sim. Record frames.
 
@@ -500,10 +495,11 @@ def run_replay_in_sim(
           - errors: (T,) EEF position error vs dataset expert (if poses given)
           - n_steps: number of steps run
     """
-    obs = env.reset()
+    obs = reset_simulation(env, initial_sim_state)
     frames = []
     sim_positions = []
     errors = []
+    success = task_succeeded(env, False, 0.)
 
     # Pad expert_actions to (N, 7) if needed
     n_actions = len(expert_actions)
@@ -512,46 +508,52 @@ def run_replay_in_sim(
         # Pad with zero gripper
         pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
         actions = np.concatenate([actions, pad], axis=1)
-    # Pad to max_steps by with zeros action
+    # Hold the final gripper command; padded motion must be zero.
     if len(actions) < max_steps:
         pad = np.tile(np.zeros_like(actions[-1:]), (max_steps - len(actions), 1))
+        pad[:, 6] = actions[-1, 6]
         actions = np.concatenate([actions, pad], axis=0)
 
-    for step in range(max_steps):
+    first_success_step = -1 if success else None
+    for step in range(0 if success else max_steps):
         # Get current frame BEFORE step
-        frame = get_sim_frame(env, key=use_camera, render_size=render_size,
+        frame = (get_sim_frame(env, key=use_camera, render_size=render_size,
                                 flip_vertical=flip_vertical,
-                                flip_horizontal=flip_horizontal)
+                                flip_horizontal=flip_horizontal) if record_frames or live_view else None)
         
         if frame is not None and frame.size > 0:
             frames.append(frame.copy())
-        _live_view_show(frame, step, title="ALIGN Replay (expert)", live_view=live_view)
+        if live_view:
+            _live_view_show(frame, step, title="ALIGN Replay (expert)", live_view=live_view)
         sim_eef = get_sim_eef_pose(obs,rotation_convention)
         sim_positions.append(sim_eef)
+        # Dataset poses are observations BEFORE actions[step], not after them.
+        if expert_poses is not None and step < len(expert_poses):
+            errors.append(float(np.linalg.norm(sim_eef[:3] - expert_poses[step, :3])))
         # Step sim with expert action
         action = actions[step].copy()
         # Clamp gripper to {-1, +1}
         if action.shape[0] >= 7:
-            action[6] = 1.0 if action[6] <= 0.1 else -1.0
+            _, action[6] = executed_binary_gripper(action[6])
         obs, reward, done, info = env.step(action)
+        success = task_succeeded(env, done, reward)
+        if success:
+            first_success_step = step
         # Get sim_eef AFTER step
         sim_eef_after = get_sim_eef_pose(obs,rotation_convention)
         sim_positions[-1] = sim_eef_after
-        # Compute EEF error vs expert (if poses available)
-        if expert_poses is not None and step < len(expert_poses):
-            expert_eef = expert_poses[step]
-            err = float(np.linalg.norm(sim_eef_after[:3] - expert_eef[:3]))
-            errors.append(err)
-        else:
-            errors.append(0.0)
-        # Don't break on done — keep running to max_steps for consistent video length
+        if success:
+            break
 
     return {
         "frames": frames,
-        "expert_actions": actions,
-        "sim_positions": np.array(sim_positions),
+        "expert_actions": actions[:len(sim_positions)],
+        "sim_positions": np.asarray(sim_positions,dtype=np.float32).reshape(-1,6),
         "errors": np.array(errors),
-        "n_steps": len(frames),
+        "n_steps": len(sim_positions),
+        "success": success,
+        "first_success_step": first_success_step,
+        "termination_reason": 'task_success' if success else 'max_steps',
     }
 
 
@@ -594,6 +596,12 @@ def run_model_in_sim(
     initial_gripper: float = 0.0,
     rotation_convention: str = "libero",
     task_text: Optional[str] = None,
+    task_context_mode: str = "auto",
+    initial_sim_state=None,
+    record_frames: bool = True,
+    task_estimator=None,
+    actual_task_name: Optional[str] = None,
+    task_context_oracle=None,
 ) -> Dict:
     """Run V4 model in MuJoCo sim. Record frames.
 
@@ -619,11 +627,11 @@ def run_model_in_sim(
                  weight = ensemble_decay ** (current_call_index -
                  source_call_index). Newer predictions dominate.
 
-    Phase 1 (steps < switch_at * max_steps):
+    Phase 1 (steps < switch_at * original demonstration length):
       Expert controls 100%. Model runs in background to build
       Mamba state, memory bank, and intent tokens.
 
-    Phase 2 (steps >= switch_at * max_steps):
+    Phase 2 (steps >= switch_at * original demonstration length):
       Model controls 100%. Uses accumulated context to continue
       the task autonomously.
 
@@ -645,22 +653,29 @@ def run_model_in_sim(
           - switch_step: int -- step at which model took over
     """
     # Pad expert_actions to (N, 7) for the "noised human" baseline (alpha-blend)
+    if not 0 <= switch_at <= 1 or max_steps < 1 or not len(expert_actions):
+        raise ValueError('Expected nonempty actions, max_steps > 0 and switch_at in [0,1]')
     n_actions = len(expert_actions)
     actions = expert_actions[:max_steps].copy()
     if actions.shape[1] < 7:
         pad = np.zeros((actions.shape[0], 7 - actions.shape[1]), dtype=actions.dtype)
         actions = np.concatenate([actions, pad], axis=1)
-    ep_len = len(actions)  # original episode length (before padding to max_steps)
-    # Pad actions to max_steps by repeating last action (safe for Phase 1 indexing)
+    ep_len = n_actions
+    # Expert-only tail holds position and the last gripper command.
     if len(actions) < max_steps:
-        pad = np.tile(actions[-1:], (max_steps - len(actions), 1))
+        pad = np.zeros((max_steps - len(actions), 7), dtype=actions.dtype)
+        pad[:, 6] = actions[-1, 6]
         actions = np.concatenate([actions, pad], axis=0)
-    obs = env.reset()
+    obs = reset_simulation(env, initial_sim_state)
     frames = []
     sim_positions = []
     errors = []
     stored_actions = []
-    success = 0
+    executed_actions = []
+    episode_success = task_succeeded(env, False, 0.)
+    success_before_handover = episode_success
+    success_after_handover = False
+    first_success_step = -1 if episode_success else None
     if hasattr(model, "reset_episode"):
         model.reset_episode()
     text_emb = None
@@ -718,7 +733,24 @@ def run_model_in_sim(
         frame_buffer.append(init_frame_stack.copy())
 
     n_steps = max_steps
-    switch_step = int(ep_len * switch_at)
+    switch_step = max_steps if switch_at == 1 else int(ep_len * switch_at)
+    if 0 < switch_at < 1 and switch_step >= max_steps:
+        raise ValueError('max_steps ends before requested handover')
+    resolved_context_mode = context_handover_mode(task_context_mode, switch_step, switch_at == 1)
+    if task_context_oracle is not None and (resolved_context_mode != 'handover' or task_estimator is None
+            or getattr(model,'task_context',None) is None):
+        raise ValueError('Oracle context requires a context policy, estimator, and explicit handover snapshot')
+    peak_snapshot = None
+    if getattr(model,'task_context',None) is not None and resolved_context_mode == 'freeze':
+        if task_estimator is None:
+            raise ValueError('Highest-score freeze requires --task-estimator; use handover for the legacy snapshot or dynamic for continuing tokens')
+        peak_snapshot = PeakTaskSnapshot(task_estimator)
+    task_trace = None
+    if task_estimator is not None:
+        if getattr(model,'task_context',None) is None or intention_stream is None:
+            raise ValueError('Task-label estimation requires a task-context policy')
+        task_trace = TaskEstimationTrace(task_estimator,actual_task_name,switch_step,n_actions,
+            context_intervention=task_context_oracle.info if task_context_oracle is not None else None)
 
     # Validate action_horizon: must be at least 1 (always re-infer) and at most
     # chunk_size (use the whole chunk before re-inferring).
@@ -758,17 +790,20 @@ def run_model_in_sim(
     # Maps each entry's source call index (so we can decay its weight).
     pending_source_call_idx: List[int] = []
 
-    for step in range(n_steps):
+    for step in range(0 if episode_success else n_steps):
         step_t0 = time.perf_counter()  # wall-clock for the entire env step
         inference_ms = 0.0             # model forward time (0 if not called)
         # 1. Render current sim frame BEFORE step
         current_frame_stack = _render_all_cameras()  # (V, H, W, 3)
         # Record the first camera's view for video output
-        frames.append(current_frame_stack[0].copy())
+        if record_frames:
+            frames.append(current_frame_stack[0].copy())
         _live_view_show(current_frame_stack[0], step, title="ALIGN Model Rollout", live_view=live_view)
 
         sim_eef = get_sim_eef_pose(obs,rotation_convention)
         sim_positions.append(sim_eef)
+        if expert_poses is not None and step < len(expert_poses):
+            errors.append(float(np.linalg.norm(sim_eef[:3] - expert_poses[step, :3])))
 
         # 2. Update sliding windows: pop oldest, push newest
         sim_state = carry_gripper_state(last_state, sim_eef)
@@ -809,10 +844,38 @@ def run_model_in_sim(
                                                      enabled=device.type == "cuda"):
                 with sdpa_kernel(backends=[SDPBackend.MATH]):
                     stream_out = intention_stream.observe(
-                        f_t, s_t, produce_intent=should_infer, store_memory=not should_infer,
+                        f_t, s_t, produce_intent=should_infer,
+                        store_memory=not should_infer and peak_snapshot is None,
                     )
-            if context_handover:
+            selection = None
+            if peak_snapshot is not None:
+                selected,selection = peak_snapshot.observe(step,intention_stream.cache.last_task)
+                if selection['updated']:
+                    intention_stream.freeze_task()
+                    pending_actions.clear()
+                    pending_source_call_idx.clear()
+                    should_infer = True
+                # Apply the selected task to this observation, not the next one.
+                stream_out['intent_emb'] = torch.cat([selected,stream_out['intent_emb'][:,selected.shape[1]:]],dim=1)
+                bank = getattr(model,'memory_module',None)
+                if not should_infer and bank is not None and hasattr(bank,'observe_only'):
+                    bank.observe_only(stream_out['z_v_pooled_seq'][:,-1],stream_out['z_s_seq'][:,-1],None,
+                        observed_mask=stream_out['observed_mask'],timestamp=stream_out['timestamp'])
+            if context_handover and resolved_context_mode == 'handover':
                 intention_stream.freeze_task()
+            if task_context_oracle is not None and step >= switch_step:
+                selected = task_context_oracle.observe(step,switch_step,intention_stream.cache.last_task)
+                # Only replace task tokens. Recurrence, live execution, visual
+                # features, and model parameters remain on their normal path.
+                intention_stream.cache.task_snapshot = selected
+                stream_out['intent_emb'] = torch.cat([selected,stream_out['intent_emb'][:,selected.shape[1]:]],dim=1)
+            if task_trace is not None:
+                # Read the continuing estimate separately from a possible actor
+                # snapshot. Explicit oracle runs mark privileged GT selection.
+                inferred = intention_stream.cache.last_task
+                used = stream_out['intent_emb'][:,:task_estimator.token_shape[0]]
+                task_trace.observe(step,inferred,used,execution_token=stream_out['intent_emb'][:,task_estimator.token_shape[0]:task_estimator.token_shape[0]+1],
+                                   snapshot_selection=selection)
         if should_infer:
             if hasattr(model, "predict_sim_action_chunk"):
                 a_model_full = model.predict_sim_action_chunk(obs, task_text=task_text, env=env)
@@ -969,18 +1032,21 @@ def run_model_in_sim(
                   f"action={a_model}")
 
         stored_actions.append(a_model_scaled.copy())
+        executed_actions.append(final_action.copy())
 
         # 6. Step sim
         obs, reward, done, info = env.step(final_action)
+        succeeded = task_succeeded(env, done, reward)
+        if succeeded:
+            if first_success_step is None:
+                first_success_step = step
+            episode_success = True
+            if step < switch_step:
+                success_before_handover = True
+            else:
+                success_after_handover = True
         sim_eef_after = get_sim_eef_pose(obs,rotation_convention)
         sim_positions[-1] = sim_eef_after
-        # 7. Compute EEF error vs dataset expert (only while expert data exists)
-        if expert_poses is not None and step < len(expert_poses):
-            expert_eef = expert_poses[step]
-            err = float(np.linalg.norm(sim_eef_after[:3] - expert_eef[:3]))
-            errors.append(err)
-        else:
-            errors.append(0.0)
 
         # Timing log: record per-step wall-clock and inference time so the
         # caller can compute env-step latency vs amortized model latency.
@@ -993,24 +1059,35 @@ def run_model_in_sim(
                 "inference_ms": inference_ms,
             })
 
-        # Don't break on done — keep running to max_steps for consistent video length
-        if done:
-            success += 1
+        if succeeded:
+            break
 
     return {
         "frames": frames,
-        "sim_positions": np.array(sim_positions),
+        "sim_positions": np.asarray(sim_positions,dtype=np.float32).reshape(-1,6),
         "errors": np.array(errors),
-        "stored_actions": np.array(stored_actions) if stored_actions else np.zeros((0, 6)),
-        "n_steps": len(frames),
+        "stored_actions": np.array(stored_actions) if stored_actions else np.zeros((0, 7)),
+        "n_steps": len(sim_positions),
         "switch_step": switch_step,
+        "task_context_mode": resolved_context_mode if getattr(model, 'task_context', None) is not None else None,
+        "task_context_selection": (task_context_oracle.summary() if task_context_oracle is not None else
+                                   peak_snapshot.summary() if peak_snapshot is not None else None),
+        "termination_reason": 'task_success' if episode_success else 'max_steps',
+        "episode_success": episode_success,
+        "success_before_handover": success_before_handover,
+        "success_after_handover": success_after_handover,
+        "first_success_step": first_success_step,
+        "policy_eligible": switch_step < max_steps and not success_before_handover,
+        "executed_actions": np.asarray(executed_actions,dtype=np.float32).reshape(-1,7),
         "action_magnitude_model": float(np.mean(np.linalg.norm(
-            np.array(stored_actions), axis=1
+            np.array(stored_actions)[:min(n_actions, max_steps), :6], axis=1
         ))) if stored_actions else 0.0,
         "action_magnitude_dataset": float(np.mean(np.linalg.norm(
-            actions[:, :6], axis=1
+            actions[:min(n_actions, max_steps), :6], axis=1
         ))),
-        "success": True if success >= 1 else False,
+        "success": success_after_handover and not success_before_handover,
+        "task_estimation": task_trace.summary() if task_trace is not None else None,
+        "task_estimation_trace": task_trace,
     }
 
 
@@ -1097,15 +1174,15 @@ def save_video_3panel(
     except ImportError:
         _HAS_PIL = False
 
-    n = min(len(dataset_frames), len(replay_frames), len(model_frames))
-    if n == 0:
+    n = len(model_frames)
+    if n == 0 or not dataset_frames or not replay_frames:
         return
 
 
     writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=8)
     for i in range(n):
-        d = dataset_frames[i]
-        r = replay_frames[i]
+        d = dataset_frames[min(i,len(dataset_frames)-1)]
+        r = replay_frames[min(i,len(replay_frames)-1)]
         m = model_frames[i]
 
         # Labels for each panel
@@ -1180,8 +1257,8 @@ def main(argv=None):
     parser.add_argument("--xvla-tokenizer", default=None, help="Local BART tokenizer snapshot for offline XVLA")
     parser.add_argument("--xvla-dtype", choices=["float32", "bfloat16"], default=None)
     parser.add_argument("--xvla-denoising-steps", type=int, default=None)
-    parser.add_argument("--cameras", nargs="+", default=["image","wrist_image"],
-                        help="Camera names (default: wrist_image). "
+    parser.add_argument("--cameras", nargs="+", default=None,
+                        help="Camera names (default: checkpoint camera order). "
                              "MUST match the cameras used during training "
                              "(e.g. 'image wrist_image' for 2-cam checkpoints).")
     parser.add_argument("--memory-intervention",choices=["normal","bypass","empty"],default="normal")
@@ -1193,6 +1270,28 @@ def main(argv=None):
                         help="Path to a text file with episode keys to evaluate "
                              "(one per line, e.g. 'ep_000001'). "
                              "Use scripts/save_val_episodes.py to generate this from a training run.")
+    parser.add_argument('--episode-set', choices=['development', 'comparison'], default='development',
+                        help='Saved development by default; comparison uses an explicit episode file and reports training overlap')
+    parser.add_argument('--preflight-only', action='store_true',
+                        help='Validate checkpoint split, cameras and handover without loading DINO or running simulation')
+    parser.add_argument('--replay-only', action='store_true',
+                        help='Validate expert replay on the saved development split without loading the policy or DINO')
+    parser.add_argument('--task-context-mode', choices=['auto', 'freeze', 'handover', 'dynamic'], default='auto',
+                        help='Freeze: highest-score task snapshot from the first observation, replace only on a strictly higher score; '
+                             'requires --task-estimator. Handover: legacy fixed snapshot. Auto: freeze with a human prefix, dynamic otherwise')
+    parser.add_argument('--task-estimator', default=None,
+                        help='Training-only task-label probe NPZ; supplies snapshot scores in freeze mode and task diagnostics in all modes')
+    parser.add_argument('--oracle-task-bank', default=None,
+                        help='Privileged evaluation-only bank of GT-selected native task snapshots')
+    parser.add_argument('--oracle-task-mode', choices=['none','repair','episode'], default='none',
+                        help='Oracle diagnostic: repair only wrongly decoded handover tokens, or replace every episode task snapshot')
+    parser.add_argument('--replay-position-tolerance', type=float, default=.02,
+                        help='Maximum mean and initial pre-action EEF replay error in metres (default .02)')
+    # Compatibility with earlier commands; replay never filters policy episodes.
+    parser.add_argument('--allow-unverified-replay', action='store_true', default=True,
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--initial-states', default=None,
+                        help='Optional NPZ mapping each converted episode key to its original flat simulator state')
     parser.add_argument("--noise-std", type=float, default=0.00001,
                         help="Gaussian noise std for noised actions.")
     parser.add_argument("--max-steps", type=int, default=300,
@@ -1269,6 +1368,130 @@ def main(argv=None):
                              "'q' or ESC to close the window.")
     parser.add_argument("--rotation-convention",choices=["libero","shortest"],default="libero",help="LIBERO positive-X axis-angle branch; shortest reproduces the old incompatible input representation")
     args = parser.parse_args(argv)
+    if not 0 <= args.switch_at <= 1 or args.max_steps < 1 or args.n_episodes < 1:
+        parser.error('switch-at must be in [0,1]; max-steps and n-episodes must be positive')
+    if args.replay_position_tolerance <= 0 or args.noise_std < 0:
+        parser.error('Replay tolerance must be positive and noise-std nonnegative')
+    if args.alpha != 1.:
+        parser.error('This evaluator uses explicit expert/model handover and supports alpha=1 only')
+    if args.policy_type == 'align':
+        checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=True, mmap=True)
+        saved_cfg = checkpoint.get('config', {})
+        del checkpoint
+    else:
+        saved_cfg = {}
+    task_estimator = None
+    if args.task_estimator:
+        if not saved_cfg.get('task_context_config') or args.replay_only:
+            parser.error('--task-estimator requires an ALIGN context-policy rollout; replay-only does not load context')
+        try:
+            task_estimator = TaskLabelEstimator(args.task_estimator)
+        except (ValueError,OSError,KeyError) as error:
+            parser.error(str(error))
+    task_oracle_bank = None
+    if args.oracle_task_mode != 'none' or args.oracle_task_bank:
+        if (args.oracle_task_mode == 'none' or not args.oracle_task_bank or task_estimator is None
+                or args.task_context_mode != 'handover' or not 0 < args.switch_at < 1
+                or args.replay_only or args.episode_set != 'development'):
+            parser.error('Oracle diagnostics require a bank, repair/episode mode, estimator, development split, and explicit handover with 0 < switch-at < 1')
+        from eval.task_context_oracle import TaskContextOracleBank
+        from data.task_context_dataset import file_hash
+        try:
+            task_oracle_bank = TaskContextOracleBank(args.oracle_task_bank,task_estimator,saved_cfg,file_hash(args.checkpoint))
+        except (ValueError,OSError,KeyError) as error:
+            parser.error(str(error))
+        if abs(task_oracle_bank.metadata['handover_fraction']-args.switch_at)>1e-8:
+            parser.error('Oracle bank handover fraction differs from switch-at')
+    args.cameras = args.cameras or saved_cfg.get('cameras') or ['image', 'wrist_image']
+    if saved_cfg.get('cameras') and args.cameras != saved_cfg['cameras']:
+        parser.error('Camera order differs from checkpoint training cameras')
+    if saved_cfg.get('num_cameras', len(args.cameras)) != len(args.cameras):
+        parser.error('Camera count differs from checkpoint training cameras')
+    try:
+        episodes, episode_selection = select_evaluation_episodes(
+            list_episodes(args.data), saved_cfg, args.val_episodes, args.n_episodes, args.episode_set)
+    except ValueError as error:
+        parser.error(str(error))
+    if not episodes:
+        parser.error('No episodes selected')
+    if args.out_dir is None:
+        args.out_dir = (str(Path('eval/libero_results/xvla_libero') / str(args.switch_at))
+                        if args.policy_type == 'xvla' else
+                        str(Path(args.checkpoint).parent / f'eval_corrected_{args.switch_at}_{args.task_context_mode}'))
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
+    preflight_episodes = []
+    with h5py.File(args.data, 'r') as source:
+        for key in episodes:
+            group = source[key]
+            if any(camera not in group['frames'] for camera in args.cameras):
+                parser.error(f'{key}: dataset is missing a requested camera')
+            n = len(group['actions'])
+            if not n or 'poses' not in group or len(group['poses']) != n:
+                parser.error(f'{key}: expected aligned nonempty actions and poses')
+            if any(len(group['frames'][camera]) != n for camera in args.cameras):
+                parser.error(f'{key}: frame/action lengths differ')
+            if group['actions'].shape[1:] != (7,) or group['poses'].shape[1:] != (6,):
+                parser.error(f'{key}: expected 7D actions and 6D poses')
+            if not np.isfinite(group['actions'][:]).all() or not np.isfinite(group['poses'][:]).all():
+                parser.error(f'{key}: nonfinite actions or poses')
+            try:
+                _, state_source = load_initial_sim_state(key,
+                    group['initial_sim_state'][()] if 'initial_sim_state' in group else None, args.initial_states)
+            except ValueError as error:
+                parser.error(str(error))
+            switch = args.max_steps if args.switch_at == 1 else int(n * args.switch_at)
+            if args.switch_at not in (0, 1) and switch >= args.max_steps:
+                parser.error(f'{key}: max-steps ends before requested handover')
+            try:
+                mode = context_handover_mode(args.task_context_mode, switch, args.switch_at == 1)
+            except ValueError as error:
+                parser.error(str(error))
+            preflight_episodes.append(dict(episode=key, demonstration_steps=n, switch_step=switch,
+                context_mode=mode, initial_state_source=state_source,
+                demonstration_initial_state_available=state_source != 'captured seeded reset'))
+    from data.task_context_dataset import file_hash
+    peak_selection = bool(saved_cfg.get('task_context_config') and not args.replay_only and
+                          any(row['context_mode']=='freeze' for row in preflight_episodes))
+    if peak_selection and task_estimator is None:
+        parser.error('Highest-score freeze requires --task-estimator; use --task-context-mode handover for a fixed handover snapshot')
+    evaluation_protocol = dict(schema='align-libero-evaluation-v4', episode_selection=episode_selection,
+        replay_filters_policy_episodes=False,
+        stop_on_task_success=True,
+        task_snapshot_selection=('highest_decoder_score' if peak_selection else
+            'handover' if any(row['context_mode']=='handover' for row in preflight_episodes) else 'dynamic'),
+        checkpoint_sha256=file_hash(args.checkpoint) if args.policy_type == 'align' else None,
+        cameras=args.cameras, task_context_mode=args.task_context_mode,
+        precision=dict(context='fp32', diffusion='fp32', trainable_condition='bf16 on CUDA'),
+        evaluator_sha256=file_hash(__file__),
+        protocol_sha256=file_hash(Path(__file__).with_name('libero_protocol.py')),
+        replay_check='task predicate + mean and initial pre-action EEF error',
+        replay_position_tolerance=args.replay_position_tolerance,
+        initial_state='demonstration state when present; otherwise paired captured seeded reset',
+        initial_states_sha256=file_hash(args.initial_states) if args.initial_states else None,
+        task_estimator=(dict(path=args.task_estimator,sha256=file_hash(args.task_estimator),
+            context_fingerprint=task_estimator.metadata['context_fingerprint'],
+            training_episodes=len(task_estimator.metadata['fitting_episodes']),
+            training_only=True,diagnostic_only=not peak_selection,
+            used_for_task_snapshot_selection=peak_selection,probabilities_calibrated=False)
+            if task_estimator is not None else None),
+        episodes=preflight_episodes)
+    if task_oracle_bank is not None:
+        evaluation_protocol.update(task_oracle=task_oracle_bank.provenance(args.oracle_task_mode),
+            privileged=True, deployable=False, ground_truth_is_model_input=True,
+            task_snapshot_selection='oracle_'+args.oracle_task_mode)
+        evaluation_protocol['task_estimator'].update(diagnostic_only=False,used_for_task_snapshot_selection=True)
+    (Path(args.out_dir) / 'preflight.json').write_text(json.dumps(dict(
+        protocol=evaluation_protocol, simulation_verified=False,
+        libero_available=LIBERO_AVAILABLE, evaluation_args=vars(args)), indent=2) + '\n')
+    if args.preflight_only:
+        print(f'Preflight passed: {len(episodes)} episodes from {episode_selection["source"]}.')
+        print(f'LIBERO available: {LIBERO_AVAILABLE}; simulation has not run.')
+        print(f'Protocol: {Path(args.out_dir) / "preflight.json"}')
+        return
+    if args.use_mujoco and not LIBERO_AVAILABLE:
+        raise RuntimeError('LIBERO is not installed in this environment; preflight passed, simulation has not run')
+    if saved_cfg.get('task_context_matmul_tf32') is not None:
+        torch.backends.cuda.matmul.allow_tf32 = saved_cfg['task_context_matmul_tf32']
     if args.policy_type == "xvla" and args.memory_intervention != "normal":
         parser.error("XVLA does not support ALIGN memory interventions")
     if args.policy_type == "xvla" and args.cameras != ["image", "wrist_image"]:
@@ -1289,7 +1512,10 @@ def main(argv=None):
     print(f"  Cameras:     {args.cameras}")
 
     # Load model
-    if args.policy_type == "xvla":
+    if args.replay_only:
+        model, cfg = None, dict(saved_cfg)
+        cfg.setdefault('chunk_size', 8)
+    elif args.policy_type == "xvla":
         from eval.xvla_libero_adapter import XVLALiberoAdapter
         model = XVLALiberoAdapter(args.checkpoint, device, cache_dir=args.hf_cache_dir,
             tokenizer_path=args.xvla_tokenizer, dtype=args.xvla_dtype,
@@ -1298,6 +1524,8 @@ def main(argv=None):
         print(f"  XVLA:        {model.metadata}")
     else:
         model, cfg = load_intention_model(args.checkpoint, device)
+    if task_estimator is not None:
+        task_estimator.validate_branch(model.task_context)
     chunk_size = cfg["chunk_size"]
     print(f"  Chunk (K):   {chunk_size}")
     print(f"  Head:        {cfg.get('head_type', 'mamba')}")
@@ -1308,7 +1536,7 @@ def main(argv=None):
         print(f"  ⚠️  Camera count mismatch!")
         print(f"      Model expects {model_cameras} cameras, but you passed {args_cameras} ({args.cameras})")
         print(f"      Use --cameras to match the training config.")
-    if args.policy_type == "xvla":
+    if args.policy_type == "xvla" and not args.replay_only:
         print(f"  Text:        BART tokens (length={model.metadata['tokenizer_max_length']})")
     elif cfg.get("use_text", False):
         print(f"  Text:        enabled (dim={cfg.get('text_dim', 256)})")
@@ -1325,24 +1553,7 @@ def main(argv=None):
             args.libero_suite = "libero_spatial"  # fallback
         print(f"  Auto-detected suite: {args.libero_suite}")
 
-    # List episodes
-    episodes = list_episodes(args.data)
-    if not episodes:
-        print(f"  No episodes found in {args.data}")
-        return
-
-    # If --val-episodes is set, filter to only those episodes
-    if args.val_episodes is not None:
-        val_keys = set()
-        with open(args.val_episodes) as f:
-            for line in f:
-                val_keys.add(line.strip())
-        episodes = [e for e in episodes if e in val_keys]
-        print(f"  Using {len(episodes)} val episodes (from {args.val_episodes})")
-    else:
-        print(f"  Episodes:    {len(episodes)} (all — use --val-episodes to filter)")
-
-    episodes = episodes[:args.n_episodes]
+    print(f'  Episodes: {len(episodes)} ({episode_selection["source"]})')
 
     # Output directory for plots
     if args.out_dir is None:
@@ -1362,8 +1573,7 @@ def main(argv=None):
         return
 
     if not LIBERO_AVAILABLE:
-        print(f"\n  ⚠️  libero is not installed. Run: pip install libero")
-        return
+        raise RuntimeError('LIBERO is not installed in this environment; preflight passed, simulation has not run')
 
     print(f"\n{'='*68}")
     print(f"=== MuJoCo Sim Evaluation (alpha={args.alpha}) ===")
@@ -1380,7 +1590,7 @@ def main(argv=None):
     # Compute flip flags (same convention as old eval_libero_trajectory.py)
     flip_vertical = not args.no_flip_vertical
     flip_horizontal = not args.no_flip_horizontal
-    if args.memory_intervention != "normal" and model.use_memory_bank:
+    if args.memory_intervention != "normal" and getattr(model, 'use_memory_bank', False):
         original_condition = model.condition_actions
         def condition_with_intervention(p,s,intent=None,**kwargs):
             if args.memory_intervention == "bypass":
@@ -1416,8 +1626,7 @@ def main(argv=None):
                 task_name = best_match
         bddl_path = get_bddl_path(args.libero_suite, task_name)
         if not os.path.exists(bddl_path):
-            print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key}: BDDL not found: {bddl_path}")
-            continue
+            raise FileNotFoundError(f'{ep_key}: BDDL not found: {bddl_path}')
 
         print(f"\n  [{ep_idx+1}/{len(episodes)}] {ep_key} → task='{task_name}'")
         print(f"    BDDL: {bddl_path}")
@@ -1429,7 +1638,7 @@ def main(argv=None):
                 raise ImportError("OffScreenRenderEnv not available")
             env = OffScreenRenderEnv(
                 bddl_file_name=bddl_path,
-                use_camera_obs=True,
+                use_camera_obs=not args.replay_only or args.save_video or args.live_view,
                 camera_names=["agentview", "robot0_eye_in_hand"],
                 camera_widths=args.render_size,
                 camera_heights=args.render_size,
@@ -1438,13 +1647,21 @@ def main(argv=None):
                 initialization_noise=None,
             )
         except Exception as e:
-            print(f"    ⚠️  Failed to create env: {e}")
-            continue
+            raise RuntimeError(f'{ep_key}: failed to create LIBERO environment') from e
 
-        # ── Run 1: Replay expert actions in sim ──
-        if args.save_video:
-            t0 = time.time()
-            replay_result = run_replay_in_sim(
+        # Pair both runs from exactly the same simulator state. A seeded reset
+        # without a recorded state is explicitly not claimed to be the original demo.
+        seed_episode(episode_seed)
+        if hasattr(env, 'seed'):
+            env.seed(episode_seed)
+        env.reset()
+        initial_sim_state, initial_state_source = load_initial_sim_state(
+            ep_key, traj['initial_sim_state'], args.initial_states)
+        if initial_sim_state is None:
+            initial_sim_state = np.asarray(env.get_sim_state()).copy()
+        # Expert replay verification runs even with --no-video.
+        t0 = time.time()
+        replay_result = run_replay_in_sim(
                 env=env,
                 expert_actions=traj["actions"],
                 expert_poses=traj["poses"] if traj["poses"] is not None else None,
@@ -1455,10 +1672,40 @@ def main(argv=None):
                 flip_horizontal=flip_horizontal,
                 live_view=args.live_view,
                 rotation_convention=args.rotation_convention,
+                initial_sim_state=initial_sim_state,
+                record_frames=args.save_video,
             )
-            t_replay = time.time() - t0
+        t_replay = time.time() - t0
+        replay_check = assess_expert_replay(replay_result, args.replay_position_tolerance)
+        replay_check['initial_state_source'] = initial_state_source
+        np.savez_compressed(Path(args.out_dir) / f'{ep_key}_replay.npz',
+            executed_actions=replay_result['expert_actions'],
+            sim_positions=replay_result['sim_positions'],
+            position_errors=replay_result['errors'], initial_sim_state=initial_sim_state)
+        if args.replay_only and args.save_video:
+            try:
+                import imageio.v2 as imageio
+                with imageio.get_writer(str(Path(args.out_dir) / f'{ep_key}_replay.mp4'), fps=20) as writer:
+                    for frame in replay_result['frames']:
+                        writer.append_data(frame)
+            except Exception as error:
+                print(f'    Failed to save replay video: {error}')
+        print(f'    Expert replay: success={replay_check["task_success"]} '
+              f'EEF error={replay_check["mean_position_error"]} valid={replay_check["valid"]}')
+        if args.replay_only:
+            mujoco_results.append(dict(episode=ep_key, task_name=task_name, episode_seed=episode_seed,
+                n_steps=replay_result['n_steps'],
+                first_success_step=replay_result['first_success_step'],
+                termination_reason=replay_result['termination_reason'],
+                reference_steps=len(traj['actions']), replay_check=replay_check,
+                mean_error_replay=replay_check['mean_position_error'], mean_error_model=None,
+                success=None, policy_eligible=False, status='replay validation only'))
+            (Path(args.out_dir) / 'episode_results.json').write_text(json.dumps(dict(
+                episodes=mujoco_results, requested_episodes=len(episodes)), indent=2))
+            env.close()
+            continue
 
-        # Reseed after optional replay so video and task order cannot change
+        # Reseed after replay so video and task order cannot change
         # model initial conditions or the paired action-sampling noise stream.
         seed_episode(episode_seed)
         if hasattr(env,"seed"):env.seed(episode_seed)
@@ -1490,6 +1737,13 @@ def main(argv=None):
             live_view=args.live_view,
             rotation_convention=args.rotation_convention,
             task_text=args.task_text if args.task_text is not None else traj["text"],
+            task_context_mode=args.task_context_mode,
+            initial_sim_state=initial_sim_state,
+            record_frames=args.save_video,
+            task_estimator=task_estimator,
+            actual_task_name=task_name,
+            task_context_oracle=(task_oracle_bank.episode(ep_key,task_name,args.oracle_task_mode)
+                                 if task_oracle_bank is not None else None),
         )
         if ep_timing_log is not None:
             all_timing_logs.append({"episode": ep_key, "timing": ep_timing_log})
@@ -1499,18 +1753,37 @@ def main(argv=None):
         # EEF error for model rollout vs expert
         reference_steps = len(traj["poses"]) if traj["poses"] is not None else 0
         model_errors = model_result["errors"][:reference_steps]
-        eef_err_model = float(np.mean(model_errors)) if len(model_errors) else float("nan")
-        if args.save_video:
-            replay_errors = replay_result["errors"][:reference_steps]
-            eef_err_replay = float(np.mean(replay_errors)) if len(replay_errors) else float("nan")
+        eef_err_model = float(np.mean(model_errors)) if len(model_errors) else None
+        replay_errors = replay_result["errors"][:reference_steps]
+        eef_err_replay = float(np.mean(replay_errors)) if len(replay_errors) else None
 
+        if args.save_video:
+            replay_error_display = f'{eef_err_replay:.4f} m' if eef_err_replay is not None else 'N/A'
             print(f"    Replay run:  {replay_result['n_steps']:3d} steps  "
-                f"EEF err: {eef_err_replay:.4f} m  ({t_replay:.1f}s)")
+                f"EEF err: {replay_error_display}  ({t_replay:.1f}s)")
         switch_step = model_result.get("switch_step", 0)
+        model_error_display = f'{eef_err_model:.4f} m' if eef_err_model is not None else 'N/A'
         print(f"    Model run:   {model_result['n_steps']:3d} steps  "
-              f"EEF err: {eef_err_model:.4f} m  ({t_model:.1f}s)  "
+              f"EEF err: {model_error_display}  ({t_model:.1f}s)  "
               f"switch at step {switch_step}  "
               f"Success: {model_result['success']}  ")
+        if model_result['task_context_selection'] is not None:
+            selected = model_result['task_context_selection']
+            if selected['strategy'].startswith('oracle_'):
+                print(f'    PRIVILEGED task oracle: {selected["strategy"]}, replaced={selected["replaced"]}, source={selected["source_step"]}')
+            else:
+                print(f'    Highest-score task snapshot: observation {selected["selected_step"]}, '
+                      f'score={selected["selected_score"]}, records={len(selected["updates"])}')
+        if model_result['task_estimation'] is not None:
+            task_summary = model_result['task_estimation']
+            print(f'    Actual task: {task_summary["actual_task"]}')
+            for point in ('initial','handover','last_reference','final'):
+                estimate = task_summary['checkpoints'][point]
+                if estimate is not None:
+                    inferred = estimate['inferred']
+                    print(f'    Task estimate {point} (step {estimate["step"]}): '
+                          f'{inferred["predicted_task"]}; correct={inferred["correct"]}; '
+                          f'score={inferred["top1_probability"]:.3f} (uncalibrated)')
         # Diagnostic: action magnitude comparison
         mag_model = model_result.get("action_magnitude_model", 0.0)
         mag_dataset = model_result.get("action_magnitude_dataset", 0.0)
@@ -1520,14 +1793,26 @@ def main(argv=None):
                   f"dataset={mag_dataset:.4f}  ratio={scale_ratio:.3f}")
             if scale_ratio < 0.5:
                 print(f"    ⚠️  Model output is {scale_ratio:.1%} of dataset action scale")
-                print(f"      Try: --action-scale {1.0/max(scale_ratio, 0.01):.1f}")
+
+        # Record executed simulator commands, predictions and phase-specific
+        # success even when video/plots are disabled.
+        np.savez_compressed(Path(args.out_dir) / f'{ep_key}_rollout.npz',
+            executed_actions=model_result['executed_actions'],
+            predicted_actions=model_result['stored_actions'],
+            sim_positions=model_result['sim_positions'],
+            position_errors=model_result['errors'],
+            replay_position_errors=replay_result['errors'],
+            initial_sim_state=initial_sim_state,
+            switch_step=model_result['switch_step'])
+        if model_result['task_estimation_trace'] is not None:
+            model_result['task_estimation_trace'].save(Path(args.out_dir)/f'{ep_key}_task_estimates')
 
         # ── Save video (3-panel side-by-side) ──
         if args.save_video:
             try:
                 # Get dataset frames (agentview camera, numpy uint8)
                 dataset_frames = _extract_dataset_frames(
-                    traj, max_steps=args.max_steps,
+                    traj, max_steps=model_result['n_steps'],
                     target_camera="image",  # agentview
                     flip_vertical=False,
                     flip_horizontal=False,
@@ -1598,10 +1883,24 @@ def main(argv=None):
             "n_steps": model_result["n_steps"],
             "memory_intervention":args.memory_intervention,
             "episode_seed":episode_seed,
-            "reference_steps": min(reference_steps, model_result["n_steps"]),
-            "mean_error_replay": eef_err_replay if args.save_video else 0,
+            "reference_steps": reference_steps,
+            "mean_error_replay": eef_err_replay,
             "mean_error_model": eef_err_model,
             "success": model_result["success"],
+            "episode_success": model_result['episode_success'],
+            "success_before_handover": model_result['success_before_handover'],
+            "success_after_handover": model_result['success_after_handover'],
+            "first_success_step": model_result['first_success_step'],
+            "policy_eligible": model_result['policy_eligible'],
+            "switch_step": model_result['switch_step'],
+            "task_context_mode": model_result['task_context_mode'],
+            "task_context_selection": model_result['task_context_selection'],
+            "termination_reason": model_result['termination_reason'],
+            "task_estimation": model_result['task_estimation'],
+            "replay_check": replay_check,
+            "status": 'evaluated',
+            "mean_error_after_handover": (float(np.mean(model_errors[switch_step:]))
+                                          if len(model_errors) > switch_step else None),
         })
         progress_path = Path(args.out_dir) / "episode_results.json"
         progress_temporary = progress_path.with_suffix(".json.tmp")
@@ -1617,10 +1916,10 @@ def main(argv=None):
 
     # ── Aggregate MuJoCo metrics ──
     if mujoco_results:
-        replay_errs = [r["mean_error_replay"] for r in mujoco_results
-                        if not np.isnan(r["mean_error_replay"])]
-        model_errs = [r["mean_error_model"] for r in mujoco_results
-                       if not np.isnan(r["mean_error_model"])]
+        replay_errs = [r['mean_error_replay'] for r in mujoco_results
+                       if r['mean_error_replay'] is not None and np.isfinite(r['mean_error_replay'])]
+        model_errs = [r['mean_error_model'] for r in mujoco_results
+                      if r['mean_error_model'] is not None and np.isfinite(r['mean_error_model'])]
         print(f"\n{'='*68}")
         print(f"=== MuJoCo Aggregate (alpha={args.alpha}) ===")
         print(f"{'='*68}")
@@ -1630,40 +1929,72 @@ def main(argv=None):
             print(f"  Model  EEF err:  {np.mean(model_errs):.4f} m  (n={len(model_errs)})")
         print(f"\n  Per-episode:")
         
-        success_count = 0
         for r in mujoco_results:
-            success_count = success_count + 1 if r.get("success", False) else success_count
             tn = r.get("task_name", "?")
             print(f"    {tn[:50]:<50}  "
-                  f"replay={r['mean_error_replay']:.4f}  "
-                  f"model={r['mean_error_model']:.4f}  "
+                  f"replay={r['mean_error_replay']}  "
+                  f"model={r['mean_error_model']}  "
                   f"steps={r['n_steps']}")
+
+        eligible_results = [r for r in mujoco_results if r['policy_eligible']]
+        per_task_success = summarize_task_success(eligible_results)
+        success_count = sum(task["success_count"] for task in per_task_success.values())
+        evaluation_complete = len(mujoco_results) == len(episodes)
+        expert_replay_all_passed = all(r['replay_check']['valid'] for r in mujoco_results)
+        rate = f'{success_count}/{len(eligible_results)}' if eligible_results else None
+        evaluated_results = [r for r in mujoco_results if r['status'] == 'evaluated']
+        episode_success_count = sum(bool(r['episode_success']) for r in evaluated_results)
+        print("\n  Per-task success:")
+        for task_name, counts in per_task_success.items():
+            print(f"    {task_name}: {counts['success_count']}/{counts['n_episodes']} "
+                  f"({counts['success_rate']:.1%})")
+        print(f'\n  Policy success: {rate}; all requested episodes completed: {evaluation_complete}')
+        print(f'  Expert replay checks all passed: {expert_replay_all_passed} (informational)')
 
         # Save JSON summary
         summary = {
             "policy_type": args.policy_type,
             "policy_metadata": getattr(model, "metadata", {}),
             "evaluation_args": vars(args),
+            "evaluation_protocol": evaluation_protocol,
+            "evaluation_kind": ('privileged oracle-context diagnostic' if task_oracle_bank is not None else
+                                'expert replay validation' if args.replay_only else 'policy rollout'),
+            "evaluation_complete": evaluation_complete,
+            "expert_replay_all_passed": expert_replay_all_passed,
+            "qualified": evaluation_complete,  # Deprecated compatibility alias; no replay gating.
+            "replay_pass_count": sum(r['replay_check']['valid'] for r in mujoco_results),
+            "requested_episodes": len(episodes),
+            "n_policy_episodes": len(eligible_results),
+            "n_evaluated_episodes": len(evaluated_results),
+            "episode_success_count": episode_success_count,
+            "episode_success_rate": (f'{episode_success_count}/{len(evaluated_results)}'
+                                     if evaluated_results else None),
+            "expert_completed_episodes": sum(bool(r.get('success_before_handover')) for r in mujoco_results),
             "checkpoint": args.checkpoint,
             "data": args.data,
             "alpha": args.alpha,
             "rotation_convention": args.rotation_convention,
             "n_episodes": len(mujoco_results),
-            "success_rate": f"{success_count}/{ len(mujoco_results)}",
+            "success_count": success_count,
+            "success_rate": rate,
+            "diagnostic_success_rate": rate,
+            "per_task_success": per_task_success,
+            "task_estimation": summarize_task_estimation(mujoco_results),
             "episodes": mujoco_results,
             "aggregate": {
                 "mean_replay_err": float(np.mean(replay_errs)) if replay_errs else None,
                 "mean_model_err": float(np.mean(model_errs)) if model_errs else None,
             },
         }
-        eval_suffix = "_val" if args.val_episodes is not None else ""
-        summary_path = (Path(args.out_dir) / f"xvla.mujoco_eval_{args.switch_at}{eval_suffix}.json"
-                        if args.policy_type == "xvla" else Path(args.checkpoint).with_suffix(
-                            f".mujoco_eval_{args.switch_at}{eval_suffix}.json"))
+        # Keep corrected protocol results separate from historical sidecars.
+        summary_path = Path(args.out_dir) / 'result.json'
         with open(summary_path, "w") as f:
             json.dump(summary, f, indent=2)
-        (Path(args.out_dir) / "result.json").write_text(json.dumps(summary, indent=2))
         print(f"\n  Summary written to: {summary_path}")
+
+        quick_summary,quick_paths = write_evaluation_summary(summary_path)
+        print('\n'+render_evaluation_summary(quick_summary,detailed=False))
+        print('  Quick summaries: '+', '.join(str(path) for path in quick_paths))
 
         # Optional: save per-step timing log for action-horizon benchmarks
         if args.save_timing and all_timing_logs:

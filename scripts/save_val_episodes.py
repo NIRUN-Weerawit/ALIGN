@@ -29,9 +29,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data.align_dataset import ALIGNDataset
 from torch.utils.data import random_split
+from eval.libero_protocol import saved_development_episodes, select_evaluation_episodes
+import h5py
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Save validation episode keys from a training run."
     )
@@ -44,11 +46,25 @@ def main():
                         help="Camera names (must match training config)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override random seed (default: from checkpoint config or 42)")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Load checkpoint config
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = ckpt.get("config", {})
+    saved = saved_development_episodes(cfg)
+    if saved is not None:
+        if args.val_split is not None or args.seed is not None:
+            parser.error('Checkpoint contains an exact saved split; seed/val-split cannot override it')
+        with h5py.File(args.data, 'r') as source:
+            available = sorted(key for key in source if key.startswith('ep_'))
+        keys, _ = select_evaluation_episodes(available, cfg)
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text('\n'.join(keys) + '\n')
+        print(f'Saved {len(keys)} exact checkpoint development episodes to {output}')
+        return
+
+    print('Checkpoint has no saved episode split; reconstructing its legacy random sample split.')
 
     val_split = args.val_split or cfg.get("val_split", 0.1)
     seed = args.seed or cfg.get("seed", 42)
@@ -82,6 +98,7 @@ def main():
         ep_keys_seen.add(ep_key)
 
     ep_keys_sorted = sorted(ep_keys_seen)
+    ds.close()
     print(f"Total samples: {n_total}")
     print(f"Val split: {n_val} samples ({val_split*100:.0f}%)")
     print(f"Unique val episodes: {len(ep_keys_sorted)}")
