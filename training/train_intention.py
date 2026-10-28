@@ -395,6 +395,9 @@ def build_model(args, num_cameras, device):
         task_context_trainable=getattr(args,'task_context_trainable',False),
         task_context_fusion=getattr(args,'task_context_fusion','additive'),
         task_context_fusion_dim=getattr(args,'task_context_fusion_dim',128),
+        policy_temporal_mamba=getattr(args,'policy_temporal_mamba',False),
+        policy_temporal_width=getattr(args,'policy_temporal_width',128),
+        policy_temporal_layers=getattr(args,'policy_temporal_layers',1),
     )
     model = model.to(device)
     return model
@@ -602,7 +605,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             intent_event = stage_start()
             if num_windows > 0 and getattr(model, 'task_context', None) is not None:
                 ticks = torch.as_tensor(batch['observation_timesteps'], device=device)
-                intent_sequence = model.task_context.sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
+                intent_sequence = model.context_sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
             elif num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     intent_sequence = model.intention_encoder.forward_sequence(
@@ -1207,7 +1210,7 @@ def validate(model, loader, device, args):
             intent_sequence = None
             if num_windows > 0 and getattr(model, 'task_context', None) is not None:
                 ticks = torch.as_tensor(batch['observation_timesteps'], device=device)
-                intent_sequence = model.task_context.sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
+                intent_sequence = model.context_sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
             elif num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     intent_sequence = model.intention_encoder.forward_sequence(
@@ -1619,6 +1622,9 @@ def parse_args():
     except ValueError as error:parser.error(str(error))
     if args.num_task_tokens is not None and (args.num_task_tokens<1 or not args.task_context_checkpoint):
         parser.error("--num-task-tokens must be positive and requires --task-context-checkpoint")
+    from data.task_context_policy_dataset import validate_policy_temporal_arguments
+    try:validate_policy_temporal_arguments(args)
+    except ValueError as error:parser.error(str(error))
     if args.task_context_fusion != 'additive' and not args.task_context_checkpoint:
         parser.error('Non-additive task-context fusion requires --task-context-checkpoint')
     if args.task_context_fusion == 'aci' and (args.history_size != 1 or

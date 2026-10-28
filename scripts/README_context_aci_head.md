@@ -92,3 +92,60 @@ the original 14 ACI tests. Production-loop checks ran three optimizer updates fo
 validation on both CPU and CUDA for both objectives, confirmed nonzero context
 projection gradients, and verified bitwise unchanged observer weights. They use
 small synthetic cached-feature episodes, not a dataset-quality benchmark.
+
+## Jointly trained policy temporal Mamba
+
+Add these options to the ACI training command (use a new output directory):
+
+```bash
+--policy-temporal-mamba --policy-temporal-width 128 --policy-temporal-layers 1
+```
+
+This creates a separate, randomly initialized Mamba trained only through the
+policy's action loss. The pretrained observation-summary network, context Mamba,
+and its task/execution readouts remain frozen. `--task-context-trainable` and
+scratch context variants are rejected with this option.
+
+```text
+Frozen per-frame observation summary (256D in the current observer)
+    |                                    |
+    v                                    v
+Frozen pretrained context Mamba     Trainable policy Mamba (width 128)
+    |                                    |
+4 task + 1 execution tokens          1 policy temporal token (128D)
+    |                                    |
+    +------------ 6 context tokens ------+
+                         |
+               ACI context attention
+```
+
+The temporal token width matches the observer token width automatically. The
+original five native tokens remain numerically unchanged; the new token is
+appended after the execution token. The frozen context branch's configuration,
+weights and task-decoder fingerprint remain unchanged. The new recurrent module
+is saved separately as `policy_temporal_encoder.*` in the policy checkpoint.
+
+Training scans each complete episode once with causal Mamba sequence operations;
+all action anchors backpropagate through this scan. It does not reuse recurrent
+state across shuffled batches, consult future observations, or train a separate
+future-prediction objective. Padded observations are sanitized before projection
+and their temporal outputs are masked. Full-episode backpropagation increases
+activation memory; retain the existing episode microbatch controls.
+
+Deployment maintains independent pretrained-context and policy-temporal caches.
+Both advance once per observation and reset with a new `IntentionStream`. Task
+snapshot/handover freezes only task tokens; the execution and policy temporal
+tokens continue updating. The existing `no_execution` intervention removes the
+pretrained execution token only. `no_temporal` masks the new policy token;
+`no_context` masks all six tokens.
+
+New architecture options are checkpointed and checked on resume. A checkpoint
+without the temporal branch cannot resume as one with it; start a new run or
+use an explicit partial warm start. No full training or performance improvement
+is claimed by adding this branch.
+
+Temporal-branch verification (2026-10-28): **188 tests passed**, including CUDA
+sequence/stream equivalence and production diffusion/flow training and validation.
+Checks confirm action-loss gradients in the new Mamba, unchanged native observer
+weights and task-decoder fingerprint, isolated temporal-token masking, and strict
+self-contained checkpoint reloads. No full dataset training was launched.

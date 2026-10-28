@@ -160,6 +160,9 @@ def load_intention_model(
         task_context_initialization=cfg.get('task_context_initialization','pretrained'),
         task_context_fusion=cfg.get('task_context_fusion','additive'),
         task_context_fusion_dim=cfg.get('task_context_fusion_dim',128),
+        policy_temporal_mamba=cfg.get('policy_temporal_mamba',False),
+        policy_temporal_width=cfg.get('policy_temporal_width',128),
+        policy_temporal_layers=cfg.get('policy_temporal_layers',1),
         # V4 args (default to False/0 for backward compat with V3 checkpoints)
         use_intent_tokens=cfg.get("use_intent_tokens", False),
         num_intent_tokens=cfg.get("num_intent_tokens", 2),

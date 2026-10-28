@@ -66,7 +66,7 @@ def source_provenance(root=ROOT):
     if snapshot.exists():
         return json.loads(snapshot.read_text())
     import hashlib
-    names = ['models/context_aci_head.py','models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
+    names = ['models/context_aci_head.py','models/policy_temporal_encoder.py','models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
         'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
         'data/task_context_policy_dataset.py','training/train_intention.py','scripts/run_intention_ablation.py']
@@ -326,6 +326,9 @@ def evaluate_existing(out):
             task_context_initialization=config.get('task_context_initialization','pretrained'),
             task_context_fusion=config.get('task_context_fusion','additive'),
             task_context_fusion_dim=config.get('task_context_fusion_dim',128),
+            policy_temporal_mamba=config.get('policy_temporal_mamba',False),
+            policy_temporal_width=config.get('policy_temporal_width',128),
+            policy_temporal_layers=config.get('policy_temporal_layers',1),
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
             use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
             text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
@@ -504,6 +507,9 @@ def parse_args(argv=None):
     if any(v not in allowed for v in args.variants):
         parser.error('Unknown ablation variant')
     context_variants = [v for v in args.variants if v.startswith('context_')]
+    from data.task_context_policy_dataset import validate_policy_temporal_arguments
+    try:validate_policy_temporal_arguments(args)
+    except ValueError as error:parser.error(str(error))
     if args.task_context_fusion != 'additive' and not context_variants:
         parser.error('Non-additive task-context fusion requires a context variant')
     if args.task_context_fusion == 'aci' and ('context_history' in args.variants or args.history_size != 1 or
@@ -704,6 +710,9 @@ def main(argv=None):
                 continue
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
+        for key, default in dict(policy_temporal_mamba=False, policy_temporal_width=128, policy_temporal_layers=1).items():
+            if previous.get(key, default) != manifest[key]:
+                raise ValueError(f'Resume policy temporal configuration mismatch: {key}')
         for key in ('task_context_checkpoint','task_context_split_manifest','task_context_trainable',
                     'task_context_bundle_sha256','task_context_split','task_context_matmul_tf32'):
             if previous.get(key, False if key == 'task_context_trainable' else None) != manifest[key]:
@@ -802,7 +811,10 @@ def main(argv=None):
             task_context_trainable=args.task_context_trainable,
             task_context_initialization='scratch' if scratch else 'pretrained',
             task_context_fusion=args.task_context_fusion if context else 'additive',
-            task_context_fusion_dim=args.task_context_fusion_dim)
+            task_context_fusion_dim=args.task_context_fusion_dim,
+            policy_temporal_mamba=args.policy_temporal_mamba,
+            policy_temporal_width=args.policy_temporal_width,
+            policy_temporal_layers=args.policy_temporal_layers)
         # Cached training never uses the raw-image modules. Keep them off GPU.
         model.vision_encoder.requires_grad_(False)
         vision = model.vision_encoder

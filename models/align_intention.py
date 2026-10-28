@@ -131,6 +131,9 @@ class ALIGNIntentionModel(nn.Module):
         task_context_initialization: str = "pretrained",
         task_context_fusion: str = "additive",
         task_context_fusion_dim: int = 128,
+        policy_temporal_mamba: bool = False,
+        policy_temporal_width: int = 128,
+        policy_temporal_layers: int = 1,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -194,6 +197,19 @@ class ALIGNIntentionModel(nn.Module):
             cfg = self.task_context.config['summary_config']
             if cfg['cameras'] != num_cameras or cfg['raw_dim'] != raw_dim:
                 raise ValueError('Pretrained context camera count or DINO width differs')
+        self.policy_temporal_mamba = bool(policy_temporal_mamba)
+        self.policy_temporal_width = policy_temporal_width
+        self.policy_temporal_layers = policy_temporal_layers
+        self.policy_temporal_encoder = None
+        if policy_temporal_mamba:
+            if self.task_context is None or task_context_fusion != 'aci' or task_context_trainable or task_context_initialization != 'pretrained':
+                raise ValueError('Policy temporal Mamba requires ACI with a frozen pretrained context observer')
+            from models.policy_temporal_encoder import PolicyTemporalEncoder
+            with torch.random.fork_rng(devices=[]):
+                self.policy_temporal_encoder = PolicyTemporalEncoder(
+                    self.task_context.config['summary_config']['width'],
+                    self.task_context.config['encoder_config']['token_dim'],
+                    width=policy_temporal_width, layers=policy_temporal_layers)
         self.use_memory_bank = use_memory_bank
         self.memory_bank_len = memory_bank_len
         self.memory_mode = memory_mode
@@ -327,7 +343,7 @@ class ALIGNIntentionModel(nn.Module):
 
         # Trainable prefixes
         self._trainable_prefixes = {
-            "intention_encoder", "intention_head",
+            "intention_encoder", "intention_head", "policy_temporal_encoder",
         }
         self._encoder_prefixes = {
             "vision_encoder.backbone", "state_encoder",
@@ -403,7 +419,7 @@ class ALIGNIntentionModel(nn.Module):
                 from models.context_aci_head import ACIContextDiffusionPolicyHead, ACIContextFlowMatchingPolicyHead
                 head_class = ACIContextDiffusionPolicyHead if self.head_type == 'diffusion' else ACIContextFlowMatchingPolicyHead
                 context_options.update(state_dim=self.state_dim, visual_token_dim=self.compressed_dim,
-                    num_cameras=self.num_cameras)
+                    num_cameras=self.num_cameras, temporal_tokens=int(self.policy_temporal_mamba))
             objective_options = (dict(num_inference_steps=10,
                 num_train_timesteps=self.diffusion_train_steps,
                 loss_repeats=self.diffusion_loss_repeats,
@@ -565,7 +581,7 @@ class ALIGNIntentionModel(nn.Module):
         if self.task_context is not None:
             lengths = torch.full((B,), T, device=state_seq.device, dtype=torch.long)
             ticks = torch.arange(T, device=state_seq.device).expand(B, -1)
-            context = self.task_context.sequence(z_v_all, z_v_CLS_all, state_seq, lengths, ticks)
+            context = self.context_sequence(z_v_all, z_v_CLS_all, state_seq, lengths, ticks)
             h_seq, intent_emb = context.flatten(2), context[:, -1]
         elif self.use_history:
             intent = self.forward_intent(z_v_CLS_all, z_s_seq)
@@ -658,6 +674,12 @@ class ALIGNIntentionModel(nn.Module):
                 h_new, h_states_new = result
         elif self.task_context is not None:
             context, h_states_new = self.task_context.step(z_v_patches, z_v_cls, robot_state, h_states)
+            if self.policy_temporal_encoder is not None:
+                if h_states_new.policy_temporal is None:
+                    h_states_new.policy_temporal = self.policy_temporal_encoder.new_stream(len(robot_state))
+                temporal = self.policy_temporal_encoder.step(
+                    h_states_new.last_summary, h_states_new.policy_temporal)
+                context = torch.cat([context, temporal], -2)
             h_new = context.flatten(1)
             if produce_intent:
                 return z_v_pooled, z_s, h_new, h_states_new, context
@@ -747,6 +769,15 @@ class ALIGNIntentionModel(nn.Module):
         if not self.use_text or self.text_encoder is None:
             raise ValueError("Task text is disabled for this model")
         return self.text_encoder(texts)
+
+    def context_sequence(self, patches, cls, states, lengths, timesteps):
+        if self.policy_temporal_encoder is None:
+            return self.task_context.sequence(patches, cls, states, lengths, timesteps)
+        summaries = self.task_context.summaries(patches, cls, states,
+            timesteps / self.task_context.fps, lengths)
+        native = self.task_context.sequence_from_summaries(summaries, lengths)
+        temporal = self.policy_temporal_encoder(summaries, lengths)
+        return torch.cat([native, temporal], -2)
 
     def action_condition(self, visual, states, intent=None, text_emb=None):
         cond = self.intention_head(visual, states, intent)
@@ -847,7 +878,7 @@ class ALIGNIntentionModel(nn.Module):
         if self.task_context is not None:
             lengths = torch.full((B,), T, device=state_seq.device, dtype=torch.long)
             ticks = torch.arange(T, device=state_seq.device).expand(B, -1)
-            context = self.task_context.sequence(z_v_patches, z_v_CLS_all, state_seq, lengths, ticks)
+            context = self.context_sequence(z_v_patches, z_v_CLS_all, state_seq, lengths, ticks)
             h_seq, intent_emb = context.flatten(2), context[:, -1]
         elif self.use_history:
             intent = self.forward_intent(z_v_CLS_all, z_s_seq)

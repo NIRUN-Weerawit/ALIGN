@@ -107,19 +107,21 @@ def test_context_removal_masks_values_slot_embeddings_and_output_bias():
 
 
 @pytest.mark.parametrize('kind', ['diffusion','flow_matching'])
-def test_production_model_frozen_encoder_and_strict_loader(monkeypatch,bundle,tmp_path,kind):
+@pytest.mark.parametrize('temporal', [False,True])
+def test_production_model_frozen_encoder_and_strict_loader(monkeypatch,bundle,tmp_path,kind,temporal):
     from models.align_intention import ALIGNIntentionModel
     from data.task_context_policy_dataset import context_policy_options
     from eval.eval_intention import load_intention_model
     monkeypatch.setattr('models.align_intention.VisionEncoder',FakeVision)
     config=dict(state_dim=8,mamba_output_dim=16,num_cameras=1,compressed_dim=4,
         action_dim=7,chunk_size=8,history_size=1,head_d_model=8,head_type=kind,
-        diffusion_loss_repeats=1,diffusion_clip_sample=True,task_context_fusion='aci',task_context_fusion_dim=16)
+        diffusion_loss_repeats=1,diffusion_clip_sample=True,task_context_fusion='aci',task_context_fusion_dim=16,
+        policy_temporal_mamba=temporal,policy_temporal_width=16)
     model=ALIGNIntentionModel(**config,task_context_checkpoint=str(bundle)).train()
     model._build_head_and_bank(1024)
     activate(model.intention_head)
     _,patches,cls,state,lengths,ticks=inputs()
-    context=model.task_context.sequence(patches,cls,state,lengths,ticks)[:,3]
+    context=model.context_sequence(patches,cls,state,lengths,ticks)[:,3]
     visual=torch.randn(2,1,1024);encoded=torch.randn(2,1,8)
     cond=model.action_condition(visual,encoded,context)
     loss=model.intention_head.loss(torch.randn(2,8,7),cond,**model.action_context(visual))
@@ -155,7 +157,8 @@ def test_cli_exposes_aci_and_rejects_incompatible_options():
 
 @pytest.mark.parametrize('kind', ['diffusion','flow_matching'])
 @pytest.mark.parametrize('device_name', ['cpu','cuda'])
-def test_production_epoch_and_validation_update_head_keep_observer_fixed(monkeypatch,bundle,kind,device_name):
+@pytest.mark.parametrize('temporal', [False,True])
+def test_production_epoch_and_validation_update_head_keep_observer_fixed(monkeypatch,bundle,kind,device_name,temporal):
     if device_name=='cuda' and not torch.cuda.is_available():
         pytest.skip('CUDA unavailable')
     from types import SimpleNamespace
@@ -166,7 +169,8 @@ def test_production_epoch_and_validation_update_head_keep_observer_fixed(monkeyp
     model=ALIGNIntentionModel(state_dim=8,mamba_output_dim=16,num_cameras=1,compressed_dim=4,
         action_dim=7,chunk_size=4,history_size=1,head_d_model=8,head_type=kind,
         diffusion_loss_repeats=1,task_context_checkpoint=str(bundle),
-        task_context_fusion='aci',task_context_fusion_dim=16).to(device)
+        task_context_fusion='aci',task_context_fusion_dim=16,
+        policy_temporal_mamba=temporal,policy_temporal_width=16).to(device)
     model._build_head_and_bank(1024)
     frozen={k:v.detach().clone() for k,v in model.task_context.state_dict().items()}
     before=model.intention_head.unet.context_projection.weight.detach().clone()
@@ -181,6 +185,9 @@ def test_production_epoch_and_validation_update_head_keep_observer_fixed(monkeyp
         assert 0<loss<float('inf')
     assert not torch.equal(before,model.intention_head.unet.context_projection.weight)
     assert model.intention_head.unet.context_projection.weight.grad.abs().sum()>0
+    if temporal:
+        weight=model.policy_temporal_encoder.blocks[0].in_proj.weight
+        assert weight.grad is not None and weight.grad.abs().sum()>0
     for key,value in frozen.items():
         torch.testing.assert_close(model.task_context.state_dict()[key],value,rtol=0,atol=0)
     assert all(p.grad is None for p in model.task_context.parameters())

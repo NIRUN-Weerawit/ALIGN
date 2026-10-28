@@ -40,6 +40,8 @@ class PolicyContextState:
     recurrence: object
     task_snapshot: torch.Tensor | None = None
     last_task: torch.Tensor | None = None
+    last_summary: torch.Tensor | None = None
+    policy_temporal: object = None
 
 
 class TaskContextPolicyBranch(nn.Module):
@@ -109,6 +111,9 @@ class TaskContextPolicyBranch(nn.Module):
 
     def sequence(self, patches, cls, state, lengths, timesteps):
         summaries = self.summaries(patches, cls, state, timesteps / self.fps, lengths)
+        return self.sequence_from_summaries(summaries, lengths)
+
+    def sequence_from_summaries(self, summaries, lengths):
         encoder = self.observer.encoder
         # Read at every real time. Padding readout indices are clamped and then
         # excluded by the production action-anchor mask; no future is consulted.
@@ -136,6 +141,7 @@ class TaskContextPolicyBranch(nn.Module):
         summaries = self.summaries(patches[:, None], cls[:, None], state[:, None], seconds)[:, 0]
         with torch.autocast(device_type=state.device.type, enabled=False):
             out = self.observer.encoder.step(summaries, cache.recurrence)
+        cache.last_summary = summaries.detach()
         cache.last_task = out["tokens"].detach().clone()
         task = cache.task_snapshot if cache.task_snapshot is not None else out["tokens"]
         return torch.cat([task, out["execution_token"]], -2), cache

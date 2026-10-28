@@ -53,6 +53,10 @@ def add_context_policy_arguments(parser):
         default='additive', help='Context conditioning; aci selects alternating action-to-context/observation attention')
     parser.add_argument('--task-context-fusion-dim', type=int, default=128,
         help='Hidden width for context fusion/ACI attention (divisible by 4 for attention modes)')
+    parser.add_argument('--policy-temporal-mamba', action='store_true',
+        help='Train a separate recurrent policy token alongside the frozen pretrained observer (ACI only)')
+    parser.add_argument('--policy-temporal-width', type=int, default=128)
+    parser.add_argument('--policy-temporal-layers', type=int, default=1)
     parser.add_argument('--policy-warm-start', default=None, help='Copy shape-compatible common policy weights from an existing checkpoint; context weights remain from the observer')
 
 
@@ -63,7 +67,10 @@ def context_policy_options(model):
         task_context_trainable=branch.trainable if branch is not None else False,
         task_context_initialization=branch.initialization if branch is not None else 'pretrained',
         task_context_fusion=getattr(model, 'task_context_fusion', 'additive'),
-        task_context_fusion_dim=getattr(model, 'task_context_fusion_dim', 128))
+        task_context_fusion_dim=getattr(model, 'task_context_fusion_dim', 128),
+        policy_temporal_mamba=getattr(model, 'policy_temporal_mamba', False),
+        policy_temporal_width=getattr(model, 'policy_temporal_width', 128),
+        policy_temporal_layers=getattr(model, 'policy_temporal_layers', 1))
 
 
 def policy_parameter_groups(model, lr):
@@ -94,3 +101,14 @@ def warm_start_policy(model, path):
         raise ValueError('Warm-start checkpoint has no compatible action-policy parameters')
     model.load_state_dict(copied,strict=False)
     return dict(path=str(Path(path).resolve()), sha256=file_hash(path), tensors_copied=len(copied))
+
+
+def validate_policy_temporal_arguments(args):
+    if args.policy_temporal_width < 1 or args.policy_temporal_layers < 1:
+        raise ValueError('Policy temporal width/layers must be positive')
+    if args.policy_temporal_mamba:
+        if not args.task_context_checkpoint or args.task_context_fusion != 'aci' or args.task_context_trainable:
+            raise ValueError('--policy-temporal-mamba requires ACI and a frozen pretrained context observer')
+        variants = getattr(args, 'variants', ['context_no_memory'])
+        if any(not v.startswith('context_') or 'scratch' in v for v in variants):
+            raise ValueError('Policy temporal Mamba requires pretrained context variants only')
