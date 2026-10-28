@@ -379,6 +379,10 @@ class ALIGNDataset(Dataset):
         # collators can request a read-only view and copy directly into their
         # final batch allocation instead.
         mm = self._dinov2_memmaps[ep_idx]
+        from models.vision_config import cache_spec
+        _, width = cache_spec(self._dinov2_index["__meta__"])
+        if mm.ndim != 3 or mm.shape[1:] != (len(self.cameras)*257, width):
+            raise ValueError(f"Cached feature shape does not match backbone metadata: {mm.shape}")
         view = mm[start:start + count]
         return np.array(view) if copy else view
 

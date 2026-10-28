@@ -200,7 +200,7 @@ def main():
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cuda.enable_cudnn_sdp(False)
     start = time.perf_counter()
-    sources = ['tools/refit_task_context.py', 'training/train_task_context_teacher.py',
+    sources = ['models/vision_config.py','tools/refit_task_context.py', 'training/train_task_context_teacher.py',
         'data/training_split.py', 'configs/splits/libero_goal_piper_384_44.json',
         'training/train_task_context_encoder.py', 'data/task_context_dataset.py',
         'data/task_context_prefix_dataset.py', 'models/task_context_teacher.py',

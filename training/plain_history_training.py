@@ -135,10 +135,10 @@ def history_conditions(model, batch, device, stage_start=None, stage_end=None, r
     before = start()
     count, tokens, _ = frames.shape
     cameras = tokens // 257
-    features = frames.reshape(count, cameras, 257, 768)
-    patches = features[:, :, :-1].reshape(count, cameras * 256, 768)
+    features = frames.reshape(count, cameras, 257, model.raw_dim)
+    patches = features[:, :, :-1].reshape(count, cameras * 256, model.raw_dim)
     if visibility is not None:
-        visible_patches = visibility[:, :, None, None].expand(-1, -1, 256, 768).reshape(patches.shape)
+        visible_patches = visibility[:, :, None, None].expand(-1, -1, 256, model.raw_dim).reshape(patches.shape)
         patches = torch.where(visible_patches, patches, torch.zeros_like(patches))
     if state_mask is not None:
         states = torch.where(state_mask[:, None], states, torch.zeros_like(states))

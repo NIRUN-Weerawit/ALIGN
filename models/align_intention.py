@@ -88,7 +88,8 @@ class ALIGNIntentionModel(nn.Module):
         text_encoder_type: str = "clip",
         text_vocab: Optional[List[str]] = None,
         compressed_dim: int = 16,
-        raw_dim: int = 768,
+        raw_dim: int = None,
+        vision_backbone: str = "dinov2_vitb14",
         # V4 args
         use_intent_tokens: bool = False,
         num_intent_tokens: int = 2,
@@ -134,7 +135,10 @@ class ALIGNIntentionModel(nn.Module):
         self.text_dim = text_dim
         self.text_encoder_type = text_encoder_type
         self.compressed_dim = compressed_dim
+        from models.vision_config import feature_width
+        raw_dim = feature_width(vision_backbone, raw_dim)
         self.raw_dim = raw_dim
+        self.vision_backbone = vision_backbone
         # V4 flags
         self.use_intent_tokens = use_intent_tokens
         if use_intent_tokens and mamba_output_dim <= 0:
@@ -230,9 +234,10 @@ class ALIGNIntentionModel(nn.Module):
         self.pool_out_dim: Optional[int] = None
         self._built = False
 
-        # Vision encoder (DINOv2 with patch tokens, outputs raw 768-D features)
+        # Vision encoder with configured DINOv2 backbone and raw feature width
         self.vision_encoder = VisionEncoder(
-            embed_dim=raw_dim,  # DINOv2 ViT-B/14 output dim, hardcoded
+            backbone=vision_backbone,
+            embed_dim=raw_dim,
             num_cameras=num_cameras,
             use_patch_tokens=use_patch_tokens,
         )
@@ -424,6 +429,10 @@ class ALIGNIntentionModel(nn.Module):
         return frames.shape[1] if frames.ndim == 5 else 1
 
     def _vision_forward(self, frames: torch.Tensor) -> torch.Tensor:
+        if frames.ndim == 3:
+            if frames.shape[-1] != self.raw_dim:
+                raise ValueError("Cached visual feature width differs from configured backbone")
+            return frames
         return self.vision_encoder(frames)
 
     # ----------------------------------------------------------------
@@ -480,7 +489,12 @@ class ALIGNIntentionModel(nn.Module):
         B, T = frames_seq.shape[:2]
 
         # Batch DINOv2: reshape all frames into one big tensor
-        if frames_seq.ndim == 6:
+        if frames_seq.ndim == 4:
+            V = self.num_cameras
+            if frames_seq.shape[-2:] != (V * 257, self.raw_dim):
+                raise ValueError("Cached sequence does not match configured cameras/backbone")
+            z_v_all = frames_seq.reshape(B * T * V, 257, self.raw_dim)
+        elif frames_seq.ndim == 6:
             # (B, T, V, H, W, 3) — multi-camera
             V = frames_seq.shape[2]
             z_v_all = self._vision_forward(
@@ -588,7 +602,7 @@ class ALIGNIntentionModel(nn.Module):
         P_plus_1 = total_tokens // V  # P + 1 per camera
         P = P_plus_1 - 1
         # Reshape to (B, V, P+1, 768) so we can split into patches and CLS per camera
-        z_v_all_reshaped = z_v_all.reshape(z_v_all.shape[0], V, P_plus_1, 768)
+        z_v_all_reshaped = z_v_all.reshape(z_v_all.shape[0], V, P_plus_1, self.raw_dim)
         camera_visible = None
         if camera_mask is not None:
             camera_visible = torch.as_tensor(camera_mask,device=z_v_all.device,dtype=torch.bool).reshape(z_v_all.shape[0],V)
@@ -596,7 +610,7 @@ class ALIGNIntentionModel(nn.Module):
         # CLS is the last position per camera: (B, V, 768)
         z_v_cls = z_v_all_reshaped[:, :, -1, :]  # (B, V, 768)
         # Patches are all positions except the last per camera: (B, V, P, 768)
-        z_v_patches = z_v_all_reshaped[:, :, :-1, :].reshape(z_v_all.shape[0], V * P, 768)
+        z_v_patches = z_v_all_reshaped[:, :, :-1, :].reshape(z_v_all.shape[0], V * P, self.raw_dim)
         z_v_mod = self.encode_visual_features(z_v_patches, z_s)
         if camera_visible is not None:
             z_v_mod = (z_v_mod.reshape(z_v_mod.shape[0],V,P,-1)*camera_visible[:,:,None,None]).reshape(z_v_mod.shape)
@@ -761,7 +775,12 @@ class ALIGNIntentionModel(nn.Module):
         B, T = frames_seq.shape[:2]
 
         # ---- Vision encoding (handles both raw frames and pre-computed features) ----
-        if frames_seq.ndim == 6:
+        if frames_seq.ndim == 4:
+            V = self.num_cameras
+            if frames_seq.shape[-2:] != (V * 257, self.raw_dim):
+                raise ValueError("Cached sequence does not match configured cameras/backbone")
+            z_v_all = frames_seq.reshape(B * T * V, 257, self.raw_dim)
+        elif frames_seq.ndim == 6:
             V = frames_seq.shape[2]
             z_v_all = self._vision_forward(
                 frames_seq.reshape(B * T * V, *frames_seq.shape[3:])

@@ -343,7 +343,13 @@ def build_model(args, num_cameras, device):
     """Build ALIGNIntentionModel. All dimensions come from `args`."""
     if args.head_type not in ("diffusion", "flow_matching"):
         raise ValueError("Transformer/Mamba/hybrid action heads are future work; use diffusion or flow_matching for V4.")
+    if getattr(args,"use_precomputed_dinov2",False):
+        from models.vision_config import validate_cache
+        metadata=json.loads((Path(args.dinov2_path)/"index.json").read_text())["__meta__"]
+        validate_cache(metadata,args.vision_backbone,args.raw_dim)
     model = ALIGNIntentionModel(
+        vision_backbone=getattr(args,"vision_backbone","dinov2_vitb14"),
+        raw_dim=getattr(args,"raw_dim",None),
         state_dim=args.state_dim,
         mamba_output_dim=args.mamba_output_dim if args.use_history else 0,
         action_dim=args.action_dim,
@@ -488,21 +494,21 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # frames (last dim = 3, shape = (B, S, V, H, W, 3)). When features
         # are pre-computed, skip the DINOv2 forward entirely and just
         # unpack the saved tokens.
-        frames_are_features = frames_seg.shape[-1] == 768
+        frames_are_features = frames_seg.shape[-1] == model.raw_dim
         if frames_are_features:
             # Pre-computed features: (B, S, V*257, 768) float32
             # Layout per timestep: [cam0_patches(256), cam0_CLS(1), cam1_..., cam1_CLS, ...]
             TOKENS = frames_seg.shape[2]   # V * 257
             V = TOKENS // 257             # number of cameras
-            z_v_all = frames_seg.reshape(B * S * V, -1, 768)  # (B*S*V, P+1, raw_dim=768)
+            z_v_all = frames_seg.reshape(B * S * V, -1, model.raw_dim)  # (B*S*V, P+1, raw_dim=model.raw_dim)
             # print(f"Precomputed z_v_all shape: {z_v_all.shape}")
         else:
             V, H, W, C = frames_seg.shape[2:]
-            z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
+            z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=model.raw_dim)
             # print(f"raw z_v_all shape: {z_v_all.shape}")
 
         # Extract CLS tokens (last position per camera, NOT the last position overall).
-        future_cls_targets=(z_v_all.reshape(B,S,V,-1,768)[:,:,:,-1].detach()
+        future_cls_targets=(z_v_all.reshape(B,S,V,-1,model.raw_dim)[:,:,:,-1].detach()
                             if future_weight else None)
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
         visibility = None
@@ -511,11 +517,11 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             z_v_all = torch.where(visibility.reshape(B*S*V,1,1),z_v_all,torch.zeros_like(z_v_all))
         P_plus_1 = z_v_all.shape[1]
         P = P_plus_1 - 1
-        z_v_all = z_v_all.reshape(B * S, V, P_plus_1, 768)
+        z_v_all = z_v_all.reshape(B * S, V, P_plus_1, model.raw_dim)
         z_v_CLS_all = z_v_all[:, :, -1, :]  # (B*S, V, 768)
-        z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
+        z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=model.raw_dim)
         # Extract patches (all positions except the last per camera)
-        z_v_all = z_v_all[:, :, :-1, :].reshape(B, S , V * P, 768)   # (B, S, V*P, raw_dim=768)
+        z_v_all = z_v_all[:, :, :-1, :].reshape(B, S , V * P, model.raw_dim)   # (B, S, V*P, raw_dim=model.raw_dim)
 
         state_visibility = None
         if "observation_state_mask" in batch:
@@ -532,7 +538,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         # z_s_all = torch.stack(z_s_all, dim=1)
         patch_event = stage_start()
         z_v_mod_all = getattr(model,"encode_patch_sequence",model.vision_patch_encoder)(
-            z_v_all.reshape(B * S, V * P, 768),
+            z_v_all.reshape(B * S, V * P, model.raw_dim),
             z_s_all.reshape(B * S, -1),
         ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
         if visibility is not None:
@@ -938,7 +944,7 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
         # (B, S, V, H, W, 3). The model.forward path handles both via the
         # `_vision_forward` skip below.
         B, S = frames_seg.shape[:2]
-        frames_are_features = frames_seg.shape[-1] == 768
+        frames_are_features = frames_seg.shape[-1] == model.raw_dim
 
         # Forward (batched) through the model — one call for the whole segment
         with torch.amp.autocast("cuda", dtype=torch.bfloat16,
@@ -952,12 +958,12 @@ def train_v4_batched_epoch(model, loader, optimizer, device, args, max_steps=0):
                 P = 256
                 P_plus_1 = 257
                 features = frames_seg.float()  # ensure fp32 for vision_patch_encoder
-                features_4d = features.reshape(B * S, V, P_plus_1, 768)
-                z_v_CLS_all = features_4d[:, :, -1, :].reshape(B, S, V, 768)
-                z_v_all = features_4d[:, :, :-1, :].reshape(B, S, V * P, 768)
+                features_4d = features.reshape(B * S, V, P_plus_1, model.raw_dim)
+                z_v_CLS_all = features_4d[:, :, -1, :].reshape(B, S, V, model.raw_dim)
+                z_v_all = features_4d[:, :, :-1, :].reshape(B, S, V * P, model.raw_dim)
                 z_s_seq = model.state_encoder(states_seg.reshape(B * S, -1)).reshape(B, S, -1)
                 z_v_mod_seq = model.vision_patch_encoder(
-                    z_v_all.reshape(B * S, V * P, 768),
+                    z_v_all.reshape(B * S, V * P, model.raw_dim),
                     z_s_seq.reshape(B * S, -1),
                 ).reshape(B, S, V * P, -1)
                 pool_out_dim = V * P * z_v_mod_seq.shape[-1]
@@ -1113,19 +1119,19 @@ def validate(model, loader, device, args):
         # Pre-encode vision for the entire segment (vision is the bottleneck)
         B, S = frames_seg.shape[:2]
         # Detect pre-computed DINOv2 features vs raw frames (see train_v4_epoch)
-        frames_are_features = frames_seg.shape[-1] == 768
+        frames_are_features = frames_seg.shape[-1] == model.raw_dim
         if frames_are_features:
             TOKENS = frames_seg.shape[2]
             V = TOKENS // 257
-            z_v_all = frames_seg.reshape(B * S * V, -1, 768)  # (B*S*V, P+1, raw_dim=768)
+            z_v_all = frames_seg.reshape(B * S * V, -1, model.raw_dim)  # (B*S*V, P+1, raw_dim=model.raw_dim)
         else:
             V, H, W, C = frames_seg.shape[2:]
-            z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=768)
+            z_v_all = model._vision_forward(frames_seg.reshape(B * S * V, H, W, C))   # (B*S*V, P+1, raw_dim=model.raw_dim)
 
         # Extract CLS tokens (last position per camera, NOT the last position overall).
         # Layout: [cam0_patches..., cam0_CLS, cam1_patches..., cam1_CLS, ...]
         # Total tokens per camera = P + 1
-        future_cls_targets=(z_v_all.reshape(B,S,V,-1,768)[:,:,:,-1].detach()
+        future_cls_targets=(z_v_all.reshape(B,S,V,-1,model.raw_dim)[:,:,:,-1].detach()
                             if future_weight else None)
         visibility = None
         if "observation_camera_mask" in batch:
@@ -1134,12 +1140,12 @@ def validate(model, loader, device, args):
         P_plus_1 = z_v_all.shape[1]
         P = P_plus_1 - 1
         # Reshape to (B*S*V, P+1, 768) then take last per camera
-        z_v_all_reshaped = z_v_all.reshape(B * S, V, P_plus_1, 768)
+        z_v_all_reshaped = z_v_all.reshape(B * S, V, P_plus_1, model.raw_dim)
         z_v_CLS_all = z_v_all_reshaped[:, :, -1, :]  # (B*S, V, 768)
-        z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=768)
+        z_v_CLS_all = z_v_CLS_all.reshape(B, S, V, -1)  # (B, S, V, raw_dim=model.raw_dim)
 
         # Extract patches (all positions except the last per camera)
-        z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B, S , V * P, 768)   # (B, S, V*P, raw_dim=768)
+        z_v_all = z_v_all_reshaped[:, :, :-1, :].reshape(B, S , V * P, model.raw_dim)   # (B, S, V*P, raw_dim=model.raw_dim)
 
         state_visibility = None
         if "observation_state_mask" in batch:
@@ -1152,7 +1158,7 @@ def validate(model, loader, device, args):
         if state_visibility is not None:z_s_all = z_s_all*state_visibility[:,:,None]
 
         z_v_mod_all = getattr(model,"encode_patch_sequence",model.vision_patch_encoder)(
-            z_v_all.reshape(B * S, V * P, 768),
+            z_v_all.reshape(B * S, V * P, model.raw_dim),
             z_s_all.reshape(B * S, -1),
         ).reshape(B, S, V * P, -1)  # (B, S, V*P, comp_dim)
         if visibility is not None:
@@ -1594,7 +1600,10 @@ def parse_args():
     add_future_arguments(parser)
     from data.task_context_policy_dataset import add_context_policy_arguments
     add_context_policy_arguments(parser)
+    from models.vision_config import add_vision_arguments, feature_width
+    add_vision_arguments(parser)
     args=parser.parse_args()
+    args.raw_dim=feature_width(args.vision_backbone,args.raw_dim)
     if args.task_context_fusion != 'additive' and not args.task_context_checkpoint:
         parser.error('Non-additive task-context fusion requires --task-context-checkpoint')
     if args.task_context_fusion_dim < 1 or (args.task_context_fusion == 'cross_attention' and args.task_context_fusion_dim % 4):
@@ -1641,7 +1650,7 @@ def main():
     if args.use_precomputed_dinov2 and args.dinov2_path is None:
         if len(args.data) == 1:
             default_dinov2 = Path(args.data[0]).with_name(
-                Path(args.data[0]).stem + ".dinov2"
+                Path(args.data[0]).stem + (".dinov2" if args.vision_backbone == "dinov2_vitb14" else "." + args.vision_backbone)
             )
             args.dinov2_path = str(default_dinov2)
         else:

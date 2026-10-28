@@ -15,9 +15,9 @@ from tests.test_intention_training_contracts import FakeVision
 
 class Features:
     cameras = ['image']
-    def __init__(self):
+    def __init__(self, width=768):
         rng = np.random.default_rng(5)
-        self.frames = [rng.normal(size=(n, 257, 768)).astype('float32') for n in (17, 11)]
+        self.frames = [rng.normal(size=(n, 257, width)).astype('float32') for n in (17, 11)]
     def _get_episode_length(self, ep): return len(self.frames[ep])
     def _read_frames_dinov2(self, ep, start, count): return self.frames[ep][start:start+count]
     def _read_poses(self, ep, start, count):
@@ -56,17 +56,18 @@ def test_sparse_preserves_anchors_targets_and_dropout_histories(history, copy_mo
     assert len(batch['frames']) <= sum(len(parent[i]['frames_segment']) for i in range(2))
 
 
+@pytest.mark.parametrize('width', [768, 1024])
 @pytest.mark.parametrize('history,head_mode', [(1, 'mean'), (1, 'full'), (4, 'full')])
 @pytest.mark.parametrize('accumulate', [False, True])
 @pytest.mark.parametrize('copy_mode', ['direct', 'materialized'])
-def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accumulate, copy_mode, head_mode):
+def test_sparse_matches_dense_updates_and_validation(monkeypatch, history, accumulate, copy_mode, head_mode, width):
     monkeypatch.setattr(align, 'VisionEncoder', FakeVision)
-    parent = CachedEpisodes(Features(), [0, 1], 20, 42, True, 'episode', 100, 4, .8, True)
+    parent = CachedEpisodes(Features(width), [0, 1], 20, 42, True, 'episode', 100, 4, .8, True)
     items = [SparseHistoryEpisodes(parent, history, copy_mode=copy_mode)[i] for i in range(2)]
     sparse = collate_sparse_histories(items)
     dense = collate_segments([parent[i] for i in range(2)])
     torch.manual_seed(4)
-    reference = align.ALIGNIntentionModel(state_dim=4, compressed_dim=4,
+    reference = align.ALIGNIntentionModel(vision_backbone="dinov2_vitl14" if width==1024 else "dinov2_vitb14",raw_dim=width,state_dim=4, compressed_dim=4,
         mamba_output_dim=0, use_intent_tokens=False, use_memory_bank=False,
         history_size=history, head_history_mode=head_mode, head_type='diffusion',
         head_d_model=8, chunk_size=4)

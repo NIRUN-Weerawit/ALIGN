@@ -22,6 +22,7 @@ _spec.loader.exec_module(_module)
 class MarkerEncoder:
     def __init__(self):
         self.batch_sizes = []
+        self.raw_dim = 768
 
     def __call__(self, images):
         self.batch_sizes.append(len(images))
@@ -54,12 +55,12 @@ def test_main_reaches_disk_check_and_writes_cache(tmp_path, monkeypatch):
         ep.create_dataset("frames/image", data=np.ones((1, 2, 2, 3), dtype=np.uint8))
 
     output = tmp_path / "cache"
-    monkeypatch.setattr(_module, "build_encoder", lambda _: MarkerEncoder())
+    monkeypatch.setattr(_module, "build_encoder", lambda *args: MarkerEncoder())
     monkeypatch.setattr(_module.shutil, "disk_usage",
                         lambda _: SimpleNamespace(free=10 * 1024**3))
     monkeypatch.setattr(_module.sys, "argv", [
         "precompute_dinov2.py", "--data", str(source), "--cameras", "image",
-        "--output", str(output), "--device", "cpu",
+        "--output", str(output), "--device", "cpu", "--vision-backbone", "dinov2_vitb14",
     ])
 
     _module.main()

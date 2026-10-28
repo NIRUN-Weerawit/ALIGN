@@ -64,7 +64,7 @@ def source_provenance(root=ROOT):
     if snapshot.exists():
         return json.loads(snapshot.read_text())
     import hashlib
-    names = ['models/align_intention.py','models/intention_head.py','models/memory_bank.py',
+    names = ['models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
         'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
         'data/task_context_policy_dataset.py','training/train_intention.py','scripts/run_intention_ablation.py']
@@ -314,7 +314,7 @@ def evaluate_existing(out):
         with torch.serialization.safe_globals([type(torch.__version__)]):
             checkpoint = torch.load(out / name / "intention_best.pt", map_location="cpu", weights_only=True)
         config = checkpoint["config"]
-        model = ALIGNIntentionModel(state_dim=config["state_dim"], mamba_output_dim=config["mamba_output_dim"],
+        model = ALIGNIntentionModel(vision_backbone=config.get("vision_backbone","dinov2_vitb14"), raw_dim=config.get("raw_dim",768), state_dim=config["state_dim"], mamba_output_dim=config["mamba_output_dim"],
             action_dim=7, chunk_size=config["chunk_size"], history_size=config["history_size"],
             num_cameras=len(cameras), compressed_dim=config["compressed_dim"], head_type=config["head_type"],
             head_history_mode=config.get("head_history_mode", "mean"),
@@ -386,7 +386,7 @@ def evaluate_existing(out):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", default=str(ROOT / "data/libero_goal.h5"))
-    parser.add_argument("--cache", default=str(ROOT / "data/libero_goal.dinov2"))
+    parser.add_argument("--cache", default=str(ROOT / "data/libero_goal.dinov2_vitl14"))
     parser.add_argument("--output", required=True)
     parser.add_argument("--evaluate-existing", action="store_true")
     parser.add_argument("--resume", action="store_true",
@@ -480,7 +480,10 @@ def parse_args(argv=None):
     parser.add_argument("--gpu-memory-fraction", type=float, default=0.40)
     add_future_arguments(parser)
     add_context_policy_arguments(parser)
+    from models.vision_config import add_vision_arguments, feature_width
+    add_vision_arguments(parser)
     args = parser.parse_args(argv)
+    args.raw_dim = feature_width(args.vision_backbone,args.raw_dim)
     from data.training_split import resolve_context_manifest
     try:resolve_context_manifest(args)
     except ValueError as error:parser.error(str(error))
@@ -615,8 +618,10 @@ def main(argv=None):
                            traj_window=args.segment_length, dinov2_path=args.cache)
     sample = dataset._read_frames_dinov2(0, 0, 1)
     # The production cached trainer expects 256 patches + CLS per camera.
-    if sample.shape[-2:] != (257 * len(args.cameras), 768):
-        raise ValueError("Expected 257 DINOv2 tokens of width 768 per selected camera")
+    from models.vision_config import validate_cache
+    validate_cache(dataset._dinov2_index["__meta__"], args.vision_backbone, args.raw_dim)
+    if sample.shape[-2:] != (257 * len(args.cameras), args.raw_dim):
+        raise ValueError("Expected 257 DINOv2 tokens of configured width per selected camera")
     pool_out_dim = (sample.shape[-2] - len(args.cameras)) * args.compressed_dim
     split_record = None
     if args.task_context_checkpoint or args.task_context_split_manifest:
@@ -668,9 +673,9 @@ def main(argv=None):
                                diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
                                use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
                                length_bucket_multiplier=20)
-        legacy_defaults.update(intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False,
+        legacy_defaults.update(vision_backbone="dinov2_vitb14",raw_dim=768,intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False,
                                task_context_fusion='additive',task_context_fusion_dim=128)
-        for key in ("intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
+        for key in ("vision_backbone","raw_dim","intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
                     "gripper_state_source", "gripper_transition_fraction", "max_steps", "max_val_batches", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
                     "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
@@ -753,7 +758,7 @@ def main(argv=None):
                                 shuffle=False, collate_fn=collator, **variant_options)
         val_loader = LimitedBatches(val_loader, args.max_val_batches)
         seed_everything(args.seed)
-        model = ALIGNIntentionModel(state_dim=args.state_dim,
+        model = ALIGNIntentionModel(vision_backbone=args.vision_backbone,raw_dim=args.raw_dim,state_dim=args.state_dim,
             mamba_output_dim=0 if full_history else args.mamba_output_dim,
             action_dim=7, chunk_size=args.chunk_size, history_size=variant_history_size,
             num_cameras=len(args.cameras), compressed_dim=args.compressed_dim,

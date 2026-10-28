@@ -277,6 +277,12 @@ class VisionEncoder(nn.Module):
             raise ImportError(
                 "DINOv2 not installed. Run: pip install dinov2"
             )
+        from models.vision_config import feature_width
+        self.raw_dim = feature_width(backbone)
+        self.backbone_name = backbone
+        if self.backbone.embed_dim != self.raw_dim:
+            raise ValueError("Loaded backbone width differs from configuration")
+        self.backbone.requires_grad_(False).eval()
         self.num_cameras = num_cameras
         self.embed_dim = embed_dim
         self.fusion_type = fusion_type
@@ -304,7 +310,7 @@ class VisionEncoder(nn.Module):
         # channel compression in the downstream SEVisualCompressor.
         if num_cameras > 1 and use_patch_tokens and fusion_type == "transformer":
             # Use 768 (DINOv2 raw dim) for the cross-camera attention
-            self.cross_cam_attn = CrossCameraTransformer(embed_dim=768)
+            self.cross_cam_attn = CrossCameraTransformer(embed_dim=self.raw_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Encode camera frame(s).
@@ -366,7 +372,7 @@ class VisionEncoder(nn.Module):
                 # Reshape to (B, V * num_patches, 768) — multi-cam stacks
                 # patches along the sequence dim; single-cam is unchanged.
                 P = features.size(1)
-                features = features.reshape(B, V * P, 768)
+                features = features.reshape(B, V * P, self.raw_dim)
                 # Cross-camera attention over the V*P patch tokens (768-D).
                 # Only present when v2 is used AND num_cameras>1 AND the
                 # caller requested the transformer fusion. With

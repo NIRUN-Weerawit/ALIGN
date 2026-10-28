@@ -116,7 +116,7 @@ def main():
     development=None if args.final_refit else TaskContextEpisodes(args.targets,validation_partition(train.manifest['split']),anchors=3,seed=args.seed,verify=True)
     train_loader=make_loader(train,args.batch_size,True,args.seed)
     val_loader=None if args.final_refit else make_loader(development,args.batch_size)
-    model=TaskContextTeacher(cameras=len(train.manifest['cameras']),width=args.width,
+    model=TaskContextTeacher(cameras=len(train.manifest['cameras']),raw_dim=train.manifest['feature_shape'][-1],width=args.width,
         horizon=train.manifest['action_horizon'],procedure_points=train.manifest['procedure_points'],
         diffusion_width=args.diffusion_width,pooling=args.pooling,decoder_style=args.decoder_style).to(device)
     actions=np.concatenate([np.load(train.root/f'{key}.npz')['actions'] for key in train.keys])

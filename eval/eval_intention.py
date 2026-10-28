@@ -124,6 +124,8 @@ def load_intention_model(
         print(f"  Text:       enabled (dim={cfg.get('text_dim', 256)})")
 
     model = ALIGNIntentionModel(
+        vision_backbone=cfg.get("vision_backbone","dinov2_vitb14"),
+        raw_dim=cfg.get("raw_dim",768),
         state_dim=cfg["state_dim"],
         mamba_output_dim=mamba_output_dim,
         action_dim=cfg.get("action_dim", 6),

@@ -95,6 +95,8 @@ def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
     if (meta.get("format") != "align-dinov2-per-camera-v2" or
             meta.get("cameras") != list(cameras) or meta.get("source") != str(data)):
         raise ValueError("Cache format, source, or camera order mismatch")
+    from models.vision_config import cache_spec
+    vision_backbone, raw_dim = cache_spec(meta)
     annotation = json.loads(Path(annotations).read_text()) if annotations else {}
     groups, episodes = {}, {}
     with h5py.File(data, "r") as source:
@@ -134,12 +136,12 @@ def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
         for number, (key, ep) in enumerate(episodes.items()):
             n = ep["length"]
             raw = np.load(cache / f"{key}.npy", mmap_mode="r")
-            if raw.shape != (n, len(cameras)*257, 768) or raw.dtype != np.float32:
+            if raw.shape != (n, len(cameras)*257, raw_dim) or raw.dtype != np.float32:
                 raise ValueError(f"Invalid raw cached features: {key}")
             # Sequential blocks keep both host memory and mmap reads bounded.
             feature_path = output / f"{key}.npy"
             summary = np.lib.format.open_memmap(feature_path, mode="w+", dtype=np.float32,
-                                               shape=(n, len(cameras), 5, 768))
+                                               shape=(n, len(cameras), 5, raw_dim))
             for start in range(0, n, block_size):
                 summary[start:start+block_size] = spatial_summary(raw[start:start+block_size], len(cameras))
             summary.flush()
@@ -190,7 +192,7 @@ def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
     manifest = dict(schema=SCHEMA, source=str(data), source_stat={"size":data.stat().st_size,"mtime_ns":data.stat().st_mtime_ns},
         raw_cache=str(cache), cache_index_sha256=file_hash(cache / "index.json"), cameras=list(cameras), fps=float(fps),
         seed=seed, action_horizon=action_horizon, procedure_points=procedure_points,
-        terminal_tail=terminal_tail, feature_shape=[len(cameras),5,768], state_width=10,
+        terminal_tail=terminal_tail, feature_shape=[len(cameras),5,raw_dim], vision_backbone=vision_backbone, state_width=10,
         split=split, groups=group_ids, episodes=episodes, files=files,
         normalization_sha256=file_hash(output / "normalization.npz"),
         limitations=["No verified raw human commands are encoder inputs.",

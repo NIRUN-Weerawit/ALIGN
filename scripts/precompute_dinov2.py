@@ -10,7 +10,7 @@ so cross-camera attention is not applied to these frozen backbone features.
 Output structure:
     <output_dir>/
         index.json                       -- cache metadata + per-episode lengths
-        ep_000000.npy                    -- (N, V*257, 768) float32
+        ep_000000.npy                    -- (N, V*257, D) float32
         ep_000001.npy
         ...
 
@@ -19,7 +19,7 @@ Why per-episode .npy (not HDF5):
   .npy files let the DataLoader memmap one file at a time and let the OS
   evict pages we don't need.
 - HDF5 random reads of chunked datasets incur per-chunk metadata overhead
-  that dominates when each segment = ~30 chunk reads of (1, 514, 768).
+  that dominates when each segment = ~30 chunk reads of (1, 514, D).
 
 Usage:
     python scripts/precompute_dinov2.py \
@@ -50,13 +50,14 @@ import torch
 from tqdm import tqdm
 
 from models.align_model import VisionEncoder
+from models.vision_config import DEFAULT_BACKBONE, feature_width, add_vision_arguments
 
 
-def build_encoder(device: torch.device) -> VisionEncoder:
+def build_encoder(device: torch.device, backbone=DEFAULT_BACKBONE, raw_dim=None) -> VisionEncoder:
     """Build the single-camera encoder used by the training forward path."""
     return VisionEncoder(
-        backbone="dinov2_vitb14",
-        embed_dim=256,           # unused for v2 patch mode, kept for API compat
+        backbone=backbone,
+        embed_dim=feature_width(backbone, raw_dim),           # unused for v2 patch mode, kept for API compat
         num_cameras=1,
         use_patch_tokens=True,
         fusion_type="linear",
@@ -74,16 +75,16 @@ def encode_frames(encoder: VisionEncoder, frames: np.ndarray,
         batch_size: number of camera images per backbone call
 
     Returns:
-        (T, V*257, 768) float32 numpy
+        (T, V*257, D) float32 numpy
     """
     T, V, H, W, C = frames.shape
     flat = frames.reshape(T * V, H, W, C)
-    features = np.empty((T * V, 257, 768), dtype=np.float32)
+    features = np.empty((T * V, 257, encoder.raw_dim), dtype=np.float32)
     with torch.no_grad():
         for start in range(0, len(flat), batch_size):
             x = torch.from_numpy(flat[start:start + batch_size]).to(device)
             features[start:start + len(x)] = encoder(x).cpu().numpy()
-    return features.reshape(T, V * 257, 768)
+    return features.reshape(T, V * 257, encoder.raw_dim)
 
 
 def main():
@@ -99,26 +100,17 @@ def main():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--batch-size", type=int, default=16,
                         help="Camera images per DINOv2 call (default: 16)")
+    parser.add_argument("--dry-run", action="store_true", help="Inspect inputs and estimate storage without loading weights or writing files")
     parser.add_argument("--overwrite", action="store_true",
                         help="Overwrite existing output directory")
+    add_vision_arguments(parser)
     args = parser.parse_args()
+    args.raw_dim = feature_width(args.vision_backbone, args.raw_dim)
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
 
     src_path = Path(args.data)
     dst_dir = Path(args.output)
-
-    if dst_dir.exists():
-        if not args.overwrite:
-            print(f"  Output exists: {dst_dir} (use --overwrite to replace)")
-            return
-        # Wipe old contents
-        for child in dst_dir.iterdir():
-            if child.is_file():
-                child.unlink()
-            elif child.is_dir():
-                shutil.rmtree(child)
-    dst_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n=== DINOv2 Pre-compute ===")
     print(f"  Source: {src_path}")
@@ -147,9 +139,12 @@ def main():
         print(f"  Camera shape (per frame): ({V}, {H}, {W}, 3)")
 
     out_tokens = V * 257
-    out_dim = 768
+    out_dim = args.raw_dim
     expected_bytes = total_frames * out_tokens * out_dim * np.dtype(np.float32).itemsize
-    available_bytes = shutil.disk_usage(dst_dir).free
+    existing_parent = dst_dir
+    while not existing_parent.exists():
+        existing_parent = existing_parent.parent
+    available_bytes = shutil.disk_usage(existing_parent).free
     print(f"  Expected cache size: {expected_bytes / 1e9:.2f} GB")
     if expected_bytes + 2 * 1024**3 > available_bytes:
         raise OSError(
@@ -157,7 +152,23 @@ def main():
             f"{(expected_bytes + 2 * 1024**3) / 1e9:.2f} GB including "
             f"safety margin, have {available_bytes / 1e9:.2f} GB"
         )
-    encoder = build_encoder(device)
+    print(f"  Backbone: {args.vision_backbone}, feature width: {args.raw_dim}")
+    if args.dry_run:
+        print("  Dry run: no weights loaded and no files written.")
+        return
+    if dst_dir.exists():
+        if not args.overwrite:
+            print(f"  Output exists: {dst_dir} (use --overwrite to replace)")
+            return
+        # Wipe old contents
+        for child in dst_dir.iterdir():
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                shutil.rmtree(child)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    encoder = build_encoder(device, args.vision_backbone, args.raw_dim)
     # Freeze all params (already in eval mode, but make requires_grad explicit)
     for p in encoder.parameters():
         p.requires_grad = False
@@ -193,6 +204,8 @@ def main():
     # produced with cross-camera attention and do not match training inputs.
     index["__meta__"] = {
         "format": "align-dinov2-per-camera-v2",
+        "backbone": args.vision_backbone, "feature_dim": args.raw_dim,
+        "input_size": 224, "patch_size": 14, "tokens_per_camera": 257,
         "cameras": args.cameras,
         "source": str(src_path.resolve()),
         "dtype": "float32",
