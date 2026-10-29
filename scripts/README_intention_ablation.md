@@ -94,9 +94,29 @@ head. Training and validation both apply the configured gripper loss weight.
 Each variant gets its own configuration, epoch metrics, best checkpoint and
 latest model/optimizer recovery checkpoint. The output root stores the shared
 manifest and combined `comparison.md`/`summary.json`. Existing outputs are
-protected against accidental overwrite. Resume with the **same arguments** and
-add `--resume`; completed variants are skipped. Attempts lacking an optimizer
-checkpoint are archived and restarted rather than pretending to resume exactly.
+protected against accidental overwrite. `--resume` automatically loads the saved
+arguments from the output root's `manifest.json` before validating the configuration:
+
+```bash
+python scripts/run_intention_ablation.py \
+  --output checkpoints/ablation_goal_sequential --resume
+
+# Extend to 200 total epochs, preserving the saved model and training settings.
+python scripts/run_intention_ablation.py \
+  --output checkpoints/ablation_goal_sequential --resume --epochs 200
+```
+
+Omitting `--epochs` retains the saved target. Explicit permitted runtime options
+(for example `--num-workers`, `--micro-batch-size`, and `--gpu-memory-fraction`)
+override their saved values. Existing architecture/data compatibility checks still
+reject changes to the experiment. Completed variants are skipped. To resume only
+one variant, add `--worker-variant NAME`, or pass its subdirectory as `--output`;
+the latter loads the common parent manifest and selects that variant automatically.
+The parent manifest is required because per-variant `config.json` contains derived
+settings that cannot safely replace the common run configuration.
+
+Attempts lacking an optimizer checkpoint are archived and restarted rather than
+pretending to resume exactly. Missing or unreadable manifests fail before training.
 
 For a smoke run, add `--epochs 1 --max-steps 1` and use a new output directory.
 For the four-model sequential workflow, leave `--variants` and

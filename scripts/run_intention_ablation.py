@@ -255,6 +255,23 @@ def atomic_json(path, value):
     temporary.replace(path)
 
 
+def legacy_resume_defaults(previous):
+    """Historical defaults shared by config restoration and compatibility checks."""
+    legacy_defaults = dict(max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
+                           plain_history_size=4,
+                           weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
+                           mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
+                           memory_perceptual_recency=0.,memory_field_masks=False,memory_pre_state_visual=False,memory_value_preserving=False,memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
+                           visual_context_mode="none",memory_retrieval_depth=1,memory_intent_query=False,
+                           diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
+                           use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
+                           length_bucket_multiplier=20)
+    legacy_defaults.update(LEGACY_FLOW_DEFAULTS)
+    legacy_defaults.update(text_encoder_type="bag" if previous.get("use_task_text",False) else "clip",text_model_name="distilbert/distilbert-base-uncased",text_model_revision="main",text_max_length=128,vision_backbone="dinov2_vitb14",raw_dim=768,intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False,
+                           task_context_fusion='additive',task_context_fusion_dim=128)
+    return legacy_defaults
+
+
 def extend_resume_manifest(previous, current):
     """Preserve model/split provenance while updating allowed runtime settings."""
     if current["epochs"] < previous["epochs"]:
@@ -391,6 +408,46 @@ def evaluate_existing(out):
     (out / "EVALUATION_COMPLETE").write_text(f"All best checkpoints reevaluated with threshold {threshold:g}.\n")
 
 
+def restore_resume_arguments(parser, argv, initial):
+    """Apply the original run's defaults before normal argument validation.
+
+    CLI arguments still win. Immutable settings are checked against the manifest
+    before training; runtime controls and an increased epoch target may change.
+    A variant directory uses its parent's authoritative common manifest because
+    variant config.json files contain derived/overridden architecture fields.
+    """
+    out = Path(initial.output).expanduser().resolve()
+    manifest_path = out / 'manifest.json'
+    selected_variant = None
+    if not manifest_path.is_file() and (out / 'config.json').is_file():
+        manifest_path = out.parent / 'manifest.json'
+        selected_variant = out.name
+    try:
+        previous = json.loads(manifest_path.read_text())
+    except (OSError, ValueError) as error:
+        parser.error(f'Cannot resume: could not read saved configuration {manifest_path}: {error}')
+    if not isinstance(previous, dict) or not all(key in previous for key in ('epochs', 'variants', 'data', 'cache')):
+        parser.error(f'Cannot resume: incomplete run manifest {manifest_path}')
+    if selected_variant is not None:
+        if selected_variant not in previous['variants']:
+            parser.error(f'Variant directory {selected_variant} is not in {manifest_path}')
+        if initial.worker_variant not in (None, selected_variant):
+            parser.error('--worker-variant conflicts with the selected output variant directory')
+    saved = dict(legacy_resume_defaults(previous), **previous)
+    invocation_only = {'help', 'output', 'resume', 'evaluate_existing', 'worker_variant'}
+    defaults = {action.dest: saved[action.dest] for action in parser._actions
+                if action.dest in saved and action.dest not in invocation_only}
+    parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
+    args.output = str(manifest_path.parent)
+    if selected_variant is not None:
+        args.worker_variant = selected_variant
+    if args.epochs < previous['epochs']:
+        parser.error('Resume epoch target cannot decrease; --epochs is the total target')
+    print(f'RESUME configuration: {manifest_path}', flush=True)
+    return args
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", default=str(ROOT / "data/libero_goal.h5"))
@@ -398,7 +455,7 @@ def parse_args(argv=None):
     parser.add_argument("--output", required=True)
     parser.add_argument("--evaluate-existing", action="store_true")
     parser.add_argument("--resume", action="store_true",
-                        help="Continue from epoch checkpoints; --epochs may increase the total target. Preserve/restart attempts without optimizer state.")
+                        help="Load saved settings from --output and continue from the latest checkpoint. Explicit runtime options may override settings; --epochs is the total target.")
     parser.add_argument("--temporal-sampling",choices=["crop","episode"],default="episode")
     parser.add_argument("--supervision-points",type=int,default=16)
     parser.add_argument("--observation-dropout-prob",type=float,default=0.,help="Training-only camera/all-view feature loss at supervised anchors; same masks across ablations")
@@ -494,6 +551,8 @@ def parse_args(argv=None):
     from models.task_text_encoder import add_task_text_arguments
     add_task_text_arguments(parser)
     args = parser.parse_args(argv)
+    if args.resume:
+        args = restore_resume_arguments(parser, argv, args)
     args.raw_dim = feature_width(args.vision_backbone,args.raw_dim)
     try:validate_flow_policy_arguments(args)
     except ValueError as error:parser.error(str(error))
@@ -685,18 +744,7 @@ def main(argv=None):
     manifest['policy_warm_start_sha256'] = file_hash(args.policy_warm_start) if args.policy_warm_start else None
     if args.resume and (out / "manifest.json").exists():
         previous = json.loads((out / "manifest.json").read_text())
-        legacy_defaults = dict(max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
-                               plain_history_size=4,
-                               weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
-                               mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
-                               memory_perceptual_recency=0.,memory_field_masks=False,memory_pre_state_visual=False,memory_value_preserving=False,memory_patch_temporal=False,memory_context_only=False,memory_mode="legacy",memory_detach_writes=False,memory_write_fused=True,memory_patch_retrieval=False,
-                               visual_context_mode="none",memory_retrieval_depth=1,memory_intent_query=False,
-                               diffusion_train_steps=10,diffusion_loss_repeats=1,warm_start=None,selection_metric="val/loss",visual_token_attention=False,diffusion_clip_sample=False,observation_dropout_prob=0.,drop_state_with_all_views=False,
-                               use_task_text=False,text_dim=128,text_vocab=[],head_window_batch_size=2,
-                               length_bucket_multiplier=20)
-        legacy_defaults.update(LEGACY_FLOW_DEFAULTS)
-        legacy_defaults.update(text_encoder_type="bag" if previous.get("use_task_text",False) else "clip",text_model_name="distilbert/distilbert-base-uncased",text_model_revision="main",text_max_length=128,vision_backbone="dinov2_vitb14",raw_dim=768,intent_future_weight=0.,intent_future_horizons=[16,64],intent_future_hidden_dim=256,freeze_intent_backbone=False,
-                               task_context_fusion='additive',task_context_fusion_dim=128)
+        legacy_defaults = legacy_resume_defaults(previous)
         for key in (*LEGACY_FLOW_DEFAULTS, "text_encoder_type","text_model_name","text_model_revision","text_max_length","vision_backbone","raw_dim","intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
                     "gripper_state_source", "gripper_transition_fraction", "max_steps", "max_val_batches", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",

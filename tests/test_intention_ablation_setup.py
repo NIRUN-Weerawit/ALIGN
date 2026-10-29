@@ -55,6 +55,99 @@ def test_resume_manifest_rejects_decreasing_total_epochs():
         extend_resume_manifest(dict(epochs=80), dict(epochs=40))
 
 
+def saved_run(tmp_path, options=()):
+    import json
+    args = parse_args(['--output', str(tmp_path), *options])
+    # Manifest-only metadata must not become command-line arguments.
+    manifest = dict(vars(args), commit='original', train_episodes=['ep_0'])
+    (tmp_path / 'manifest.json').write_text(json.dumps(manifest, default=str))
+    return args
+
+
+@pytest.mark.parametrize('head', ['diffusion', 'flow_matching'])
+def test_resume_restores_saved_architecture_and_runtime(tmp_path, head):
+    original = saved_run(tmp_path, ['--variants', 'plain_history', '--plain-history-size', '8',
+        '--head-type', head, '--vision-backbone', 'dinov2_vitb14', '--compressed-dim', '64',
+        '--use-task-text', '--epochs', '200', '--num-workers', '2', '--batch-size', '8',
+        '--micro-batch-size', '1', '--data', 'custom.h5', '--cache', 'custom.dinov2'])
+    resumed = parse_args(['--output', str(tmp_path), '--resume'])
+    for key, value in vars(original).items():
+        if key != 'resume':
+            assert getattr(resumed, key) == value, key
+    assert resumed.resume and not hasattr(resumed, 'commit')
+
+
+def test_resume_explicit_runtime_overrides_and_epoch_extension(tmp_path):
+    saved_run(tmp_path, ['--epochs', '100', '--pin-memory', '--num-workers', '2',
+                        '--batch-size', '8', '--micro-batch-size', '1'])
+    args = parse_args(['--resume', '--output', str(tmp_path), '--epochs=200',
+                      '--num-workers', '0', '--micro-batch-size', '2', '--no-pin-memory'])
+    assert (args.epochs, args.num_workers, args.micro_batch_size, args.pin_memory) == (200, 0, 2, False)
+    with pytest.raises(SystemExit):
+        parse_args(['--resume', '--output', str(tmp_path), '--epochs', '99'])
+
+
+def test_resume_restores_aci_temporal_before_validation(tmp_path):
+    saved_run(tmp_path, ['--variants', 'context_no_memory', '--head-type', 'flow_matching',
+        '--task-context-checkpoint', 'observer.pt', '--task-context-split-manifest', 'split.json',
+        '--task-context-fusion', 'aci', '--policy-temporal-mamba'])
+    args = parse_args(['--resume', '--output', str(tmp_path)])
+    assert args.task_context_fusion == 'aci' and args.policy_temporal_mamba
+    assert args.head_type == 'flow_matching' and args.variants == ['context_no_memory']
+
+
+def test_resume_variant_directory_uses_parent_manifest(tmp_path):
+    saved_run(tmp_path, ['--variants', 'plain_history', 'intent_memory', '--plain-history-size', '8'])
+    variant = tmp_path / 'plain_history'
+    variant.mkdir()
+    # Derived per-variant history_size must not override the common history_size.
+    (variant / 'config.json').write_text('{"history_size": 8}')
+    args = parse_args(['--resume', '--output', str(variant)])
+    assert args.output == str(tmp_path) and args.worker_variant == 'plain_history'
+    assert args.history_size == 1 and args.plain_history_size == 8
+    assert args.variants == ['plain_history', 'intent_memory']
+    with pytest.raises(SystemExit):
+        parse_args(['--resume', '--output', str(variant), '--worker-variant', 'intent_memory'])
+
+
+def test_resume_does_not_restore_old_invocation_flags(tmp_path):
+    import json
+    saved_run(tmp_path)
+    path = tmp_path / 'manifest.json'
+    manifest = json.loads(path.read_text())
+    manifest.update(worker_variant='intent_memory', evaluate_existing=True, output='/old/location')
+    path.write_text(json.dumps(manifest))
+    args = parse_args(['--resume', '--output', str(tmp_path)])
+    assert args.output == str(tmp_path) and args.worker_variant is None
+    assert not args.evaluate_existing
+
+
+def test_resume_legacy_defaults_do_not_silently_change_model(tmp_path):
+    import json
+    saved_run(tmp_path)
+    path = tmp_path / 'manifest.json'
+    manifest = json.loads(path.read_text())
+    for key in ('vision_backbone', 'raw_dim', 'temporal_sampling', 'memory_mode',
+                'memory_detach_writes', 'memory_write_fused', 'memory_retrieval_depth',
+                'diffusion_train_steps', 'diffusion_loss_repeats', 'gripper_state_source'):
+        manifest.pop(key)
+    path.write_text(json.dumps(manifest))
+    args = parse_args(['--resume', '--output', str(tmp_path)])
+    assert (args.vision_backbone, args.raw_dim) == ('dinov2_vitb14', 768)
+    assert args.temporal_sampling == 'crop' and args.memory_mode == 'legacy'
+    assert args.memory_write_fused and not args.memory_detach_writes
+    assert args.diffusion_loss_repeats == 1 and args.diffusion_train_steps == 10
+    assert args.gripper_state_source == 'legacy_zero'
+
+
+@pytest.mark.parametrize('contents', [None, '{broken', '[]', '{}'])
+def test_resume_missing_or_invalid_manifest_fails_before_training(tmp_path, contents):
+    if contents is not None:
+        (tmp_path / 'manifest.json').write_text(contents)
+    with pytest.raises(SystemExit):
+        parse_args(['--resume', '--output', str(tmp_path)])
+
+
 def test_sparse_history_controls_are_runtime_resume_settings():
     merged = extend_resume_manifest(dict(epochs=200, plain_history_loader='dense',
         pin_memory=True, plain_head_batch_size=2), dict(epochs=200,
