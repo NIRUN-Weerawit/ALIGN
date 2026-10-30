@@ -118,6 +118,30 @@ settings that cannot safely replace the common run configuration.
 Attempts lacking an optimizer checkpoint are archived and restarted rather than
 pretending to resume exactly. Missing or unreadable manifests fail before training.
 
+To recover an OOM caused by flattened visual memory, patch retrieval can be
+enabled in the same run:
+
+```bash
+python scripts/run_intention_ablation.py \
+  --output checkpoints/YOUR_RUN --resume --memory-patch-retrieval
+```
+
+Completed non-memory variants remain completed. If the failed memory attempt has
+no recovery checkpoint, it restarts with patch retrieval. If a memory checkpoint
+exists, training continues at its next epoch with compatible policy/encoder,
+state-stream memory, and cognitive-stream memory weights retained. Changed perceptual-memory
+retrieval/gating projections are freshly initialized, the optimizer starts with
+fresh moments, and best-checkpoint selection restarts for the new architecture.
+This is an architecture migration, not an exact optimizer continuation.
+
+The old checkpoint files are preserved as hard links in timestamped
+`memory_patch_before_*` directories beside their originals (including checkpoint
+staging). Old config/metrics and migration metadata are retained as well. Saved
+configs record `memory_patch_migration`, and later ordinary resumes keep the new
+flag and restore the new optimizer normally. Other architecture checks remain
+enforced. A completed memory checkpoint is skipped unless `--epochs` is increased
+to give the new architecture more training epochs.
+
 For a smoke run, add `--epochs 1 --max-steps 1` and use a new output directory.
 For the four-model sequential workflow, leave `--variants` and
 `--worker-variant` unset. Those options are retained for selected-model and

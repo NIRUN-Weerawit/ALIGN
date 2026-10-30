@@ -33,6 +33,7 @@ from models.flow_policy_config import (add_flow_policy_arguments, flow_policy_op
 from models.align_intention import ALIGNIntentionModel
 from models.intention_future import add_future_arguments, validate_future_arguments, freeze_intent_backbone
 from training.checkpoint_io import CheckpointWriter, cpu_snapshot
+from training.memory_resume import memory_patch_transition, migrate_memory_weights, archive_memory_transition
 from training.train_intention import train_v4_epoch, validate
 from training.cached_loading import collate_cached_segments
 from training.plain_history_training import (SparseHistoryEpisodes,
@@ -69,7 +70,7 @@ def source_provenance(root=ROOT):
     names = ['models/context_aci_head.py','models/policy_temporal_encoder.py','models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
         'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
-        'data/task_context_policy_dataset.py','training/train_intention.py','scripts/run_intention_ablation.py']
+        'data/task_context_policy_dataset.py','training/train_intention.py','training/memory_resume.py','scripts/run_intention_ablation.py']
     return {'commit': subprocess.check_output(
         ['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip(),
         'source_sha256': {name:hashlib.sha256((root/name).read_bytes()).hexdigest()
@@ -280,7 +281,7 @@ def extend_resume_manifest(previous, current):
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
                 "gpu_memory_fraction", "micro_batch_size", "pin_memory",
                 "plain_history_loader", "plain_head_batch_size", "profile_data_stages",
-                "plain_history_copy_mode", "checkpoint_staging_dir"):
+                "plain_history_copy_mode", "checkpoint_staging_dir", "memory_patch_retrieval"):
         if key in current:
             merged[key] = current[key]
     return merged
@@ -469,7 +470,8 @@ def parse_args(argv=None):
     parser.add_argument("--memory-value-preserving",action=argparse.BooleanOptionalAction,default=False,help="Experimental learned Q/K selection with raw historical feature values, bypassing value projections and FFN")
     parser.add_argument("--memory-patch-temporal",action=argparse.BooleanOptionalAction,default=False,help="Experimental per-camera/grid-slot temporal retrieval instead of global historical patch attention")
     parser.add_argument("--memory-context-only",action=argparse.BooleanOptionalAction,default=False,help="Experimental retrieved branch without a direct current-query residual; current features remain in the fusion gate")
-    parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument("--memory-patch-retrieval",action=argparse.BooleanOptionalAction,default=False,
+                        help="Retrieve per-patch memory. May change on resume: retain compatible weights, reset changed memory projections and optimizer state.")
     parser.add_argument("--visual-token-attention",action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument("--visual-context-mode",choices=["none","multiscale"],default="none",help="Explicit patch tokens at three action U-Net scales; enables patch memory when used")
     parser.add_argument("--memory-retrieval-depth",type=int,default=2,help="Sequential reads of the same past bank (legacy checkpoints use 1)")
@@ -754,6 +756,8 @@ def main(argv=None):
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
                     "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
                     "visual_context_mode","memory_retrieval_depth","memory_intent_query","memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
+            if key == 'memory_patch_retrieval':
+                continue  # Per-checkpoint architecture migration is handled below.
             if key in LEGACY_FLOW_DEFAULTS and args.head_type != "flow_matching":
                 continue
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
@@ -767,9 +771,12 @@ def main(argv=None):
                 raise ValueError(f'Resume context configuration mismatch: {key}')
         if previous.get('policy_warm_start_sha256') != manifest['policy_warm_start_sha256']:
             raise ValueError('Policy warm-start weights changed on resume')
+        patch_changed = previous.get('memory_patch_retrieval', False) != args.memory_patch_retrieval
+        if patch_changed:
+            atomic_json(out / f'manifest_before_memory_patch_{time.time_ns()}.json', previous)
         manifest = extend_resume_manifest(previous, manifest)
         atomic_json(out / "manifest.json", manifest)
-        if args.epochs > previous["epochs"]:
+        if args.epochs > previous["epochs"] or patch_changed:
             # Completion markers from the previous target must not describe an
             # extended run as finished while its new epochs are in progress.
             (out / "COMPLETE").unlink(missing_ok=True)
@@ -923,6 +930,7 @@ def main(argv=None):
         checkpoints = CheckpointWriter(run,args.checkpoint_staging_dir)
         start_epoch = 1
         best = float("inf")
+        memory_migration = None
         if args.resume and run.exists():
             last_checkpoint = checkpoints.resume_path()
             if last_checkpoint is not None:
@@ -932,16 +940,29 @@ def main(argv=None):
                 # the requested epoch budget has been saved.
                 if saved["epoch"] >= args.epochs:
                     print(f"SKIP completed {name} (checkpoint epoch {saved['epoch']})",flush=True)
+                    if memory_patch_transition(model, saved):
+                        print(f"  Memory architecture unchanged in completed checkpoint; increase --epochs beyond {saved['epoch']} to train the new memory.",flush=True)
                     del model,optimizer,params,vision,saved
                     torch.cuda.empty_cache()
                     continue
-                incompatible = model.load_state_dict(saved["model_state_dict"], strict=False)
-                if model.task_context is not None and (incompatible.unexpected_keys or
-                        any(not k.startswith('vision_encoder.') for k in incompatible.missing_keys)):
-                    raise ValueError('Context resume checkpoint is missing trained parameters')
-                optimizer.load_state_dict(saved["optimizer_state_dict"])
+                if memory_patch_transition(model, saved):
+                    memory_migration = migrate_memory_weights(model, saved)
+                    memory_migration.update(source_checkpoint=str(last_checkpoint), source_provenance=provenance)
+                    memory_migration = archive_memory_transition(run,
+                        [last_checkpoint, checkpoints.best_path(), run/'training_last.pt', run/'intention_best.pt'],
+                        memory_migration)
+                    # The optimizer is newly constructed and has no moments yet.
+                    # Never put the old flattened-memory moments onto the GPU.
+                    print(f"MIGRATE {name}: patch retrieval {memory_migration['from_memory_patch_retrieval']} -> {args.memory_patch_retrieval}; compatible weights retained; perceptual memory, optimizer and best selection reset. Archive: {memory_migration['archive']}",flush=True)
+                else:
+                    incompatible = model.load_state_dict(saved["model_state_dict"], strict=False)
+                    if model.task_context is not None and (incompatible.unexpected_keys or
+                            any(not k.startswith('vision_encoder.') for k in incompatible.missing_keys)):
+                        raise ValueError('Context resume checkpoint is missing trained parameters')
+                    optimizer.load_state_dict(saved["optimizer_state_dict"])
+                    memory_migration = saved.get('config', {}).get('memory_patch_migration')
                 start_epoch = saved["epoch"] + 1
-                best = saved["best_loss"]
+                best = float('inf') if memory_patch_transition(model, saved) else saved["best_loss"]
                 records[name] = saved["record"]
                 best_checkpoint = checkpoints.best_path()
                 if not best_checkpoint.exists() or not zipfile.is_zipfile(best_checkpoint):
@@ -968,6 +989,8 @@ def main(argv=None):
                       head_history_mode="full" if full_history else "mean", action_dim=7,
                       num_cameras=len(args.cameras), model_class="ALIGNIntentionModel",
                       trainable_parameters=sum(p.numel() for p in params))
+        if memory_migration is not None:
+            config['memory_patch_migration'] = memory_migration
         config.update(context_policy_options(model))
         atomic_json(run / "config.json", config)
         torch.cuda.reset_peak_memory_stats()

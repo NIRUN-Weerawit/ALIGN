@@ -156,6 +156,20 @@ def test_sparse_history_controls_are_runtime_resume_settings():
     assert merged['pin_memory'] is False and merged['plain_head_batch_size'] == 32
 
 
+def test_resume_patch_retrieval_override_is_saved_for_later_resumes(tmp_path):
+    import json
+    saved_run(tmp_path,['--variants','no_intent_no_memory','intent_memory'])
+    previous=json.loads((tmp_path/'manifest.json').read_text())
+    args=parse_args(['--output',str(tmp_path),'--resume','--memory-patch-retrieval'])
+    assert args.memory_patch_retrieval
+    merged=extend_resume_manifest(previous,vars(args))
+    assert merged['memory_patch_retrieval'] is True
+    (tmp_path/'manifest.json').write_text(json.dumps(merged))
+    assert parse_args(['--output',str(tmp_path),'--resume']).memory_patch_retrieval
+    disabled=parse_args(['--output',str(tmp_path),'--resume','--no-memory-patch-retrieval'])
+    assert disabled.memory_patch_retrieval is False
+
+
 def test_plain_history_prefetch_defaults_and_explicit_override():
     plain = parse_args(['--output', 'example', '--variants', 'plain_history'])
     assert plain.num_workers == 1 and plain.prefetch_factor == 1

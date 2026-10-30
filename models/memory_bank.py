@@ -208,7 +208,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
                         cognitive_dim: int,
                         state_dim: int, 
                         bank_len: int = 16, 
-                        num_heads: int = 4):
+                        num_heads: int = 4, perceptual_token_dim: Optional[int] = None):
         super().__init__()
         self.perceptual_dim = perceptual_dim
         self.cognitive_dim = max(cognitive_dim, 1)  # minimum 1 to avoid empty MultiheadAttention
@@ -219,7 +219,8 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         # Retrieval modules (one per stream). Cognitive is only created if there
         # are intent tokens (cognitive_dim > 0), otherwise nn.MultiheadAttention
         # would fail with embed_dim=0.
-        self.perceptual_retrieval   = MemoryRetrieval(perceptual_dim, num_heads)
+        retrieval_dim = perceptual_dim if perceptual_token_dim is None else perceptual_token_dim
+        self.perceptual_retrieval   = MemoryRetrieval(retrieval_dim, num_heads)
         if cognitive_dim > 0:
             self.cognitive_retrieval    = MemoryRetrieval(cognitive_dim, num_heads)
         else:
@@ -227,7 +228,7 @@ class PerceptualCognitiveMemoryModule(nn.Module):
         self.state_retrieval        = MemoryRetrieval(state_dim, num_heads)
 
         # Gate fusion modules (one per stream)
-        self.perceptual_gate        = MemoryGateFusion(perceptual_dim)
+        self.perceptual_gate        = MemoryGateFusion(retrieval_dim)
         if cognitive_dim > 0:
             self.cognitive_gate         = MemoryGateFusion(cognitive_dim)
         else:
@@ -532,7 +533,12 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
             raise ValueError("Value-preserving patch retrieval requires temporal spatial alignment")
         if bank_len < 2:
             raise ValueError('Episodic memory capacity must be at least two for consolidation')
-        super().__init__(perceptual_dim,cognitive_dim,state_dim,bank_len,num_heads)
+        if patch_dim is not None and (patch_dim < 1 or perceptual_dim % patch_dim or patch_dim % num_heads):
+            raise ValueError('Patch width must divide perceptual width and attention heads')
+        # Construct patch-width layers directly. Building flattened projections
+        # first can allocate billions of temporary parameters on the host.
+        super().__init__(perceptual_dim,cognitive_dim,state_dim,bank_len,num_heads,
+                         perceptual_token_dim=patch_dim)
         self.detach_writes, self.write_fused = detach_writes,write_fused
         self.mask_missing_fields = mask_missing_fields
         self.perceptual_recency_scale = perceptual_recency_scale
@@ -540,11 +546,6 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
             raise ValueError("Temporal patch retrieval requires patch-preserving memory")
         self.patch_dim = patch_dim
         self.patch_temporal = patch_temporal
-        if patch_dim is not None:
-            if perceptual_dim % patch_dim or patch_dim % num_heads:
-                raise ValueError('Patch width must divide perceptual width and attention heads')
-            self.perceptual_retrieval = MemoryRetrieval(patch_dim,num_heads)
-            self.perceptual_gate = MemoryGateFusion(patch_dim)
         for name in ['perceptual_retrieval','state_retrieval','cognitive_retrieval']:
             retrieval = getattr(self,name)
             if retrieval is not None:
