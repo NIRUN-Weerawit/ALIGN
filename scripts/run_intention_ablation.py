@@ -67,7 +67,7 @@ def source_provenance(root=ROOT):
     if snapshot.exists():
         return json.loads(snapshot.read_text())
     import hashlib
-    names = ['models/context_aci_head.py','models/policy_temporal_encoder.py','models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
+    names = ['data/teacher_policy_context.py','models/context_aci_head.py','models/policy_temporal_encoder.py','models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
         'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
         'data/task_context_policy_dataset.py','training/train_intention.py','training/memory_resume.py','scripts/run_intention_ablation.py']
@@ -102,8 +102,9 @@ def episode_split(dataset, seed, fraction):
 
 
 class CachedEpisodes(Dataset):
-    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False, profile=False, gripper_transition_fraction=0.0, gripper_state_source="causal"):
+    def __init__(self, dataset, episodes, length, seed, training, temporal_sampling="crop", supervision_points=16, chunk_size=8, observation_dropout_prob=0., drop_state_with_all_views=False, profile=False, gripper_transition_fraction=0.0, gripper_state_source="causal", teacher_targets=None):
         self.dataset, self.episodes = dataset, episodes
+        self.teacher_targets = teacher_targets
         self.length, self.seed, self.training = length, seed, training
         self._epoch = torch.zeros((), dtype=torch.int64).share_memory_()
         self.temporal_sampling, self.supervision_points, self.chunk_size = temporal_sampling, supervision_points, chunk_size
@@ -161,6 +162,9 @@ class CachedEpisodes(Dataset):
                 anchors[np.concatenate([selected, uniform])] = True
         result = dict(frames_segment=frames, states_segment=states.astype(np.float32),
                     actions_segment=actions.astype(np.float32), segment_len=length)
+        if self.teacher_targets is not None:
+            key = self.dataset._episode_keys[ep]
+            result['teacher_task_tokens'] = self.teacher_targets[key].copy()
         result['text'] = self.dataset._read_text(ep) if hasattr(self.dataset, '_read_text') else ''
         if anchors is not None:
             result.update(loss_anchor_mask=anchors,observation_timesteps=np.arange(n,dtype=np.float32))
@@ -201,6 +205,8 @@ def collate_segments(items):
                 arr = item[key]
                 batch[index, :len(arr)] = arr
             result[key] = torch.from_numpy(batch)
+    if 'teacher_task_tokens' in items[0]:
+        result['teacher_task_tokens'] = torch.from_numpy(np.stack([x['teacher_task_tokens'] for x in items]))
     return result
 
 
@@ -320,6 +326,12 @@ def evaluate_existing(out):
         traj_window=manifest["segment_length"], dinov2_path=manifest["cache"])
     val_eps = [dataset._episode_keys.index(key) for key in manifest["val_episodes"]]
     data = CachedEpisodes(dataset, val_eps, manifest["segment_length"], manifest["seed"] + 1000, False, manifest.get("temporal_sampling","crop"),manifest.get("supervision_points",16),manifest["chunk_size"])
+    from data.teacher_policy_context import load_policy_teacher_targets
+    train_eps = [dataset._episode_keys.index(key) for key in manifest.get('train_episodes', [])]
+    teacher_args = SimpleNamespace(**manifest)
+    data.teacher_targets = load_policy_teacher_targets(teacher_args, dataset, train_eps, val_eps)
+    if manifest.get('task_context_teacher_provenance') != teacher_args.task_context_teacher_provenance:
+        raise ValueError('Teacher provenance changed')
     data.gripper_state_source = manifest.get("gripper_state_source", "legacy_zero")
     loader = DataLoader(data, batch_size=manifest.get('micro_batch_size') or manifest["batch_size"], shuffle=False,
         num_workers=0, pin_memory=False, collate_fn=collate_cached_segments)
@@ -338,6 +350,7 @@ def evaluate_existing(out):
             action_dim=7, chunk_size=config["chunk_size"], history_size=config["history_size"],
             num_cameras=len(cameras), compressed_dim=config["compressed_dim"], head_type=config["head_type"],
             head_history_mode=config.get("head_history_mode", "mean"),
+            task_context_source=config.get('task_context_source', 'student'),
             task_context_config=config.get('task_context_config'),
             task_context_tokens=config.get('task_context_tokens',config.get('num_task_tokens')),
             task_context_trainable=config.get('task_context_trainable',False),
@@ -558,6 +571,9 @@ def parse_args(argv=None):
     args.raw_dim = feature_width(args.vision_backbone,args.raw_dim)
     try:validate_flow_policy_arguments(args)
     except ValueError as error:parser.error(str(error))
+    from data.teacher_policy_context import validate_teacher_context_arguments
+    try:validate_teacher_context_arguments(args)
+    except ValueError as error:parser.error(str(error))
     if args.num_task_tokens is not None and (args.num_task_tokens<1 or not args.task_context_checkpoint):
         parser.error("--num-task-tokens must be positive and requires --task-context-checkpoint")
     from data.training_split import resolve_context_manifest
@@ -727,6 +743,8 @@ def main(argv=None):
         raise ValueError("Batch size exceeds the training episode count")
     if any(dataset._get_episode_length(ep) < args.history_size + args.chunk_size for ep in train_eps + val_eps):
         raise ValueError("An episode is too short for this history/chunk configuration")
+    from data.teacher_policy_context import load_policy_teacher_targets
+    teacher_targets = load_policy_teacher_targets(args, dataset, train_eps, val_eps)
     provenance = source_provenance()
     manifest = dict(vars(args), commit=provenance['commit'], source_provenance=provenance,
         torch=str(torch.__version__), cuda=torch.version.cuda,
@@ -762,7 +780,7 @@ def main(argv=None):
                 continue
             if previous.get(key, legacy_defaults.get(key)) != manifest[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
-        for key, default in dict(policy_temporal_mamba=False, policy_temporal_width=128, policy_temporal_layers=1).items():
+        for key, default in dict(task_context_source='student', task_context_teacher_targets=None, task_context_teacher_provenance=None, policy_temporal_mamba=False, policy_temporal_width=128, policy_temporal_layers=1).items():
             if previous.get(key, default) != manifest[key]:
                 raise ValueError(f'Resume policy temporal configuration mismatch: {key}')
         for key in ('task_context_checkpoint','task_context_split_manifest','task_context_trainable',
@@ -785,8 +803,8 @@ def main(argv=None):
     else:
         atomic_json(out / "manifest.json", manifest)
     print(f"Split: {len(train_eps)} train episodes / {len(val_eps)} held-out episodes", flush=True)
-    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob,args.drop_state_with_all_views)
-    val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size)
+    train_data = CachedEpisodes(dataset, train_eps, args.segment_length, args.seed, True, args.temporal_sampling,args.supervision_points,args.chunk_size,args.observation_dropout_prob,args.drop_state_with_all_views, teacher_targets=teacher_targets)
+    val_data = CachedEpisodes(dataset, val_eps, args.segment_length, args.seed + 1000, False, args.temporal_sampling,args.supervision_points,args.chunk_size, teacher_targets=teacher_targets)
     train_data.gripper_transition_fraction = args.gripper_transition_fraction
     train_data.gripper_state_source = val_data.gripper_state_source = args.gripper_state_source
     train_data.profile = val_data.profile = args.profile_data_stages
@@ -863,6 +881,7 @@ def main(argv=None):
             intent_future_hidden_dim=args.intent_future_hidden_dim,
             task_context_checkpoint=args.task_context_checkpoint if context else None,
             task_context_tokens=args.num_task_tokens if context else None,
+            task_context_source=args.task_context_source if context else 'student',
             task_context_trainable=args.task_context_trainable,
             task_context_initialization='scratch' if scratch else 'pretrained',
             task_context_fusion=args.task_context_fusion if context else 'additive',

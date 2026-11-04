@@ -41,6 +41,10 @@ def policy_episode_split(dataset, path, observer_metadata=None, allow_unbound_ma
 
 
 def add_context_policy_arguments(parser):
+    parser.add_argument('--task-context-source', choices=('student', 'teacher'), default='student',
+        help='Task-token source during training/validation; execution tokens always remain live')
+    parser.add_argument('--task-context-teacher-targets', default=None,
+        help='Exported frozen_latents directory containing manifest.json and episode task-token NPZs')
     parser.add_argument('--task-context-checkpoint', default=None, help='Pretrained observer bundle; context variants replace legacy intention')
     parser.add_argument('--task-context-split-manifest', default=None, help='Exact teacher target manifest; required for context-policy runs and shared by all arms')
     parser.add_argument('--task-context-split-override', action='store_true',
@@ -62,7 +66,7 @@ def add_context_policy_arguments(parser):
 
 def context_policy_options(model):
     branch = getattr(model, 'task_context', None)
-    return dict(task_context_tokens=branch.config['encoder_config']['tokens'] if branch is not None else None,
+    return dict(task_context_source=getattr(model, 'task_context_source', 'student'), task_context_tokens=branch.config['encoder_config']['tokens'] if branch is not None else None,
         task_context_config=branch.config if branch is not None else None,
         task_context_trainable=branch.trainable if branch is not None else False,
         task_context_initialization=branch.initialization if branch is not None else 'pretrained',

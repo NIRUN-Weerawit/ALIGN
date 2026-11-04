@@ -131,6 +131,21 @@ class TaskContextPolicyBranch(nn.Module):
                 task = (weight[..., None, None] * native).sum(-3)
         return torch.cat([task, out["execution_token"]], -2)
 
+    def set_reference_task_tokens(self, cache, tokens):
+        """Lock an externally encoded reference demonstration; execution stays live."""
+        if cache is None:
+            raise ValueError("Create/observe a context stream before setting a reference")
+        device = next(self.observer.parameters()).device
+        tokens = torch.as_tensor(tokens, device=device, dtype=torch.float32)
+        cfg = self.config['encoder_config']
+        if tokens.ndim != 3 or tokens.shape[1:] != (cfg['tokens'], cfg['token_dim']) or not torch.isfinite(tokens).all():
+            raise ValueError("Reference tokens must be finite [batch, task_tokens, token_dim]")
+        if tokens.shape[0] != cache.recurrence.layers[0][0].shape[0]:
+            raise ValueError("Reference token batch differs from context stream")
+        if cache.last_task is not None and tokens.shape != cache.last_task.shape:
+            raise ValueError("Reference token batch differs from context stream")
+        cache.task_snapshot = tokens.detach().clone()
+
     def new_stream(self, batch_size):
         return PolicyContextState(self.observer.encoder.new_stream(batch_size))
 

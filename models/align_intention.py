@@ -134,6 +134,7 @@ class ALIGNIntentionModel(nn.Module):
         policy_temporal_mamba: bool = False,
         policy_temporal_width: int = 128,
         policy_temporal_layers: int = 1,
+        task_context_source: str = "student",
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -180,6 +181,11 @@ class ALIGNIntentionModel(nn.Module):
             raise ValueError('ACI requires history_size=1, mean head history, and no additional visual-attention mode')
         self.task_context_fusion = task_context_fusion
         self.task_context_fusion_dim = task_context_fusion_dim
+        if task_context_source not in ('student', 'teacher'):
+            raise ValueError('Unknown task context source')
+        if task_context_source == 'teacher' and not (task_context_checkpoint or task_context_config):
+            raise ValueError('Teacher conditioning requires a context observer')
+        self.task_context_source = task_context_source
         self.task_context = None
         if task_context_checkpoint or task_context_config:
             if use_intent_tokens or use_text or intent_future_weight or head_type not in ('diffusion', 'flow_matching'):

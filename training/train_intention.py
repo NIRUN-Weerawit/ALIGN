@@ -220,9 +220,11 @@ def build_datasets(args):
         train, val, record = policy_episode_split(ds, args.task_context_split_manifest, bundle['metadata'],
             allow_unbound_manifest=getattr(args, 'task_context_split_override', False))
         args.task_context_split = record
+        from data.teacher_policy_context import load_policy_teacher_targets
+        teacher_targets = load_policy_teacher_targets(args, ds, train, val)
         return ds, CachedEpisodes(ds, train, args.chunk_size, args.seed, True,
-            temporal_sampling='episode', chunk_size=args.chunk_size), CachedEpisodes(ds, val, args.chunk_size,
-            args.seed, False, temporal_sampling='episode', chunk_size=args.chunk_size)
+            temporal_sampling='episode', chunk_size=args.chunk_size, teacher_targets=teacher_targets), CachedEpisodes(ds, val, args.chunk_size,
+            args.seed, False, temporal_sampling='episode', chunk_size=args.chunk_size, teacher_targets=teacher_targets)
     # V4 mode: enabled if any V4 feature is on or segment args are set
     is_v4 = (
         getattr(args, "use_intent_tokens", False)
@@ -390,6 +392,7 @@ def build_model(args, num_cameras, device):
         intent_future_weight=getattr(args,'intent_future_weight',0.),
         intent_future_horizons=getattr(args,'intent_future_horizons',[16,64]),
         intent_future_hidden_dim=getattr(args,'intent_future_hidden_dim',256),
+        task_context_source=getattr(args, 'task_context_source', 'student'),
         task_context_checkpoint=getattr(args,'task_context_checkpoint',None),
         task_context_tokens=getattr(args,'num_task_tokens',None),
         task_context_trainable=getattr(args,'task_context_trainable',False),
@@ -605,7 +608,8 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
             intent_event = stage_start()
             if num_windows > 0 and getattr(model, 'task_context', None) is not None:
                 ticks = torch.as_tensor(batch['observation_timesteps'], device=device)
-                intent_sequence = model.context_sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
+                from data.teacher_policy_context import policy_context_sequence
+                intent_sequence = policy_context_sequence(model, z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks, batch)
             elif num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     intent_sequence = model.intention_encoder.forward_sequence(
@@ -1210,7 +1214,8 @@ def validate(model, loader, device, args):
             intent_sequence = None
             if num_windows > 0 and getattr(model, 'task_context', None) is not None:
                 ticks = torch.as_tensor(batch['observation_timesteps'], device=device)
-                intent_sequence = model.context_sequence(z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks)
+                from data.teacher_policy_context import policy_context_sequence
+                intent_sequence = policy_context_sequence(model, z_v_all, z_v_CLS_all, states_seg, seg_lens, ticks, batch)
             elif num_windows > 0 and getattr(model, "intention_encoder", None) is not None:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
                     intent_sequence = model.intention_encoder.forward_sequence(
@@ -1619,6 +1624,9 @@ def parse_args():
     args=parser.parse_args()
     args.raw_dim=feature_width(args.vision_backbone,args.raw_dim)
     try:validate_flow_policy_arguments(args)
+    except ValueError as error:parser.error(str(error))
+    from data.teacher_policy_context import validate_teacher_context_arguments
+    try:validate_teacher_context_arguments(args)
     except ValueError as error:parser.error(str(error))
     if args.num_task_tokens is not None and (args.num_task_tokens<1 or not args.task_context_checkpoint):
         parser.error("--num-task-tokens must be positive and requires --task-context-checkpoint")

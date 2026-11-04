@@ -159,6 +159,7 @@ def load_intention_model(
         task_context_trainable=cfg.get('task_context_trainable',False),
         task_context_initialization=cfg.get('task_context_initialization','pretrained'),
         task_context_fusion=cfg.get('task_context_fusion','additive'),
+        task_context_source=cfg.get('task_context_source', 'student'),
         task_context_fusion_dim=cfg.get('task_context_fusion_dim',128),
         policy_temporal_mamba=cfg.get('policy_temporal_mamba',False),
         policy_temporal_width=cfg.get('policy_temporal_width',128),

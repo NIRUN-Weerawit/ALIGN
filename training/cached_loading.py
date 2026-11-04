@@ -41,6 +41,8 @@ def collate_cached_segments(items):
         for index, item in enumerate(items):
             batch[index, :len(item[key])] = item[key]
         result[key] = torch.from_numpy(batch)
+    if 'teacher_task_tokens' in items[0]:
+        result['teacher_task_tokens'] = torch.from_numpy(np.stack([x['teacher_task_tokens'] for x in items]))
     if profiling:
         result['data_stage_cpu_s'] = {
             key: sum(x['data_stage_cpu_s'][key] for x in items)
