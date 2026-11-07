@@ -33,6 +33,7 @@ from models.flow_policy_config import (add_flow_policy_arguments, flow_policy_op
 from models.align_intention import ALIGNIntentionModel
 from models.intention_future import add_future_arguments, validate_future_arguments, freeze_intent_backbone
 from training.checkpoint_io import CheckpointWriter, cpu_snapshot
+from training.metric_history import reconcile_metrics
 from training.memory_resume import memory_patch_transition, migrate_memory_weights, archive_memory_transition
 from training.train_intention import train_v4_epoch, validate
 from training.cached_loading import collate_cached_segments
@@ -990,10 +991,7 @@ def main(argv=None):
                     best = float("inf")
                 # A metric written before an interrupted checkpoint save is replayed.
                 metric_file = run / "metrics.jsonl"
-                if metric_file.exists():
-                    completed = [line for line in metric_file.read_text().splitlines()
-                                 if json.loads(line)["epoch"] < start_epoch]
-                    metric_file.write_text("\n".join(completed) + ("\n" if completed else ""))
+                reconcile_metrics(metric_file, start_epoch)
                 del saved
                 print(f"RESUME {name} epoch={start_epoch}", flush=True)
             else:
