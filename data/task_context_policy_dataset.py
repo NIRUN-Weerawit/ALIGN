@@ -137,9 +137,6 @@ def validate_policy_temporal_arguments(args):
     if getattr(args, 'memory_consolidation_key', 'perceptual') == 'temporal':
         if not args.policy_temporal_mamba or not args.memory_temporal_cognitive or args.memory_mode != 'episodic':
             raise ValueError('Temporal consolidation requires episodic memory and --policy-temporal-mamba')
-        variants = getattr(args, 'variants', ['context_memory'] if getattr(args, 'use_memory_bank', False) else [])
-        if not variants or any(v != 'context_memory' for v in variants):
-            raise ValueError('Temporal consolidation requires context_memory variants')
     import math
     for key in ('task_context_lr', 'task_context_summary_lr'):
         value = getattr(args, key, None)

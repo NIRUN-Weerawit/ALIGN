@@ -221,11 +221,11 @@ class ALIGNIntentionModel(nn.Module):
                     self.task_context.config['encoder_config']['token_dim'],
                     width=policy_temporal_width, layers=policy_temporal_layers)
         self.memory_temporal_cognitive = bool(memory_temporal_cognitive)
-        self.memory_consolidation_key = memory_consolidation_key
+        self.memory_consolidation_key = memory_consolidation_key if use_memory_bank else 'perceptual'
         self.memory_merge_timestamp = memory_merge_timestamp
         if memory_consolidation_key not in ('perceptual', 'temporal'):
             raise ValueError('Unknown memory consolidation key')
-        if memory_consolidation_key == 'temporal' and (
+        if use_memory_bank and memory_consolidation_key == 'temporal' and (
                 not use_memory_bank or memory_mode != 'episodic' or
                 not policy_temporal_mamba or not memory_temporal_cognitive):
             raise ValueError('Temporal consolidation requires episodic memory and a policy temporal cognitive stream')

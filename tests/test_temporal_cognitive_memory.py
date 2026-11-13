@@ -107,3 +107,31 @@ def test_cli_temporal_consolidation_validation():
     assert parse_args(base).memory_merge_timestamp == 'latest'
     with pytest.raises(SystemExit):
         parse_args(base + ['--no-memory-temporal-cognitive'])
+
+
+@pytest.mark.parametrize('variants', [['context_memory', 'context_no_memory'], ['context_no_memory']])
+def test_temporal_consolidation_accepts_shared_ablation_options(variants):
+    from scripts.run_intention_ablation import parse_args
+    args = parse_args(['--output', 'unused', '--variants', *variants,
+        '--task-context-checkpoint', 'observer.pt', '--task-context-split-manifest', 'manifest.json',
+        '--task-context-fusion', 'aci', '--policy-temporal-mamba', '--memory-consolidation-key', 'temporal'])
+    assert args.variants == variants and args.memory_consolidation_key == 'temporal'
+
+
+def test_no_memory_model_normalizes_unused_temporal_key(monkeypatch, bundle):
+    from models.align_intention import ALIGNIntentionModel
+    from data.task_context_policy_dataset import context_policy_options
+    monkeypatch.setattr('models.align_intention.VisionEncoder', FakeVision)
+    model = ALIGNIntentionModel(state_dim=8, mamba_output_dim=16, num_cameras=1,
+        compressed_dim=4, action_dim=7, chunk_size=4, history_size=1, head_d_model=8,
+        task_context_checkpoint=str(bundle), task_context_fusion='aci', task_context_fusion_dim=16,
+        policy_temporal_mamba=True, policy_temporal_width=16, use_memory_bank=False,
+        memory_consolidation_key='temporal')
+    model._build_head_and_bank(1024)
+    assert model.memory_module is None
+    assert context_policy_options(model)['memory_consolidation_key'] == 'perceptual'
+    _, patches, cls, state, lengths, ticks = inputs()
+    payload = model.context_sequence(patches, cls, state, lengths, ticks)[:, 0]
+    visual, encoded = torch.randn(2, 1, 1024), torch.randn(2, 1, 8)
+    output = model.condition_actions(visual, encoded, payload)
+    assert output[0] is visual and output[1] is encoded and output[2] is payload
