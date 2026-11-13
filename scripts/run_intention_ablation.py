@@ -32,7 +32,8 @@ from models.flow_policy_config import (add_flow_policy_arguments, flow_policy_op
     validate_flow_policy_arguments, LEGACY_FLOW_DEFAULTS)
 from models.align_intention import ALIGNIntentionModel
 from models.intention_future import add_future_arguments, validate_future_arguments, freeze_intent_backbone
-from training.checkpoint_io import CheckpointWriter, cpu_snapshot
+from training.checkpoint_io import (CheckpointWriter, cpu_snapshot, METRIC_CHECKPOINTS,
+                                    save_metric_checkpoints, restore_metric_scores)
 from training.metric_history import reconcile_metrics
 from training.memory_resume import memory_patch_transition, migrate_memory_weights, archive_memory_transition
 from training.train_intention import train_v4_epoch, validate
@@ -958,6 +959,7 @@ def main(argv=None):
         checkpoints = CheckpointWriter(run,args.checkpoint_staging_dir)
         start_epoch = 1
         best = float("inf")
+        best_scores = {}
         memory_migration = None
         if args.resume and run.exists():
             last_checkpoint = checkpoints.resume_path()
@@ -977,7 +979,8 @@ def main(argv=None):
                     memory_migration = migrate_memory_weights(model, saved)
                     memory_migration.update(source_checkpoint=str(last_checkpoint), source_provenance=provenance)
                     memory_migration = archive_memory_transition(run,
-                        [last_checkpoint, checkpoints.best_path(), run/'training_last.pt', run/'intention_best.pt'],
+                        [last_checkpoint, checkpoints.best_path(), run/'training_last.pt', run/'intention_best.pt',
+                         run/'intention_last.pt', *[checkpoints.best_path(filename) for filename in METRIC_CHECKPOINTS.values()]],
                         memory_migration)
                     # The optimizer is newly constructed and has no moments yet.
                     # Never put the old flattened-memory moments onto the GPU.
@@ -989,6 +992,8 @@ def main(argv=None):
                         raise ValueError('Context resume checkpoint is missing trained parameters')
                     optimizer.load_state_dict(saved["optimizer_state_dict"])
                     memory_migration = saved.get('config', {}).get('memory_patch_migration')
+                if not memory_patch_transition(model, saved):
+                    best_scores = restore_metric_scores(checkpoints, saved)
                 start_epoch = saved["epoch"] + 1
                 best = float('inf') if memory_patch_transition(model, saved) else saved["best_loss"]
                 records[name] = saved["record"]
@@ -1064,12 +1069,15 @@ def main(argv=None):
                     optimizer_state_dict=optimizer.state_dict(), record=records[name],
                     config=dict(config,frozen_vision_omitted=True)))
                 evaluation = dict(model_state_dict=snapshot["model_state_dict"],
-                                  config=snapshot["config"],epoch=epoch,val_loss=val_loss)
+                                  config=snapshot["config"],epoch=epoch,val_loss=val_loss,
+                                  train_loss=train_loss,metrics={key:row[key] for key in METRIC_CHECKPOINTS})
+                best_scores = save_metric_checkpoints(checkpoints, evaluation, row, best_scores)
+                checkpoints.save("intention_last.pt", evaluation)
                 if improved:
                     checkpoints.save("intention_best.pt",evaluation)
                 if args.keep_epoch_checkpoints:
                     checkpoints.save(f"epoch_{epoch:03d}.pt",evaluation)
-                latest = dict(snapshot,epoch=epoch,best_loss=best)
+                latest = dict(snapshot,epoch=epoch,best_loss=best,best_metric_scores=best_scores)
                 checkpoints.save("training_last.pt",latest)
                 del latest,snapshot,evaluation
                 row["checkpoint_io"] = checkpoints.status()

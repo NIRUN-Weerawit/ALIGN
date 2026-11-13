@@ -129,3 +129,42 @@ def test_gpu_weights_can_change_while_immutable_checkpoint_is_mirrored(tmp_path)
     finally:release.set()
     saved=torch.load(writer.output/'training_last.pt',weights_only=True)
     torch.testing.assert_close(saved['weight'],expected)
+
+
+@pytest.mark.parametrize('staged', [False, True])
+def test_independent_metric_winners_and_last_survive_resume(tmp_path, staged):
+    from training.checkpoint_io import METRIC_CHECKPOINTS, save_metric_checkpoints, restore_metric_scores
+    output = tmp_path / 'run'
+    staging = tmp_path / 'stage' if staged else None
+    rows = [dict(zip(METRIC_CHECKPOINTS, values)) for values in
+            [(3., 2., 4.), (2., 3., 5.), (4., 1., 3.), (5., 4., 6.)]]
+    scores = {}
+    with CheckpointWriter(output, staging) as writer:
+        for epoch, metrics in enumerate(rows, 1):
+            checkpoint = payload(epoch)
+            scores = save_metric_checkpoints(writer, checkpoint, metrics, scores)
+            writer.save('intention_last.pt', checkpoint)
+            writer.save('training_last.pt', dict(checkpoint, best_metric_scores=scores))
+        assert restore_metric_scores(writer, dict(epoch=4)) == dict(zip(METRIC_CHECKPOINTS, [2., 1., 3.]))
+    for metric, expected_epoch in zip(METRIC_CHECKPOINTS, [2, 3, 3]):
+        saved = torch.load(output / METRIC_CHECKPOINTS[metric], weights_only=True)
+        assert saved['epoch'] == expected_epoch and saved['selection_metric'] == metric
+    assert torch.load(output / 'intention_last.pt', weights_only=True)['epoch'] == 4
+    assert torch.load(output / 'training_last.pt', weights_only=True)['epoch'] == 4
+    with CheckpointWriter(output, staging) as writer:
+        restored = restore_metric_scores(writer, dict(epoch=4))
+        assert restored == scores
+        save_metric_checkpoints(writer, payload(5), rows[-1], restored)
+    assert torch.load(output / 'intention_best_val_loss.pt', weights_only=True)['epoch'] == 2
+
+
+def test_metric_recovery_ignores_missing_corrupt_and_future_winners(tmp_path):
+    from training.checkpoint_io import METRIC_CHECKPOINTS, save_metric_checkpoints, restore_metric_scores
+    writer = CheckpointWriter(tmp_path)
+    assert restore_metric_scores(writer, dict(epoch=2)) == {}
+    metrics = dict(zip(METRIC_CHECKPOINTS, [3., 2., 1.]))
+    scores = save_metric_checkpoints(writer, payload(3), metrics, {})
+    assert scores == metrics and restore_metric_scores(writer, dict(epoch=2)) == {}
+    (tmp_path / 'intention_best_val_loss.pt').write_bytes(b'incomplete')
+    assert 'val/loss' not in restore_metric_scores(writer, dict(epoch=3))
+    assert save_metric_checkpoints(writer, payload(4), {'pos_mse': float('nan')}, {}) == {}

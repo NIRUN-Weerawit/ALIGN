@@ -111,9 +111,9 @@ class CheckpointWriter:
         paths = ([self.local/'training_last.pt'] if self.local is not None else [])
         return latest_resume_checkpoint(paths+[self.output/'training_last.pt'])
 
-    def best_path(self):
-        local = self.local/'intention_best.pt' if self.local is not None else None
-        return local if local is not None and local.exists() else self.output/'intention_best.pt'
+    def best_path(self, filename="intention_best.pt"):
+        local = self.local/filename if self.local is not None else None
+        return local if local is not None and local.exists() else self.output/filename
 
     @staticmethod
     def _estimated_bytes(payload):
@@ -240,3 +240,45 @@ class CheckpointWriter:
             self.close()
         else:
             self.close(wait=False)
+
+
+METRIC_CHECKPOINTS = {
+    'val/loss': 'intention_best_val_loss.pt',
+    'pos_mse': 'intention_best_pos_mse.pt',
+    'train/loss': 'intention_best_train_loss.pt',
+}
+
+
+def save_metric_checkpoints(writer, payload, metrics, best_scores):
+    """Publish independent metric winners and return their saved best scores."""
+    import math
+    updated = dict(best_scores)
+    for metric, filename in METRIC_CHECKPOINTS.items():
+        value = metrics.get(metric)
+        if value is None or not math.isfinite(value):
+            continue
+        if value < updated.get(metric, float('inf')):
+            winner = dict(payload, selection_metric=metric, selection_score=float(value))
+            writer.save(filename, winner)
+            updated[metric] = float(value)
+    return updated
+
+
+def restore_metric_scores(writer, saved):
+    """Only retain thresholds backed by a readable winner at/before recovery."""
+    import math
+    scores = {}
+    for metric, filename in METRIC_CHECKPOINTS.items():
+        path = writer.best_path(filename)
+        if not path.exists():
+            continue
+        try:
+            checkpoint = torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+            score = float(checkpoint['selection_score'])
+            epoch = int(checkpoint['epoch'])
+            matches = checkpoint['selection_metric'] == metric
+        except (RuntimeError, EOFError, OSError, ValueError, KeyError, TypeError):
+            continue
+        if matches and math.isfinite(score) and epoch <= int(saved['epoch']):
+            scores[metric] = score
+    return scores

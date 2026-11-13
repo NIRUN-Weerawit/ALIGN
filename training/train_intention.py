@@ -1934,6 +1934,9 @@ def main():
         mode_str = "(V3 mode)"
     print(f"  Training for {args.epochs} epochs... {mode_str}")
     best_val_loss = float("inf")
+    from training.checkpoint_io import CheckpointWriter, cpu_snapshot, save_metric_checkpoints
+    metric_checkpoints = CheckpointWriter(out_dir)
+    best_scores = {}
     profiler = None
     profile_dir = None
     if args.profile_steps:
@@ -2032,21 +2035,23 @@ def main():
             log_fp.write(json.dumps(log_record) + "\n")
             log_fp.flush()
 
-        # Save best (based on val_loss)
-        if is_primary() and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            ckpt = {
-                "model_state_dict": model.state_dict(),
-                "config": config_snapshot,
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "val_action_mean": val_action,
-                "val_per_dim": val_per_dim,
-                "phase": "intention_head",
-            }
-            torch.save(ckpt, out_dir / "intention_best.pt")
-            print(f"    ↳ new best (val_loss={val_loss:.5f}), "
-                  f"saved to intention_best.pt")
+        if is_primary():
+            metrics = {'val/loss': val_loss, 'train/loss': train_loss,
+                       'pos_mse': val_per_dim.get('pos_mse')}
+            ckpt = cpu_snapshot(dict(
+                model_state_dict=model.state_dict(), config=config_snapshot,
+                epoch=epoch, val_loss=val_loss, train_loss=train_loss,
+                val_action_mean=val_action, val_per_dim=val_per_dim,
+                metrics=metrics, phase='intention_head'))
+            best_scores = save_metric_checkpoints(metric_checkpoints, ckpt, metrics, best_scores)
+            metric_checkpoints.save('intention_last.pt', ckpt)
+            metric_checkpoints.save('training_last.pt', dict(
+                ckpt, optimizer_state_dict=cpu_snapshot(optimizer.state_dict()),
+                best_metric_scores=best_scores))
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                metric_checkpoints.save('intention_best.pt', ckpt)
+                print(f"    ↳ new best (val_loss={val_loss:.5f}), saved to intention_best.pt")
 
     if log_fp is not None:
         log_fp.close()
