@@ -45,7 +45,7 @@ def test_merge_preserves_timestamps_and_padding_does_not_advance_clock():
     m.reset(2,torch.device('cpu'))
     for t in [10.,20.,40.]:
         m.observe_only(torch.ones(2,4),torch.zeros(2,4),observed_mask=torch.tensor([True,False]),timestamp=torch.full((2,),t))
-    assert m.timestamps[0].tolist()==[15.,40.]
+    assert m.timestamps[0].tolist()==[20.,40.]
     assert m._count.tolist()==[2,0] and m._next_timestep.tolist()==[41.,0.]
 
 
@@ -169,7 +169,7 @@ def test_batch_consolidation_chooses_each_episodes_pair_and_preserves_padding(pa
                            [[1,0,0,0],[0,1,0,0],[0,0,0,0]]])
     torch.testing.assert_close(m.perceptual_bank.reshape(3,3,4),expected)
     torch.testing.assert_close(m.state_bank,expected*10)
-    assert m.timestamps.tolist()==[[.5,2,3],[0,1.5,3],[0,1,-1]]
+    assert m.timestamps.tolist()==[[1,2,3],[0,2,3],[0,1,-1]]
     assert m._count.tolist()==[3,3,2]
 
 
@@ -381,7 +381,7 @@ def test_field_merge_copies_single_valid_values_and_preserves_their_time():
     bank.observe_only(0*p,s,timestamp=torch.tensor([2.]))
     torch.testing.assert_close(bank.perceptual_bank[:,0],p)
     assert bank.perceptual_times.tolist()==[[0.,-1.]]
-    assert bank.state_times.tolist()==[[.5,2.]]
+    assert bank.state_times.tolist()==[[1.,2.]]
     torch.testing.assert_close(bank.state_bank[:,0],s)
 
 
@@ -400,7 +400,7 @@ def test_field_masks_average_two_valid_observations_and_reset_masks():
     bank.reset(1,torch.device('cpu'));p=torch.ones(1,4)
     for t,k in enumerate([1,3,5]):bank.observe_only(k*p,p,timestamp=torch.tensor([float(t)]))
     torch.testing.assert_close(bank.perceptual_bank[:,0],2*p)
-    assert bank.perceptual_times.tolist()==[[.5,2.]]
+    assert bank.perceptual_times.tolist()==[[1.,2.]]
     bank.reset(2,torch.device('cpu'))
     assert bank.perceptual_times.shape==(2,2) and (bank.perceptual_times==-1).all()
 

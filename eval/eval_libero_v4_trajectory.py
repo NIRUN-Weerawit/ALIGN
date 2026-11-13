@@ -859,7 +859,9 @@ def run_model_in_sim(
                 stream_out['intent_emb'] = torch.cat([selected,stream_out['intent_emb'][:,selected.shape[1]:]],dim=1)
                 bank = getattr(model,'memory_module',None)
                 if not should_infer and bank is not None and hasattr(bank,'observe_only'):
-                    bank.observe_only(stream_out['z_v_pooled_seq'][:,-1],stream_out['z_s_seq'][:,-1],None,
+                    cognitive = (model.memory_cognitive_input(stream_out.get('intent_emb'))
+                                 if hasattr(model, 'memory_cognitive_input') else None)
+                    bank.observe_only(stream_out['z_v_pooled_seq'][:,-1],stream_out['z_s_seq'][:,-1],cognitive,
                         observed_mask=stream_out['observed_mask'],timestamp=stream_out['timestamp'])
             if context_handover and resolved_context_mode == 'handover':
                 intention_stream.freeze_task()

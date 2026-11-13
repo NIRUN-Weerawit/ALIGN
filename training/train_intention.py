@@ -398,6 +398,9 @@ def build_model(args, num_cameras, device):
         task_context_trainable=getattr(args,'task_context_trainable',False),
         task_context_fusion=getattr(args,'task_context_fusion','additive'),
         task_context_fusion_dim=getattr(args,'task_context_fusion_dim',128),
+        memory_temporal_cognitive=getattr(args, 'memory_temporal_cognitive', True),
+        memory_consolidation_key=getattr(args, 'memory_consolidation_key', 'perceptual'),
+        memory_merge_timestamp=getattr(args, 'memory_merge_timestamp', 'latest'),
         policy_temporal_mamba=getattr(args,'policy_temporal_mamba',False),
         policy_temporal_width=getattr(args,'policy_temporal_width',128),
         policy_temporal_layers=getattr(args,'policy_temporal_layers',1),
@@ -647,7 +650,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
                             timestamp = batch["observation_timesteps"][:,current_t].to(device)
                             with (torch.no_grad() if getattr(model.memory_module,"detach_writes",False) else nullcontext()):
                                 if hasattr(model.memory_module,"observe_only"):
-                                    model.memory_module.observe_only(p_context,z_s_all[:,current_t],c_context,observed,timestamp)
+                                    model.memory_module.observe_only(p_context,z_s_all[:,current_t],model.memory_cognitive_input(c_context),observed,timestamp)
                                 else:
                                     model.condition_actions(p_context[:,None],z_s_all[:,current_t:current_t+1],c_context,observed)
                             stage_end("memory_observe_only_gpu_s", observe_event)
@@ -1249,7 +1252,7 @@ def validate(model, loader, device, args):
                             timestamp = batch["observation_timesteps"][:,current_t].to(device)
                             with (torch.no_grad() if getattr(model.memory_module,"detach_writes",False) else nullcontext()):
                                 if hasattr(model.memory_module,"observe_only"):
-                                    model.memory_module.observe_only(p_context,z_s_all[:,current_t],c_context,observed,timestamp)
+                                    model.memory_module.observe_only(p_context,z_s_all[:,current_t],model.memory_cognitive_input(c_context),observed,timestamp)
                                 else:
                                     model.condition_actions(p_context[:,None],z_s_all[:,current_t:current_t+1],c_context,observed)
                         continue

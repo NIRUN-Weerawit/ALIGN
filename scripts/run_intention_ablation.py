@@ -265,7 +265,7 @@ def atomic_json(path, value):
 
 def legacy_resume_defaults(previous):
     """Historical defaults shared by config restoration and compatibility checks."""
-    legacy_defaults = dict(max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
+    legacy_defaults = dict(memory_temporal_cognitive=False, memory_consolidation_key='perceptual', memory_merge_timestamp='mean', max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
                            plain_history_size=4,
                            weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                            mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
@@ -358,6 +358,9 @@ def evaluate_existing(out):
             task_context_initialization=config.get('task_context_initialization','pretrained'),
             task_context_fusion=config.get('task_context_fusion','additive'),
             task_context_fusion_dim=config.get('task_context_fusion_dim',128),
+            memory_temporal_cognitive=config.get('memory_temporal_cognitive', False),
+            memory_consolidation_key=config.get('memory_consolidation_key', 'perceptual'),
+            memory_merge_timestamp=config.get('memory_merge_timestamp', 'mean'),
             policy_temporal_mamba=config.get('policy_temporal_mamba',False),
             policy_temporal_width=config.get('policy_temporal_width',128),
             policy_temporal_layers=config.get('policy_temporal_layers',1),
@@ -773,7 +776,7 @@ def main(argv=None):
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "use_task_text", "text_dim", "text_vocab", "task_context_fusion", "task_context_fusion_dim",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
-                    "temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
+                    "memory_temporal_cognitive","memory_consolidation_key","memory_merge_timestamp","temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
                     "visual_context_mode","memory_retrieval_depth","memory_intent_query","memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
             if key == 'memory_patch_retrieval':
                 continue  # Per-checkpoint architecture migration is handled below.
@@ -887,6 +890,9 @@ def main(argv=None):
             task_context_initialization='scratch' if scratch else 'pretrained',
             task_context_fusion=args.task_context_fusion if context else 'additive',
             task_context_fusion_dim=args.task_context_fusion_dim,
+            memory_temporal_cognitive=args.memory_temporal_cognitive,
+            memory_consolidation_key=args.memory_consolidation_key,
+            memory_merge_timestamp=args.memory_merge_timestamp,
             policy_temporal_mamba=args.policy_temporal_mamba,
             policy_temporal_width=args.policy_temporal_width,
             policy_temporal_layers=args.policy_temporal_layers)

@@ -518,7 +518,15 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
     """
     def __init__(self, perceptual_dim, cognitive_dim, state_dim, bank_len=16,
                  num_heads=2, detach_writes=True, write_fused=False, patch_dim=None, context_only=False, patch_temporal=False, value_preserving=False, mask_missing_fields=False, perceptual_recency_scale=0.,
-                 retrieval_depth=1, intent_query=False):
+                 retrieval_depth=1, intent_query=False, consolidation_key="perceptual", merge_timestamp="latest"):
+        if consolidation_key not in ('perceptual', 'cognitive'):
+            raise ValueError('Unknown memory consolidation key')
+        if consolidation_key == 'cognitive' and cognitive_dim <= 0:
+            raise ValueError('Cognitive consolidation requires a cognitive stream')
+        if merge_timestamp not in ('latest', 'mean'):
+            raise ValueError('Unknown merged timestamp policy')
+        self.consolidation_key = consolidation_key
+        self.merge_timestamp = merge_timestamp
         if not isinstance(retrieval_depth,int) or retrieval_depth < 1:
             raise ValueError('Retrieval depth must be a positive integer')
         if intent_query and cognitive_dim <= 0:
@@ -632,7 +640,8 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
         # Each episode chooses its own adjacent merge, without device-to-host
         # synchronization for every row and observation.
         full = (self._count == self.bank_len) & mask
-        normalized = F.normalize(self.perceptual_bank.flatten(2),dim=-1)
+        key_bank = self.cognitive_bank if self.consolidation_key == 'cognitive' else self.perceptual_bank
+        normalized = F.normalize(key_bank.flatten(2),dim=-1)
         pair = (normalized[:,:-1]*normalized[:,1:]).sum(-1).argmax(1)
         positions = torch.arange(self.bank_len,device=p.device)[None].expand(B,-1)
         shifted_indices = (positions + (positions > pair[:,None])).clamp_max(self.bank_len-1)
@@ -655,7 +664,8 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
                 denominator=(v1.float()+v2.float()).clamp_min(1)
                 average=(bank.gather(1,index(pair[:,None]))*v1[...,None]+
                          bank.gather(1,index(pair[:,None]+1))*v2[...,None])/denominator[...,None].to(bank.dtype)
-                merged_time=torch.where(v1|v2,(first.clamp_min(0)*v1+second.clamp_min(0)*v2)/denominator,-1.)
+                merged_time = (torch.maximum(first, second) if self.merge_timestamp == 'latest' else
+                               torch.where(v1 | v2, (first.clamp_min(0)*v1 + second.clamp_min(0)*v2)/denominator, -1.))
                 shifted_time=field_times.gather(1,time_index(shifted_indices))
                 retained_time=torch.where((positions==pair[:,None]).reshape(B,self.bank_len,*time_extra),merged_time,shifted_time)
                 retained_time=torch.where(full.reshape(B,1,*time_extra),retained_time,field_times)
@@ -678,7 +688,18 @@ class EpisodicMemoryModule(PerceptualCognitiveMemoryModule):
             self.perceptual_bank = merge_and_write(self.perceptual_bank,p)
             self.state_bank = merge_and_write(self.state_bank,s)
             self.cognitive_bank = merge_and_write(self.cognitive_bank,c)
-        self.timestamps = merge_and_write(self.timestamps,timestamp)
+        # Reuse the same pair and shifting as feature consolidation, but the
+        # representative timestamp is the newest observation in that pair.
+        if self.merge_timestamp == 'latest':
+            latest = torch.maximum(self.timestamps.gather(1, pair[:, None]),
+                                   self.timestamps.gather(1, pair[:, None] + 1))
+            shifted = self.timestamps.gather(1, shifted_indices)
+            merged = torch.where(positions == pair[:, None], latest, shifted)
+            retained = torch.where(full[:, None], merged, self.timestamps)
+            added = retained.scatter(1, count.clamp_max(self.bank_len - 1)[:, None], timestamp[:, None])
+            self.timestamps = torch.where(mask[:, None], added, retained)
+        else:
+            self.timestamps = merge_and_write(self.timestamps,timestamp)
         self._count = torch.where(mask,count+1,self._count)
         self._next_timestep = torch.where(mask,timestamp+1,self._next_timestep)
 

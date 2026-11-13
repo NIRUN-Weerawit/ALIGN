@@ -59,6 +59,13 @@ def add_context_policy_arguments(parser):
         help='Hidden width for context fusion/ACI attention (divisible by 4 for attention modes)')
     parser.add_argument('--policy-temporal-mamba', action='store_true',
         help='Train a separate recurrent policy token alongside the frozen pretrained observer (ACI only)')
+    import argparse
+    parser.add_argument('--memory-temporal-cognitive', action=argparse.BooleanOptionalAction, default=True,
+        help='Store and retrieve the live policy temporal token in context-model cognitive memory')
+    parser.add_argument('--memory-consolidation-key', choices=('perceptual', 'temporal'), default='perceptual',
+        help='Select adjacent merges by perceptual features or policy temporal cognitive features')
+    parser.add_argument('--memory-merge-timestamp', choices=('latest', 'mean'), default='latest',
+        help='Timestamp retained by consolidated entries; mean reproduces historical checkpoints')
     parser.add_argument('--policy-temporal-width', type=int, default=128)
     parser.add_argument('--policy-temporal-layers', type=int, default=1)
     parser.add_argument('--policy-warm-start', default=None, help='Copy shape-compatible common policy weights from an existing checkpoint; context weights remain from the observer')
@@ -66,7 +73,9 @@ def add_context_policy_arguments(parser):
 
 def context_policy_options(model):
     branch = getattr(model, 'task_context', None)
-    return dict(task_context_source=getattr(model, 'task_context_source', 'student'), task_context_tokens=branch.config['encoder_config']['tokens'] if branch is not None else None,
+    return dict(memory_temporal_cognitive=model.memory_temporal_cognitive,
+        memory_consolidation_key=model.memory_consolidation_key,
+        memory_merge_timestamp=model.memory_merge_timestamp, task_context_source=getattr(model, 'task_context_source', 'student'), task_context_tokens=branch.config['encoder_config']['tokens'] if branch is not None else None,
         task_context_config=branch.config if branch is not None else None,
         task_context_trainable=branch.trainable if branch is not None else False,
         task_context_initialization=branch.initialization if branch is not None else 'pretrained',
@@ -108,6 +117,12 @@ def warm_start_policy(model, path):
 
 
 def validate_policy_temporal_arguments(args):
+    if getattr(args, 'memory_consolidation_key', 'perceptual') == 'temporal':
+        if not args.policy_temporal_mamba or not args.memory_temporal_cognitive or args.memory_mode != 'episodic':
+            raise ValueError('Temporal consolidation requires episodic memory and --policy-temporal-mamba')
+        variants = getattr(args, 'variants', ['context_memory'] if getattr(args, 'use_memory_bank', False) else [])
+        if not variants or any(v != 'context_memory' for v in variants):
+            raise ValueError('Temporal consolidation requires context_memory variants')
     if args.policy_temporal_width < 1 or args.policy_temporal_layers < 1:
         raise ValueError('Policy temporal width/layers must be positive')
     if args.policy_temporal_mamba:

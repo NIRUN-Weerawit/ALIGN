@@ -109,6 +109,9 @@ class ALIGNIntentionModel(nn.Module):
         memory_pre_state_visual: bool = False,
         memory_field_masks: bool = False,
         memory_perceptual_recency: float = 0.,
+        memory_temporal_cognitive: bool = True,
+        memory_consolidation_key: str = "perceptual",
+        memory_merge_timestamp: str = "latest",
         flow_inference_steps: int = 10,
         flow_solver: str = "euler",
         flow_loss_repeats: int = 1,
@@ -216,6 +219,15 @@ class ALIGNIntentionModel(nn.Module):
                     self.task_context.config['summary_config']['width'],
                     self.task_context.config['encoder_config']['token_dim'],
                     width=policy_temporal_width, layers=policy_temporal_layers)
+        self.memory_temporal_cognitive = bool(memory_temporal_cognitive)
+        self.memory_consolidation_key = memory_consolidation_key
+        self.memory_merge_timestamp = memory_merge_timestamp
+        if memory_consolidation_key not in ('perceptual', 'temporal'):
+            raise ValueError('Unknown memory consolidation key')
+        if memory_consolidation_key == 'temporal' and (
+                not use_memory_bank or memory_mode != 'episodic' or
+                not policy_temporal_mamba or not memory_temporal_cognitive):
+            raise ValueError('Temporal consolidation requires episodic memory and a policy temporal cognitive stream')
         self.use_memory_bank = use_memory_bank
         self.memory_bank_len = memory_bank_len
         self.memory_mode = memory_mode
@@ -460,8 +472,12 @@ class ALIGNIntentionModel(nn.Module):
         # Build memory bank (2-stream: perceptual, state; cognitive optional)
         if self.use_memory_bank:
             cognitive_dim = self.intent_dim * self.num_intent_tokens if self.use_intent_tokens else 0
+            if self.temporal_cognitive_memory:
+                cognitive_dim = self.task_context.config['encoder_config']['token_dim']
             memory_class = EpisodicMemoryModule if self.memory_mode == "episodic" else PerceptualCognitiveMemoryModule
-            memory_kwargs = dict(retrieval_depth=self.memory_retrieval_depth,intent_query=self.memory_intent_query,perceptual_recency_scale=self.memory_perceptual_recency,mask_missing_fields=self.memory_field_masks,value_preserving=self.memory_value_preserving,patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
+            memory_kwargs = dict(consolidation_key='cognitive' if self.memory_consolidation_key == 'temporal' else 'perceptual',
+                                 merge_timestamp=self.memory_merge_timestamp,
+                                 retrieval_depth=self.memory_retrieval_depth,intent_query=self.memory_intent_query,perceptual_recency_scale=self.memory_perceptual_recency,mask_missing_fields=self.memory_field_masks,value_preserving=self.memory_value_preserving,patch_temporal=self.memory_patch_temporal,context_only=self.memory_context_only,detach_writes=self.memory_detach_writes,write_fused=self.memory_write_fused,
                                  patch_dim=self.compressed_dim if self.memory_patch_retrieval else None) if self.memory_mode == "episodic" else {}
             self.memory_module = memory_class(
                 perceptual_dim=pool_out_dim,
@@ -729,6 +745,21 @@ class ALIGNIntentionModel(nn.Module):
                     outputs.append(self.encode_visual_features(p,s))
         return torch.cat(outputs)
 
+    @property
+    def temporal_cognitive_memory(self):
+        return (self.memory_temporal_cognitive and self.task_context is not None
+                and self.policy_temporal_mamba)
+
+    def memory_cognitive_input(self, intent):
+        """Extract the live policy token; task/execution slots bypass memory."""
+        if self.task_context is None:
+            return intent
+        if self.temporal_cognitive_memory:
+            if intent is None:
+                raise ValueError('Temporal cognitive memory requires the policy context payload')
+            return intent[:, -1:]
+        return None
+
     def condition_actions(self, z_v_window: torch.Tensor,
                           z_s_window: torch.Tensor,
                           intent_emb: Optional[torch.Tensor] = None,
@@ -743,12 +774,13 @@ class ALIGNIntentionModel(nn.Module):
             return z_v_window, z_s_window, intent_emb
         context = intent_emb if self.task_context is not None else None
         z_v, z_s, intent = self.memory_module(
-            z_v_window[:, -1], z_s_window[:, -1], None if self.task_context is not None else intent_emb,
+            z_v_window[:, -1], z_s_window[:, -1], self.memory_cognitive_input(intent_emb),
             observed_mask=observed_mask,
             **({"timestamp":timestamp} if self.memory_mode == "episodic" else {}),
         )
         if self.task_context is not None:
-            intent = context
+            intent = (torch.cat([context[:, :-1], intent], dim=1)
+                      if self.temporal_cognitive_memory else context)
         if self.memory_pre_state_visual:
             current_state=z_s_window[:,-1]
             live_state=torch.where(current_state.ne(0).any(-1,keepdim=True),current_state,z_s)

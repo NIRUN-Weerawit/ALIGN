@@ -42,6 +42,8 @@ class IntentionStream:
         self.timestep += 1
         if store_memory and bank is not None and hasattr(bank,"observe_only"):
             cognitive = (result[4] if len(result)==5 else None) if getattr(self.model,'task_context',None) is None else None
+            if hasattr(self.model, 'memory_cognitive_input'):
+                cognitive = self.model.memory_cognitive_input(result[4] if len(result) == 5 else None)
             bank.observe_only(visual,state,cognitive,observed_mask=observed,timestamp=timestamp)
         if not self.visual:
             self.visual.extend([visual] * self.history_size)
