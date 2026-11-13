@@ -50,7 +50,7 @@ class TaskContextPolicyBranch(nn.Module):
     Config plus the policy state_dict reconstruct this without the original
     bundle path. Neither whole-episode teacher nor training labels are loaded.
     """
-    def __init__(self, checkpoint=None, config=None, trainable=False, initialization="pretrained"):
+    def __init__(self, checkpoint=None, config=None, trainable=False, initialization="pretrained", summary_trainable=False):
         super().__init__()
         if initialization not in ("pretrained", "scratch"):
             raise ValueError("Unknown task-context initialization")
@@ -79,17 +79,20 @@ class TaskContextPolicyBranch(nn.Module):
             self.observer.encoder = TaskContextEncoder(**config["encoder_config"])
             self.observer.encoder.latent_mean.copy_(original.latent_mean)
             self.observer.encoder.latent_std.copy_(original.latent_std)
+        self.summary_trainable = bool(summary_trainable)
         self.trainable = bool(trainable or initialization == "scratch")
         self.initialization = initialization
         self.observer.requires_grad_(False).eval()
         self.observer.encoder.requires_grad_(self.trainable)
+        self.observer.summary.requires_grad_(self.summary_trainable)
         self.fps = float(config["metadata"]["fps"])
         if self.fps <= 0:
             raise ValueError("Context frame rate must be positive")
 
     def train(self, mode=True):
         super().train(mode)
-        self.observer.summary.eval()
+        if not self.summary_trainable:
+            self.observer.summary.eval()
         if not self.trainable:
             self.observer.encoder.eval()
         return self
@@ -103,7 +106,7 @@ class TaskContextPolicyBranch(nn.Module):
             cls = torch.where(valid[..., None, None], cls, 0.)
             state = torch.where(valid[..., None], state, 0.)
             seconds = torch.where(valid, seconds, 0.)
-        with torch.no_grad(), torch.autocast(device_type=state.device.type, enabled=False):
+        with torch.set_grad_enabled(torch.is_grad_enabled() and self.training and self.summary_trainable), torch.autocast(device_type=state.device.type, enabled=False):
             slots = visual_slots(patches.float(), cls.float(), self.config["summary_config"]["cameras"])
             geometry = torch.cat([state[..., :3].float(), rotation_columns(state[..., 3:6].float()), state[..., 6:7].float()], -1)
             geometry = (geometry - self.observer.state_mean) / self.observer.state_std
@@ -119,10 +122,10 @@ class TaskContextPolicyBranch(nn.Module):
         # excluded by the production action-anchor mask; no future is consulted.
         anchors = torch.arange(summaries.shape[1], device=summaries.device)[None].expand(len(summaries), -1)
         anchors = torch.minimum(anchors, lengths[:, None] - 1)
-        with torch.set_grad_enabled(self.training and self.trainable), torch.autocast(device_type=summaries.device.type, enabled=False):
+        with torch.set_grad_enabled(torch.is_grad_enabled() and self.training and (self.trainable or self.summary_trainable)), torch.autocast(device_type=summaries.device.type, enabled=False):
             out = encoder(summaries, lengths, anchors)
             task = out['tokens']
-            if self.training and self.trainable:
+            if self.training and (self.trainable or self.summary_trainable):
                 # Forward remains the top-weight mode. Straight-through selector
                 # gradients allow action-only scratch/fine-tune arms to learn weights.
                 probability = out['logits'].softmax(-1)

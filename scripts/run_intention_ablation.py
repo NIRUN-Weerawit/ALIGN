@@ -265,7 +265,7 @@ def atomic_json(path, value):
 
 def legacy_resume_defaults(previous):
     """Historical defaults shared by config restoration and compatibility checks."""
-    legacy_defaults = dict(memory_temporal_cognitive=False, memory_consolidation_key='perceptual', memory_merge_timestamp='mean', max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
+    legacy_defaults = dict(task_context_summary_trainable=False, task_context_lr=None, task_context_summary_lr=None, memory_temporal_cognitive=False, memory_consolidation_key='perceptual', memory_merge_timestamp='mean', max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
                            plain_history_size=4,
                            weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                            mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
@@ -355,6 +355,7 @@ def evaluate_existing(out):
             task_context_config=config.get('task_context_config'),
             task_context_tokens=config.get('task_context_tokens',config.get('num_task_tokens')),
             task_context_trainable=config.get('task_context_trainable',False),
+            task_context_summary_trainable=config.get('task_context_summary_trainable', False),
             task_context_initialization=config.get('task_context_initialization','pretrained'),
             task_context_fusion=config.get('task_context_fusion','additive'),
             task_context_fusion_dim=config.get('task_context_fusion_dim',128),
@@ -776,7 +777,7 @@ def main(argv=None):
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "use_task_text", "text_dim", "text_vocab", "task_context_fusion", "task_context_fusion_dim",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
-                    "memory_temporal_cognitive","memory_consolidation_key","memory_merge_timestamp","temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
+                    "task_context_summary_trainable","task_context_lr","task_context_summary_lr","memory_temporal_cognitive","memory_consolidation_key","memory_merge_timestamp","temporal_sampling","supervision_points","memory_mode","memory_detach_writes","memory_write_fused",
                     "visual_context_mode","memory_retrieval_depth","memory_intent_query","memory_perceptual_recency","memory_field_masks","memory_pre_state_visual","memory_value_preserving","memory_patch_temporal","memory_context_only","memory_patch_retrieval","diffusion_train_steps","diffusion_loss_repeats","warm_start","selection_metric","visual_token_attention","diffusion_clip_sample","observation_dropout_prob","drop_state_with_all_views","head_window_batch_size","length_bucket_multiplier"):
             if key == 'memory_patch_retrieval':
                 continue  # Per-checkpoint architecture migration is handled below.
@@ -887,6 +888,7 @@ def main(argv=None):
             task_context_tokens=args.num_task_tokens if context else None,
             task_context_source=args.task_context_source if context else 'student',
             task_context_trainable=args.task_context_trainable,
+            task_context_summary_trainable=args.task_context_summary_trainable,
             task_context_initialization='scratch' if scratch else 'pretrained',
             task_context_fusion=args.task_context_fusion if context else 'additive',
             task_context_fusion_dim=args.task_context_fusion_dim,
@@ -943,7 +945,7 @@ def main(argv=None):
             print(f'POLICY WARM START {name}: {warm_start_policy(model,args.policy_warm_start)}',flush=True)
         if args.freeze_intent_backbone:freeze_intent_backbone(model)
         params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(policy_parameter_groups(model,args.lr), lr=args.lr, weight_decay=args.weight_decay, fused=True)
+        optimizer = torch.optim.AdamW(policy_parameter_groups(model,args.lr,args.task_context_lr,args.task_context_summary_lr), lr=args.lr, weight_decay=args.weight_decay, fused=True)
         loop_args = SimpleNamespace(history_size=variant_history_size, chunk_size=args.chunk_size,
             action_dim=7, head_type=args.head_type, skip_nan=False, grad_clip=args.grad_clip,
             no_sample_during_train=True, debug=False, gripper_threshold=args.gripper_threshold,

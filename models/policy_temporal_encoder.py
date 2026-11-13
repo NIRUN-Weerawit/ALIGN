@@ -32,8 +32,8 @@ class PolicyTemporalEncoder(nn.Module):
         if (lengths < 1).any() or (lengths > summaries.shape[1]).any():
             raise ValueError('Invalid policy temporal sequence lengths')
         valid = torch.arange(summaries.shape[1], device=summaries.device)[None] < lengths[:, None]
-        # Summary/observer are frozen; padded NaNs must not reach ANY projection.
-        summaries = torch.where(valid[..., None], summaries.detach(), 0.)
+        # Sanitize padding before projection while preserving trainable summary gradients.
+        summaries = torch.where(valid[..., None], summaries, 0.)
         with torch.autocast(device_type=summaries.device.type, enabled=False):
             x = self.input(summaries.float())
             for norm, block in zip(self.norms, self.blocks):

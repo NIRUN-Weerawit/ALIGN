@@ -396,6 +396,7 @@ def build_model(args, num_cameras, device):
         task_context_checkpoint=getattr(args,'task_context_checkpoint',None),
         task_context_tokens=getattr(args,'num_task_tokens',None),
         task_context_trainable=getattr(args,'task_context_trainable',False),
+        task_context_summary_trainable=getattr(args, 'task_context_summary_trainable', False),
         task_context_fusion=getattr(args,'task_context_fusion','additive'),
         task_context_fusion_dim=getattr(args,'task_context_fusion_dim',128),
         memory_temporal_cognitive=getattr(args, 'memory_temporal_cognitive', True),
@@ -1883,8 +1884,8 @@ def main():
     if args.fused_adamw:
         adamw_kwargs["fused"] = True
     from data.task_context_policy_dataset import policy_parameter_groups
-    optimizer = torch.optim.AdamW(policy_parameter_groups(model,args.lr), **adamw_kwargs)
-    print(f"  Optimizer: 1 LR group (lr={args.lr:.2e}, {n_trainable:,} trainable params; "
+    optimizer = torch.optim.AdamW(policy_parameter_groups(model,args.lr,args.task_context_lr,args.task_context_summary_lr), **adamw_kwargs)
+    print(f"  Optimizer: {len(optimizer.param_groups)} LR groups ({n_trainable:,} trainable params; "
           f"fused={args.fused_adamw})")
 
     # Save config snapshot

@@ -52,7 +52,14 @@ def add_context_policy_arguments(parser):
              "family's train/val episodes). All other manifest checks still apply; the override is recorded in the checkpoint config.")
     parser.add_argument('--num-task-tokens','--task-context-tokens',type=int,default=None,
         help='Expected task-token count; inferred from observer when omitted. Requires matching pretraining.')
-    parser.add_argument('--task-context-trainable', action='store_true', help='Fine-tune causal encoder with action loss; frozen summary is retained')
+    parser.add_argument('--task-context-trainable', '--unfreeze-task-context-encoder', action='store_true',
+        help='Train the student context encoder and readouts with policy action loss')
+    parser.add_argument('--task-context-summary-trainable', '--unfreeze-summary-encoder', action='store_true',
+        help='Train the observation summary encoder with policy action loss')
+    parser.add_argument('--task-context-lr', '--task-context-encoder-lr', type=float, default=None,
+        help='Student encoder learning rate; default 0.1 times policy LR, or policy LR for scratch')
+    parser.add_argument('--task-context-summary-lr', type=float, default=None,
+        help='Observation summary learning rate; default 0.1 times policy LR')
     parser.add_argument('--task-context-fusion', choices=('additive', 'gated_residual', 'film', 'cross_attention', 'aci'),
         default='additive', help='Context conditioning; aci selects alternating action-to-context/observation attention')
     parser.add_argument('--task-context-fusion-dim', type=int, default=128,
@@ -78,6 +85,7 @@ def context_policy_options(model):
         memory_merge_timestamp=model.memory_merge_timestamp, task_context_source=getattr(model, 'task_context_source', 'student'), task_context_tokens=branch.config['encoder_config']['tokens'] if branch is not None else None,
         task_context_config=branch.config if branch is not None else None,
         task_context_trainable=branch.trainable if branch is not None else False,
+        task_context_summary_trainable=branch.summary_trainable if branch is not None else False,
         task_context_initialization=branch.initialization if branch is not None else 'pretrained',
         task_context_fusion=getattr(model, 'task_context_fusion', 'additive'),
         task_context_fusion_dim=getattr(model, 'task_context_fusion_dim', 128),
@@ -86,15 +94,24 @@ def context_policy_options(model):
         policy_temporal_layers=getattr(model, 'policy_temporal_layers', 1))
 
 
-def policy_parameter_groups(model, lr):
-    """Frozen pilot trains adapters/policy; pretrained fine-tuning uses 0.1x LR."""
+def policy_parameter_groups(model, lr, task_context_lr=None, task_context_summary_lr=None):
+    """Give each unfrozen context module its own optimizer group."""
     branch = getattr(model, 'task_context', None)
-    if branch is None or not branch.trainable or branch.initialization == 'scratch':
+    if branch is None or not (branch.trainable or branch.summary_trainable):
         return [p for p in model.parameters() if p.requires_grad]
     encoder = [p for p in branch.observer.encoder.parameters() if p.requires_grad]
-    ids = {id(p) for p in encoder}
-    other = [p for p in model.parameters() if p.requires_grad and id(p) not in ids]
-    return [dict(params=other, lr=lr), dict(params=encoder, lr=lr*.1)]
+    summary = [p for p in branch.observer.summary.parameters() if p.requires_grad]
+    context_ids = {id(p) for p in encoder + summary}
+    policy = [p for p in model.parameters() if p.requires_grad and id(p) not in context_ids]
+    groups = [dict(params=policy, lr=lr, name='policy')]
+    if encoder:
+        default_lr = lr if branch.initialization == 'scratch' else lr * .1
+        groups.append(dict(params=encoder, lr=task_context_lr if task_context_lr is not None else default_lr,
+                           name='task_context_encoder'))
+    if summary:
+        groups.append(dict(params=summary, lr=task_context_summary_lr if task_context_summary_lr is not None else lr * .1,
+                           name='task_context_summary'))
+    return groups
 
 
 def warm_start_policy(model, path):
@@ -123,11 +140,18 @@ def validate_policy_temporal_arguments(args):
         variants = getattr(args, 'variants', ['context_memory'] if getattr(args, 'use_memory_bank', False) else [])
         if not variants or any(v != 'context_memory' for v in variants):
             raise ValueError('Temporal consolidation requires context_memory variants')
+    import math
+    for key in ('task_context_lr', 'task_context_summary_lr'):
+        value = getattr(args, key, None)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(f'{key} must be finite and positive')
+    if (args.task_context_trainable or getattr(args, 'task_context_summary_trainable', False)) and not args.task_context_checkpoint:
+        raise ValueError('Unfreezing context modules requires --task-context-checkpoint')
     if args.policy_temporal_width < 1 or args.policy_temporal_layers < 1:
         raise ValueError('Policy temporal width/layers must be positive')
     if args.policy_temporal_mamba:
-        if not args.task_context_checkpoint or args.task_context_fusion != 'aci' or args.task_context_trainable:
-            raise ValueError('--policy-temporal-mamba requires ACI and a frozen pretrained context observer')
+        if not args.task_context_checkpoint or args.task_context_fusion != 'aci':
+            raise ValueError('--policy-temporal-mamba requires ACI and a pretrained context observer')
         variants = getattr(args, 'variants', ['context_no_memory'])
         if any(not v.startswith('context_') or 'scratch' in v for v in variants):
             raise ValueError('Policy temporal Mamba requires pretrained context variants only')

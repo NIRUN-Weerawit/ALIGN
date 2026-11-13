@@ -157,6 +157,7 @@ def load_intention_model(
         task_context_config=cfg.get('task_context_config'),
         task_context_tokens=cfg.get('task_context_tokens',cfg.get('num_task_tokens')),
         task_context_trainable=cfg.get('task_context_trainable',False),
+        task_context_summary_trainable=cfg.get('task_context_summary_trainable', False),
         task_context_initialization=cfg.get('task_context_initialization','pretrained'),
         task_context_fusion=cfg.get('task_context_fusion','additive'),
         task_context_source=cfg.get('task_context_source', 'student'),

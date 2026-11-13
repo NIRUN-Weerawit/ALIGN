@@ -131,6 +131,7 @@ class ALIGNIntentionModel(nn.Module):
         task_context_tokens: int = None,
         task_context_config: dict = None,
         task_context_trainable: bool = False,
+        task_context_summary_trainable: bool = False,
         task_context_initialization: str = "pretrained",
         task_context_fusion: str = "additive",
         task_context_fusion_dim: int = 128,
@@ -199,7 +200,7 @@ class ALIGNIntentionModel(nn.Module):
             # Loading a new branch must not perturb common visual/state initialization.
             with torch.random.fork_rng(devices=[]):
                 self.task_context = TaskContextPolicyBranch(task_context_checkpoint, task_context_config,
-                    task_context_trainable, task_context_initialization)
+                    task_context_trainable, task_context_initialization, task_context_summary_trainable)
             actual_tokens=self.task_context.config['encoder_config']['tokens']
             if task_context_tokens is not None and actual_tokens != task_context_tokens:
                 raise ValueError(f'Requested {task_context_tokens} task tokens but observer has {actual_tokens}; pretrain a matching teacher/student')
@@ -211,8 +212,8 @@ class ALIGNIntentionModel(nn.Module):
         self.policy_temporal_layers = policy_temporal_layers
         self.policy_temporal_encoder = None
         if policy_temporal_mamba:
-            if self.task_context is None or task_context_fusion != 'aci' or task_context_trainable or task_context_initialization != 'pretrained':
-                raise ValueError('Policy temporal Mamba requires ACI with a frozen pretrained context observer')
+            if self.task_context is None or task_context_fusion != 'aci' or task_context_initialization != 'pretrained':
+                raise ValueError('Policy temporal Mamba requires ACI with a pretrained context observer')
             from models.policy_temporal_encoder import PolicyTemporalEncoder
             with torch.random.fork_rng(devices=[]):
                 self.policy_temporal_encoder = PolicyTemporalEncoder(
