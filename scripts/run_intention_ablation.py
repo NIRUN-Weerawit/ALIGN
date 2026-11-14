@@ -289,7 +289,7 @@ def extend_resume_manifest(previous, current):
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
                 "gpu_memory_fraction", "micro_batch_size", "pin_memory",
                 "plain_history_loader", "plain_head_batch_size", "profile_data_stages",
-                "plain_history_copy_mode", "checkpoint_staging_dir", "memory_patch_retrieval"):
+                "plain_history_copy_mode", "checkpoint_staging_dir", "memory_patch_retrieval", "save_all_checkpoints"):
         if key in current:
             merged[key] = current[key]
     return merged
@@ -500,6 +500,8 @@ def parse_args(argv=None):
     parser.add_argument("--diffusion-train-steps",type=int,default=100)
     parser.add_argument("--diffusion-loss-repeats",type=int,default=4)
     parser.add_argument("--warm-start",type=Path,help="Existing four-variant run; copy matching parameters, retain fresh diffusion schedule")
+    parser.add_argument('--save-all-checkpoints', action=argparse.BooleanOptionalAction, default=True,
+                        help='Save independent metric winners and a lightweight last model, alongside selected best and training recovery')
     parser.add_argument("--keep-epoch-checkpoints",action=argparse.BooleanOptionalAction,default=False)
     parser.add_argument("--checkpoint-staging-dir",default=None,help="Fast local checkpoint directory; mirror immutable files to output asynchronously. Resume prefers the highest saved epoch from local/output checkpoints.")
     parser.add_argument("--selection-metric",choices=["val/loss","pos_mse"],default="pos_mse",
@@ -1071,8 +1073,9 @@ def main(argv=None):
                 evaluation = dict(model_state_dict=snapshot["model_state_dict"],
                                   config=snapshot["config"],epoch=epoch,val_loss=val_loss,
                                   train_loss=train_loss,metrics={key:row[key] for key in METRIC_CHECKPOINTS})
-                best_scores = save_metric_checkpoints(checkpoints, evaluation, row, best_scores)
-                checkpoints.save("intention_last.pt", evaluation)
+                if args.save_all_checkpoints:
+                    best_scores = save_metric_checkpoints(checkpoints, evaluation, row, best_scores)
+                    checkpoints.save("intention_last.pt", evaluation)
                 if improved:
                     checkpoints.save("intention_best.pt",evaluation)
                 if args.keep_epoch_checkpoints:

@@ -168,3 +168,15 @@ def test_metric_recovery_ignores_missing_corrupt_and_future_winners(tmp_path):
     (tmp_path / 'intention_best_val_loss.pt').write_bytes(b'incomplete')
     assert 'val/loss' not in restore_metric_scores(writer, dict(epoch=3))
     assert save_metric_checkpoints(writer, payload(4), {'pos_mse': float('nan')}, {}) == {}
+
+
+def test_save_all_checkpoints_defaults_and_resume_override(tmp_path):
+    import json
+    from scripts.run_intention_ablation import parse_args, extend_resume_manifest
+    assert parse_args(['--output', str(tmp_path)]).save_all_checkpoints is True
+    assert parse_args(['--output', str(tmp_path), '--no-save-all-checkpoints']).save_all_checkpoints is False
+    previous = dict(epochs=5, variants=['no_intent_no_memory'], data='data.h5', cache='cache', save_all_checkpoints=True)
+    (tmp_path / 'manifest.json').write_text(json.dumps(previous))
+    args = parse_args(['--output', str(tmp_path), '--resume', '--no-save-all-checkpoints'])
+    assert args.save_all_checkpoints is False
+    assert extend_resume_manifest(previous, vars(args))['save_all_checkpoints'] is False

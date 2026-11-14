@@ -1620,6 +1620,8 @@ def parse_args():
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     add_future_arguments(parser)
     from data.task_context_policy_dataset import add_context_policy_arguments
+    parser.add_argument('--save-all-checkpoints', action=argparse.BooleanOptionalAction, default=True,
+                        help='Save independent metric winners and a lightweight last model, alongside selected best and training recovery')
     add_context_policy_arguments(parser)
     from models.vision_config import add_vision_arguments, feature_width
     add_vision_arguments(parser)
@@ -2043,8 +2045,9 @@ def main():
                 epoch=epoch, val_loss=val_loss, train_loss=train_loss,
                 val_action_mean=val_action, val_per_dim=val_per_dim,
                 metrics=metrics, phase='intention_head'))
-            best_scores = save_metric_checkpoints(metric_checkpoints, ckpt, metrics, best_scores)
-            metric_checkpoints.save('intention_last.pt', ckpt)
+            if args.save_all_checkpoints:
+                best_scores = save_metric_checkpoints(metric_checkpoints, ckpt, metrics, best_scores)
+                metric_checkpoints.save('intention_last.pt', ckpt)
             metric_checkpoints.save('training_last.pt', dict(
                 ckpt, optimizer_state_dict=cpu_snapshot(optimizer.state_dict()),
                 best_metric_scores=best_scores))
