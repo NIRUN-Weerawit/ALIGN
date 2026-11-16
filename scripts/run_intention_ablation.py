@@ -283,8 +283,6 @@ def legacy_resume_defaults(previous):
 
 def extend_resume_manifest(previous, current):
     """Preserve model/split provenance while updating allowed runtime settings."""
-    if current["epochs"] < previous["epochs"]:
-        raise ValueError("Resume epoch target cannot decrease; --epochs is the total target")
     merged = dict(current, **previous)
     for key in ("epochs", "num_workers", "prefetch_factor", "cpu_threads",
                 "gpu_memory_fraction", "micro_batch_size", "pin_memory",
@@ -465,8 +463,6 @@ def restore_resume_arguments(parser, argv, initial):
     args.output = str(manifest_path.parent)
     if selected_variant is not None:
         args.worker_variant = selected_variant
-    if args.epochs < previous['epochs']:
-        parser.error('Resume epoch target cannot decrease; --epochs is the total target')
     print(f'RESUME configuration: {manifest_path}', flush=True)
     return args
 
@@ -810,7 +806,7 @@ def main(argv=None):
             atomic_json(out / f'manifest_before_memory_patch_{time.time_ns()}.json', previous)
         manifest = extend_resume_manifest(previous, manifest)
         atomic_json(out / "manifest.json", manifest)
-        if args.epochs > previous["epochs"] or patch_changed:
+        if args.epochs != previous["epochs"] or patch_changed:
             # Completion markers from the previous target must not describe an
             # extended run as finished while its new epochs are in progress.
             (out / "COMPLETE").unlink(missing_ok=True)

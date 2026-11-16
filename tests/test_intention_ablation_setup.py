@@ -36,8 +36,8 @@ def test_deployed_snapshot_records_original_source_provenance(tmp_path):
     assert source_provenance(tmp_path) == provenance
 
 
-@pytest.mark.parametrize("target", [80, 100])
-def test_resume_manifest_allows_same_or_larger_total_epochs(target):
+@pytest.mark.parametrize("target", [40, 80, 100])
+def test_resume_manifest_allows_adjusting_total_epochs(target):
     original = dict(epochs=80, commit="original", lr=0.001,
                     num_workers=4, gpu_memory_fraction=0.9)
     current = dict(epochs=target, commit="resuming", lr=0.001,
@@ -49,10 +49,6 @@ def test_resume_manifest_allows_same_or_larger_total_epochs(target):
     assert merged["gpu_memory_fraction"] == 1.0
     assert original["epochs"] == 80
 
-
-def test_resume_manifest_rejects_decreasing_total_epochs():
-    with pytest.raises(ValueError, match="total target"):
-        extend_resume_manifest(dict(epochs=80), dict(epochs=40))
 
 
 def saved_run(tmp_path, options=()):
@@ -83,8 +79,8 @@ def test_resume_explicit_runtime_overrides_and_epoch_extension(tmp_path):
     args = parse_args(['--resume', '--output', str(tmp_path), '--epochs=200',
                       '--num-workers', '0', '--micro-batch-size', '2', '--no-pin-memory'])
     assert (args.epochs, args.num_workers, args.micro_batch_size, args.pin_memory) == (200, 0, 2, False)
-    with pytest.raises(SystemExit):
-        parse_args(['--resume', '--output', str(tmp_path), '--epochs', '99'])
+    shortened = parse_args(['--resume', '--output', str(tmp_path), '--epochs', '99'])
+    assert shortened.epochs == 99
 
 
 def test_resume_restores_aci_temporal_before_validation(tmp_path):
@@ -381,3 +377,15 @@ def test_crop_still_requires_segment_to_fit_chunk():
     with pytest.raises(SystemExit):
         parse_args(["--output", "example", "--temporal-sampling", "crop",
                     "--segment-length", "4", "--chunk-size", "64"])
+
+
+def test_shortened_resume_target_persists_for_following_variants(tmp_path):
+    import json
+    original = saved_run(tmp_path, ['--epochs', '400'])
+    shortened = parse_args(['--output', str(tmp_path), '--resume', '--epochs', '200'])
+    manifest_path = tmp_path / 'manifest.json'
+    merged = extend_resume_manifest(json.loads(manifest_path.read_text()), vars(shortened))
+    manifest_path.write_text(json.dumps(merged, default=str))
+    restored = parse_args(['--output', str(tmp_path), '--resume'])
+    assert restored.epochs == 200
+    assert original.variants == restored.variants
