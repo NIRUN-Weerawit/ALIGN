@@ -208,7 +208,7 @@ def test_plain_history_variant_has_independent_window_for_both_heads(history_siz
 
 @pytest.mark.parametrize("options", [["--history-size", "0"], ["--head-d-model", "10"],
     ["--compressed-dim", "3"], ["--chunk-size", "2"], ["--validation-fraction", "1"],
-    ["--segment-length", "4"], ["--lr", "0"], ["--batch-size", "0"]])
+    ["--segment-length", "0"], ["--lr", "0"], ["--batch-size", "0"]])
 def test_invalid_shared_arguments_fail_before_training(options):
     with pytest.raises(SystemExit):
         parse_args(["--output", "example", *options])
@@ -365,3 +365,19 @@ def test_gripper_balanced_accuracy_exposes_majority_only_predictions():
     assert rates['balanced_accuracy']==.5
     single_class=gripper_class_metrics(dict(tp=10,tn=0,fp=0,fn=0))
     assert single_class['label_0_recall'] is None and single_class['balanced_accuracy'] is None
+
+
+@pytest.mark.parametrize("backbone", ["unet", "transformer"])
+@pytest.mark.parametrize("variant", ["context_no_memory", "context_memory"])
+def test_context_episode_chunk_can_exceed_segment_length(backbone, variant):
+    args = parse_args(["--output", "example", "--variants", variant,
+        "--task-context-checkpoint", "observer.pt", "--task-context-split-manifest", "split.json",
+        "--temporal-sampling", "episode", "--action-backbone", backbone,
+        "--segment-length", "4", "--chunk-size", "64"])
+    assert args.chunk_size == 64 and args.segment_length == 4
+
+
+def test_crop_still_requires_segment_to_fit_chunk():
+    with pytest.raises(SystemExit):
+        parse_args(["--output", "example", "--temporal-sampling", "crop",
+                    "--segment-length", "4", "--chunk-size", "64"])

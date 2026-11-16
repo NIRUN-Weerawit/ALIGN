@@ -266,7 +266,7 @@ def atomic_json(path, value):
 
 def legacy_resume_defaults(previous):
     """Historical defaults shared by config restoration and compatibility checks."""
-    legacy_defaults = dict(task_context_summary_trainable=False, task_context_lr=None, task_context_summary_lr=None, memory_temporal_cognitive=False, memory_consolidation_key='perceptual', memory_merge_timestamp='mean', max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
+    legacy_defaults = dict(action_backbone="unet", transformer_layers=4, transformer_heads=8, task_context_summary_trainable=False, task_context_lr=None, task_context_summary_lr=None, memory_temporal_cognitive=False, memory_consolidation_key='perceptual', memory_merge_timestamp='mean', max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
                            plain_history_size=4,
                            weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                            mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
@@ -366,6 +366,9 @@ def evaluate_existing(out):
             policy_temporal_mamba=config.get('policy_temporal_mamba',False),
             policy_temporal_width=config.get('policy_temporal_width',128),
             policy_temporal_layers=config.get('policy_temporal_layers',1),
+            action_backbone=config.get("action_backbone", "unet"),
+            transformer_layers=config.get("transformer_layers", 4),
+            transformer_heads=config.get("transformer_heads", 8),
             head_d_model=config["head_d_model"], use_intent_tokens=config["use_intent_tokens"],
             use_text=config.get("use_text",False),text_dim=config.get("text_dim",256),
             text_encoder_type=config.get("text_encoder_type","clip"),text_vocab=config.get("text_vocab"),
@@ -538,6 +541,9 @@ def parse_args(argv=None):
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--action-backbone", choices=["unet", "transformer"], default="unet")
+    parser.add_argument("--transformer-layers", type=int, default=4)
+    parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--head-type", choices=["diffusion", "flow_matching"], default="diffusion")
     parser.add_argument("--use-task-text", action="store_true", help="Condition the generative head on the recorded task instruction")
     parser.add_argument("--text-dim", type=int, default=128)
@@ -633,15 +639,17 @@ def parse_args(argv=None):
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.num_workers < 0 or args.prefetch_factor < 1 or args.length_bucket_multiplier < 1:
         parser.error("--num-workers must be nonnegative; prefetch and bucket multipliers must be positive")
-    if args.segment_length < args.history_size + args.chunk_size:
+    if args.temporal_sampling == "crop" and args.segment_length < args.history_size + args.chunk_size:
         parser.error("Segment must contain both history and action chunk")
     if any(name in args.variants for name in ("plain_history", "context_history")):
         if args.head_type not in ("diffusion", "flow_matching"):
             parser.error("History variants require diffusion or flow matching")
         if args.temporal_sampling != "episode":
             parser.error("History variants require episode sampling for causal start padding")
-    if args.chunk_size < 4:
-        parser.error("--chunk-size must be at least 4 for the generative U-Net")
+    if args.action_backbone == "transformer" and (args.transformer_heads < 1 or args.transformer_layers < 2 or args.head_d_model % args.transformer_heads):
+        parser.error("Transformer needs at least two layers and a positive head count dividing head-d-model")
+    if args.chunk_size < (4 if args.action_backbone == "unet" else 1):
+        parser.error("--chunk-size must be positive (at least 4 for U-Net)")
     if args.head_d_model % 8:
         parser.error("--head-d-model must be divisible by 8 for GroupNorm")
     if not 0 <= args.gripper_transition_fraction <= 1:
@@ -704,7 +712,7 @@ def main(argv=None):
     if args.evaluate_existing:
         evaluate_existing(Path(args.output).resolve())
         return
-    if args.segment_length < args.history_size + args.chunk_size:
+    if args.temporal_sampling == "crop" and args.segment_length < args.history_size + args.chunk_size:
         raise ValueError("Segment must contain both history and action chunk")
     args.warm_start = str(args.warm_start.resolve()) if args.warm_start else None
     out = Path(args.output).resolve()
@@ -776,7 +784,7 @@ def main(argv=None):
         for key in (*LEGACY_FLOW_DEFAULTS, "text_encoder_type","text_model_name","text_model_revision","text_max_length","vision_backbone","raw_dim","intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
                     "gripper_state_source", "gripper_transition_fraction", "max_steps", "max_val_batches", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
-                    "weight_decay", "grad_clip", "head_type", "state_dim", "compressed_dim",
+                    "weight_decay", "grad_clip", "head_type", "action_backbone", "transformer_layers", "transformer_heads", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "use_task_text", "text_dim", "text_vocab", "task_context_fusion", "task_context_fusion_dim",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
@@ -871,6 +879,8 @@ def main(argv=None):
             action_dim=7, chunk_size=args.chunk_size, history_size=variant_history_size,
             num_cameras=len(args.cameras), compressed_dim=args.compressed_dim,
             head_type=args.head_type, head_history_mode="full" if full_history else "mean",
+            action_backbone=args.action_backbone,
+            transformer_layers=args.transformer_layers, transformer_heads=args.transformer_heads,
             head_d_model=args.head_d_model,
             mamba_d_state=args.mamba_d_state, mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
             use_intent_tokens=intent, num_intent_tokens=args.num_intent_tokens, intent_dim=args.intent_dim,

@@ -79,6 +79,9 @@ class ALIGNIntentionModel(nn.Module):
         mamba_expand: int = 2,
         head_type: str = "diffusion",
         head_history_mode: str = "mean",
+        action_backbone: str = "unet",
+        transformer_layers: int = 4,
+        transformer_heads: int = 8,
         head_d_model: int = 384,
         head_nhead: int = 4,
         head_num_layers: int = 2,
@@ -278,6 +281,13 @@ class ALIGNIntentionModel(nn.Module):
         self.diffusion_loss_repeats = diffusion_loss_repeats
         self.visual_token_attention = visual_token_attention
         self.diffusion_clip_sample = diffusion_clip_sample
+        if action_backbone not in ("unet", "transformer"):
+            raise ValueError("Unknown action backbone")
+        if action_backbone == "transformer" and head_type not in ("diffusion", "flow_matching"):
+            raise ValueError("Transformer backbone requires diffusion or flow_matching")
+        self.action_backbone = action_backbone
+        self.transformer_layers = transformer_layers
+        self.transformer_heads = transformer_heads
         self.head_type = head_type
         if head_history_mode not in ("mean", "full"):
             raise ValueError("Unknown action-head history mode")
@@ -461,6 +471,14 @@ class ALIGNIntentionModel(nn.Module):
         if self.use_text and self.text_encoder_type in ("bag", "distilbert"):
             self.text_condition = nn.Linear(self.text_dim, cond_dim, bias=False).to(device)
             nn.init.zeros_(self.text_condition.weight)
+
+        if self.action_backbone == "transformer":
+            from models.action_transformer import ActionTransformer
+            head = self.intention_head
+            head.unet = ActionTransformer(action_dim=self.action_dim,
+                cond_dim=head.cond_dim, time_dim=head.time_dim, width=self.head_d_model,
+                layers=self.transformer_layers, heads=self.transformer_heads,
+                aci=head.unet if self.task_context_fusion == 'aci' and self.task_context is not None else None)
 
         if self.visual_token_attention and hasattr(self.intention_head,"unet"):
             self.intention_head.unet.configure_visual_attention(pool_out_dim,self.compressed_dim)

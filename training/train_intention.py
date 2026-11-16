@@ -365,6 +365,7 @@ def build_model(args, num_cameras, device):
         mamba_d_conv=args.mamba_d_conv,
         mamba_expand=args.mamba_expand,
         head_type=args.head_type,
+        action_backbone=args.action_backbone, transformer_layers=args.transformer_layers, transformer_heads=args.transformer_heads,
         head_d_model=args.head_d_model,
         head_nhead=args.head_nhead,
         head_num_layers=args.head_num_layers,
@@ -1461,6 +1462,9 @@ def parse_args():
     parser.add_argument("--chunk-size", type=int, default=10)
 
     # Head selection
+    parser.add_argument("--action-backbone", choices=["unet", "transformer"], default="unet")
+    parser.add_argument("--transformer-layers", type=int, default=4)
+    parser.add_argument("--transformer-heads", type=int, default=8)
     parser.add_argument("--head-type", choices=["transformer", "mamba", "hybrid", "diffusion", "flow_matching"],
                         default="diffusion",
                         help="V4 supports diffusion and flow_matching; transformer/mamba/hybrid are future work. Which head architecture: transformer, mamba, hybrid, "
