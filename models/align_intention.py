@@ -79,6 +79,7 @@ class ALIGNIntentionModel(nn.Module):
         mamba_expand: int = 2,
         head_type: str = "diffusion",
         head_history_mode: str = "mean",
+        task_context_bag_text: bool = False,
         action_backbone: str = "unet",
         transformer_layers: int = 4,
         transformer_heads: int = 8,
@@ -193,16 +194,20 @@ class ALIGNIntentionModel(nn.Module):
         if task_context_source == 'teacher' and not (task_context_checkpoint or task_context_config):
             raise ValueError('Teacher conditioning requires a context observer')
         self.task_context_source = task_context_source
+        self.task_context_bag_text = task_context_bag_text
+        if task_context_bag_text and (not use_text or text_encoder_type != 'bag' or task_context_source != 'student' or task_context_trainable):
+            raise ValueError('Bag context requires bag text, student source, and no student fine-tuning')
         self.task_context = None
         if task_context_checkpoint or task_context_config:
-            if use_intent_tokens or use_text or intent_future_weight or head_type not in ('diffusion', 'flow_matching'):
+            if use_intent_tokens or (use_text and not task_context_bag_text) or intent_future_weight or head_type not in ('diffusion', 'flow_matching'):
                 raise ValueError('Task context replaces legacy intent/text and requires a diffusion or flow-matching head')
             if memory_intent_query:
                 raise ValueError('Task-context memory currently retrieves visual/state evidence only')
-            from models.task_context_policy import TaskContextPolicyBranch
+            from models.task_context_policy import TaskContextPolicyBranch, BagContextPolicyBranch
+            context_class = BagContextPolicyBranch if task_context_bag_text else TaskContextPolicyBranch
             # Loading a new branch must not perturb common visual/state initialization.
             with torch.random.fork_rng(devices=[]):
-                self.task_context = TaskContextPolicyBranch(task_context_checkpoint, task_context_config,
+                self.task_context = context_class(task_context_checkpoint, task_context_config,
                     task_context_trainable, task_context_initialization, task_context_summary_trainable)
             actual_tokens=self.task_context.config['encoder_config']['tokens']
             if task_context_tokens is not None and actual_tokens != task_context_tokens:
@@ -369,6 +374,11 @@ class ALIGNIntentionModel(nn.Module):
         else:
             self.text_encoder = None
         self.text_condition = None
+        self.text_context_projection = None
+        if task_context_bag_text:
+            if self.task_context is None:raise ValueError('Bag context requires a context observer for the visual summary')
+            ec=self.task_context.config['encoder_config']
+            self.text_context_projection=nn.Linear(text_dim,(ec['tokens']+1)*ec['token_dim'])
 
         # Trainable prefixes
         self._trainable_prefixes = {
@@ -468,7 +478,7 @@ class ALIGNIntentionModel(nn.Module):
         else:
             raise ValueError(f"Unknown head_type: {self.head_type}")
 
-        if self.use_text and self.text_encoder_type in ("bag", "distilbert"):
+        if self.use_text and not self.task_context_bag_text and self.text_encoder_type in ("bag", "distilbert"):
             self.text_condition = nn.Linear(self.text_dim, cond_dim, bias=False).to(device)
             nn.init.zeros_(self.text_condition.weight)
 
@@ -825,7 +835,11 @@ class ALIGNIntentionModel(nn.Module):
     def encode_task_text(self, texts: List[str]) -> torch.Tensor:
         if not self.use_text or self.text_encoder is None:
             raise ValueError("Task text is disabled for this model")
-        return self.text_encoder(texts)
+        value=self.text_encoder(texts)
+        if self.task_context_bag_text:
+            ec=self.task_context.config['encoder_config']
+            self.task_context.text_payload=self.text_context_projection(value).reshape(len(texts),ec['tokens']+1,ec['token_dim'])
+        return value
 
     def context_sequence(self, patches, cls, states, lengths, timesteps):
         if self.policy_temporal_encoder is None:

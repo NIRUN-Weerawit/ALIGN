@@ -266,7 +266,7 @@ def atomic_json(path, value):
 
 def legacy_resume_defaults(previous):
     """Historical defaults shared by config restoration and compatibility checks."""
-    legacy_defaults = dict(action_backbone="unet", transformer_layers=4, transformer_heads=8, task_context_summary_trainable=False, task_context_lr=None, task_context_summary_lr=None, memory_temporal_cognitive=False, memory_consolidation_key='perceptual', memory_merge_timestamp='mean', max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
+    legacy_defaults = dict(task_context_bag_text=False, action_backbone="unet", transformer_layers=4, transformer_heads=8, task_context_summary_trainable=False, task_context_lr=None, task_context_summary_lr=None, memory_temporal_cognitive=False, memory_consolidation_key='perceptual', memory_merge_timestamp='mean', max_val_batches=0, gripper_state_source="legacy_zero", gripper_transition_fraction=0.0, cameras=["image", "wrist_image"], validation_fraction=0.1,
                            plain_history_size=4,
                            weight_decay=1e-4, grad_clip=1.0, mamba_output_dim=128,
                            mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, temporal_sampling="crop",supervision_points=16,
@@ -364,6 +364,7 @@ def evaluate_existing(out):
             policy_temporal_mamba=config.get('policy_temporal_mamba',False),
             policy_temporal_width=config.get('policy_temporal_width',128),
             policy_temporal_layers=config.get('policy_temporal_layers',1),
+            task_context_bag_text=config.get("task_context_bag_text", False),
             action_backbone=config.get("action_backbone", "unet"),
             transformer_layers=config.get("transformer_layers", 4),
             transformer_heads=config.get("transformer_heads", 8),
@@ -599,6 +600,8 @@ def parse_args(argv=None):
     except ValueError as error:parser.error(str(error))
     if args.task_context_fusion != 'additive' and not context_variants:
         parser.error('Non-additive task-context fusion requires a context variant')
+    if args.task_context_bag_text and (not context_variants or not args.use_task_text or args.text_encoder_type != 'bag' or args.task_context_trainable or args.task_context_source != 'student'):
+        parser.error('Bag context requires context variants, --use-task-text, bag encoder, student source, and a frozen student')
     if args.task_context_fusion == 'aci' and ('context_history' in args.variants or args.history_size != 1 or
             args.visual_token_attention or args.visual_context_mode != 'none'):
         parser.error('ACI requires history-size 1 and no additional visual-attention mode')
@@ -609,7 +612,7 @@ def parse_args(argv=None):
     if context_variants:
         if not args.task_context_checkpoint or not args.task_context_split_manifest:
             parser.error('Context variants require --task-context-checkpoint and --task-context-split-manifest')
-        if args.temporal_sampling != 'episode' or args.history_size != 1 or args.head_type not in ('diffusion', 'flow_matching') or args.use_task_text or args.memory_intent_query or args.intent_future_weight:
+        if args.temporal_sampling != 'episode' or args.history_size != 1 or args.head_type not in ('diffusion', 'flow_matching') or (args.use_task_text and not args.task_context_bag_text) or args.memory_intent_query or args.intent_future_weight:
             parser.error('Context variants require full episodes, history size 1, diffusion/flow matching, no task text/legacy future loss/cognitive memory query')
         if args.gripper_state_source != 'causal':
             parser.error('Context variants require causal gripper state')
@@ -780,7 +783,7 @@ def main(argv=None):
         for key in (*LEGACY_FLOW_DEFAULTS, "text_encoder_type","text_model_name","text_model_revision","text_max_length","vision_backbone","raw_dim","intent_future_weight","intent_future_horizons","intent_future_hidden_dim","freeze_intent_backbone",
                     "gripper_state_source", "gripper_transition_fraction", "max_steps", "max_val_batches", "history_size", "plain_history_size", "chunk_size", "segment_length", "batch_size",
                     "seed", "variants", "data", "cache", "cameras", "validation_fraction", "lr",
-                    "weight_decay", "grad_clip", "head_type", "action_backbone", "transformer_layers", "transformer_heads", "state_dim", "compressed_dim",
+                    "weight_decay", "grad_clip", "head_type", "task_context_bag_text", "action_backbone", "transformer_layers", "transformer_heads", "state_dim", "compressed_dim",
                     "head_d_model", "mamba_output_dim", "mamba_d_state", "mamba_d_conv", "mamba_expand",
                     "use_task_text", "text_dim", "text_vocab", "task_context_fusion", "task_context_fusion_dim",
                     "intent_dim", "num_intent_tokens", "memory_bank_len", "gripper_loss_weight", "gripper_threshold",
@@ -875,6 +878,7 @@ def main(argv=None):
             action_dim=7, chunk_size=args.chunk_size, history_size=variant_history_size,
             num_cameras=len(args.cameras), compressed_dim=args.compressed_dim,
             head_type=args.head_type, head_history_mode="full" if full_history else "mean",
+            task_context_bag_text=args.task_context_bag_text,
             action_backbone=args.action_backbone,
             transformer_layers=args.transformer_layers, transformer_heads=args.transformer_heads,
             head_d_model=args.head_d_model,

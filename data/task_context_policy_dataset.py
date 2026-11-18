@@ -67,6 +67,7 @@ def add_context_policy_arguments(parser):
     parser.add_argument('--policy-temporal-mamba', action='store_true',
         help='Train a separate recurrent policy token alongside the frozen pretrained observer (ACI only)')
     import argparse
+    parser.add_argument('--task-context-bag-text', action='store_true', help='Replace task and execution context slots with bag-of-words instruction embeddings')
     parser.add_argument('--memory-temporal-cognitive', action=argparse.BooleanOptionalAction, default=True,
         help='Store and retrieve the live policy temporal token in context-model cognitive memory')
     parser.add_argument('--memory-consolidation-key', choices=('perceptual', 'temporal'), default='perceptual',
@@ -99,7 +100,7 @@ def policy_parameter_groups(model, lr, task_context_lr=None, task_context_summar
     branch = getattr(model, 'task_context', None)
     if branch is None or not (branch.trainable or branch.summary_trainable):
         return [p for p in model.parameters() if p.requires_grad]
-    encoder = [p for p in branch.observer.encoder.parameters() if p.requires_grad]
+    encoder = [p for p in getattr(branch.observer,'encoder',torch.nn.Identity()).parameters() if p.requires_grad]
     summary = [p for p in branch.observer.summary.parameters() if p.requires_grad]
     context_ids = {id(p) for p in encoder + summary}
     policy = [p for p in model.parameters() if p.requires_grad and id(p) not in context_ids]

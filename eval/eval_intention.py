@@ -137,6 +137,7 @@ def load_intention_model(
         mamba_d_state=cfg["mamba_d_state"],
         mamba_d_conv=cfg["mamba_d_conv"],
         mamba_expand=cfg["mamba_expand"],
+        task_context_bag_text=cfg.get("task_context_bag_text", False),
         action_backbone=cfg.get("action_backbone", "unet"),
         transformer_layers=cfg.get("transformer_layers", 4),
         transformer_heads=cfg.get("transformer_heads", 8),

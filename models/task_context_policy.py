@@ -262,3 +262,38 @@ class ContextDiffusionPolicyHead(ContextPolicyConditioning, DiffusionPolicyHead)
 
 class ContextFlowMatchingPolicyHead(ContextPolicyConditioning, FlowMatchingPolicyHead):
     """Flow action decoder with the same task/execution-token conditioning."""
+
+class BagContextPolicyBranch(TaskContextPolicyBranch):
+    """Replace task AND execution readouts with supplied instruction embeddings.
+
+    Retain the pretrained visual summary for the independent policy Mamba.
+    The unused pretrained student encoder is removed from the model.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        del self.observer.encoder
+        self.text_payload = None
+
+    def train(self, mode=True):
+        nn.Module.train(self, mode)
+        if not self.summary_trainable:self.observer.summary.eval()
+        return self
+
+    def sequence_from_summaries(self, summaries, lengths):
+        if self.text_payload is None or len(self.text_payload) != len(summaries):
+            raise ValueError('Encode episode task text before context observations')
+        return self.text_payload[:, None].expand(-1, summaries.shape[1], -1, -1)
+
+    def new_stream(self, batch_size):
+        from types import SimpleNamespace
+        return PolicyContextState(SimpleNamespace(steps=0))
+
+    @torch.no_grad()
+    def step(self, patches, cls, state, cache=None):
+        cache = self.new_stream(len(state)) if cache is None else cache
+        seconds = state.new_full((len(state),1),cache.recurrence.steps/self.fps)
+        cache.last_summary=self.summaries(patches[:,None],cls[:,None],state[:,None],seconds)[:,0]
+        tokens=self.sequence_from_summaries(cache.last_summary[:,None],None)[:,0]
+        cache.last_task=tokens[:,:-1].detach().clone()
+        cache.recurrence.steps+=1
+        return tokens,cache

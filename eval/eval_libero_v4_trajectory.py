@@ -679,7 +679,7 @@ def run_model_in_sim(
     if hasattr(model, "reset_episode"):
         model.reset_episode()
     text_emb = None
-    if getattr(model, "text_condition", None) is not None:
+    if (getattr(model, "text_condition", None) is not None or getattr(model,"task_context_bag_text",False)):
         if not task_text:
             raise ValueError("Text-conditioned checkpoint requires a task instruction")
         with torch.no_grad():

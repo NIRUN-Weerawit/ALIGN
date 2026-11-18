@@ -365,6 +365,7 @@ def build_model(args, num_cameras, device):
         mamba_d_conv=args.mamba_d_conv,
         mamba_expand=args.mamba_expand,
         head_type=args.head_type,
+        task_context_bag_text=args.task_context_bag_text,
         action_backbone=args.action_backbone, transformer_layers=args.transformer_layers, transformer_heads=args.transformer_heads,
         head_d_model=args.head_d_model,
         head_nhead=args.head_nhead,
@@ -488,7 +489,7 @@ def train_v4_epoch(model, loader, optimizer, device, args, max_steps=0):
         actions_seg = torch.as_tensor(batch["actions_segment"]).to(device, dtype=torch.float32, non_blocking=True)  # (B, S, 7)
         future_state_targets=states_seg.detach() if future_weight else None
         stage_end('host_to_device_gpu_s', transfer_event)
-        text_emb = model.encode_task_text(batch["texts"]) if getattr(model, "text_condition", None) is not None else None
+        text_emb = model.encode_task_text(batch["texts"]) if (getattr(model, "text_condition", None) is not None or getattr(model,"task_context_bag_text",False)) else None
         # print(f"frames_seg shape: {frames_seg.shape}, states_seg shape: {states_seg.shape}, actions_seg shape: {actions_seg.shape}")
         # Keep length/anchor bookkeeping on CPU. Moving a tiny mask to CUDA is
         # cheap; calling .any()/.sum().item() on a CUDA mask at every anchor
@@ -1111,7 +1112,7 @@ def validate(model, loader, device, args):
     pbar = tqdm(loader, desc="  [val]  ", unit="batch", leave=False,
                 disable=not is_primary())
     for batch in pbar:
-        text_emb = model.encode_task_text(batch["texts"]) if getattr(model, "text_condition", None) is not None else None
+        text_emb = model.encode_task_text(batch["texts"]) if (getattr(model, "text_condition", None) is not None or getattr(model,"task_context_bag_text",False)) else None
 
         Hs = args.history_size
         chunk_size = args.chunk_size
@@ -1650,7 +1651,7 @@ def parse_args():
         parser.error('ACI requires history-size 1 and no additional visual-attention mode')
     if args.task_context_fusion_dim < 1 or (args.task_context_fusion in ('cross_attention', 'aci') and args.task_context_fusion_dim % 4):
         parser.error('Task-context fusion width must be positive and divisible by 4 for cross-attention')
-    if args.task_context_checkpoint and (args.head_type not in ('diffusion', 'flow_matching') or args.use_intent_tokens or args.use_text or args.history_size != 1 or args.memory_intent_query):
+    if args.task_context_checkpoint and (args.head_type not in ('diffusion', 'flow_matching') or args.use_intent_tokens or (args.use_text and not args.task_context_bag_text) or args.history_size != 1 or args.memory_intent_query):
         parser.error('Context policy needs diffusion or flow matching, history size 1, no legacy intent/text or cognitive memory query')
     try:validate_future_arguments(args)
     except ValueError as error:parser.error(str(error))
