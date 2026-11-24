@@ -5,7 +5,7 @@ Unknown success/command/event provenance remains explicit in the manifest.
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 import hashlib
 import json
 from pathlib import Path
@@ -236,6 +236,9 @@ def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
 
 
 class TaskContextEpisodes(Dataset):
+    # Keep descriptors bounded across epochs. Batch items retain their own mmap views.
+    _MAX_CACHED_EPISODES = 64
+
     def __init__(self, root, split, *, anchors=8, seed=0, verify=False):
         self.root = Path(root)
         self.manifest = json.loads((self.root / "manifest.json").read_text())
@@ -249,8 +252,9 @@ class TaskContextEpisodes(Dataset):
             raise ValueError("Normalization hash mismatch")
         self.keys = self.manifest["split"][split]
         self.split, self.anchors, self.seed, self.epoch = split, anchors, seed, 0
-        self.norm = dict(np.load(self.root / "normalization.npz"))
-        self._cache = {}
+        with np.load(self.root / "normalization.npz", allow_pickle=False) as normalization:
+            self.norm = dict(normalization)
+        self._cache = OrderedDict()
         if verify:
             for key in self.keys:
                 for suffix, field in [("npy","features_sha256"),("npz","targets_sha256")]:
@@ -263,8 +267,13 @@ class TaskContextEpisodes(Dataset):
     def __getitem__(self, index):
         key = self.keys[index]
         if key not in self._cache:
-            self._cache[key] = (np.load(self.root/f"{key}.npy", mmap_mode="r"),
-                               dict(np.load(self.root/f"{key}.npz")))
+            if len(self._cache) >= self._MAX_CACHED_EPISODES:
+                self._cache.popitem(last=False)
+            with np.load(self.root / f"{key}.npz", allow_pickle=False) as targets:
+                values = dict(targets)
+            features = np.load(self.root / f"{key}.npy", mmap_mode="r", allow_pickle=False)
+            self._cache[key] = features, values
+        self._cache.move_to_end(key)
         features, values = self._cache[key]
         n, horizon = len(features), self.manifest["action_horizon"]
         if self.split == "train":
