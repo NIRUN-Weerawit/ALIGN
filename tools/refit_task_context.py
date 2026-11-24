@@ -1,4 +1,4 @@
-"""Refit teacher/student on 384 episodes, optionally matching a policy split.
+"""Train and export a fixed-budget teacher/student pair on a declared split.
 
 Uses fixed, predeclared budgets and final checkpoints. No development or
 confirmation metrics select weights. Existing gated exports remain unchanged;
@@ -152,11 +152,12 @@ def export_observer(teacher_path, student_path, targets, cache, output, protocol
     metadata = dict(teacher_sha256=file_hash(teacher_path), student_sha256=file_hash(student_path),
         target_manifest_sha256=source.manifest['manifest_sha256'],
         prefix_manifest_sha256=prefixes.manifest['manifest_sha256'],
-        refit_protocol_sha256=file_hash(protocol_path), training_episodes=384, heldout_episodes=44,
-        split_reference=source.manifest['refit'],
+        refit_protocol_sha256=file_hash(protocol_path), training_episodes=len(source.manifest['split']['train']),
+        heldout_episodes=len(source.manifest['split']['confirmation']),
+        split_reference=source.manifest.get('refit', {'rule': 'Prepared target manifest'}),
         checkpoint_selection='fixed_budget_final', cameras=source.manifest['cameras'], fps=source.manifest['fps'],
         limitations=source.manifest['limitations'] + [
-            'Fixed-budget 384-episode refit; no new controlled information-gate claim.',
+            'Fixed-budget refit; no new controlled information-gate claim.',
             'Held-out episodes have appeared in earlier experiments; this refit initializes from scratch.',
             'New latent space requires new downstream action-policy training and task-label estimators.'])
     bundle = dict(schema='align-causal-task-observer-v1',
@@ -174,7 +175,9 @@ def export_observer(teacher_path, student_path, targets, cache, output, protocol
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-targets', default='reports/task_context_teacher_20261020/targets')
-    parser.add_argument('--split-manifest', default=str(PIPER_SPLIT), help='Policy manifest specifying exact 384 train_episodes and 44 val_episodes (default: canonical Piper split)')
+    parser.add_argument('--split-manifest', help='Policy manifest specifying exact 384 train_episodes and 44 val_episodes (default: canonical Piper split)')
+    parser.add_argument('--prepared-targets', action='store_true',
+        help='Use --source-targets and its train/confirmation split directly, including multi-dataset targets')
     parser.add_argument('--report-dir', required=True)
     parser.add_argument('--checkpoint-dir', required=True)
     parser.add_argument('--num-task-tokens','--task-context-tokens',type=int,default=4)
@@ -188,7 +191,15 @@ def main():
     report, checkpoints = Path(a.report_dir).resolve(), Path(a.checkpoint_dir).resolve()
     source_manifest = json.loads((Path(a.source_targets) / 'manifest.json').read_text())
     split_reference = None
-    if a.split_manifest:
+    if a.prepared_targets:
+        source_manifest = TaskContextEpisodes(a.source_targets, 'train').manifest
+        if source_manifest['split']['development'] or not all(
+                source_manifest['split'][name] for name in ('train', 'confirmation')):
+            parser.error('--prepared-targets requires nonempty train and confirmation and an empty development split')
+        if a.split_manifest is not None:
+            parser.error('--prepared-targets uses its own split and cannot take --split-manifest')
+    else:
+        a.split_manifest = a.split_manifest or str(PIPER_SPLIT)
         _, split_reference = read_policy_split(a.split_manifest, source_manifest['episodes'], source_manifest['cameras'])
     if report.exists() or checkpoints.exists():
         raise FileExistsError('Use new report and checkpoint directories')
@@ -202,7 +213,7 @@ def main():
         torch.backends.cuda.enable_cudnn_sdp(False)
     start = time.perf_counter()
     sources = ['models/vision_config.py','tools/refit_task_context.py', 'training/train_task_context_teacher.py',
-        'data/training_split.py', 'configs/splits/libero_goal_piper_384_44.json',
+        'data/multi_dataset.py', 'data/training_split.py', 'configs/splits/libero_goal_piper_384_44.json',
         'training/train_task_context_encoder.py', 'data/task_context_dataset.py',
         'data/task_context_prefix_dataset.py', 'models/task_context_teacher.py',
         'models/task_context_encoder.py', 'models/task_context_observer.py']
@@ -212,13 +223,16 @@ def main():
         dest = snapshot / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / name, dest)
+    train_count = len(source_manifest['split']['train']) if a.prepared_targets else 384
+    heldout_count = len(source_manifest['split']['confirmation']) if a.prepared_targets else 44
+    updates_per_epoch = (train_count + 7) // 8
     protocol_path = report / 'protocol.json'
     if split_reference:
         shutil.copyfile(a.split_manifest, report / 'policy_split_reference.json')
     write_json(protocol_path, dict(schema='align-task-context-fixed-refit-v1', seed=a.seed,
         teacher_epochs=a.teacher_epochs, student_epochs=a.student_epochs, num_task_tokens=a.num_task_tokens,
-        train_episodes=384, development_episodes=0, heldout_episodes=44,
-        teacher_updates=a.teacher_epochs * 48, student_updates=a.student_epochs * 48,
+        train_episodes=train_count, development_episodes=0, heldout_episodes=heldout_count,
+        teacher_updates=a.teacher_epochs * updates_per_epoch, student_updates=a.student_epochs * updates_per_epoch,
         checkpoint_selection='fixed_budget_final', initialize='from_scratch',
         split_reference=split_reference,
         heldout_rule=('Exact policy val_episodes' if split_reference else 'Original confirmation keys')
@@ -235,8 +249,12 @@ def main():
                 stderr=subprocess.STDOUT, check=True)
     try:
         status('prepare_targets')
-        targets = report / 'targets'
-        manifest = prepare_targets(a.source_targets, targets, a.split_manifest)
+        if a.prepared_targets:
+            targets = Path(a.source_targets).resolve()
+            manifest = source_manifest
+        else:
+            targets = report / 'targets'
+            manifest = prepare_targets(a.source_targets, targets, a.split_manifest)
         write_json(report / 'split.json', dict(split=manifest['split'],
             manifest_sha256=manifest['manifest_sha256'], counts={k:len(v) for k,v in manifest['split'].items()}))
         teacher_run, student_run = checkpoints / 'teacher', checkpoints / 'student'
@@ -268,7 +286,7 @@ def main():
         student_ds = TaskContextPrefixes(cache, 'confirmation', verify=True)
         teacher_metrics, teacher_rows = evaluate_teacher(teacher_model, make_loader(teacher_ds, 8), device, 'full')
         student_metrics, student_rows = evaluate_student(student_model, teacher_model, prefix_loader(student_ds), device)
-        write_json(report / 'heldout.json', dict(split='confirmation', episodes=44,
+        write_json(report / 'heldout.json', dict(split='confirmation', episodes=heldout_count,
             checkpoints=dict(teacher=file_hash(teacher), student=file_hash(student)),
             used_for_selection=False, teacher=teacher_metrics, student=student_metrics,
             teacher_rows=teacher_rows, student_rows=student_rows))

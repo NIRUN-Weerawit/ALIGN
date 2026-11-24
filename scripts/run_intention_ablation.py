@@ -27,7 +27,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from data.align_dataset import ALIGNDataset
+from data.align_dataset import ALIGNDataset  # Re-exported for existing probe scripts.
+from data.multi_dataset import MultiEpisodeDataset, dataset_sources, open_datasets
 from models.flow_policy_config import (add_flow_policy_arguments, flow_policy_options,
     validate_flow_policy_arguments, LEGACY_FLOW_DEFAULTS)
 from models.align_intention import ALIGNIntentionModel
@@ -70,7 +71,7 @@ def source_provenance(root=ROOT):
         return json.loads(snapshot.read_text())
     import hashlib
     names = ['data/teacher_policy_context.py','models/context_aci_head.py','models/policy_temporal_encoder.py','models/flow_policy_config.py','models/task_text_encoder.py','models/vision_config.py','models/align_model.py','models/align_intention.py','models/intention_head.py','models/memory_bank.py',
-        'data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
+        'data/multi_dataset.py','data/training_split.py','configs/splits/libero_goal_piper_384_44.json',
         'models/task_context_policy.py','models/task_context_observer.py','models/task_context_encoder.py',
         'data/task_context_policy_dataset.py','training/train_intention.py','training/memory_resume.py','scripts/run_intention_ablation.py']
     return {'commit': subprocess.check_output(
@@ -81,6 +82,15 @@ def source_provenance(root=ROOT):
 
 def episode_split(dataset, seed, fraction):
     from data.training_split import piper_episode_indices
+    if isinstance(dataset, MultiEpisodeDataset):
+        train, val = [], []
+        offset = 0
+        for source in dataset.datasets:
+            source_train, source_val = episode_split(source, seed, fraction)
+            train.extend(offset + idx for idx in source_train)
+            val.extend(offset + idx for idx in source_val)
+            offset += len(source._episode_keys)
+        return train, val
     fixed = piper_episode_indices(dataset)
     if fixed is not None:
         return fixed
@@ -322,8 +332,8 @@ def evaluate_existing(out):
     records = json.loads((out / "summary.json").read_text())
     cameras = manifest.get("cameras", ["image", "wrist_image"])
     threshold = manifest.get("gripper_threshold", 0.5)
-    dataset = ALIGNDataset(manifest["data"], mode="head", cameras=cameras,
-        traj_window=manifest["segment_length"], dinov2_path=manifest["cache"])
+    dataset = open_datasets(manifest["data"], manifest["cache"], mode="head", cameras=cameras,
+        traj_window=manifest["segment_length"])
     val_eps = [dataset._episode_keys.index(key) for key in manifest["val_episodes"]]
     data = CachedEpisodes(dataset, val_eps, manifest["segment_length"], manifest["seed"] + 1000, False, manifest.get("temporal_sampling","crop"),manifest.get("supervision_points",16),manifest["chunk_size"])
     from data.teacher_policy_context import load_policy_teacher_targets
@@ -470,8 +480,8 @@ def restore_resume_arguments(parser, argv, initial):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", default=str(ROOT / "data/libero_goal.h5"))
-    parser.add_argument("--cache", default=str(ROOT / "data/libero_goal.dinov2_vitl14"))
+    parser.add_argument("--data", nargs="+", default=str(ROOT / "data/libero_goal.h5"))
+    parser.add_argument("--cache", nargs="+", default=str(ROOT / "data/libero_goal.dinov2_vitl14"))
     parser.add_argument("--output", required=True)
     parser.add_argument("--evaluate-existing", action="store_true")
     parser.add_argument("--resume", action="store_true",
@@ -579,6 +589,14 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.resume:
         args = restore_resume_arguments(parser, argv, args)
+    try:
+        dataset_sources(args.data, args.cache)
+    except ValueError as error:
+        parser.error(str(error))
+    for name in ('data', 'cache'):
+        values = getattr(args, name)
+        if isinstance(values, list) and len(values) == 1:
+            setattr(args, name, values[0])
     args.raw_dim = feature_width(args.vision_backbone,args.raw_dim)
     try:validate_flow_policy_arguments(args)
     except ValueError as error:parser.error(str(error))
@@ -727,14 +745,14 @@ def main(argv=None):
     if args.worker_variant and args.worker_variant not in args.variants:
         raise ValueError("Worker variant must be in the requested variants")
     torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
-    dataset = ALIGNDataset(args.data, mode="head", cameras=args.cameras,
-                           traj_window=args.segment_length, dinov2_path=args.cache)
-    sample = dataset._read_frames_dinov2(0, 0, 1)
-    # The production cached trainer expects 256 patches + CLS per camera.
+    dataset = open_datasets(args.data, args.cache, mode="head", cameras=args.cameras,
+                            traj_window=args.segment_length)
     from models.vision_config import validate_cache
-    validate_cache(dataset._dinov2_index["__meta__"], args.vision_backbone, args.raw_dim)
-    if sample.shape[-2:] != (257 * len(args.cameras), args.raw_dim):
-        raise ValueError("Expected 257 DINOv2 tokens of configured width per selected camera")
+    for source in getattr(dataset, 'datasets', [dataset]):
+        sample = source._read_frames_dinov2(0, 0, 1)
+        validate_cache(source._dinov2_index["__meta__"], args.vision_backbone, args.raw_dim)
+        if sample.shape[-2:] != (257 * len(args.cameras), args.raw_dim):
+            raise ValueError("Expected 257 DINOv2 tokens of configured width per selected camera")
     pool_out_dim = (sample.shape[-2] - len(args.cameras)) * args.compressed_dim
     split_record = None
     if args.task_context_checkpoint or args.task_context_split_manifest:

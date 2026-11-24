@@ -59,7 +59,7 @@ def geometric_state(poses, gripper):
 
 
 def grouped_split(groups, seed, development_fraction=.1, confirmation_fraction=.1):
-    if not 0 < development_fraction < 1 or not 0 < confirmation_fraction < 1:
+    if not 0 <= development_fraction < 1 or not 0 < confirmation_fraction < 1:
         raise ValueError("Held-out fractions must be positive")
     if development_fraction + confirmation_fraction >= 1:
         raise ValueError("No training fraction remains")
@@ -70,9 +70,9 @@ def grouped_split(groups, seed, development_fraction=.1, confirmation_fraction=.
     rng = np.random.default_rng(seed)
     for group in sorted(by_group):
         keys = rng.permutation(sorted(by_group[group])).tolist()
-        if len(keys) < 3:
-            raise ValueError("Every offline group needs at least three episodes")
-        ndev = max(1, round(len(keys) * development_fraction))
+        if len(keys) < (3 if development_fraction else 2):
+            raise ValueError("Offline group has too few episodes for its held-out partitions")
+        ndev = max(1, round(len(keys) * development_fraction)) if development_fraction else 0
         ntest = max(1, round(len(keys) * confirmation_fraction))
         if ndev + ntest >= len(keys):
             raise ValueError("Group too small for requested split")
@@ -85,57 +85,86 @@ def grouped_split(groups, seed, development_fraction=.1, confirmation_fraction=.
 def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
                   terminal_tail=8, action_horizon=8, procedure_points=8,
                   annotations=None, block_size=16, split_mode='auto'):
-    data, cache, output = Path(data).resolve(), Path(cache).resolve(), Path(output)
+    from contextlib import ExitStack
+    from data.multi_dataset import dataset_sources, episode_key
+    from data.training_split import piper_partition
+    from models.vision_config import cache_spec
+
+    sources = dataset_sources(data, cache)
+    multi = len(sources) > 1
+    output = Path(output)
     if output.exists():
         raise FileExistsError(f"Target directory already exists: {output}")
     if min(fps, terminal_tail, action_horizon, procedure_points, block_size) <= 0:
         raise ValueError("Target sizes and fps must be positive")
-    index = json.loads((cache / "index.json").read_text())
-    meta = index.get("__meta__", {})
-    if (meta.get("format") != "align-dinov2-per-camera-v2" or
-            meta.get("cameras") != list(cameras) or meta.get("source") != str(data)):
-        raise ValueError("Cache format, source, or camera order mismatch")
-    from models.vision_config import cache_spec
-    vision_backbone, raw_dim = cache_spec(meta)
     annotation = json.loads(Path(annotations).read_text()) if annotations else {}
-    groups, episodes = {}, {}
-    with h5py.File(data, "r") as source:
-        keys = sorted(k for k in source if k.startswith("ep_"))
-        for key in keys:
-            group = source[key]
-            raw = group["texts"][()]
-            descriptions = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
-            label = descriptions[0] if isinstance(descriptions, list) else str(descriptions)
-            group_id = hashlib.sha256(label.strip().encode()).hexdigest()[:16]
-            spec = annotation.get(key, {})
-            if spec.get("success") is False:
-                continue  # Failed endpoints are not desired-goal targets.
-            n = len(group["poses"])
-            if key not in index or index[key]["length"] != n or n < action_horizon:
-                raise ValueError(f"Episode/cache length mismatch or short episode: {key}")
-            groups[key] = spec.get("objective_group_id", group_id)
-            interval = spec.get("terminal_interval", [max(0, n-terminal_tail), n])
-            if not 0 <= interval[0] < interval[1] <= n:
-                raise ValueError(f"Invalid terminal interval for {key}")
-            if "actions" not in group or group["actions"].shape != (n, 7):
-                raise ValueError(f"Seven-dimensional expert action targets required: {key}")
-            episodes[key] = dict(length=n, group_id=groups[key], terminal_interval=interval,
-                success=spec.get("success"), terminal_approved=bool(spec.get("success") is True and "terminal_interval" in spec),
-                events=spec.get("events", []), input_commands="unavailable_unverified",
-                state_gripper="measured" if "gripper" in group else "previous_recorded_action",
-                timestamp_source="recorded" if "timestamps" in group else "index_over_declared_fps",
-                annotations=spec)
-    from data.training_split import piper_partition
-    fixed = piper_partition(list(episodes), {k:v['length'] for k,v in episodes.items()}, str(data)) if split_mode == 'auto' else None
-    split = (dict(train=fixed[0], development=[], confirmation=fixed[1])
-             if fixed is not None else grouped_split(groups, seed))
+    groups, episodes, locations = {}, {}, {}
+    split = {name: [] for name in ('train', 'development', 'confirmation')}
+    source_records = []
+    expected_spec = None
+    for data, cache in sources:
+        index = json.loads((cache / "index.json").read_text())
+        meta = index.get("__meta__", {})
+        if (meta.get("format") != "align-dinov2-per-camera-v2" or
+                meta.get("cameras") != list(cameras) or meta.get("source") != str(data)):
+            raise ValueError("Cache format, source, or camera order mismatch")
+        vision_backbone, raw_dim = cache_spec(meta)
+        if expected_spec is not None and expected_spec != (vision_backbone, raw_dim):
+            raise ValueError('All target caches must use the same backbone and feature width')
+        expected_spec = (vision_backbone, raw_dim)
+        source_groups = {}
+        with h5py.File(data, "r") as source:
+            keys = sorted(k for k in source if k.startswith("ep_"))
+            for local_key in keys:
+                key = episode_key(data, local_key) if multi else local_key
+                group = source[local_key]
+                raw = group["texts"][()]
+                descriptions = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                label = descriptions[0] if isinstance(descriptions, list) else str(descriptions)
+                group_id = hashlib.sha256(label.strip().encode()).hexdigest()[:16]
+                spec = annotation.get(key, {})
+                if spec.get("success") is False:
+                    continue  # Failed endpoints are not desired-goal targets.
+                n = len(group["poses"])
+                if local_key not in index or index[local_key]["length"] != n or n < action_horizon:
+                    raise ValueError(f"Episode/cache length mismatch or short episode: {key}")
+                groups[key] = spec.get("objective_group_id", group_id)
+                interval = spec.get("terminal_interval", [max(0, n-terminal_tail), n])
+                if not 0 <= interval[0] < interval[1] <= n:
+                    raise ValueError(f"Invalid terminal interval for {key}")
+                if "actions" not in group or group["actions"].shape != (n, 7):
+                    raise ValueError(f"Seven-dimensional expert action targets required: {key}")
+                episodes[key] = dict(length=n, group_id=groups[key], terminal_interval=interval,
+                    success=spec.get("success"), terminal_approved=bool(spec.get("success") is True and "terminal_interval" in spec),
+                    events=spec.get("events", []), input_commands="unavailable_unverified",
+                    state_gripper="measured" if "gripper" in group else "previous_recorded_action",
+                    timestamp_source="recorded" if "timestamps" in group else "index_over_declared_fps",
+                    annotations=spec)
+                locations[key] = (data, cache, local_key)
+                source_groups[local_key] = groups[key]
+        lengths = {key: episodes[episode_key(data, key) if multi else key]['length']
+                   for key in source_groups}
+        fixed = piper_partition(list(source_groups), lengths, str(data)) if split_mode == 'auto' else None
+        if fixed is not None:
+            partition = dict(train=fixed[0], development=[], confirmation=fixed[1])
+        elif multi and split_mode == 'auto':
+            partition = grouped_split(source_groups, seed, development_fraction=0.)
+        else:
+            partition = grouped_split(source_groups, seed)
+        for name, keys in partition.items():
+            split[name].extend(episode_key(data, key) if multi else key for key in keys)
+        stat = data.stat()
+        source_records.append(dict(source=str(data), source_stat=dict(size=stat.st_size, mtime_ns=stat.st_mtime_ns),
+            raw_cache=str(cache), cache_index_sha256=file_hash(cache / "index.json")))
     group_ids = {g: i for i, g in enumerate(sorted(set(groups.values())))}
     output.mkdir(parents=True)
     files = {}
-    with h5py.File(data, "r") as source:
+    with ExitStack() as stack:
+        handles = {path: stack.enter_context(h5py.File(path, "r")) for path, _ in sources}
         for number, (key, ep) in enumerate(episodes.items()):
+            data, cache, local_key = locations[key]
             n = ep["length"]
-            raw = np.load(cache / f"{key}.npy", mmap_mode="r")
+            raw = np.load(cache / f"{local_key}.npy", mmap_mode="r")
             if raw.shape != (n, len(cameras)*257, raw_dim) or raw.dtype != np.float32:
                 raise ValueError(f"Invalid raw cached features: {key}")
             # Sequential blocks keep both host memory and mmap reads bounded.
@@ -145,7 +174,7 @@ def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
             for start in range(0, n, block_size):
                 summary[start:start+block_size] = spatial_summary(raw[start:start+block_size], len(cameras))
             summary.flush()
-            group = source[key]
+            group = handles[data][local_key]
             actions = np.asarray(group["actions"], dtype=np.float32)
             if "gripper" in group:
                 gripper = np.asarray(group["gripper"], dtype=np.float32).reshape(n)
@@ -189,8 +218,8 @@ def build_targets(data, cache, output, *, cameras, fps, seed=20261020,
     np.savez(output / "normalization.npz", state_mean=states.mean(0),
         state_std=np.maximum(states.std(0), .05), visual_scale=visual_scale,
         terminal_mean=terminal_deltas.mean(0), procedure_mean=procedure_deltas.mean(0))
-    manifest = dict(schema=SCHEMA, source=str(data), source_stat={"size":data.stat().st_size,"mtime_ns":data.stat().st_mtime_ns},
-        raw_cache=str(cache), cache_index_sha256=file_hash(cache / "index.json"), cameras=list(cameras), fps=float(fps),
+    provenance = dict(sources=source_records) if multi else source_records[0]
+    manifest = dict(schema=SCHEMA, **provenance, cameras=list(cameras), fps=float(fps),
         seed=seed, action_horizon=action_horizon, procedure_points=procedure_points,
         terminal_tail=terminal_tail, feature_shape=[len(cameras),5,raw_dim], vision_backbone=vision_backbone, state_width=10,
         split=split, groups=group_ids, episodes=episodes, files=files,

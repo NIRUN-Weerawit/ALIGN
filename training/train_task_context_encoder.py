@@ -97,8 +97,17 @@ def evaluate(model, teacher, loader, device):
         metrics = batch_metrics(model, teacher, batch, out)
         modes += np.bincount(out["mode"].cpu().numpy().ravel(), minlength=len(modes))
         for i, key in enumerate(batch["keys"]):
-            rows.append(dict(key=key, **{name: np.nanmean(v[i].cpu().numpy()).item() for name, v in metrics.items()}))
-    means = {k: float(np.mean([r[k] for r in rows])) for k in rows[0] if k != "key"}
+            row = dict(key=key)
+            for name, values in metrics.items():
+                episode = values[i]
+                if name.startswith(("future_h", "persistence_h")):
+                    episode = episode[~episode.isnan()]
+                row[name] = episode.mean().item() if episode.numel() else None
+            rows.append(row)
+    means = {}
+    for name in metrics:
+        values = [row[name] for row in rows if row[name] is not None]
+        means[name] = float(np.mean(values)) if values else None
     # Exclude oracle selection, action targets, and confirmation from checkpoint choice.
     means["selection"] = float(np.mean([means[k] for k in ("latent_mse", "terminal", "procedure", "procedure_state")]))
     means["top_mode_counts"] = modes.tolist()

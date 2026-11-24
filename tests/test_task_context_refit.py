@@ -84,7 +84,7 @@ def test_teacher_final_refit_never_loads_validation(monkeypatch, tmp_path):
     batch['keys'] = ['a', 'b', 'c']
     np.savez(tmp_path / 'a.npz', actions=np.ones((4, 7), np.float32))
     dataset = SimpleNamespace(manifest=dict(cameras=['image'], action_horizon=4,
-        procedure_points=3, manifest_sha256='test', split=dict(development=[])), root=tmp_path, keys=['a'])
+        feature_shape=[1, 5, model.config['raw_dim']], procedure_points=3, manifest_sha256='test', split=dict(development=[])), root=tmp_path, keys=['a'])
     splits = []
     def load_data(root, split, **kw):
         assert split == 'train'

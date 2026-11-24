@@ -10,6 +10,20 @@ def policy_episode_split(dataset, path, observer_metadata=None, allow_unbound_ma
     m = json.loads(path.read_text())
     if m.get('schema') != SCHEMA or json_hash({k:v for k,v in m.items() if k != 'manifest_sha256'}) != m.get('manifest_sha256'):
         raise ValueError('Invalid pretrained target split manifest')
+    from data.multi_dataset import MultiEpisodeDataset
+
+    if isinstance(dataset, MultiEpisodeDataset):
+        declared = {record['source']: record for record in m.get('sources', [])}
+        if set(declared) != {str(source.h5_path.resolve()) for source in dataset.datasets}:
+            raise ValueError('Pretrained split sources differ from policy data sources')
+        for source in dataset.datasets:
+            path = source.h5_path.resolve()
+            stat = path.stat()
+            record = declared[str(path)]
+            if record['source_stat'] != dict(size=stat.st_size, mtime_ns=stat.st_mtime_ns):
+                raise ValueError(f'Policy source changed since target preparation: {path}')
+            if record['cache_index_sha256'] != file_hash(source.dinov2_path / 'index.json'):
+                raise ValueError(f'Policy feature index differs from target preparation: {path}')
     partitions = m['split']
     flat = [k for rows in partitions.values() for k in rows]
     if len(flat) != len(set(flat)) or set(flat) != set(dataset._episode_keys):

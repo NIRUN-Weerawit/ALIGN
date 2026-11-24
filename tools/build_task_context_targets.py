@@ -10,8 +10,8 @@ from data.task_context_dataset import build_targets
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--data',required=True)
-    parser.add_argument('--cache',required=True)
+    parser.add_argument('--data',nargs='+',required=True)
+    parser.add_argument('--cache',nargs='+',required=True)
     parser.add_argument('--output',required=True)
     parser.add_argument('--cameras',nargs='+',default=['image','wrist_image'])
     parser.add_argument('--fps',type=float,required=True,help='Declared source rate when timestamps are absent')
@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--procedure-points',type=int,default=8)
     parser.add_argument('--annotations',help='Optional per-episode JSON with verified success/terminal intervals')
     parser.add_argument('--split-mode', choices=['auto','legacy'], default='auto',
-        help='Default: fixed Piper 384/44 for LIBERO Goal; legacy restores the original three-way split')
+        help='Default: fixed Piper 384/44 for LIBERO Goal; other sources in a multi-dataset run use task-stratified 90/10; legacy uses three-way splits')
     args=parser.parse_args()
     build_targets(args.data,args.cache,args.output,cameras=args.cameras,fps=args.fps,
         seed=args.seed,terminal_tail=args.terminal_tail,action_horizon=args.action_horizon,
