@@ -24,6 +24,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
+from collections import OrderedDict
 import h5py
 import numpy as np
 from PIL import Image
@@ -102,7 +103,7 @@ class ALIGNDataset(Dataset):
         # directory of per-episode .npy files + index.json — see
         # scripts/precompute_dinov2.py.
         self._dinov2_index = None     # dict loaded from index.json
-        self._dinov2_memmaps = None   # dict {ep_idx: np.memmap}
+        self._dinov2_memmaps = None   # LRU of episode feature mappings
         self._episode_keys = sorted([k for k in self._h5.keys() if k.startswith("ep_")])
         if not self._episode_keys:
             # Backward compat: root-level frames/noisy_poses (single episode)
@@ -355,12 +356,12 @@ class ALIGNDataset(Dataset):
                     f"DINOv2 cache source {cache_meta.get('source')} does not "
                     f"match dataset {self.h5_path.resolve()}"
                 )
-            self._dinov2_memmaps = {}
+            self._dinov2_memmaps = OrderedDict()
 
         # Spawned DataLoader workers inherit validated metadata through pickle,
         # but each worker must create its own mmap-handle cache.
         if self._dinov2_memmaps is None:
-            self._dinov2_memmaps = {}
+            self._dinov2_memmaps = OrderedDict()
 
         ep_name = self._episode_keys[ep_idx]
         if ep_name not in self._dinov2_index:
@@ -371,6 +372,9 @@ class ALIGNDataset(Dataset):
             npy_path = self.dinov2_path / f"{ep_name}.npy"
             if not npy_path.exists():
                 raise FileNotFoundError(f"Missing {npy_path}")
+            # Drop the cache reference only. In-flight views keep the mapping alive.
+            if len(self._dinov2_memmaps) >= 64:
+                self._dinov2_memmaps.popitem(last=False)
             self._dinov2_memmaps[ep_idx] = np.load(
                 npy_path, mmap_mode="r",
             )
@@ -378,6 +382,7 @@ class ALIGNDataset(Dataset):
         # The default keeps the historical writable-copy contract. Custom
         # collators can request a read-only view and copy directly into their
         # final batch allocation instead.
+        self._dinov2_memmaps.move_to_end(ep_idx)
         mm = self._dinov2_memmaps[ep_idx]
         from models.vision_config import cache_spec
         _, width = cache_spec(self._dinov2_index["__meta__"])
